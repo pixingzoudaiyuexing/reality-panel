@@ -8,6 +8,26 @@ independent `v*` / `node-v*` tracks since this release).
 
 ---
 
+## [1.2.8] - 2026-08-13
+
+Panel-only update. The node binary remains `node-v1.2.2`; the installer script
+is served from `main`, so new node installs pick up the script improvements
+without a node crate release.
+
+### Added
+
+- **Automatic fallback certificates.** The node installer now supports
+  `--fallback-certbot-domain`, `--fallback-certbot-email`, and
+  `--fallback-certbot-staging`. When used with `--nginx-sni` plus
+  `--openlist-port` or `--fallback-http-upstream`, it installs certbot, requests
+  a Let's Encrypt certificate through an nginx webroot challenge, and writes a
+  deploy hook so renewals reload nginx.
+- **Richer install-command generator.** The Device Groups install-command modal
+  can now generate Reality SNI commands with OpenList fallback, fallback port,
+  fallback server name, and certbot options.
+
+---
+
 ## [1.2.7] - 2026-08-13
 
 Panel and node are released together for the Reality SNI forwarding feature.

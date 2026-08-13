@@ -20,8 +20,42 @@ function isMonitorOnly(g: { group_type: string }): boolean {
 
 const dash = <span style={{ color: 'var(--rp-text-tertiary)' }}>-</span>;
 
-function buildInstallCommand(token: string, panelUrl: string): string {
-  return `bash <(curl -fsSL ${INSTALL_SCRIPT_URL}) -t ${token} -u ${panelUrl}`;
+interface InstallCommandOptions {
+  nginxSni?: boolean;
+  openlistPort?: number | null;
+  fallbackPort?: number | null;
+  fallbackName?: string;
+  certbotDomain?: string;
+  certbotEmail?: string;
+  certbotStaging?: boolean;
+}
+
+interface InstallCommandContext {
+  token: string;
+  panelUrl: string;
+}
+
+const shellArg = (value: string): string => {
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+};
+
+function buildInstallCommand(token: string, panelUrl: string, options: InstallCommandOptions = {}): string {
+  const args = [
+    `bash <(curl -fsSL ${INSTALL_SCRIPT_URL})`,
+    `-t ${shellArg(token)}`,
+    `-u ${shellArg(panelUrl)}`,
+  ];
+  if (options.nginxSni) {
+    args.push('--nginx-sni');
+    if (options.openlistPort) args.push(`--openlist-port ${options.openlistPort}`);
+    if (options.fallbackPort) args.push(`--fallback-port ${options.fallbackPort}`);
+    if (options.fallbackName?.trim()) args.push(`--fallback-name ${shellArg(options.fallbackName.trim())}`);
+    if (options.certbotDomain?.trim()) args.push(`--fallback-certbot-domain ${shellArg(options.certbotDomain.trim())}`);
+    if (options.certbotEmail?.trim()) args.push(`--fallback-certbot-email ${shellArg(options.certbotEmail.trim())}`);
+    if (options.certbotStaging) args.push('--fallback-certbot-staging');
+  }
+  return args.map((arg, idx) => idx === 0 ? arg : `  ${arg}`).join(' \\\n');
 }
 
 function isLocalhost(): boolean {
@@ -40,6 +74,13 @@ export default function Groups() {
   const [editOpen, setEditOpen] = useState(false);
   const [cmdModalOpen, setCmdModalOpen] = useState(false);
   const [cmdModalContent, setCmdModalContent] = useState<{ title: ReactNode; body: ReactNode }>({ title: null, body: null });
+  const [installContext, setInstallContext] = useState<InstallCommandContext | null>(null);
+  const [installOptions, setInstallOptions] = useState<InstallCommandOptions>({
+    nginxSni: true,
+    openlistPort: 5244,
+    fallbackPort: 8443,
+    certbotStaging: false,
+  });
   const [editing, setEditing] = useState<DeviceGroup | null>(null);
   // v1.2.3: node-token rotation. `rotating` is the target group; `confirmName`
   // is the typed group name that unlocks the button — rotation kicks every node
@@ -197,22 +238,16 @@ export default function Groups() {
 
   const showInstallCommand = async (g: DeviceGroup) => {
     const panelUrl = await panelUrlRef();
-    const cmd = buildInstallCommand(g.token, panelUrl);
+    setInstallContext({ token: g.token, panelUrl });
+    setInstallOptions({
+      nginxSni: true,
+      openlistPort: 5244,
+      fallbackPort: 8443,
+      certbotStaging: false,
+    });
     setCmdModalContent({
       title: <span>{t('installCommandTitle')}</span>,
-      body: (
-        <>
-          {(isLocalhost() || panelUrl.includes("127.0.0.1") || panelUrl.includes("localhost") || panelUrl.includes("0.0.0.0")) && (
-            <Alert type="warning" showIcon style={{ marginBottom: 12 }} title={t('localhostWarning')} />
-          )}
-          <Input.TextArea value={cmd} readOnly autoSize={{ minRows: 3, maxRows: 5 }} style={{ fontFamily: 'var(--rp-font-mono)', fontSize: 12 }} />
-          <div style={{ textAlign: 'right', marginTop: 8 }}>
-            <Button type="primary" icon={<CopyOutlined />} onClick={() => doCopy(cmd, t('installCommandCopied'))}>
-              {t('copyInstallCommand')}
-            </Button>
-          </div>
-        </>
-      ),
+      body: null,
     });
     setCmdModalOpen(true);
   };
@@ -240,6 +275,7 @@ export default function Groups() {
       const cmd = buildInstallCommand(newToken, panelUrl);
       setRotating(null);
       setConfirmName('');
+      setInstallContext(null);
       load();
       setCmdModalContent({
         title: <span>{t('tokenRotated')}</span>,
@@ -497,8 +533,86 @@ export default function Groups() {
         </Form>
       </Modal>
 
-      <Modal title={cmdModalContent.title} open={cmdModalOpen} onCancel={() => setCmdModalOpen(false)} footer={null} width={580}>
-        {cmdModalContent.body}
+      <Modal title={cmdModalContent.title} open={cmdModalOpen} onCancel={() => { setCmdModalOpen(false); setInstallContext(null); }} footer={null} width={640}>
+        {installContext ? (
+          <>
+            {(isLocalhost() || installContext.panelUrl.includes("127.0.0.1") || installContext.panelUrl.includes("localhost") || installContext.panelUrl.includes("0.0.0.0")) && (
+              <Alert type="warning" showIcon style={{ marginBottom: 12 }} title={t('localhostWarning')} />
+            )}
+            <Form layout="vertical" size="small">
+              <Form.Item label={t('installRealitySniMode')}>
+                <Switch
+                  checked={!!installOptions.nginxSni}
+                  onChange={(checked) => setInstallOptions(o => ({ ...o, nginxSni: checked }))}
+                />
+              </Form.Item>
+              {installOptions.nginxSni && (
+                <>
+                  <Form.Item label={t('installOpenlistPort')}>
+                    <InputNumber
+                      min={1}
+                      max={65535}
+                      value={installOptions.openlistPort}
+                      onChange={(value) => setInstallOptions(o => ({ ...o, openlistPort: typeof value === 'number' ? value : null }))}
+                      style={{ width: '100%' }}
+                    />
+                  </Form.Item>
+                  <Form.Item label={t('installFallbackPort')}>
+                    <InputNumber
+                      min={1}
+                      max={65535}
+                      value={installOptions.fallbackPort}
+                      onChange={(value) => setInstallOptions(o => ({ ...o, fallbackPort: typeof value === 'number' ? value : null }))}
+                      style={{ width: '100%' }}
+                    />
+                  </Form.Item>
+                  <Form.Item label={t('installFallbackName')}>
+                    <Input
+                      value={installOptions.fallbackName}
+                      placeholder="op1.example.com"
+                      onChange={(e) => setInstallOptions(o => ({ ...o, fallbackName: e.target.value }))}
+                    />
+                  </Form.Item>
+                  <Form.Item label={t('installCertbotDomain')} extra={t('installCertbotDomainHint')}>
+                    <Input
+                      value={installOptions.certbotDomain}
+                      placeholder="op1.example.com"
+                      onChange={(e) => setInstallOptions(o => ({ ...o, certbotDomain: e.target.value }))}
+                    />
+                  </Form.Item>
+                  <Form.Item label={t('installCertbotEmail')}>
+                    <Input
+                      value={installOptions.certbotEmail}
+                      placeholder="admin@example.com"
+                      onChange={(e) => setInstallOptions(o => ({ ...o, certbotEmail: e.target.value }))}
+                    />
+                  </Form.Item>
+                  <Form.Item label={t('installCertbotStaging')}>
+                    <Switch
+                      checked={!!installOptions.certbotStaging}
+                      onChange={(checked) => setInstallOptions(o => ({ ...o, certbotStaging: checked }))}
+                    />
+                  </Form.Item>
+                </>
+              )}
+            </Form>
+            <Input.TextArea
+              value={buildInstallCommand(installContext.token, installContext.panelUrl, installOptions)}
+              readOnly
+              autoSize={{ minRows: 5, maxRows: 9 }}
+              style={{ fontFamily: 'var(--rp-font-mono)', fontSize: 12 }}
+            />
+            <div style={{ textAlign: 'right', marginTop: 8 }}>
+              <Button
+                type="primary"
+                icon={<CopyOutlined />}
+                onClick={() => doCopy(buildInstallCommand(installContext.token, installContext.panelUrl, installOptions), t('installCommandCopied'))}
+              >
+                {t('copyInstallCommand')}
+              </Button>
+            </div>
+          </>
+        ) : cmdModalContent.body}
       </Modal>
 
       {/* v1.2.3: rotate confirmation. Deliberately heavier than a Popconfirm —

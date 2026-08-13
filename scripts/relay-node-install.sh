@@ -16,6 +16,9 @@
 #   --openlist-port N   Use an existing local OpenList HTTP Docker site as the
 #                       fallback, e.g. 5244 maps to http://127.0.0.1:5244.
 #   --fallback-backend  Direct TLS fallback backend, e.g. 127.0.0.1:8443.
+#   --fallback-certbot-domain DOMAIN
+#                       Auto-issue and renew a Let's Encrypt certificate for
+#                       the local HTTPS fallback wrapper.
 #
 # Environment:
 #   RELAY_PROXY           Same as -p (e.g. socks5://127.0.0.1:10808)
@@ -62,6 +65,9 @@ SNI_FALLBACK_HTTP_UPSTREAM="${SNI_FALLBACK_HTTP_UPSTREAM:-}"
 SNI_DEFAULT_BACKEND="${NGINX_SNI_DEFAULT_BACKEND:-}"
 SNI_FALLBACK_CERT="${SNI_FALLBACK_CERT:-}"
 SNI_FALLBACK_KEY="${SNI_FALLBACK_KEY:-}"
+SNI_FALLBACK_CERTBOT_DOMAIN="${SNI_FALLBACK_CERTBOT_DOMAIN:-}"
+SNI_FALLBACK_CERTBOT_EMAIL="${SNI_FALLBACK_CERTBOT_EMAIL:-}"
+SNI_FALLBACK_CERTBOT_STAGING="${SNI_FALLBACK_CERTBOT_STAGING:-0}"
 # v1.2: explicit node version override (--version X.Y.Z). When empty, the
 # script queries GitHub for the latest node-v* tag and falls back to
 # SCRIPT_VERSION if the query fails (it NEVER guesses the panel version).
@@ -83,6 +89,9 @@ while [[ $# -gt 0 ]]; do
         --fallback-name)    SNI_FALLBACK_SERVER_NAME="$2"; shift 2 ;;
         --fallback-cert)    SNI_FALLBACK_CERT="$2"; shift 2 ;;
         --fallback-key)     SNI_FALLBACK_KEY="$2"; shift 2 ;;
+        --fallback-certbot-domain) SNI_FALLBACK_CERTBOT_DOMAIN="$2"; shift 2 ;;
+        --fallback-certbot-email)  SNI_FALLBACK_CERTBOT_EMAIL="$2"; shift 2 ;;
+        --fallback-certbot-staging) SNI_FALLBACK_CERTBOT_STAGING="1"; shift ;;
         -h|--help)
             echo "Usage: $0 -t <token> -u <panel-url> [-s <service-name>] [-p <proxy>] [--version X.Y.Z] [--nginx-sni --openlist-port 5244]"
             echo ""
@@ -102,6 +111,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --fallback-name X   Fallback HTTPS server_name / self-signed CN (default: localhost)"
             echo "  --fallback-cert P   Existing PEM fullchain for fallback HTTPS wrapper"
             echo "  --fallback-key P    Existing PEM private key for fallback HTTPS wrapper"
+            echo "  --fallback-certbot-domain DOMAIN"
+            echo "                       Auto-issue and renew a Let's Encrypt cert for the fallback wrapper"
+            echo "  --fallback-certbot-email EMAIL"
+            echo "                       Email used for Let's Encrypt registration and notices"
+            echo "  --fallback-certbot-staging"
+            echo "                       Use Let's Encrypt staging for dry-run testing"
             echo ""
             echo "Environment:"
             echo "  RELAY_PROXY           Same as -p"
@@ -112,6 +127,9 @@ while [[ $# -gt 0 ]]; do
             echo "  SNI_FALLBACK_PORT     Same as --fallback-port"
             echo "  SNI_FALLBACK_SERVER_NAME Same as --fallback-name"
             echo "  SNI_FALLBACK_CERT / SNI_FALLBACK_KEY Same as --fallback-cert/--fallback-key"
+            echo "  SNI_FALLBACK_CERTBOT_DOMAIN / SNI_FALLBACK_CERTBOT_EMAIL"
+            echo "                       Same as --fallback-certbot-domain/--fallback-certbot-email"
+            echo "  SNI_FALLBACK_CERTBOT_STAGING=1 Same as --fallback-certbot-staging"
             exit 0
             ;;
         *)
@@ -143,6 +161,31 @@ if [ -n "$SNI_FALLBACK_HTTP_UPSTREAM" ]; then
     upstream_port="${SNI_FALLBACK_HTTP_UPSTREAM##*:}"
     if [ "$upstream_port" = "$SNI_FALLBACK_HTTP_UPSTREAM" ] || ! [[ "$upstream_port" =~ ^[0-9]+$ ]] || [ "$upstream_port" -lt 1 ] || [ "$upstream_port" -gt 65535 ]; then
         fail "--openlist-port/--fallback-http-upstream must end with a port from 1 to 65535"
+    fi
+fi
+case "$SNI_FALLBACK_CERTBOT_STAGING" in
+    1|true|TRUE|yes|YES|on|ON) SNI_FALLBACK_CERTBOT_STAGING="1" ;;
+    0|false|FALSE|no|NO|off|OFF|"") SNI_FALLBACK_CERTBOT_STAGING="0" ;;
+    *) fail "--fallback-certbot-staging / SNI_FALLBACK_CERTBOT_STAGING must be boolean" ;;
+esac
+if [ -n "$SNI_FALLBACK_CERTBOT_DOMAIN" ]; then
+    if [[ "$SNI_FALLBACK_CERTBOT_DOMAIN" == *"://"* || "$SNI_FALLBACK_CERTBOT_DOMAIN" == */* || "$SNI_FALLBACK_CERTBOT_DOMAIN" == \** ]]; then
+        fail "--fallback-certbot-domain must be a plain hostname, not a URL or wildcard"
+    fi
+    if ! [[ "$SNI_FALLBACK_CERTBOT_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]; then
+        fail "--fallback-certbot-domain must be a valid FQDN, e.g. op1.example.com"
+    fi
+    if [ -n "$SNI_DEFAULT_BACKEND" ]; then
+        fail "--fallback-certbot-domain is for the local HTTPS wrapper; use it with --openlist-port/--fallback-http-upstream, not --fallback-backend"
+    fi
+    if [ -z "$SNI_FALLBACK_HTTP_UPSTREAM" ]; then
+        fail "--fallback-certbot-domain requires --openlist-port or --fallback-http-upstream"
+    fi
+    if [ -n "$SNI_FALLBACK_CERT" ] || [ -n "$SNI_FALLBACK_KEY" ]; then
+        fail "Use either --fallback-certbot-domain OR --fallback-cert/--fallback-key, not both"
+    fi
+    if [ "$SNI_FALLBACK_SERVER_NAME" = "localhost" ]; then
+        SNI_FALLBACK_SERVER_NAME="$SNI_FALLBACK_CERTBOT_DOMAIN"
     fi
 fi
 if [ -n "$SNI_DEFAULT_BACKEND" ]; then
@@ -206,6 +249,118 @@ set_env_var() {
     printf '%s=%s\n' "$key" "$(shell_quote "$value")" >> "$file"
 }
 
+install_certbot_if_needed() {
+    command -v certbot >/dev/null 2>&1 && return 0
+
+    info "Installing certbot for Let's Encrypt fallback certificate ..."
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -y -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot
+    else
+        install_pkg certbot
+    fi
+}
+
+configure_certbot_renew_hook() {
+    local hook="/etc/letsencrypt/renewal-hooks/deploy/relay-panel-nginx-reload.sh"
+    mkdir -p "$(dirname "$hook")"
+    cat > "$hook" <<'HOOKEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files nginx.service >/dev/null 2>&1; then
+    systemctl reload nginx || systemctl restart nginx
+elif command -v nginx >/dev/null 2>&1; then
+    nginx -s reload
+fi
+HOOKEOF
+    chmod 755 "$hook"
+}
+
+enable_certbot_auto_renewal() {
+    local enabled=0
+
+    if command -v systemctl >/dev/null 2>&1; then
+        local timer
+        for timer in certbot.timer certbot-renew.timer snap.certbot.renew.timer; do
+            if systemctl list-unit-files "$timer" 2>/dev/null | grep -q "^${timer}"; then
+                if systemctl enable --now "$timer"; then
+                    info "Enabled certificate auto-renewal timer: ${timer}"
+                    enabled=1
+                    break
+                else
+                    warn "Failed to enable ${timer}; trying the next renewal option."
+                fi
+            fi
+        done
+    fi
+
+    if [ "$enabled" != "1" ]; then
+        mkdir -p /etc/cron.d
+        cat > /etc/cron.d/relay-panel-certbot-renew <<'CRONEOF'
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+17 3,15 * * * root certbot renew --quiet
+CRONEOF
+        chmod 644 /etc/cron.d/relay-panel-certbot-renew
+        warn "No certbot systemd timer was enabled; installed cron fallback: /etc/cron.d/relay-panel-certbot-renew"
+    fi
+}
+
+issue_fallback_certbot_certificate() {
+    [ -n "$SNI_FALLBACK_CERTBOT_DOMAIN" ] || return 0
+
+    install_certbot_if_needed
+    configure_certbot_renew_hook
+    enable_certbot_auto_renewal
+
+    local domain="$SNI_FALLBACK_CERTBOT_DOMAIN"
+    local cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+    local key="/etc/letsencrypt/live/${domain}/privkey.pem"
+    if [ -s "$cert" ] && [ -s "$key" ]; then
+        info "Using existing Let's Encrypt certificate for ${domain}"
+    else
+        info "Requesting Let's Encrypt certificate for ${domain} via nginx webroot ..."
+        mkdir -p /var/www/relay-panel-certbot/.well-known/acme-challenge
+        cat > /etc/nginx/conf.d/relay-panel-certbot-http.conf <<NGINXEOF
+server {
+    listen 80;
+    server_name ${domain};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/relay-panel-certbot;
+        default_type "text/plain";
+    }
+
+    location / {
+        return 404;
+    }
+}
+NGINXEOF
+        nginx -t
+        systemctl enable nginx
+        systemctl reload nginx || systemctl restart nginx
+
+        local email_args=(--register-unsafely-without-email)
+        if [ -n "$SNI_FALLBACK_CERTBOT_EMAIL" ]; then
+            email_args=(-m "$SNI_FALLBACK_CERTBOT_EMAIL")
+        fi
+        local staging_args=()
+        if [ "$SNI_FALLBACK_CERTBOT_STAGING" = "1" ]; then
+            staging_args=(--staging)
+        fi
+        certbot certonly --webroot \
+            -w /var/www/relay-panel-certbot \
+            -d "$domain" \
+            --non-interactive --agree-tos \
+            --keep-until-expiring \
+            "${email_args[@]}" \
+            "${staging_args[@]}"
+    fi
+
+    SNI_FALLBACK_CERT="$cert"
+    SNI_FALLBACK_KEY="$key"
+}
+
 ensure_nginx_stream_include() {
     if grep -Rqs "include /etc/nginx/stream.d/\\*.conf;" /etc/nginx/nginx.conf /etc/nginx/conf.d 2>/dev/null; then
         return
@@ -237,6 +392,7 @@ configure_nginx_sni() {
 
     if [ -n "$SNI_FALLBACK_HTTP_UPSTREAM" ]; then
         info "Configuring local HTTPS fallback wrapper -> http://${SNI_FALLBACK_HTTP_UPSTREAM}"
+        issue_fallback_certbot_certificate
         local cert="${SNI_FALLBACK_CERT:-/etc/nginx/relay-panel-certs/fallback.crt}"
         local key="${SNI_FALLBACK_KEY:-/etc/nginx/relay-panel-certs/fallback.key}"
         if [ -n "$SNI_FALLBACK_CERT" ] || [ -n "$SNI_FALLBACK_KEY" ]; then

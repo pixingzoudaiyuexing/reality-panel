@@ -103,7 +103,7 @@ docker compose -f docker-compose.release.yaml up -d
 默认镜像：
 
 ```text
-ghcr.io/pixingzoudaiyuexing/relay-panel-panel:1.2.7
+ghcr.io/pixingzoudaiyuexing/relay-panel-panel:1.2.8
 ghcr.io/pixingzoudaiyuexing/relay-panel-node:1.2.2
 ```
 
@@ -176,7 +176,21 @@ bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-pa
   --fallback-backend 127.0.0.1:8443
 ```
 
-要让浏览器显示“安全”，fallback 站点需要有效证书。可以用真实域名申请证书后传入：
+要让浏览器显示“安全”，fallback 站点需要有效证书。脚本可以用 certbot 自动申请并配置续签后 reload nginx：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
+  -t <NODE_TOKEN> \
+  -u http://<PANEL_IP>:18888 \
+  --nginx-sni \
+  --openlist-port 5244 \
+  --fallback-certbot-domain op1.example.com \
+  --fallback-certbot-email admin@example.com
+```
+
+前提是 `op1.example.com` 已解析到中转节点公网 IP，并且节点的 `80` 端口可被 Let's Encrypt 访问。
+
+也可以传入已有证书：
 
 ```bash
 --fallback-cert /etc/letsencrypt/live/op1.example.com/fullchain.pem \
