@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 /// wire fields from ListenerConfig. A v0.4.6 node still expects those fields,
 /// so deserialization would fail or misread — the gate forces a coordinated
 /// upgrade. Also adds node_transport to the listener fingerprint.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 4;
+/// v5 = reality-sni fork: ListenerConfig gains optional `sni`, and nodes may
+/// receive node_transport=nginx_sni for generated Nginx Stream SNI routing.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 5;
 
 // === Auth ===
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,6 +160,9 @@ pub struct ListenerConfig {
     /// None → node uses its built-in default ("/relay").
     #[serde(default)]
     pub ws_path: Option<String>,
+    /// TLS SNI hostname used by node_transport=nginx_sni.
+    #[serde(default)]
+    pub sni: Option<String>,
     pub targets: Vec<String>,
     /// v0.4.6: how the node picks among `targets` for each new connection /
     /// UDP session. Defaults to `First` so old configs and v0.4.5 rows behave
@@ -247,6 +252,7 @@ pub fn build_listeners_for_rule(
             node_transport: transport,
             // Per-rule WS path override; None → node uses its built-in "/relay".
             ws_path: rule.ws_path.clone(),
+            sni: rule.sni.clone(),
             targets: targets.clone(),
             load_balance_strategy: LoadBalanceStrategy::from_db_str(&rule.load_balance_strategy),
             // v0.4.6: convert the user-facing Mbps caps to bytes/sec here so the
@@ -362,6 +368,7 @@ impl LoadBalanceStrategy {
 /// - `Raw` = plain TCP/UDP
 /// - `Ws` = plaintext WebSocket
 /// - `TlsSimple` = raw TCP over TLS, terminated at relay-node (v0.4.1).
+/// - `NginxSni` = REALITY-style TLS SNI routing through Nginx Stream.
 ///
 /// v0.4.1: `Wss` (WebSocket Secure via reverse proxy) is REMOVED. Any old DB
 /// row with `public_transport='wss'` is converted to `'ws'` by Migration 18
@@ -377,6 +384,7 @@ pub enum PublicTransport {
     Raw,
     Ws,
     TlsSimple,
+    NginxSni,
 }
 
 impl PublicTransport {
@@ -388,6 +396,7 @@ impl PublicTransport {
             "ws" => PublicTransport::Ws,
             // Legacy v0.3.x "tls" → tls_simple.
             "tls" | "tls_simple" => PublicTransport::TlsSimple,
+            "nginx_sni" => PublicTransport::NginxSni,
             _ => PublicTransport::Raw,
         }
     }
@@ -397,6 +406,7 @@ impl PublicTransport {
             PublicTransport::Raw => "raw",
             PublicTransport::Ws => "ws",
             PublicTransport::TlsSimple => "tls_simple",
+            PublicTransport::NginxSni => "nginx_sni",
         }
     }
     /// Derive the transport the NODE actually listens on.
@@ -407,6 +417,7 @@ impl PublicTransport {
             PublicTransport::Raw => NodeTransport::Raw,
             PublicTransport::Ws => NodeTransport::Ws,
             PublicTransport::TlsSimple => NodeTransport::TlsSimple,
+            PublicTransport::NginxSni => NodeTransport::NginxSni,
         }
     }
 }
@@ -423,6 +434,9 @@ pub enum NodeTransport {
     /// v0.4.1: node terminates TLS directly (tokio-rustls). In v0.4.0 the node
     /// logs and skips a TlsSimple listener (no rustls integration yet).
     TlsSimple,
+    /// Managed by Nginx Stream. relay-node writes/reloads config but does not
+    /// accept data-plane connections itself.
+    NginxSni,
 }
 
 impl NodeTransport {
@@ -432,6 +446,7 @@ impl NodeTransport {
         match s {
             "ws" => NodeTransport::Ws,
             "tls" | "tls_simple" => NodeTransport::TlsSimple,
+            "nginx_sni" => NodeTransport::NginxSni,
             _ => NodeTransport::Raw,
         }
     }
@@ -441,6 +456,7 @@ impl NodeTransport {
             NodeTransport::Raw => "raw",
             NodeTransport::Ws => "ws",
             NodeTransport::TlsSimple => "tls_simple",
+            NodeTransport::NginxSni => "nginx_sni",
         }
     }
 }
@@ -854,6 +870,9 @@ pub struct CreateRuleRequest {
     /// ("/relay") — so this is purely an override, not a required field.
     #[serde(default)]
     pub ws_path: Option<String>,
+    /// Required for nginx_sni rules. Ignored for normal raw/ws/tls_simple rules.
+    #[serde(default)]
+    pub sni: Option<String>,
     pub target_addr: String,
     pub target_port: u16,
     /// v0.4.6: optional multi-target list. Omitted means use the legacy
@@ -903,6 +922,10 @@ pub struct UpdateRuleRequest {
     /// stored value untouched.
     #[serde(default)]
     pub ws_path: Option<Option<String>>,
+    /// Update with Some(Some(value)) to set SNI, Some(None) to clear SNI,
+    /// omitted to keep the stored value.
+    #[serde(default)]
+    pub sni: Option<Option<String>>,
     pub target_addr: Option<String>,
     pub target_port: Option<u16>,
     /// v0.4.6: replace the rule's target list. Omitted keeps current targets.
@@ -1183,6 +1206,10 @@ mod tests {
             NodeTransport::from_db_str("tls_simple"),
             NodeTransport::TlsSimple
         );
+        assert_eq!(
+            NodeTransport::from_db_str("nginx_sni"),
+            NodeTransport::NginxSni
+        );
         // Legacy "tls" → tls_simple.
         assert_eq!(NodeTransport::from_db_str("tls"), NodeTransport::TlsSimple);
     }
@@ -1202,6 +1229,10 @@ mod tests {
         assert_eq!(
             PublicTransport::TlsSimple.derive_node_transport(),
             NodeTransport::TlsSimple
+        );
+        assert_eq!(
+            PublicTransport::NginxSni.derive_node_transport(),
+            NodeTransport::NginxSni
         );
     }
 
@@ -1313,6 +1344,16 @@ mod tests {
         let ls = build_listeners_for_rule(&r, vec!["t:1".into()]);
         assert_eq!(ls.len(), 1);
         assert_eq!(ls[0].ws_path.as_deref(), Some("/custom"));
+    }
+
+    #[test]
+    fn build_listeners_passes_through_sni() {
+        let mut r = rule(3, "tcp", "nginx_sni");
+        r.sni = Some("op1.example.com".into());
+        let ls = build_listeners_for_rule(&r, vec!["10.0.0.1:55443".into()]);
+        assert_eq!(ls.len(), 1);
+        assert_eq!(ls[0].node_transport, NodeTransport::NginxSni);
+        assert_eq!(ls[0].sni.as_deref(), Some("op1.example.com"));
     }
 
     #[test]

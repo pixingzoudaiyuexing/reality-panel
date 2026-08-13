@@ -307,10 +307,13 @@ CREATE TABLE IF NOT EXISTS schema_version (
 -- revision 11 (run_pg_migrations) for the upgrade path on existing DBs.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_port_tcp
     ON forward_rules (device_group_in, listen_port)
-    WHERE protocol IN ('tcp', 'tcp_udp');
+    WHERE protocol IN ('tcp', 'tcp_udp') AND node_transport != 'nginx_sni';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_port_udp
     ON forward_rules (device_group_in, listen_port)
     WHERE protocol IN ('udp', 'tcp_udp');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_nginx_sni
+    ON forward_rules (device_group_in, listen_port, lower(sni))
+    WHERE node_transport = 'nginx_sni' AND sni IS NOT NULL AND sni != '';
 
 -- Default admin user (password: admin123, will be hashed on init via the
 -- same UserRepository::replace_placeholder_admin_password path SQLite uses).
@@ -379,7 +382,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 27;
+pub const PG_SCHEMA_VERSION: i32 = 28;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -835,7 +838,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         let tcp_dupes: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM (
                  SELECT device_group_in, listen_port FROM forward_rules
-                 WHERE protocol IN ('tcp', 'tcp_udp')
+                WHERE protocol IN ('tcp', 'tcp_udp') AND node_transport != 'nginx_sni'
                  GROUP BY device_group_in, listen_port HAVING COUNT(*) > 1
              ) d",
         )
@@ -869,7 +872,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
             sqlx::query(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_port_tcp
                  ON forward_rules (device_group_in, listen_port)
-                 WHERE protocol IN ('tcp', 'tcp_udp')",
+                 WHERE protocol IN ('tcp', 'tcp_udp') AND node_transport != 'nginx_sni'",
             )
             .execute(&mut *tx)
             .await?;
@@ -1446,6 +1449,35 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         );
     }
 
+    // Reality/SNI fork: nginx_sni rules share one TCP port and route by SNI.
+    if current < 28 {
+        let mut tx = pool.begin().await?;
+        sqlx::query("DROP INDEX IF EXISTS idx_fr_port_tcp")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_port_tcp
+             ON forward_rules (device_group_in, listen_port)
+             WHERE protocol IN ('tcp', 'tcp_udp') AND node_transport != 'nginx_sni'",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_nginx_sni
+             ON forward_rules (device_group_in, listen_port, lower(sni))
+             WHERE node_transport = 'nginx_sni' AND sni IS NOT NULL AND sni != ''",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (28) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 28: enabled nginx_sni per-SNI uniqueness");
+    }
+
     Ok(())
 }
 
@@ -1502,6 +1534,11 @@ mod tests {
             vec!["SELECT 1"]
         );
         assert!(split_sql_statements("   \n -- just a comment\n").is_empty());
+    }
+
+    #[test]
+    fn pg_schema_version_matches_latest_migration() {
+        assert_eq!(PG_SCHEMA_VERSION, 28);
     }
 
     // The real baseline schema must split into runnable statements, and no

@@ -1008,6 +1008,70 @@ async fn rule_insert_quota_guarded_tcp_udp_share_port() {
     }
 }
 
+#[tokio::test]
+async fn rule_insert_quota_guarded_nginx_sni_shares_port_by_sni() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+    let insert_sni = |name: &'static str, sni: &'static str| {
+        let db = &db;
+        async move {
+            <SqliteRepository as RuleRepository>::insert_quota_guarded(
+                db,
+                name,
+                1,
+                443,
+                "tcp",
+                "nginx_sni",
+                "nginx_sni",
+                "direct",
+                "nginx_sni",
+                None,
+                Some(sni),
+                1,
+                None,
+                "direct",
+                "127.0.0.1",
+                55443,
+            )
+            .await
+        }
+    };
+
+    insert_sni("op1", "op1.example.com").await.unwrap();
+    insert_sni("op2", "op2.example.com").await.unwrap();
+
+    match insert_sni("op1-dup-case", "OP1.EXAMPLE.COM").await {
+        Err(DbError::PortConflict) => {}
+        other => panic!("expected PortConflict for duplicate SNI, got {:?}", other),
+    }
+
+    match db
+        .insert_quota_guarded(
+            "raw",
+            1,
+            443,
+            "tcp",
+            "raw",
+            "raw",
+            "direct",
+            "raw",
+            None,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+        )
+        .await
+    {
+        Err(DbError::PortConflict) => {}
+        other => panic!(
+            "expected PortConflict for raw TCP on SNI port, got {:?}",
+            other
+        ),
+    }
+}
+
 /// v0.4.11 PR4: the same port on a DIFFERENT group is allowed (independent
 /// pools). Different users sharing one group share its pool — modeled here
 /// by inserting two rules with different uids into the same group.

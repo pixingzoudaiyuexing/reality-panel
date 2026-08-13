@@ -282,7 +282,7 @@ pub trait RuleRepository: Send + Sync {
     async fn list_group_port_protocols(
         &self,
         device_group_in: i64,
-    ) -> Result<Vec<(i32, String)>, DbError>;
+    ) -> Result<Vec<(i32, String, String)>, DbError>;
     /// v1.2.x: the auto-assign port pool configured on a device group
     /// (`device_groups.port_range`, e.g. "10000-65535"). `auto_assign_port`
     /// parses this to bound its search. Returns `None` when the group id
@@ -318,6 +318,7 @@ pub trait RuleRepository: Send + Sync {
         route_mode: &str,
         entry_transport: &str,
         ws_path: Option<&str>,
+        sni: Option<&str>,
         device_group_in: i64,
         device_group_out: Option<i64>,
         forward_mode: &str,
@@ -365,6 +366,7 @@ pub trait RuleRepository: Send + Sync {
         route_mode: &str,
         entry_transport: &str,
         ws_path: Option<&str>,
+        sni: Option<&str>,
         device_group_in: i64,
         device_group_out: Option<i64>,
         forward_mode: &str,
@@ -402,6 +404,7 @@ pub trait RuleRepository: Send + Sync {
         entry_transport: Option<&str>,
         route_mode: Option<&str>,
         ws_path: Option<Option<&str>>,
+        sni: Option<Option<&str>>,
         device_group_in: Option<i64>,
         device_group_out: Option<Option<i64>>,
         forward_mode: Option<&str>,

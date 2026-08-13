@@ -3,7 +3,7 @@
 # RelayPanel node installer - downloads and runs relay-node as a systemd service.
 #
 # Usage:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/scripts/relay-node-install.sh) \
+#   bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
 #     -t <NODE_TOKEN> -u <PANEL_URL>
 #
 # Options:
@@ -12,6 +12,10 @@
 #   -s, --service-name  systemd service name (default: relay-node)
 #   -p, --proxy         Proxy for downloads, e.g. socks5://127.0.0.1:10808
 #                       (or set RELAY_PROXY env var)
+#   --nginx-sni         Enable Nginx Stream SNI mode.
+#   --openlist-port N   Use an existing local OpenList HTTP Docker site as the
+#                       fallback, e.g. 5244 maps to http://127.0.0.1:5244.
+#   --fallback-backend  Direct TLS fallback backend, e.g. 127.0.0.1:8443.
 #
 # Environment:
 #   RELAY_PROXY           Same as -p (e.g. socks5://127.0.0.1:10808)
@@ -34,8 +38,8 @@ cd / 2>/dev/null || true
 
 # Bump this when releasing a new version. The binary is downloaded from
 # GitHub Releases assets.
-SCRIPT_VERSION="1.2.1"
-REPO="MoeShinX/relay-panel"
+SCRIPT_VERSION="1.2.2"
+REPO="pixingzoudaiyuexing/relay-panel"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -51,6 +55,13 @@ NODE_TOKEN=""
 PANEL_URL=""
 SERVICE_NAME="relay-node"
 PROXY="${RELAY_PROXY:-}"
+NGINX_SNI="${NGINX_SNI:-0}"
+SNI_FALLBACK_PORT="${SNI_FALLBACK_PORT:-8443}"
+SNI_FALLBACK_SERVER_NAME="${SNI_FALLBACK_SERVER_NAME:-localhost}"
+SNI_FALLBACK_HTTP_UPSTREAM="${SNI_FALLBACK_HTTP_UPSTREAM:-}"
+SNI_DEFAULT_BACKEND="${NGINX_SNI_DEFAULT_BACKEND:-}"
+SNI_FALLBACK_CERT="${SNI_FALLBACK_CERT:-}"
+SNI_FALLBACK_KEY="${SNI_FALLBACK_KEY:-}"
 # v1.2: explicit node version override (--version X.Y.Z). When empty, the
 # script queries GitHub for the latest node-v* tag and falls back to
 # SCRIPT_VERSION if the query fails (it NEVER guesses the panel version).
@@ -64,8 +75,16 @@ while [[ $# -gt 0 ]]; do
         -s|--service-name)  SERVICE_NAME="$2"; shift 2 ;;
         -p|--proxy)         PROXY="$2"; shift 2 ;;
         --version)          TARGET_VERSION="$2"; shift 2 ;;
+        --nginx-sni)        NGINX_SNI="1"; shift ;;
+        --fallback-backend) SNI_DEFAULT_BACKEND="$2"; shift 2 ;;
+        --fallback-http-upstream) SNI_FALLBACK_HTTP_UPSTREAM="$2"; shift 2 ;;
+        --openlist-port)    SNI_FALLBACK_HTTP_UPSTREAM="127.0.0.1:$2"; shift 2 ;;
+        --fallback-port)    SNI_FALLBACK_PORT="$2"; shift 2 ;;
+        --fallback-name)    SNI_FALLBACK_SERVER_NAME="$2"; shift 2 ;;
+        --fallback-cert)    SNI_FALLBACK_CERT="$2"; shift 2 ;;
+        --fallback-key)     SNI_FALLBACK_KEY="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 -t <token> -u <panel-url> [-s <service-name>] [-p <proxy>] [--version X.Y.Z]"
+            echo "Usage: $0 -t <token> -u <panel-url> [-s <service-name>] [-p <proxy>] [--version X.Y.Z] [--nginx-sni --openlist-port 5244]"
             echo ""
             echo "Options:"
             echo "  -t, --token         Node token from the panel UI (required)"
@@ -73,10 +92,26 @@ while [[ $# -gt 0 ]]; do
             echo "  -s, --service-name  systemd service name (default: relay-node)"
             echo "  -p, --proxy         Download proxy, e.g. socks5://127.0.0.1:10808"
             echo "  --version X.Y.Z     Install a specific node version (default: latest node-v* from GitHub)"
+            echo "  --nginx-sni         Configure Nginx Stream SNI routing"
+            echo "  --openlist-port N   Use local OpenList HTTP Docker site as fallback, e.g. 5244"
+            echo "  --fallback-http-upstream HOST:PORT"
+            echo "                       HTTP upstream to wrap with local HTTPS, e.g. 127.0.0.1:5244"
+            echo "  --fallback-backend HOST:PORT"
+            echo "                       Direct TLS fallback backend; no HTTP wrapper is created"
+            echo "  --fallback-port N   Local HTTPS wrapper port for --openlist-port/--fallback-http-upstream (default: 8443)"
+            echo "  --fallback-name X   Fallback HTTPS server_name / self-signed CN (default: localhost)"
+            echo "  --fallback-cert P   Existing PEM fullchain for fallback HTTPS wrapper"
+            echo "  --fallback-key P    Existing PEM private key for fallback HTTPS wrapper"
             echo ""
             echo "Environment:"
             echo "  RELAY_PROXY           Same as -p"
             echo "  RELAY_NODE_BASE_URL   Custom mirror for binary downloads"
+            echo "  NGINX_SNI=1           Same as --nginx-sni"
+            echo "  SNI_FALLBACK_HTTP_UPSTREAM Same as --fallback-http-upstream"
+            echo "  NGINX_SNI_DEFAULT_BACKEND Same as --fallback-backend"
+            echo "  SNI_FALLBACK_PORT     Same as --fallback-port"
+            echo "  SNI_FALLBACK_SERVER_NAME Same as --fallback-name"
+            echo "  SNI_FALLBACK_CERT / SNI_FALLBACK_KEY Same as --fallback-cert/--fallback-key"
             exit 0
             ;;
         *)
@@ -91,6 +126,33 @@ if [ -z "$NODE_TOKEN" ]; then
 fi
 if [ -z "$PANEL_URL" ]; then
     fail "Missing required option: -u/--url. Example: http://203.0.113.10:18888"
+fi
+if ! [[ "$SNI_FALLBACK_PORT" =~ ^[0-9]+$ ]] || [ "$SNI_FALLBACK_PORT" -lt 1 ] || [ "$SNI_FALLBACK_PORT" -gt 65535 ]; then
+    fail "--fallback-port must be an integer from 1 to 65535"
+fi
+if [ -n "$SNI_FALLBACK_HTTP_UPSTREAM" ] && [ -n "$SNI_DEFAULT_BACKEND" ]; then
+    fail "Use either --fallback-http-upstream/--openlist-port OR --fallback-backend, not both"
+fi
+if { [ -n "$SNI_FALLBACK_CERT" ] && [ -z "$SNI_FALLBACK_KEY" ]; } || { [ -z "$SNI_FALLBACK_CERT" ] && [ -n "$SNI_FALLBACK_KEY" ]; }; then
+    fail "--fallback-cert and --fallback-key must be provided together"
+fi
+if [ -n "$SNI_FALLBACK_HTTP_UPSTREAM" ]; then
+    if [[ "$SNI_FALLBACK_HTTP_UPSTREAM" == *"://"* || "$SNI_FALLBACK_HTTP_UPSTREAM" == */* ]]; then
+        fail "--fallback-http-upstream must be HOST:PORT, not a URL"
+    fi
+    upstream_port="${SNI_FALLBACK_HTTP_UPSTREAM##*:}"
+    if [ "$upstream_port" = "$SNI_FALLBACK_HTTP_UPSTREAM" ] || ! [[ "$upstream_port" =~ ^[0-9]+$ ]] || [ "$upstream_port" -lt 1 ] || [ "$upstream_port" -gt 65535 ]; then
+        fail "--openlist-port/--fallback-http-upstream must end with a port from 1 to 65535"
+    fi
+fi
+if [ -n "$SNI_DEFAULT_BACKEND" ]; then
+    if [[ "$SNI_DEFAULT_BACKEND" == *"://"* || "$SNI_DEFAULT_BACKEND" == */* ]]; then
+        fail "--fallback-backend must be HOST:PORT, not a URL"
+    fi
+    backend_port="${SNI_DEFAULT_BACKEND##*:}"
+    if [ "$backend_port" = "$SNI_DEFAULT_BACKEND" ] || ! [[ "$backend_port" =~ ^[0-9]+$ ]] || [ "$backend_port" -lt 1 ] || [ "$backend_port" -gt 65535 ]; then
+        fail "--fallback-backend must end with a port from 1 to 65535"
+    fi
 fi
 
 # ---------- Platform check ----------
@@ -111,6 +173,113 @@ case "$ARCH_RAW" in
         ;;
 esac
 info "Detected architecture: $ARCH ($ARCH_RAW)"
+
+install_pkg() {
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -y -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "$@"
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "$@"
+    else
+        fail "No supported package manager found. Install required packages manually: $*"
+    fi
+}
+
+ensure_line_in_file() {
+    local file="$1"
+    local line="$2"
+    touch "$file"
+    grep -Fqx "$line" "$file" || printf '%s\n' "$line" >> "$file"
+}
+
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+set_env_var() {
+    local file="$1"
+    local key="$2"
+    local value="$3"
+    sed -i "/^[#[:space:]]*${key}=.*/d" "$file"
+    printf '%s=%s\n' "$key" "$(shell_quote "$value")" >> "$file"
+}
+
+ensure_nginx_stream_include() {
+    if grep -Rqs "include /etc/nginx/stream.d/\\*.conf;" /etc/nginx/nginx.conf /etc/nginx/conf.d 2>/dev/null; then
+        return
+    fi
+    cat > /etc/nginx/relay-panel-stream.conf <<'NGINXEOF'
+stream {
+    include /etc/nginx/stream.d/*.conf;
+}
+NGINXEOF
+    ensure_line_in_file /etc/nginx/nginx.conf "include /etc/nginx/relay-panel-stream.conf;"
+}
+
+configure_nginx_sni() {
+    [ "$NGINX_SNI" = "1" ] || return 0
+
+    info "Configuring Nginx Stream SNI mode ..."
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -y -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx openssl ca-certificates
+        if apt-cache show libnginx-mod-stream >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libnginx-mod-stream
+        fi
+    else
+        install_pkg nginx openssl ca-certificates
+    fi
+    mkdir -p /etc/nginx/stream.d /etc/nginx/relay-panel-certs /var/log/nginx
+
+    ensure_nginx_stream_include
+
+    if [ -n "$SNI_FALLBACK_HTTP_UPSTREAM" ]; then
+        info "Configuring local HTTPS fallback wrapper -> http://${SNI_FALLBACK_HTTP_UPSTREAM}"
+        local cert="${SNI_FALLBACK_CERT:-/etc/nginx/relay-panel-certs/fallback.crt}"
+        local key="${SNI_FALLBACK_KEY:-/etc/nginx/relay-panel-certs/fallback.key}"
+        if [ -n "$SNI_FALLBACK_CERT" ] || [ -n "$SNI_FALLBACK_KEY" ]; then
+            [ -s "$cert" ] || fail "Fallback certificate not found or empty: $cert"
+            [ -s "$key" ] || fail "Fallback key not found or empty: $key"
+        elif [ ! -s "$cert" ] || [ ! -s "$key" ]; then
+            openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+                -subj "/CN=${SNI_FALLBACK_SERVER_NAME}" \
+                -keyout "$key" -out "$cert" >/dev/null 2>&1
+            chmod 600 "$key"
+        fi
+
+        cat > /etc/nginx/conf.d/relay-panel-fallback.conf <<NGINXEOF
+server {
+    listen 127.0.0.1:${SNI_FALLBACK_PORT} ssl;
+    server_name ${SNI_FALLBACK_SERVER_NAME};
+
+    ssl_certificate ${cert};
+    ssl_certificate_key ${key};
+
+    location / {
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_pass http://${SNI_FALLBACK_HTTP_UPSTREAM};
+    }
+}
+NGINXEOF
+        SNI_DEFAULT_BACKEND="127.0.0.1:${SNI_FALLBACK_PORT}"
+    elif [ -z "$SNI_DEFAULT_BACKEND" ]; then
+        warn "No fallback backend configured. Unmatched SNI will use 127.0.0.1:9 and fail closed."
+        warn "For OpenList Docker, re-run with: --nginx-sni --openlist-port 5244"
+        SNI_DEFAULT_BACKEND="127.0.0.1:9"
+    fi
+
+    nginx -t
+    systemctl enable nginx
+    systemctl restart nginx
+}
 
 # ---------- Install dirs ----------
 INSTALL_DIR="/opt/${SERVICE_NAME}"
@@ -475,7 +644,30 @@ if [ ! -f "$ENV_FILE" ]; then
 # (PKCS#8, PKCS#1 RSA, or SEC1 EC). The key file MUST be chmod 600.
 #   TLS_CERT_PATH=/opt/relay-node/certs/fullchain.pem
 #   TLS_KEY_PATH=/opt/relay-node/certs/privkey.pem
+
+# ── Reality/SNI forwarding via Nginx Stream ──
+# The installer can populate these automatically with --nginx-sni.
+# For an OpenList Docker site on 127.0.0.1:5244, run with:
+#   --nginx-sni --openlist-port 5244
+#   NGINX_SNI_ENABLED=1
+#   NGINX_SNI_CONF_PATH=/etc/nginx/stream.d/relay-panel-sni.conf
+#   NGINX_SNI_DEFAULT_BACKEND=127.0.0.1:8443
+#   NGINX_SNI_ACCESS_LOG_PATH=/var/log/nginx/sni-router.log
+#   NGINX_SNI_TRAFFIC_STATE_PATH=/opt/relay-node/nginx-sni-log.offset
 ENVEOF
+    chmod 600 "$ENV_FILE"
+fi
+
+configure_nginx_sni
+if [ "$NGINX_SNI" = "1" ]; then
+    info "Writing nginx_sni environment to $ENV_FILE"
+    set_env_var "$ENV_FILE" "NGINX_SNI_ENABLED" "1"
+    set_env_var "$ENV_FILE" "NGINX_SNI_CONF_PATH" "/etc/nginx/stream.d/relay-panel-sni.conf"
+    set_env_var "$ENV_FILE" "NGINX_SNI_DEFAULT_BACKEND" "$SNI_DEFAULT_BACKEND"
+    set_env_var "$ENV_FILE" "NGINX_SNI_TEST_CMD" "nginx -t"
+    set_env_var "$ENV_FILE" "NGINX_SNI_RELOAD_CMD" "systemctl reload nginx"
+    set_env_var "$ENV_FILE" "NGINX_SNI_ACCESS_LOG_PATH" "/var/log/nginx/sni-router.log"
+    set_env_var "$ENV_FILE" "NGINX_SNI_TRAFFIC_STATE_PATH" "${INSTALL_DIR}/nginx-sni-log.offset"
     chmod 600 "$ENV_FILE"
 fi
 

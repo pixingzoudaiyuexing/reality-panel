@@ -8,6 +8,34 @@ independent `v*` / `node-v*` tracks since this release).
 
 ---
 
+## [1.2.7] - 2026-08-13
+
+Panel and node are released together for the Reality SNI forwarding feature.
+This panel expects config protocol 5 nodes for `nginx_sni` rules.
+
+### Added
+
+- **Reality SNI forwarding rules.** The rules API, SQLite/PostgreSQL storage,
+  validation, and frontend now understand `nginx_sni` transport with an
+  explicit SNI field. One listen port can host multiple SNI rules, while
+  duplicate `(group, port, sni)` combinations are rejected.
+- **SNI rule import/export.** Rule JSON import/export now preserves protocol,
+  public/node transport, SNI, and load-balance strategy so Reality entries can
+  be backed up and migrated without hand editing.
+- **Nginx SNI traffic accounting.** The panel accepts rule traffic reported by
+  Reality SNI nodes, allowing the existing quota and statistics views to keep
+  working with Nginx Stream based forwarding.
+
+### Changed
+
+- **PostgreSQL schema version bumped to 28.** The rules table now stores SNI.
+  Existing rules keep working; only `nginx_sni` rules require an SNI value.
+- **Release and package namespace switched to this fork.** Install commands,
+  update checks, GitHub Actions, and GHCR image names now point at
+  `pixingzoudaiyuexing/relay-panel`.
+
+---
+
 ## [1.2.6] - 2026-08-12
 
 Panel only. The node remains `node-v1.2.1`; this release does not change the

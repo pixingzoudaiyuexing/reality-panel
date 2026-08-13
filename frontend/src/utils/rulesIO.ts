@@ -2,11 +2,10 @@
  * Rule export/import helpers — extracted from Rules.tsx so the round-trip is
  * unit-testable without mounting the React page.
  *
- * The export format is intentionally MINIMAL (a "share export"): only
- * `dest[]`, `listen_port`, `name`. Its purpose is quick copy/paste and target
- * migration between groups/installs, NOT a full backup (rate limits, load-
- * balance strategy, protocol, group, etc. are deliberately dropped — the import
- * path re-applies sensible defaults via IMPORT_DEFAULTS in Rules.tsx).
+ * The export format started as a MINIMAL "share export" (`dest[]`,
+ * `listen_port`, `name`). vReality-SNI keeps that old shape importable, but new
+ * exports also preserve the fields that matter for migration: protocol,
+ * transport, SNI, and load-balance strategy.
  *
  * The golden property this module guarantees: a rule exported by `buildExportJSON`
  * ALWAYS round-trips back through `validateImportEntry` + `parseDest` into the
@@ -36,6 +35,10 @@ export interface ExportEntry {
   dest: string[];
   listen_port: number;
   name: string;
+  protocol?: string;
+  public_transport?: string;
+  sni?: string;
+  load_balance_strategy?: string;
 }
 
 /**
@@ -53,7 +56,18 @@ export function buildExportJSON(rules: ForwardRule[]): string {
   const simplified: ExportEntry[] = rules.map(r => {
     const targets = ruleTargets(r).filter(t => t.enabled);
     const dest = targets.map(t => formatDest(t.host, t.port));
-    return { dest, listen_port: r.listen_port, name: r.name };
+    const publicTransport = r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni'
+      ? 'nginx_sni'
+      : 'raw';
+    return {
+      dest,
+      listen_port: r.listen_port,
+      name: r.name,
+      protocol: publicTransport === 'nginx_sni' ? 'tcp' : r.protocol,
+      public_transport: publicTransport,
+      sni: publicTransport === 'nginx_sni' ? (r.sni?.trim().toLowerCase() || undefined) : undefined,
+      load_balance_strategy: r.load_balance_strategy ?? 'first',
+    };
   });
   return JSON.stringify(simplified);
 }
@@ -79,6 +93,21 @@ export interface ImportEntry {
   name?: string;
   listen_port?: number;
   dest?: string[];
+  protocol?: string;
+  public_transport?: string;
+  node_transport?: string;
+  sni?: string;
+  load_balance_strategy?: string;
+}
+
+export interface ValidatedImportEntry {
+  name: string;
+  listen_port: number;
+  dest: string[];
+  protocol?: string;
+  public_transport?: string;
+  sni?: string;
+  load_balance_strategy?: string;
 }
 
 /**
@@ -120,6 +149,30 @@ export function validateImportEntry(e: unknown): string | null {
     if (typeof d !== 'string') return `invalid dest format: ${String(d)}`;
     if (!parseDest(d)) return `invalid dest format: ${d}`;
   }
+  const protocol = e['protocol'];
+  if (protocol !== undefined && (
+    typeof protocol !== 'string' || !['tcp', 'udp', 'tcp_udp'].includes(protocol)
+  )) return 'protocol must be tcp, udp, or tcp_udp';
+
+  const publicTransport = e['public_transport'];
+  if (publicTransport !== undefined && (
+    typeof publicTransport !== 'string' || !['raw', 'nginx_sni'].includes(publicTransport)
+  )) return 'public_transport must be raw or nginx_sni';
+
+  const nodeTransport = e['node_transport'];
+  if (nodeTransport !== undefined && (
+    typeof nodeTransport !== 'string' || !['raw', 'nginx_sni'].includes(nodeTransport)
+  )) return 'node_transport must be raw or nginx_sni';
+
+  const sni = e['sni'];
+  if (sni !== undefined && (typeof sni !== 'string' || sni.trim() === '')) return 'sni must be a non-empty string';
+  const isSni = publicTransport === 'nginx_sni' || nodeTransport === 'nginx_sni' || typeof sni === 'string';
+  if (isSni && (typeof sni !== 'string' || sni.trim() === '')) return 'sni is required for nginx_sni';
+
+  const strategy = e['load_balance_strategy'];
+  if (strategy !== undefined && (
+    typeof strategy !== 'string' || !['first', 'round_robin', 'failover'].includes(strategy)
+  )) return 'load_balance_strategy must be first, round_robin, or failover';
   return null;
 }
 
@@ -129,13 +182,22 @@ export function validateImportEntry(e: unknown): string | null {
  * Centralises the `as` cast so the consuming code (handleImport) doesn't lie
  * about types in multiple places.
  */
-export function asValidatedEntry(e: unknown): { name: string; listen_port: number; dest: string[] } {
+export function asValidatedEntry(e: unknown): ValidatedImportEntry {
   // validateImportEntry already checked the runtime types; re-assert here only
   // to satisfy TS. This never throws for an entry that passed validation.
   const o = e as Record<string, unknown>;
+  const sni = typeof o['sni'] === 'string' ? o['sni'].trim().toLowerCase() : undefined;
+  const publicTransport =
+    o['public_transport'] === 'nginx_sni' || o['node_transport'] === 'nginx_sni' || sni
+      ? 'nginx_sni'
+      : (o['public_transport'] as string | undefined);
   return {
     name: o['name'] as string,
     listen_port: o['listen_port'] as number,
     dest: o['dest'] as string[],
+    protocol: o['protocol'] as string | undefined,
+    public_transport: publicTransport,
+    sni,
+    load_balance_strategy: o['load_balance_strategy'] as string | undefined,
   };
 }

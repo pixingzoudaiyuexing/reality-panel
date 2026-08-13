@@ -31,7 +31,10 @@ pub fn validate_forward_mode(mode: &str) -> bool {
 pub fn is_public_transport_accepted(transport: PublicTransport) -> bool {
     matches!(
         transport,
-        PublicTransport::Raw | PublicTransport::Ws | PublicTransport::TlsSimple
+        PublicTransport::Raw
+            | PublicTransport::Ws
+            | PublicTransport::TlsSimple
+            | PublicTransport::NginxSni
     )
 }
 
@@ -50,10 +53,12 @@ pub fn is_public_transport_accepted(transport: PublicTransport) -> bool {
 /// "raw"|"ws"|"wss"|"tls_simple"). Unknown values are not rejected here —
 /// they're handled by their own field validation.
 pub fn validate_protocol_transport(protocol: &str, transport: &str) -> Option<&'static str> {
-    // WS and TLS Simple are TCP-only transports.
-    if (transport == "ws" || transport == "tls_simple") && protocol != "tcp" {
+    // WS, TLS Simple, and Nginx SNI are TCP-only transports.
+    if (transport == "ws" || transport == "tls_simple" || transport == "nginx_sni")
+        && protocol != "tcp"
+    {
         return Some(
-            "This transport (ws/tls_simple) currently carries TCP forwarding only; \
+            "This transport (ws/tls_simple/nginx_sni) currently carries TCP forwarding only; \
              UDP / TCP+UDP are not supported.",
         );
     }
@@ -63,6 +68,71 @@ pub fn validate_protocol_transport(protocol: &str, transport: &str) -> Option<&'
         return Some("UDP rules only support 'raw' transport");
     }
     None
+}
+
+pub fn normalize_sni(sni: Option<&str>) -> Option<String> {
+    sni.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+}
+
+pub fn is_plausible_sni(sni: &str) -> bool {
+    let s = sni.trim();
+    if s.is_empty() || s.len() > 253 || s.contains("://") || s.contains('/') {
+        return false;
+    }
+    if s.chars().any(char::is_whitespace) {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+}
+
+fn rule_port_conflicts(
+    candidate_rule_id: i64,
+    candidate_group: i64,
+    candidate_port: i32,
+    candidate_protocol: &str,
+    candidate_node_transport: &str,
+    candidate_sni: Option<&str>,
+    existing: &[relay_shared::models::ForwardRule],
+) -> bool {
+    let candidate_is_nginx_sni = candidate_node_transport == "nginx_sni";
+    let candidate_needs_tcp = matches!(candidate_protocol, "tcp" | "tcp_udp");
+    let candidate_needs_udp = matches!(candidate_protocol, "udp" | "tcp_udp");
+    let candidate_sni = candidate_sni.unwrap_or("").to_ascii_lowercase();
+
+    existing.iter().any(|rule| {
+        if rule.id == candidate_rule_id
+            || rule.device_group_in != candidate_group
+            || rule.listen_port != candidate_port
+        {
+            return false;
+        }
+        let existing_is_nginx_sni = rule.node_transport == "nginx_sni";
+        let existing_tcp =
+            matches!(rule.protocol.as_str(), "tcp" | "tcp_udp") || existing_is_nginx_sni;
+        let existing_udp = matches!(rule.protocol.as_str(), "udp" | "tcp_udp");
+
+        if candidate_is_nginx_sni {
+            if !existing_is_nginx_sni && existing_tcp {
+                return true;
+            }
+            if existing_is_nginx_sni {
+                return rule
+                    .sni
+                    .as_deref()
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case(&candidate_sni);
+            }
+            return false;
+        }
+
+        if candidate_needs_tcp && existing_tcp {
+            return true;
+        }
+        candidate_needs_udp && existing_udp
+    })
 }
 
 /// Map Protocol enum to stable DB string.
@@ -214,7 +284,7 @@ pub async fn auto_assign_port(
     let (lo, hi) = resolve_auto_port_range(&range_raw);
 
     // (port, protocol) pairs already in use on this group.
-    let group_ports: Vec<(i32, String)> = db
+    let group_ports: Vec<(i32, String, String)> = db
         .list_group_port_protocols(device_group_in)
         .await
         .map_err(|e| e.to_string())?;
@@ -223,8 +293,9 @@ pub async fn auto_assign_port(
     // candidate's.
     let used: std::collections::HashSet<u16> = group_ports
         .into_iter()
-        .filter_map(|(p, proto)| {
-            let occupies_tcp = matches!(proto.as_str(), "tcp" | "tcp_udp");
+        .filter_map(|(p, proto, node_transport)| {
+            let occupies_tcp =
+                matches!(proto.as_str(), "tcp" | "tcp_udp") || node_transport == "nginx_sni";
             let occupies_udp = matches!(proto.as_str(), "udp" | "tcp_udp");
             let conflicts = (needs_tcp && occupies_tcp) || (needs_udp && occupies_udp);
             if conflicts {
@@ -382,7 +453,7 @@ pub async fn create_rule(
 
     if !is_public_transport_accepted(req.public_transport) {
         return Err(CreateRuleError::BadRequest(
-            "public_transport: only 'raw', 'ws' and 'tls_simple' are supported".into(),
+            "public_transport: only 'raw', 'ws', 'tls_simple' and 'nginx_sni' are supported".into(),
         ));
     }
 
@@ -403,9 +474,12 @@ pub async fn create_rule(
     // - TLS Simple: must bind a tls_simple transport template
     let public_transport = &req.public_transport;
     if let Some(pid) = req.tunnel_profile_id {
-        if public_transport == &PublicTransport::Raw {
+        if matches!(
+            public_transport,
+            PublicTransport::Raw | PublicTransport::NginxSni
+        ) {
             return Err(CreateRuleError::BadRequest(
-                "tunnel_profile_id must be null for Raw transport".into(),
+                "tunnel_profile_id must be null for Raw or Nginx SNI transport".into(),
             ));
         }
         match db
@@ -421,9 +495,9 @@ pub async fn create_rule(
                 let expected_transport = match public_transport {
                     PublicTransport::Ws => "ws",
                     PublicTransport::TlsSimple => "tls_simple",
-                    PublicTransport::Raw => {
+                    PublicTransport::Raw | PublicTransport::NginxSni => {
                         return Err(CreateRuleError::BadRequest(
-                            "tunnel_profile_id must be null for Raw transport".into(),
+                            "tunnel_profile_id must be null for Raw or Nginx SNI transport".into(),
                         ));
                     }
                 };
@@ -462,6 +536,19 @@ pub async fn create_rule(
     let public_str = req.public_transport.to_db_str();
     let node_str = req.public_transport.derive_node_transport().to_db_str();
     let route_str = req.route_mode.to_db_str();
+    let sni = normalize_sni(req.sni.as_deref());
+    if req.public_transport == PublicTransport::NginxSni {
+        let Some(ref sni_value) = sni else {
+            return Err(CreateRuleError::BadRequest(
+                "sni is required for nginx_sni transport".into(),
+            ));
+        };
+        if !is_plausible_sni(sni_value) {
+            return Err(CreateRuleError::BadRequest(
+                "sni must be a hostname without scheme/path/spaces".into(),
+            ));
+        }
+    }
     let ws_path: Option<String> = if req.public_transport == PublicTransport::Ws {
         req.ws_path
             .as_ref()
@@ -511,6 +598,9 @@ pub async fn create_rule(
                 route_str,
                 public_str,
                 ws_path.as_deref(),
+                (req.public_transport == PublicTransport::NginxSni)
+                    .then_some(sni.as_deref())
+                    .flatten(),
                 req.device_group_in,
                 req.device_group_out,
                 &req.forward_mode,
@@ -596,7 +686,8 @@ pub async fn update_rule(
     if let Some(ref transport) = req.public_transport {
         if !is_public_transport_accepted(*transport) {
             return Err(UpdateRuleError::BadRequest(
-                "public_transport: only 'raw', 'ws' and 'tls_simple' are supported".into(),
+                "public_transport: only 'raw', 'ws', 'tls_simple' and 'nginx_sni' are supported"
+                    .into(),
             ));
         }
     }
@@ -661,6 +752,7 @@ pub async fn update_rule(
         || req.public_transport.is_some()
         || req.route_mode.is_some()
         || req.ws_path.is_some()
+        || req.sni.is_some()
         || req.device_group_in.is_some()
         || req.device_group_out.is_some()
         || req.forward_mode.is_some()
@@ -683,6 +775,7 @@ pub async fn update_rule(
         || req.public_transport.is_some()
         || req.route_mode.is_some()
         || req.ws_path.is_some()
+        || req.sni.is_some()
         || req.device_group_in.is_some()
         || req.device_group_out.is_some()
         || req.forward_mode.is_some()
@@ -708,6 +801,7 @@ pub async fn update_rule(
         "raw" => PublicTransport::Raw,
         "ws" => PublicTransport::Ws,
         "tls_simple" => PublicTransport::TlsSimple,
+        "nginx_sni" => PublicTransport::NginxSni,
         _ => {
             tracing::error!(
                 "update_rule {}: unknown existing public_transport '{}'",
@@ -730,15 +824,16 @@ pub async fn update_rule(
     };
 
     match (effective_transport, effective_pid) {
-        (PublicTransport::Raw, Some(_)) => {
+        (PublicTransport::Raw | PublicTransport::NginxSni, Some(_)) => {
             return Err(UpdateRuleError::BadRequest(
-                "tunnel_profile_id must be null for Raw transport".into(),
+                "tunnel_profile_id must be null for Raw or Nginx SNI transport".into(),
             ));
         }
         (PublicTransport::Ws, None) | (PublicTransport::TlsSimple, None) => {
             let transport_name = match effective_transport {
                 PublicTransport::Ws => "WebSocket",
                 PublicTransport::TlsSimple => "TLS Simple",
+                PublicTransport::NginxSni => unreachable!(),
                 PublicTransport::Raw => unreachable!(),
             };
             return Err(UpdateRuleError::BadRequest(format!(
@@ -750,6 +845,7 @@ pub async fn update_rule(
             let expected_transport = match effective_transport {
                 PublicTransport::Ws => "ws",
                 PublicTransport::TlsSimple => "tls_simple",
+                PublicTransport::NginxSni => unreachable!(),
                 PublicTransport::Raw => unreachable!(),
             };
             match db
@@ -784,7 +880,25 @@ pub async fn update_rule(
                 }
             }
         }
-        (PublicTransport::Raw, None) => {}
+        (PublicTransport::Raw | PublicTransport::NginxSni, None) => {}
+    }
+
+    let effective_sni = match &req.sni {
+        Some(Some(raw)) => normalize_sni(Some(raw.as_str())),
+        Some(None) => None,
+        None => normalize_sni(existing.sni.as_deref()),
+    };
+    if effective_transport == PublicTransport::NginxSni {
+        let Some(ref sni_value) = effective_sni else {
+            return Err(UpdateRuleError::BadRequest(
+                "sni is required for nginx_sni transport".into(),
+            ));
+        };
+        if !is_plausible_sni(sni_value) {
+            return Err(UpdateRuleError::BadRequest(
+                "sni must be a hostname without scheme/path/spaces".into(),
+            ));
+        }
     }
 
     if let Some(new_proto) = req.protocol.as_ref() {
@@ -816,6 +930,47 @@ pub async fn update_rule(
         }
     }
 
+    if req.listen_port.is_some()
+        || req.protocol.is_some()
+        || req.public_transport.is_some()
+        || req.device_group_in.is_some()
+        || req.sni.is_some()
+    {
+        let candidate_protocol = req
+            .protocol
+            .as_ref()
+            .map(protocol_to_str)
+            .unwrap_or(existing.protocol.as_str());
+        let candidate_node_transport = req
+            .public_transport
+            .map(|t| t.derive_node_transport().to_db_str())
+            .unwrap_or(existing.node_transport.as_str());
+        let candidate_group = req.device_group_in.unwrap_or(existing.device_group_in);
+        let candidate_port = req
+            .listen_port
+            .map(|p| p as i32)
+            .unwrap_or(existing.listen_port);
+        let all_rules = db.list_rules(&ResourceScope::All).await.map_err(|e| {
+            tracing::error!(
+                "update_rule {}: list_rules for conflict check failed: {}",
+                id,
+                e
+            );
+            UpdateRuleError::Database(e)
+        })?;
+        if rule_port_conflicts(
+            id,
+            candidate_group,
+            candidate_port,
+            candidate_protocol,
+            candidate_node_transport,
+            effective_sni.as_deref(),
+            &all_rules,
+        ) {
+            return Err(UpdateRuleError::PortConflict);
+        }
+    }
+
     let (public, node, entry) = match req.public_transport {
         Some(v) => {
             let p = v.to_db_str();
@@ -830,6 +985,17 @@ pub async fn update_rule(
             .filter(|s| !s.is_empty())
             .map(|s| s as &str)
     });
+    let normalized_sni_update: Option<Option<String>> =
+        if effective_transport == PublicTransport::NginxSni {
+            req.sni
+                .as_ref()
+                .map(|v| v.as_deref().and_then(|s| normalize_sni(Some(s))))
+        } else if req.sni.is_some() || req.public_transport.is_some() {
+            Some(None)
+        } else {
+            None
+        };
+    let sni_update: Option<Option<&str>> = normalized_sni_update.as_ref().map(|v| v.as_deref());
 
     let update_result = if has_scalar_field {
         db.update_rule_fields(
@@ -843,6 +1009,7 @@ pub async fn update_rule(
             entry,
             req.route_mode.as_ref().map(|r| r.to_db_str()),
             ws_path,
+            sni_update,
             req.device_group_in,
             device_group_out_arg,
             req.forward_mode.as_deref(),
@@ -971,6 +1138,15 @@ mod tests {
         assert!(validate_protocol_transport("tcp_udp", "raw").is_none());
         // v0.3.0-alpha headline: WS over TCP.
         assert!(validate_protocol_transport("tcp", "ws").is_none());
+    }
+
+    #[test]
+    fn sni_validation_accepts_real_hostname_not_wildcard_pattern() {
+        assert!(is_plausible_sni("op1.example.com"));
+        assert!(is_plausible_sni("cdn-1.example.com"));
+        assert!(!is_plausible_sni("*.example.com"));
+        assert!(!is_plausible_sni("https://example.com"));
+        assert!(!is_plausible_sni("example.com/path"));
     }
 
     /// UDP / TCP+UDP over WS must be rejected (WS carries TCP only in alpha).

@@ -7,7 +7,7 @@ mod updater;
 mod ws_client;
 
 use config::NodeConfig;
-use forwarder::ForwarderManager;
+use forwarder::{nginx_sni_traffic::NginxSniTrafficConfig, ForwarderManager};
 use reporter::{ConnectionTracker, TrafficCounter};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -198,6 +198,11 @@ async fn run() {
     }
 
     let manager = Arc::new(Mutex::new(manager_inner));
+    let nginx_sni_traffic = NginxSniTrafficConfig {
+        enabled: config.nginx_sni_enabled,
+        access_log_path: config.nginx_sni_access_log_path.clone().into(),
+        state_path: config.nginx_sni_traffic_state_path.clone().into(),
+    };
 
     // Unified sampler: CPU/mem + disk + network rate + cumulative traffic.
     let metrics = Arc::new(NodeMetrics::new(&config.network_interface));
@@ -294,6 +299,7 @@ async fn run() {
         // channel — these values reflect real active TCP/UDP forwarding state
         // and are reported over plain HTTP, so they keep working even if WS
         // is down.
+        forwarder::nginx_sni_traffic::ingest_once(&nginx_sni_traffic, &manager, &counter).await;
         reporter::report_traffic(&config, &counter).await;
         // Drain any listener bind/runtime errors captured since the last cycle
         // and forward them to the panel so an operator can see WHY a rule isn't

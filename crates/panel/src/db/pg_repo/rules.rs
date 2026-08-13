@@ -4,6 +4,141 @@ use crate::db::repo::*;
 use async_trait::async_trait;
 use relay_shared::models::ForwardRule;
 
+#[cfg(test)]
+#[allow(dead_code)]
+impl PgRepository {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_quota_guarded(
+        &self,
+        name: &str,
+        uid: i64,
+        listen_port: i32,
+        protocol: &str,
+        public_transport: &str,
+        node_transport: &str,
+        route_mode: &str,
+        entry_transport: &str,
+        ws_path: Option<&str>,
+        device_group_in: i64,
+        device_group_out: Option<i64>,
+        forward_mode: &str,
+        target_addr: &str,
+        target_port: i32,
+    ) -> Result<u64, DbError> {
+        <Self as RuleRepository>::insert_quota_guarded(
+            self,
+            name,
+            uid,
+            listen_port,
+            protocol,
+            public_transport,
+            node_transport,
+            route_mode,
+            entry_transport,
+            ws_path,
+            None,
+            device_group_in,
+            device_group_out,
+            forward_mode,
+            target_addr,
+            target_port,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_rule_full(
+        &self,
+        name: &str,
+        uid: i64,
+        listen_port: i32,
+        protocol: &str,
+        public_transport: &str,
+        node_transport: &str,
+        route_mode: &str,
+        entry_transport: &str,
+        ws_path: Option<&str>,
+        device_group_in: i64,
+        device_group_out: Option<i64>,
+        forward_mode: &str,
+        target_addr: &str,
+        target_port: i32,
+        targets: &[relay_shared::protocol::RuleTargetRequest],
+        load_balance_strategy: &str,
+        upload_limit_mbps: i32,
+        download_limit_mbps: i32,
+        tunnel_profile_id: Option<i64>,
+    ) -> Result<Option<i64>, DbError> {
+        <Self as RuleRepository>::create_rule_full(
+            self,
+            name,
+            uid,
+            listen_port,
+            protocol,
+            public_transport,
+            node_transport,
+            route_mode,
+            entry_transport,
+            ws_path,
+            None,
+            device_group_in,
+            device_group_out,
+            forward_mode,
+            target_addr,
+            target_port,
+            targets,
+            load_balance_strategy,
+            upload_limit_mbps,
+            download_limit_mbps,
+            tunnel_profile_id,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_rule_fields(
+        &self,
+        id: i64,
+        scope: &ResourceScope,
+        name: Option<&str>,
+        listen_port: Option<i32>,
+        protocol: Option<&str>,
+        public_transport: Option<&str>,
+        node_transport: Option<&str>,
+        entry_transport: Option<&str>,
+        route_mode: Option<&str>,
+        ws_path: Option<Option<&str>>,
+        device_group_in: Option<i64>,
+        device_group_out: Option<Option<i64>>,
+        forward_mode: Option<&str>,
+        target_addr: Option<&str>,
+        target_port: Option<i32>,
+        paused: Option<bool>,
+    ) -> Result<u64, DbError> {
+        <Self as RuleRepository>::update_rule_fields(
+            self,
+            id,
+            scope,
+            name,
+            listen_port,
+            protocol,
+            public_transport,
+            node_transport,
+            entry_transport,
+            route_mode,
+            ws_path,
+            None,
+            device_group_in,
+            device_group_out,
+            forward_mode,
+            target_addr,
+            target_port,
+            paused,
+        )
+        .await
+    }
+}
+
 // ── RuleRepository ──
 
 #[async_trait]
@@ -244,9 +379,9 @@ impl RuleRepository for PgRepository {
     async fn list_group_port_protocols(
         &self,
         device_group_in: i64,
-    ) -> Result<Vec<(i32, String)>, DbError> {
-        let rows: Vec<(i32, String)> = sqlx::query_as(
-            "SELECT listen_port, protocol FROM forward_rules WHERE device_group_in = $1",
+    ) -> Result<Vec<(i32, String, String)>, DbError> {
+        let rows: Vec<(i32, String, String)> = sqlx::query_as(
+            "SELECT listen_port, protocol, node_transport FROM forward_rules WHERE device_group_in = $1",
         )
         .bind(device_group_in)
         .fetch_all(&self.pool)
@@ -293,6 +428,7 @@ impl RuleRepository for PgRepository {
         route_mode: &str,
         entry_transport: &str,
         ws_path: Option<&str>,
+        sni: Option<&str>,
         device_group_in: i64,
         device_group_out: Option<i64>,
         forward_mode: &str,
@@ -316,6 +452,7 @@ impl RuleRepository for PgRepository {
         // The INSERT keeps its own WHERE guard as the authoritative quota check
         // and the partial unique indexes are the authoritative port backstop;
         // the locks only make the reads stable for the duration.
+        let is_nginx_sni = node_transport == "nginx_sni";
         let needs_tcp = matches!(protocol, "tcp" | "tcp_udp");
         let needs_udp = matches!(protocol, "udp" | "tcp_udp");
 
@@ -339,12 +476,18 @@ impl RuleRepository for PgRepository {
         let conflict: Result<Option<(i32,)>, sqlx::Error> = sqlx::query_as(
             "SELECT 1 FROM forward_rules \
              WHERE device_group_in = $1 AND listen_port = $2 \
-               AND ( ($3 AND protocol IN ('tcp', 'tcp_udp')) \
-                  OR ($4 AND protocol IN ('udp', 'tcp_udp')) ) \
+               AND ( \
+                    ($3 AND node_transport = 'nginx_sni' AND lower(COALESCE(sni, '')) = lower($4)) \
+                 OR ($3 AND node_transport != 'nginx_sni' AND protocol IN ('tcp', 'tcp_udp')) \
+                 OR (NOT $3 AND node_transport = 'nginx_sni' AND $5) \
+                 OR ($6 AND protocol IN ('udp', 'tcp_udp')) \
+               ) \
              LIMIT 1",
         )
         .bind(device_group_in)
         .bind(listen_port)
+        .bind(is_nginx_sni)
+        .bind(sni.unwrap_or(""))
         .bind(needs_tcp)
         .bind(needs_udp)
         .fetch_optional(&mut *tx)
@@ -366,12 +509,12 @@ impl RuleRepository for PgRepository {
         let result = sqlx::query(
             "INSERT INTO forward_rules \
                (name, uid, listen_port, protocol, public_transport, node_transport, \
-                route_mode, entry_transport, ws_path, \
+                route_mode, entry_transport, ws_path, sni, \
                 device_group_in, device_group_out, forward_mode, target_addr, target_port) \
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 \
-             WHERE (SELECT max_rules FROM users WHERE id = $15) = 0 \
-                OR (SELECT COUNT(*) FROM forward_rules WHERE uid = $16) \
-                   < (SELECT max_rules FROM users WHERE id = $17)",
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15 \
+             WHERE (SELECT max_rules FROM users WHERE id = $16) = 0 \
+                OR (SELECT COUNT(*) FROM forward_rules WHERE uid = $17) \
+                   < (SELECT max_rules FROM users WHERE id = $18)",
         )
         .bind(name)
         .bind(uid)
@@ -382,6 +525,7 @@ impl RuleRepository for PgRepository {
         .bind(route_mode)
         .bind(entry_transport)
         .bind(ws_path)
+        .bind(sni)
         .bind(device_group_in)
         .bind(device_group_out)
         .bind(forward_mode)
@@ -418,6 +562,7 @@ impl RuleRepository for PgRepository {
         route_mode: &str,
         entry_transport: &str,
         ws_path: Option<&str>,
+        sni: Option<&str>,
         device_group_in: i64,
         device_group_out: Option<i64>,
         forward_mode: &str,
@@ -436,6 +581,7 @@ impl RuleRepository for PgRepository {
         // The new id comes from RETURNING (not a post-commit listen_port
         // re-lookup), so two inbound groups reusing a port can't cross-write.
 
+        let is_nginx_sni = node_transport == "nginx_sni";
         let needs_tcp = matches!(protocol, "tcp" | "tcp_udp");
         let needs_udp = matches!(protocol, "udp" | "tcp_udp");
 
@@ -479,12 +625,18 @@ impl RuleRepository for PgRepository {
             sqlx::query_as(
                 "SELECT 1 FROM forward_rules \
                  WHERE device_group_in = $1 AND listen_port = $2 \
-                   AND ( ($3 AND protocol IN ('tcp', 'tcp_udp')) \
-                      OR ($4 AND protocol IN ('udp', 'tcp_udp')) ) \
+                   AND ( \
+                        ($3 AND node_transport = 'nginx_sni' AND lower(COALESCE(sni, '')) = lower($4)) \
+                     OR ($3 AND node_transport != 'nginx_sni' AND protocol IN ('tcp', 'tcp_udp')) \
+                     OR (NOT $3 AND node_transport = 'nginx_sni' AND $5) \
+                     OR ($6 AND protocol IN ('udp', 'tcp_udp')) \
+                   ) \
                  LIMIT 1",
             )
             .bind(device_group_in)
             .bind(listen_port)
+            .bind(is_nginx_sni)
+            .bind(sni.unwrap_or(""))
             .bind(needs_tcp)
             .bind(needs_udp)
             .fetch_optional(&mut *tx)
@@ -503,12 +655,12 @@ impl RuleRepository for PgRepository {
             sqlx::query_scalar(
                 "INSERT INTO forward_rules \
                    (name, uid, listen_port, protocol, public_transport, node_transport, \
-                    route_mode, entry_transport, ws_path, \
+                    route_mode, entry_transport, ws_path, sni, \
                     device_group_in, device_group_out, forward_mode, target_addr, target_port) \
-                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 \
-                 WHERE (SELECT max_rules FROM users WHERE id = $15) = 0 \
-                    OR (SELECT COUNT(*) FROM forward_rules WHERE uid = $16) \
-                       < (SELECT max_rules FROM users WHERE id = $17) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15 \
+                 WHERE (SELECT max_rules FROM users WHERE id = $16) = 0 \
+                    OR (SELECT COUNT(*) FROM forward_rules WHERE uid = $17) \
+                       < (SELECT max_rules FROM users WHERE id = $18) \
                  RETURNING id",
             )
             .bind(name)
@@ -520,6 +672,7 @@ impl RuleRepository for PgRepository {
             .bind(route_mode)
             .bind(entry_transport)
             .bind(ws_path)
+            .bind(sni)
             .bind(device_group_in)
             .bind(device_group_out)
             .bind(forward_mode)
@@ -656,6 +809,7 @@ impl RuleRepository for PgRepository {
         entry_transport: Option<&str>,
         route_mode: Option<&str>,
         ws_path: Option<Option<&str>>,
+        sni: Option<Option<&str>>,
         device_group_in: Option<i64>,
         device_group_out: Option<Option<i64>>,
         forward_mode: Option<&str>,
@@ -686,6 +840,9 @@ impl RuleRepository for PgRepository {
         }
         if ws_path.is_some() {
             sets.push("ws_path = ");
+        }
+        if sni.is_some() {
+            sets.push("sni = ");
         }
         if device_group_in.is_some() {
             sets.push("device_group_in = ");
@@ -760,6 +917,9 @@ impl RuleRepository for PgRepository {
             q = q.bind(v);
         }
         if let Some(v) = ws_path {
+            q = q.bind(v);
+        }
+        if let Some(v) = sni {
             q = q.bind(v);
         }
         if let Some(v) = device_group_in {

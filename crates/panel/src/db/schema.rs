@@ -421,10 +421,13 @@ CREATE TABLE IF NOT EXISTS kvs (
 -- the upgrade path on existing DBs.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_port_tcp
     ON forward_rules (device_group_in, listen_port)
-    WHERE protocol IN ('tcp', 'tcp_udp');
+    WHERE protocol IN ('tcp', 'tcp_udp') AND node_transport != 'nginx_sni';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_port_udp
     ON forward_rules (device_group_in, listen_port)
     WHERE protocol IN ('udp', 'tcp_udp');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_nginx_sni
+    ON forward_rules (device_group_in, listen_port, lower(sni))
+    WHERE node_transport = 'nginx_sni' AND sni IS NOT NULL AND sni != '';
 
 -- Default admin user (password: admin123, will be hashed on init)
 INSERT OR IGNORE INTO users (id, username, password, admin, max_rules)
@@ -1295,7 +1298,7 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         let tcp_dupes: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM (
                  SELECT device_group_in, listen_port FROM forward_rules
-                 WHERE protocol IN ('tcp', 'tcp_udp')
+                 WHERE protocol IN ('tcp', 'tcp_udp') AND node_transport != 'nginx_sni'
                  GROUP BY device_group_in, listen_port HAVING COUNT(*) > 1
              )",
         )
@@ -1327,7 +1330,7 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
             sqlx::query(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_port_tcp
                  ON forward_rules (device_group_in, listen_port)
-                 WHERE protocol IN ('tcp', 'tcp_udp')",
+                 WHERE protocol IN ('tcp', 'tcp_udp') AND node_transport != 'nginx_sni'",
             )
             .execute(pool)
             .await?;
@@ -1344,6 +1347,27 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
             );
         }
     }
+
+    // Reality/SNI fork: Nginx SNI rules intentionally share one TCP listen
+    // port, so exclude them from the regular TCP port-uniqueness partition and
+    // make uniqueness depend on SNI instead.
+    sqlx::query("DROP INDEX IF EXISTS idx_fr_port_tcp")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_port_tcp
+     ON forward_rules (device_group_in, listen_port)
+     WHERE protocol IN ('tcp', 'tcp_udp') AND node_transport != 'nginx_sni'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_nginx_sni
+     ON forward_rules (device_group_in, listen_port, lower(sni))
+         WHERE node_transport = 'nginx_sni' AND sni IS NOT NULL AND sni != ''",
+    )
+    .execute(pool)
+    .await?;
 
     // ── Migration 29: v0.4.21 PR2 registration allowed plan ids ──
     //

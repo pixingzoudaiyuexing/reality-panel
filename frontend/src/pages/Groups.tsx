@@ -9,7 +9,7 @@ import { useAuth } from '../auth/useAuth';
 
 const { Text } = Typography;
 
-const INSTALL_SCRIPT_URL = 'https://raw.githubusercontent.com/MoeShinX/relay-panel/main/scripts/relay-node-install.sh';
+const INSTALL_SCRIPT_URL = 'https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh';
 
 /** v1.2.5: the forwarding/visibility columns and fields that a monitor-only
  *  group has no use for. It carries no rules and never reaches a regular user,

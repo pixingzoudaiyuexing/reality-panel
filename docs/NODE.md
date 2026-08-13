@@ -45,7 +45,7 @@ This is the supported path. It detects the architecture, downloads the right
 binary from GitHub Releases, writes a systemd service, and starts it.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/scripts/relay-node-install.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
   -t <NODE_TOKEN> \
   -u https://your-panel.example.com
 ```
@@ -77,9 +77,9 @@ server where you copy the binary over manually).
 ```bash
 # 1. Download the right binary for your arch (replace with your release version)
 ARCH=amd64   # or arm64
-VERSION=1.0.3
+VERSION=1.2.2
 curl -fL -o relay-node \
-  "https://github.com/MoeShinX/relay-panel/releases/download/v${VERSION}/relay-node-linux-${ARCH}"
+  "https://github.com/pixingzoudaiyuexing/relay-panel/releases/download/node-v${VERSION}/relay-node-linux-${ARCH}"
 
 # 2. Make it executable and put it somewhere
 chmod +x relay-node
@@ -214,7 +214,7 @@ After install:
 ```bash
 # 1. Version should print instantly and exit (does NOT start the service)
 timeout 3 /opt/relay-node/relay-node --version
-# expected: relay-node 1.0.3
+# expected: relay-node 1.2.2
 
 # 2. Service status
 systemctl status relay-node
@@ -224,7 +224,7 @@ journalctl -u relay-node -f
 ```
 
 In the logs you should see:
-- `RelayNode 1.0.3 starting, panel=...`
+- `RelayNode 1.2.2 starting, panel=...`
 - `websocket connected` (if your reverse proxy supports WS)
 - `TCP listening on <port> (rule <id>)` / `UDP listening on ...` for each rule
 - `report_traffic HTTP 200` (the per-report status line; the detailed per-cycle
@@ -274,7 +274,7 @@ carries the correct `-t <NODE_TOKEN> -u <PANEL_URL>`, so you don't have to
 remember them:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/scripts/relay-node-install.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
   -t <NODE_TOKEN> \
   -u https://your-panel.example.com
 ```
@@ -419,16 +419,16 @@ directly and install by hand (see [Manual install](#option-b-manual-install)):
 
 ```bash
 # Example: pin to a specific version on amd64
-VERSION=1.0.3
+VERSION=1.2.2
 ARCH=amd64   # or arm64
 curl -fL -o relay-node \
-  "https://github.com/MoeShinX/relay-panel/releases/download/v${VERSION}/relay-node-linux-${ARCH}"
+  "https://github.com/pixingzoudaiyuexing/relay-panel/releases/download/node-v${VERSION}/relay-node-linux-${ARCH}"
 ```
 
 Then follow the [Manual systemd setup](#manual-systemd-setup) to run it.
 
 All released versions and their assets are listed on the
-[Releases page](https://github.com/MoeShinX/relay-panel/releases).
+[Releases page](https://github.com/pixingzoudaiyuexing/relay-panel/releases).
 
 ---
 

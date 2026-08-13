@@ -41,6 +41,11 @@ function payloadWithTargets<T extends Record<string, unknown>>(values: T & { tar
   };
 }
 
+function normalizeSni(value?: string | null): string | undefined {
+  const s = value?.trim().toLowerCase();
+  return s || undefined;
+}
+
 /** Trigger a browser download of a text file. */
 function downloadText(filename: string, text: string) {
   const blob = new Blob([text], { type: 'application/json' });
@@ -224,8 +229,15 @@ export default function Rules() {
     download_limit_mbps?: number;
     tunnel_profile_id?: number | null;
     owner_uid?: number | null;
+    sni?: string;
   }) => {
-    // v0.4.20: WS/TLS tunnel hidden — always raw, no profile.
+    const transport = values.public_transport === 'nginx_sni' ? 'nginx_sni' : 'raw';
+    const sni = normalizeSni(values.sni);
+    if (transport === 'nginx_sni' && !sni) {
+      message.error(t('sniRequired'));
+      return;
+    }
+    // v0.4.20: WS/TLS tunnel hidden — only raw and reality-SNI are exposed.
     // v0.4.20: forward_mode always direct, no outbound group.
     // v0.4.20: owner determined by entry point (filterOwnerUid from URL).
     const owner_uid = filterOwnerUid ?? undefined;
@@ -237,7 +249,9 @@ export default function Rules() {
     const payload = payloadWithTargets({
       ...values,
       listen_port: values.listen_port || null,
-      public_transport: 'raw',
+      protocol: transport === 'nginx_sni' ? 'tcp' : values.protocol,
+      public_transport: transport,
+      sni,
       tunnel_profile_id: null,
       forward_mode: 'direct',
       route_mode: 'direct',
@@ -258,6 +272,8 @@ export default function Rules() {
     setEditing(r);
     editForm.setFieldsValue({
       name: r.name, listen_port: r.listen_port, protocol: r.protocol,
+      public_transport: r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni' ? 'nginx_sni' : 'raw',
+      sni: r.sni ?? undefined,
       device_group_in: r.device_group_in,
       target_addr: r.target_addr, target_port: r.target_port,
       targets: ruleTargets(r),
@@ -276,7 +292,9 @@ export default function Rules() {
     createForm.setFieldsValue({
       name: `${r.name}-copy`,
       listen_port: null,
-      protocol: r.protocol,
+      protocol: r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni' ? 'tcp' : r.protocol,
+      public_transport: r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni' ? 'nginx_sni' : 'raw',
+      sni: r.sni ?? undefined,
       device_group_in: r.device_group_in,
       target_addr: r.target_addr,
       target_port: r.target_port,
@@ -342,11 +360,16 @@ const IMPORT_DEFAULTS = {
         return { host: p.host, port: p.port, enabled: true };
       });
       const first = targets[0];
+      const importedTransport = entry.public_transport === 'nginx_sni' ? 'nginx_sni' : IMPORT_DEFAULTS.public_transport;
       try {
         const res = await api.post<unknown, ApiEnvelope<null>>('/rules', {
           name: entry.name,
           listen_port: entry.listen_port,
           ...IMPORT_DEFAULTS,
+          protocol: importedTransport === 'nginx_sni' ? 'tcp' : (entry.protocol ?? IMPORT_DEFAULTS.protocol),
+          public_transport: importedTransport,
+          sni: importedTransport === 'nginx_sni' ? entry.sni : undefined,
+          load_balance_strategy: entry.load_balance_strategy ?? IMPORT_DEFAULTS.load_balance_strategy,
           device_group_in: importGroupId,
           target_addr: first.host,
           target_port: first.port,
@@ -372,12 +395,25 @@ const IMPORT_DEFAULTS = {
     download_limit_mbps?: number;
     max_connections?: number;
     auto_restart_minutes?: number;
+    public_transport?: string;
+    sni?: string;
   }) => {
     if (!editing) return;
     const payload: Record<string, unknown> = {};
+    const oldTransport = editing.public_transport === 'nginx_sni' || editing.node_transport === 'nginx_sni' ? 'nginx_sni' : 'raw';
+    const newTransport = values.public_transport === 'nginx_sni' ? 'nginx_sni' : 'raw';
+    const newSni = normalizeSni(values.sni);
+    if (newTransport === 'nginx_sni' && !newSni) {
+      message.error(t('sniRequired'));
+      return;
+    }
     if (values.name !== undefined && values.name !== editing.name) payload.name = values.name;
     if (values.listen_port !== undefined && values.listen_port !== editing.listen_port) payload.listen_port = values.listen_port;
-    if (values.protocol !== undefined && values.protocol !== editing.protocol) payload.protocol = values.protocol;
+    const effectiveProtocol = newTransport === 'nginx_sni' ? 'tcp' : values.protocol;
+    if (effectiveProtocol !== undefined && effectiveProtocol !== editing.protocol) payload.protocol = effectiveProtocol;
+    if (newTransport !== oldTransport) payload.public_transport = newTransport;
+    if (newTransport === 'nginx_sni' && newSni !== normalizeSni(editing.sni)) payload.sni = newSni;
+    if (newTransport === 'raw' && oldTransport === 'nginx_sni') payload.sni = null;
     if (values.device_group_in !== undefined && values.device_group_in !== editing.device_group_in) payload.device_group_in = values.device_group_in;
     const newTargets = formTargets(values);
     const oldTargets = ruleTargets(editing);
@@ -576,6 +612,11 @@ const IMPORT_DEFAULTS = {
     if (p === 'udp') return <Tag color="purple">UDP</Tag>;
     return <Tag color="blue">TCP</Tag>;
   };
+  const transportTag = (r: ForwardRule) => {
+    const transport = r.public_transport ?? r.node_transport ?? 'raw';
+    if (transport === 'nginx_sni') return <Tag color="gold">{t('entryTransportNginxSni')}</Tag>;
+    return <Tag>{t('entryTransportRaw')}</Tag>;
+  };
 
   const allColumns = [
     { title: t('id'), dataIndex: 'id', key: 'id', width: 60 },
@@ -606,6 +647,7 @@ const IMPORT_DEFAULTS = {
       render: (p: string, r: ForwardRule) => (
         <Space size={4}>
           {protoTags(p)}
+          {transportTag(r)}
           {r.paused && <Tag color="red">{t('paused')}</Tag>}
           {!r.paused && ruleOverQuota(r) && (
             <Tooltip title={t('quotaExhaustedHint')}>
@@ -614,6 +656,13 @@ const IMPORT_DEFAULTS = {
           )}
         </Space>
       ),
+    },
+    {
+      title: t('sni'), dataIndex: 'sni', key: 'sni', width: 180,
+      render: (v: string | null | undefined, r: ForwardRule) =>
+        (r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni') && v
+          ? <span className="rp-mono">{v}</span>
+          : <Text type="secondary">-</Text>,
     },
     {
       title: t('target'), key: 'target',
@@ -717,6 +766,10 @@ const IMPORT_DEFAULTS = {
   const editGroupId = Form.useWatch('device_group_in', editForm);
   const createProto = Form.useWatch('protocol', createForm);
   const editProto = Form.useWatch('protocol', editForm);
+  const createTransport = Form.useWatch('public_transport', createForm);
+  const editTransport = Form.useWatch('public_transport', editForm);
+  const createIsSni = createTransport === 'nginx_sni';
+  const editIsSni = editTransport === 'nginx_sni';
 
   const hostForForm = (gid?: number) => {
     if (!gid) return '';
@@ -734,6 +787,23 @@ const IMPORT_DEFAULTS = {
       />
     );
   };
+
+  const handleCreateTransportChange = (v: string) => {
+    if (v === 'nginx_sni') {
+      createForm.setFieldsValue({ protocol: 'tcp', listen_port: createForm.getFieldValue('listen_port') ?? 443 });
+    }
+  };
+
+  const handleEditTransportChange = (v: string) => {
+    if (v === 'nginx_sni') {
+      editForm.setFieldsValue({ protocol: 'tcp', listen_port: editForm.getFieldValue('listen_port') ?? 443 });
+    }
+  };
+
+  const transportOptions = [
+    { value: 'raw', label: t('entryTransportRaw') },
+    { value: 'nginx_sni', label: t('entryTransportNginxSni') },
+  ];
 
   /** v1.2.0: connection cap + scheduled restart. Shared by the create and edit
    *  forms so the two can't drift (the rate-limit block above predates this and
@@ -990,15 +1060,29 @@ const IMPORT_DEFAULTS = {
                   />
                 )}
                 {renderHostHint(createGroupId)}
-                <Form.Item name="listen_port" label={t('listenPort')} extra={t('listenPortHint')}><InputNumber min={1} max={65535} style={{ width: '100%' }} placeholder="auto" /></Form.Item>
+                <Form.Item name="listen_port" label={t('listenPort')} extra={createIsSni ? t('sniListenPortHint') : t('listenPortHint')}>
+                  <InputNumber min={1} max={65535} style={{ width: '100%' }} placeholder={createIsSni ? '443' : 'auto'} />
+                </Form.Item>
+                <Form.Item name="public_transport" label={t('transportMethod')} initialValue="raw">
+                  <Select options={transportOptions} onChange={handleCreateTransportChange} />
+                </Form.Item>
+                {createIsSni && (
+                  <Form.Item
+                    name="sni"
+                    label={t('sni')}
+                    extra={t('sniHint')}
+                    rules={[{ required: true, message: t('sniRequired') }]}
+                  >
+                    <Input placeholder="op1.example.com" />
+                  </Form.Item>
+                )}
                 <Form.Item name="protocol" label={t('protocol')} rules={[{ required: true }]} initialValue="tcp_udp"
-                  extra={isUdp(createProto) ? t('entryTransportUdpOnlyRaw') : undefined}>
+                  extra={createIsSni ? t('sniTcpOnly') : (isUdp(createProto) ? t('entryTransportUdpOnlyRaw') : undefined)}>
                   <Select
                     options={protocolOptions}
+                    disabled={createIsSni}
                   />
                 </Form.Item>
-                {/* v0.4.20: WS/TLS tunnel hidden — public_transport always raw. */}
-                <Form.Item name="public_transport" hidden initialValue="raw"><Input /></Form.Item>
                 {/* v0.4.20: forward_mode always direct. */}
                 <Form.Item name="forward_mode" hidden initialValue="direct"><Input /></Form.Item>
                 <Form.Item name="device_group_in" label={t('inboundGroup')} rules={[{ required: true }]}>
@@ -1042,15 +1126,29 @@ const IMPORT_DEFAULTS = {
               children: (<>
                 <Form.Item name="name" label={t('name')}><Input /></Form.Item>
                 {renderHostHint(editGroupId)}
-                <Form.Item name="listen_port" label={t('listenPort')}><InputNumber min={1} max={65535} style={{ width: '100%' }} /></Form.Item>
+                <Form.Item name="listen_port" label={t('listenPort')} extra={editIsSni ? t('sniListenPortHint') : undefined}>
+                  <InputNumber min={1} max={65535} style={{ width: '100%' }} />
+                </Form.Item>
+                <Form.Item name="public_transport" label={t('transportMethod')} initialValue="raw">
+                  <Select options={transportOptions} onChange={handleEditTransportChange} />
+                </Form.Item>
+                {editIsSni && (
+                  <Form.Item
+                    name="sni"
+                    label={t('sni')}
+                    extra={t('sniHint')}
+                    rules={[{ required: true, message: t('sniRequired') }]}
+                  >
+                    <Input placeholder="op1.example.com" />
+                  </Form.Item>
+                )}
                 <Form.Item name="protocol" label={t('protocol')}
-                  extra={isUdp(editProto) ? t('entryTransportUdpOnlyRaw') : undefined}>
+                  extra={editIsSni ? t('sniTcpOnly') : (isUdp(editProto) ? t('entryTransportUdpOnlyRaw') : undefined)}>
                   <Select
                     options={protocolOptions}
+                    disabled={editIsSni}
                   />
                 </Form.Item>
-                {/* v0.4.20: WS/TLS tunnel hidden — public_transport always raw. */}
-                <Form.Item name="public_transport" hidden initialValue="raw"><Input /></Form.Item>
                 {/* v0.4.20: forward_mode always direct. */}
                 <Form.Item name="forward_mode" hidden initialValue="direct"><Input /></Form.Item>
                 <Form.Item name="device_group_in" label={t('inboundGroup')}><Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} /></Form.Item>
@@ -1101,7 +1199,7 @@ const IMPORT_DEFAULTS = {
             <Alert type="info" showIcon style={{ marginBottom: 12 }}
               title={t('importHint')} />
             <TextArea value={importText} onChange={e => setImportText(e.target.value)}
-              rows={10} placeholder='[{"dest":["1.2.3.4:8080"],"listen_port":38446,"name":"SK5"}]' />
+              rows={10} placeholder='[{"dest":["1.2.3.4:55443"],"listen_port":443,"name":"op1","public_transport":"nginx_sni","sni":"op1.example.com"}]' />
           </>
         ) : (
           <div style={{ maxHeight: 300, overflowY: 'auto' }} aria-live="polite" aria-label={t('import')}>

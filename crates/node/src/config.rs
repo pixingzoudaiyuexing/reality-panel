@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::path::PathBuf;
 
 const INSECURE_NODE_TOKEN: &str = "default-token";
 
@@ -19,6 +20,14 @@ pub struct NodeConfig {
     pub outbound_interface: String,
     /// v1.0.4: Exact IPv4 source for outbound connections.
     pub outbound_bind_ipv4: Option<String>,
+    /// Reality/SNI fork: generate and reload an Nginx Stream ssl_preread router.
+    pub nginx_sni_enabled: bool,
+    pub nginx_sni_conf_path: String,
+    pub nginx_sni_test_cmd: String,
+    pub nginx_sni_reload_cmd: String,
+    pub nginx_sni_default_backend: String,
+    pub nginx_sni_access_log_path: String,
+    pub nginx_sni_traffic_state_path: String,
 }
 
 impl NodeConfig {
@@ -61,9 +70,45 @@ impl NodeConfig {
             outbound_bind_ipv4: std::env::var("OUTBOUND_BIND_IPV4")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            nginx_sni_enabled: parse_bool_env("NGINX_SNI_ENABLED", false),
+            nginx_sni_conf_path: std::env::var("NGINX_SNI_CONF_PATH")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "/etc/nginx/stream.d/relay-panel-sni.conf".to_string()),
+            nginx_sni_test_cmd: std::env::var("NGINX_SNI_TEST_CMD")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "nginx -t".to_string()),
+            nginx_sni_reload_cmd: std::env::var("NGINX_SNI_RELOAD_CMD")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "systemctl reload nginx".to_string()),
+            nginx_sni_default_backend: std::env::var("NGINX_SNI_DEFAULT_BACKEND")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "127.0.0.1:9".to_string()),
+            nginx_sni_access_log_path: std::env::var("NGINX_SNI_ACCESS_LOG_PATH")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "/var/log/nginx/sni-router.log".to_string()),
+            nginx_sni_traffic_state_path: std::env::var("NGINX_SNI_TRAFFIC_STATE_PATH")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "/opt/relay-node/nginx-sni-log.offset".to_string()),
         };
         cfg.validate();
         cfg
+    }
+
+    pub fn nginx_sni_config(&self) -> crate::forwarder::nginx_sni::NginxSniConfig {
+        crate::forwarder::nginx_sni::NginxSniConfig {
+            enabled: self.nginx_sni_enabled,
+            conf_path: PathBuf::from(&self.nginx_sni_conf_path),
+            test_cmd: self.nginx_sni_test_cmd.clone(),
+            reload_cmd: self.nginx_sni_reload_cmd.clone(),
+            default_backend: self.nginx_sni_default_backend.clone(),
+            access_log_path: self.nginx_sni_access_log_path.clone(),
+        }
     }
 
     fn validate(&self) {
@@ -83,5 +128,15 @@ impl NodeConfig {
             );
             std::process::exit(1);
         }
+    }
+}
+
+fn parse_bool_env(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
     }
 }

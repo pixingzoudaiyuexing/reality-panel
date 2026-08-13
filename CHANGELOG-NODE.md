@@ -11,6 +11,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.2.2] - 2026-08-13
+
+Node release for Reality SNI forwarding. Requires a panel that speaks config
+protocol 5 for `nginx_sni` rules.
+
+### Added
+
+- **Nginx Stream SNI router.** `relay-node` can now manage an Nginx
+  `ssl_preread` stream configuration and route multiple Reality SNI domains
+  through one public `:443` listener.
+- **Load strategies for SNI upstreams.** `first`, `round_robin`, and
+  `failover` are rendered into the generated Nginx upstreams.
+- **Per-rule traffic ingestion.** The node tails the Nginx SNI access log,
+  maps entries back to rule ids, and reports upload/download bytes to the
+  panel.
+
+### Changed
+
+- **Node installer supports SNI mode.** `scripts/relay-node-install.sh` now
+  accepts `--nginx-sni`, OpenList fallback via `--openlist-port`, and custom
+  fallback settings via `--fallback-*`.
+- **Fallback no longer creates a fake default site.** If no fallback is
+  configured, unmatched SNI traffic fails closed to `127.0.0.1:9`. Operators can
+  attach their own OpenList or HTTPS site instead.
+- **Release source switched to this fork.** The installer and self-updater now
+  use `pixingzoudaiyuexing/relay-panel` releases.
+
+---
+
 ## [1.2.1] - 2026-08-02
 
 Node only. Nothing on the wire changed — the config protocol stays at version

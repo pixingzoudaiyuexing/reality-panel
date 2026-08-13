@@ -53,17 +53,19 @@ export interface ForwardRule {
   paused: boolean;
   listen_port: number;
   protocol: string;
-  /** v0.4.0: user-facing ingress transport. "raw" | "ws" | "wss" | "tls_simple".
+  /** v0.4.0: user-facing ingress transport. "raw" | "ws" | "wss" | "tls_simple" | "nginx_sni".
    *  Legacy "tls" is mapped to "tls_simple" on read. Replaces entry_transport. */
   public_transport?: string;
   /** v0.4.0: the transport the node listens on (derived from public_transport).
-   *  "raw" | "ws" | "tls_simple". The node never receives "wss". */
+   *  "raw" | "ws" | "tls_simple" | "nginx_sni". The node never receives "wss". */
   node_transport?: string;
   /** v0.4.0: forwarding topology. "direct" | "group". (v0.4.7: chain removed.) */
   route_mode?: string;
   /** v0.4.0: WS path override for ws/wss rules. Null/undefined → the node uses
    *  its built-in default ("/relay"). Only meaningful for ws/wss. */
   ws_path?: string | null;
+  /** Required when public_transport/node_transport is "nginx_sni". */
+  sni?: string | null;
   device_group_in: number;
   device_group_out: number | null;
   forward_mode: string;

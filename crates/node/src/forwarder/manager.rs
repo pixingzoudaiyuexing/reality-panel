@@ -1,5 +1,6 @@
 use super::gate::RuleRuntime;
 use super::limiter::RateLimit;
+use super::nginx_sni::{self, NginxSniConfig, NginxSniPlan};
 use super::selector::TargetSelector;
 use super::tcp;
 use super::tls;
@@ -137,6 +138,9 @@ pub struct ForwarderManager {
     listen_ipv6: String,
     /// v1.0.4: resolved outbound source IPv4 (None = auto-route).
     source_ipv4: Option<std::net::Ipv4Addr>,
+    /// Reality/SNI fork: node delegates TLS SNI routing to Nginx Stream.
+    nginx_sni: NginxSniConfig,
+    nginx_sni_plan: Option<NginxSniPlan>,
 }
 
 impl ForwarderManager {
@@ -152,6 +156,8 @@ impl ForwarderManager {
             listen_ipv4: "0.0.0.0".into(),
             listen_ipv6: "::".into(),
             source_ipv4: None,
+            nginx_sni: NginxSniConfig::default(),
+            nginx_sni_plan: None,
         }
     }
 
@@ -171,6 +177,7 @@ impl ForwarderManager {
                 interface: cfg.outbound_interface.clone(),
             },
         )?;
+        self.nginx_sni = cfg.nginx_sni_config();
         Ok(())
     }
 
@@ -227,6 +234,52 @@ impl ForwarderManager {
     }
 
     pub async fn apply_config(&mut self, config: &NodeConfigResponse) {
+        let sni_listeners: Vec<ListenerConfig> = config
+            .listeners
+            .iter()
+            .filter(|l| l.node_transport == NodeTransport::NginxSni)
+            .cloned()
+            .collect();
+        let normal_listeners: Vec<ListenerConfig> = config
+            .listeners
+            .iter()
+            .filter(|l| l.node_transport != NodeTransport::NginxSni)
+            .cloned()
+            .collect();
+        let effective_config = NodeConfigResponse {
+            listeners: normal_listeners,
+        };
+
+        let sni_plan = NginxSniPlan::from_listeners(
+            &sni_listeners,
+            &self.nginx_sni.default_backend,
+            &self.nginx_sni.access_log_path,
+        );
+        if self.nginx_sni.enabled {
+            if self.nginx_sni_plan.as_ref() != Some(&sni_plan) {
+                if let Err(e) = nginx_sni::apply_plan(&sni_plan, &self.nginx_sni) {
+                    tracing::error!("nginx_sni apply failed: {}", e);
+                    self.listener_errors.lock().await.push(ListenerError {
+                        port: sni_listeners.first().map(|l| l.port).unwrap_or(0),
+                        protocol: "tcp".to_string(),
+                        error: format!("nginx_sni apply failed: {}", e),
+                    });
+                } else {
+                    self.nginx_sni_plan = Some(sni_plan);
+                }
+            }
+        } else if !sni_listeners.is_empty() {
+            tracing::warn!(
+                "received {} nginx_sni listener(s), but NGINX_SNI_ENABLED is false; skipping",
+                sni_listeners.len()
+            );
+            self.listener_errors.lock().await.push(ListenerError {
+                port: sni_listeners.first().map(|l| l.port).unwrap_or(0),
+                protocol: "tcp".to_string(),
+                error: "nginx_sni disabled on this node".to_string(),
+            });
+        }
+
         // ── Step 1: recover dead listeners ──
         // v0.3.6: a listener task that exited (bind failure, unrecoverable
         // error, or the v0.3.5 "instant accept error killed the task" bug) left
@@ -257,7 +310,7 @@ impl ForwarderManager {
         // ── Step 2: compute the desired set ──
         // Protocol::TcpUdp should never appear here (the panel expands it), but
         // we skip it defensively.
-        let active_keys: HashSet<ListenerKey> = config
+        let active_keys: HashSet<ListenerKey> = effective_config
             .listeners
             .iter()
             .filter(|l| l.protocol != Protocol::TcpUdp)
@@ -268,7 +321,11 @@ impl ForwarderManager {
         // decide which stopped listeners truly belong to deleted rules (and
         // therefore need their traffic counters pruned) vs. listeners that
         // are merely being restarted with a different fingerprint.
-        let desired_rule_ids: HashSet<i64> = config.listeners.iter().map(|l| l.rule_id).collect();
+        let desired_rule_ids: HashSet<i64> = effective_config
+            .listeners
+            .iter()
+            .map(|l| l.rule_id)
+            .collect();
 
         // v0.5.1: prune counters for dead listeners whose rule is no longer in
         // the new config AND has no other live listener referencing it.
@@ -295,7 +352,7 @@ impl ForwarderManager {
             .collect();
         // Fingerprint-changed listeners that ARE still desired: stop them now so
         // step 4 starts them fresh with the new config.
-        for listener in &config.listeners {
+        for listener in &effective_config.listeners {
             let key = (listener.port, listener.protocol, listener.node_transport);
             if let Some(m) = self.listeners.get(&key) {
                 let new_fp = ListenerFingerprint::from_listener(listener);
@@ -344,7 +401,7 @@ impl ForwarderManager {
         // two). We index them by rule_id within this apply; identical caps on the
         // two expanded listeners of one rule produce one Arc<RuleLimiter>.
         let mut rule_limiters: HashMap<i64, RateLimit> = HashMap::new();
-        for listener in &config.listeners {
+        for listener in &effective_config.listeners {
             let key = (listener.port, listener.protocol, listener.node_transport);
             // Skip if already running with the SAME fingerprint (no change).
             if let Some(m) = self.listeners.get(&key) {
@@ -748,6 +805,12 @@ impl ForwarderManager {
         self.last_config = Some(config.clone());
     }
 
+    pub fn nginx_sni_rule_id_for(&self, port: u16, sni: &str) -> Option<i64> {
+        self.nginx_sni_plan
+            .as_ref()
+            .and_then(|plan| plan.rule_id_for(port, sni))
+    }
+
     /// v1.2.0: restart ONE rule — drop every connection it is currently
     /// forwarding, then rebuild its listeners from the last applied config.
     ///
@@ -867,6 +930,7 @@ mod tests {
                 protocol: proto,
                 node_transport: transport,
                 ws_path: None,
+                sni: None,
                 targets: vec!["127.0.0.1:1".into()],
                 load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                 upload_limit_bps: None,
@@ -890,6 +954,7 @@ mod tests {
                 protocol: proto,
                 node_transport: transport,
                 ws_path: ws_path.map(str::to_string),
+                sni: None,
                 targets: targets.into_iter().map(String::from).collect(),
                 load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                 upload_limit_bps: None,
@@ -1152,6 +1217,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
+                    sni: None,
                     targets: vec!["127.0.0.1:1".into()],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
@@ -1164,6 +1230,7 @@ mod tests {
                     protocol: Protocol::Udp,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
+                    sni: None,
                     targets: vec!["127.0.0.1:1".into()],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
@@ -1232,6 +1299,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
+                    sni: None,
                     targets: vec!["127.0.0.1:1".into()],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
@@ -1244,6 +1312,7 @@ mod tests {
                     protocol: Protocol::Udp,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
+                    sni: None,
                     targets: vec!["127.0.0.1:1".into()],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
@@ -1365,6 +1434,7 @@ mod tests {
                 protocol: Protocol::Tcp,
                 node_transport: NodeTransport::Raw,
                 ws_path: None,
+                sni: None,
                 targets: vec!["127.0.0.1:9".into(), "127.0.0.1:10".into()],
                 load_balance_strategy: strategy,
                 upload_limit_bps: None,
@@ -1398,6 +1468,7 @@ mod tests {
                 protocol: Protocol::Tcp,
                 node_transport: transport,
                 ws_path: None,
+                sni: None,
                 targets: vec!["127.0.0.1:9".into()],
                 load_balance_strategy: LoadBalanceStrategy::First,
                 upload_limit_bps: None,
@@ -1461,6 +1532,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
+                    sni: None,
                     targets: vec!["127.0.0.1:9".into()],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
@@ -1473,6 +1545,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
+                    sni: None,
                     targets: vec!["127.0.0.1:9".into()],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
@@ -1494,6 +1567,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
+                    sni: None,
                     targets: vec!["127.0.0.1:9".into()],
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
@@ -1506,6 +1580,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
+                    sni: None,
                     targets: vec!["127.0.0.1:10".into()], // changed
                     load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                     upload_limit_bps: None,
@@ -1772,6 +1847,7 @@ mod tests {
                     protocol: Protocol::Tcp,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
+                    sni: None,
                     targets: vec!["127.0.0.1:1".into()],
                     load_balance_strategy: LoadBalanceStrategy::First,
                     upload_limit_bps: None,
@@ -1784,6 +1860,7 @@ mod tests {
                     protocol: Protocol::Udp,
                     node_transport: NodeTransport::Raw,
                     ws_path: None,
+                    sni: None,
                     targets: vec!["127.0.0.1:1".into()],
                     load_balance_strategy: LoadBalanceStrategy::First,
                     upload_limit_bps: None,
@@ -1804,6 +1881,7 @@ mod tests {
                 protocol: Protocol::Tcp,
                 node_transport: NodeTransport::Raw,
                 ws_path: None,
+                sni: None,
                 targets: vec!["127.0.0.1:2".into()],
                 load_balance_strategy: LoadBalanceStrategy::First,
                 upload_limit_bps: None,

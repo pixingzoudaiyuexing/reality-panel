@@ -1252,6 +1252,7 @@ mod tests {
                 protocol: relay_shared::protocol::Protocol::Tcp,
                 node_transport: NodeTransport::Raw,
                 ws_path: None,
+                sni: None,
                 targets: vec!["127.0.0.1:1".to_string()],
                 load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
                 upload_limit_bps: None,

@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/MoeShinX/relay-panel/releases/latest"><img src="https://img.shields.io/github/v/release/MoeShinX/relay-panel?style=flat-square&label=Release&color=blue" alt="Release" /></a>
-  <a href="https://github.com/MoeShinX/relay-panel/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/MoeShinX/relay-panel/ci.yml?style=flat-square&label=CI" alt="CI" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/MoeShinX/relay-panel?style=flat-square&label=License&color=red" alt="License" /></a>
+  <a href="https://github.com/pixingzoudaiyuexing/relay-panel/releases/latest"><img src="https://img.shields.io/github/v/release/pixingzoudaiyuexing/relay-panel?style=flat-square&label=Release&color=blue" alt="Release" /></a>
+  <a href="https://github.com/pixingzoudaiyuexing/relay-panel/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/pixingzoudaiyuexing/relay-panel/ci.yml?style=flat-square&label=CI" alt="CI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/pixingzoudaiyuexing/relay-panel?style=flat-square&label=License&color=red" alt="License" /></a>
 </p>
 
 <p align="center">
@@ -46,7 +46,7 @@ Full feature reference and user docs: **[relaypanel.dev](https://relaypanel.dev)
 **One command deploy:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/install.sh | bash
 ```
 
 > 🔑 **Default login `admin` / `admin123` — first login forces a password change.**

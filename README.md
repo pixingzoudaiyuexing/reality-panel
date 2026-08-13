@@ -2,10 +2,10 @@
   <img src="frontend/public/favicon.svg" width="80" height="80" alt="RelayPanel Logo" />
 </p>
 
-<h1 align="center">RelayPanel</h1>
+<h1 align="center">RelayPanel Reality SNI Edition</h1>
 
 <p align="center">
-  ⚡ 自托管 TCP/UDP 端口转发管理面板 ⚡
+  单公网 IP + 统一 443 + 基于 TLS SNI 的 Reality L4 转发面板
 </p>
 
 <p align="center">
@@ -13,93 +13,244 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/MoeShinX/relay-panel/releases/latest"><img src="https://img.shields.io/github/v/release/MoeShinX/relay-panel?style=flat-square&label=Release&color=blue" alt="Release" /></a>
-  <a href="https://github.com/MoeShinX/relay-panel/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/MoeShinX/relay-panel/ci.yml?style=flat-square&label=CI" alt="CI" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/MoeShinX/relay-panel?style=flat-square&label=License&color=red" alt="License" /></a>
+  <a href="https://github.com/pixingzoudaiyuexing/relay-panel/releases/latest"><img src="https://img.shields.io/github/v/release/pixingzoudaiyuexing/relay-panel?style=flat-square&label=Release&color=blue" alt="Release" /></a>
+  <a href="https://github.com/pixingzoudaiyuexing/relay-panel/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/pixingzoudaiyuexing/relay-panel/ci.yml?style=flat-square&label=CI" alt="CI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/pixingzoudaiyuexing/relay-panel?style=flat-square&label=License&color=red" alt="License" /></a>
 </p>
 
 <p align="center">
-  用 Rust 编写,通过 Web UI 管理转发规则、设备分组、流量配额和实时节点状态。<br/>
-  轻量：Panel ~7 MB + Node ~4 MB。部署方式：Docker Compose。数据库：SQLite / PostgreSQL。
+  基于 <a href="https://github.com/MoeShinX/relay-panel">MoeShinX/relay-panel</a> 二开。<br/>
+  保留原有 TCP/UDP 转发、节点管理、用户额度、流量统计能力，并新增 Reality SNI 转发链路。
 </p>
 
 ---
 
-## ✨ 功能亮点
+## 适合什么场景
 
-- 🔀 **转发规则** — TCP/UDP 多目标转发，故障转移 / 轮询负载均衡，目标熔断自动恢复，域名目标跟随 DDNS
-- 🚦 **连接治理** — 每条规则可设并发连接数上限；支持单条 / 批量 / 定时重启，重启会掐断旧连接并重建监听
-- 🛒 **套餐与计费** — 用户自助买套餐、卡密充值余额；按「(上行 + 下行) × 线路倍率」扣额度；一人一个当前套餐，续费叠加、换套餐整体替换
-- 📊 **流量可视** — 按规则 / 用户计量，近 1 / 7 / 30 天趋势图按线路分色堆叠，看得出是哪条线路在吃额度
-- 🖥️ **节点管理** — 实时 CPU / 内存 / 连接数、地区识别、掉线推送 Telegram 或邮件、面板一键升级节点（免 SSH）
-- 👤 **用户与分组** — 管理任意用户的规则与套餐、重置流量密码、封禁；设备分组可隐藏，节点卸载不影响规则
-- 🗄️ **部署友好** — SQLite（零配置）或 PostgreSQL；面板与节点均支持 amd64 / arm64
-- 🔒 **安全** — 首次登录强制改密码，节点 Bearer Token 鉴权
+这版主要用于 Reality 节点入口中转：
 
-完整功能说明与使用文档：**[relaypanel.dev](https://relaypanel.dev)**
+- 多个 Reality 落地节点共用一个中转公网 IP。
+- 客户端统一连接 `中转IP:443`。
+- 面板按 TLS ClientHello 里的 SNI，把 `op1.example.com`、`op2.example.com`、`op3.example.com` 分发到不同落地节点。
+- 未命中规则的连接进入 fallback，可以接 OpenList、普通 HTTPS 站点或直接丢弃。
+- 面板继续统计每条规则的流量、额度和在线节点状态。
 
----
+典型链路：
 
-## 🚀 快速开始
+```text
+客户端
+  -> 中转节点 64.x.x.x:443
+  -> Nginx Stream ssl_preread 读取 SNI
+  -> op1.example.com => Reality 节点 A:55443
+  -> op2.example.com => Reality 节点 B:55443
+  -> op3.example.com => Reality 节点 C:55443
+```
 
-**一条命令部署：**
+## 功能
+
+- Reality SNI 转发：同一个监听端口可以按不同 SNI 分流。
+- Nginx Stream L4 转发：中转节点不解密 Reality TLS，只读取 SNI。
+- 负载策略：支持 `first`、`round_robin`、`failover`。
+- 流量统计：从 Nginx Stream access log 采集每条规则的上下行。
+- 导入导出：规则导入导出保留 Reality SNI、协议、转发类型和负载策略。
+- 节点安装脚本：支持 `--nginx-sni`、OpenList fallback 和自定义 fallback。
+- Docker 发布：Panel 和 Node 镜像发布到本 fork 的 GHCR Packages。
+
+## 面板部署
+
+### 一键脚本
+
+Debian / Ubuntu 上用 root 执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeShinX/relay-panel/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/install.sh | bash
 ```
 
-> 🔑 **默认账号 `admin` / `admin123`，首次登录强制修改密码。**
+脚本会把项目安装到 `/opt/relay-panel`，自动安装 Docker、生成密钥并启动面板。
 
-📖 完整指南：**[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**
+默认访问地址：
 
----
-
-## 🏗️ 架构
-
-```
-  浏览器 (React UI)          relay-node (Tokio TCP/UDP)
-       │                          ▲
-       ▼                          │
-   relay-panel  ◄─── WebSocket 配置推送 + HTTP 状态上报
-   (Axum API)                     │
-       │                          ▼
-   SQLite / PG              转发流量到真实目标
+```text
+http://服务器IP:18888
 ```
 
----
+默认账号：
 
-## 🔄 更新
+```text
+admin / admin123
+```
 
-**面板**（更新前请备份 `.env` 和数据库）：
+首次登录会强制修改密码。
+
+### Docker Compose
+
+也可以手动部署：
 
 ```bash
-cd /opt/relay-panel && git pull --quiet && ./deploy.sh
+git clone https://github.com/pixingzoudaiyuexing/relay-panel.git
+cd relay-panel
+
+cat > .env <<EOF
+JWT_SECRET=$(openssl rand -hex 32)
+PANEL_KEY=$(openssl rand -hex 16)
+DATABASE_URL=sqlite:/app/data/data.db?mode=rwc
+PUBLIC_PANEL_URL=http://你的面板IP:18888
+EOF
+
+docker compose -f docker-compose.release.yaml up -d
 ```
 
-**节点**：面板 → 节点状态 → 点「升级」，无需 SSH。仅 systemd 节点可用（Docker 节点改为更新镜像）；升级会断开该节点上正在进行的转发连接。详见 [转发节点文档](docs/NODE.zh-CN.md#更新)。
+默认镜像：
 
----
+```text
+ghcr.io/pixingzoudaiyuexing/relay-panel-panel:1.2.7
+ghcr.io/pixingzoudaiyuexing/relay-panel-node:1.2.2
+```
 
-## 🛠️ 本地开发
+完整部署细节见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+
+## 节点部署
+
+先在面板里创建一个“入口/监听”设备分组，复制分组 token，然后在中转节点服务器执行：
 
 ```bash
-cargo build && cargo run -p relay-panel &   # API 在 :18888
-cd frontend && npm install && npm run dev   # UI 在 :5173
-python3 tests/e2e_test.py                   # 端到端测试
+bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
+  -t <NODE_TOKEN> \
+  -u http://<PANEL_IP>:18888 \
+  --nginx-sni
 ```
 
----
+安装完成后，节点会运行 systemd 服务：
 
-## 📦 技术栈
+```bash
+systemctl status relay-node
+journalctl -u relay-node -f
+```
 
-Rust · Axum · Tokio · sqlx · SQLite/PostgreSQL · JWT · React 19 · TypeScript · Ant Design · Docker Compose
+节点文档见 [docs/NODE.zh-CN.md](docs/NODE.zh-CN.md)。
 
----
+## 使用 OpenList 做 fallback 站点
 
-## 📄 许可证与免责声明
+如果你希望未命中 SNI 规则时显示一个真实 HTTPS 站点，可以先在中转节点上用 Docker 启动 OpenList。
+OpenList 官方 Docker 文档推荐使用轻量镜像 `openlistteam/openlist:latest-lite`，服务端口为 `5244`。
 
-AGPL-3.0 —— 详见 [LICENSE](LICENSE)。
+建议只监听本机，避免绕过 Nginx 直接暴露：
 
-开源流量转发工具，**仅供个人学习与研究使用**。请在合法合规前提下使用，风险自负。
+```bash
+docker run -d \
+  --name openlist \
+  --restart unless-stopped \
+  -p 127.0.0.1:5244:5244 \
+  -v /etc/openlist:/opt/openlist/data \
+  -e UMASK=022 \
+  -e TZ=Asia/Shanghai \
+  openlistteam/openlist:latest-lite
+```
 
-完整 **[免责声明](docs/DISCLAIMER.md)**
+然后安装或重装 relay-node：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
+  -t <NODE_TOKEN> \
+  -u http://<PANEL_IP>:18888 \
+  --nginx-sni \
+  --openlist-port 5244 \
+  --fallback-name op1.example.com
+```
+
+这个模式会在节点本机创建一个 HTTPS wrapper：
+
+```text
+127.0.0.1:8443 -> http://127.0.0.1:5244
+```
+
+然后把 Nginx SNI 默认后端设为 `127.0.0.1:8443`。
+
+如果你已经有自己的 HTTPS fallback，可以直接指定：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
+  -t <NODE_TOKEN> \
+  -u http://<PANEL_IP>:18888 \
+  --nginx-sni \
+  --fallback-backend 127.0.0.1:8443
+```
+
+要让浏览器显示“安全”，fallback 站点需要有效证书。可以用真实域名申请证书后传入：
+
+```bash
+--fallback-cert /etc/letsencrypt/live/op1.example.com/fullchain.pem \
+--fallback-key /etc/letsencrypt/live/op1.example.com/privkey.pem
+```
+
+不配置 fallback 时，节点默认 fail-closed 到 `127.0.0.1:9`。
+
+## 添加 Reality SNI 规则
+
+在面板“转发规则”里添加规则：
+
+```text
+协议: TCP
+公网转发类型: REALITY SNI 转发 / nginx_sni
+节点转发类型: REALITY SNI 转发 / nginx_sni
+监听端口: 443
+SNI: op1.13886.xyz
+目标地址: 216.195.201.113
+目标端口: 55443
+负载策略: first / round_robin / failover
+```
+
+客户端配置保持：
+
+```text
+连接地址: 中转服务器公网 IP
+连接端口: 443
+SNI / serverName: op1.13886.xyz
+Reality 落地节点参数: 按真实节点配置填写
+```
+
+同一个中转节点可以继续添加：
+
+```text
+op2.13886.xyz -> 141.11.219.133:55443
+op3.13886.xyz -> 107.175.140.11:55443
+```
+
+注意：SNI 必须和客户端实际发送的 `serverName` 一致。域名 DNS 可以解析到中转 IP，也可以由客户端显式连接中转 IP；Nginx 分流依据是 TLS 握手里的 SNI，不是普通 HTTP Host。
+
+## 更新
+
+面板：
+
+```bash
+cd /opt/relay-panel
+git pull --ff-only
+./deploy.sh
+```
+
+节点：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
+  -t <NODE_TOKEN> \
+  -u http://<PANEL_IP>:18888 \
+  --nginx-sni
+```
+
+systemd 节点也可以在面板“节点状态”里一键升级。
+
+## 开发
+
+```bash
+cargo build
+cargo run -p relay-panel
+cd frontend && npm install && npm run dev
+```
+
+Rust 后端使用 Axum / Tokio / sqlx，前端使用 React 19 / TypeScript / Ant Design。
+
+## 许可证与声明
+
+本项目遵循 [AGPL-3.0](LICENSE)。
+
+请只在合法合规的网络环境中使用。你需要自行承担部署、转发、域名、证书和节点使用带来的责任。

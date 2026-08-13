@@ -93,9 +93,46 @@ describe('buildExportJSON', () => {
     expect(entry.dest).toEqual(['[2001:db8::1]:443', '93.184.216.34:80']);
   });
 
-  it('only carries dest / listen_port / name (the minimal share shape)', () => {
-    const out = JSON.parse(buildExportJSON([mkRule({ name: 'r1', listen_port: 10000, target_addr: '1.1.1.1', target_port: 80 })]));
-    expect(Object.keys(out[0]).sort()).toEqual(['dest', 'listen_port', 'name']);
+  it('carries migration-critical protocol / transport / load-balance metadata', () => {
+    const out = JSON.parse(buildExportJSON([mkRule({
+      name: 'r1',
+      listen_port: 10000,
+      target_addr: '1.1.1.1',
+      target_port: 80,
+      protocol: 'tcp',
+      public_transport: 'raw',
+      load_balance_strategy: 'failover',
+    })]));
+    expect(out[0]).toMatchObject({
+      dest: ['1.1.1.1:80'],
+      listen_port: 10000,
+      name: 'r1',
+      protocol: 'tcp',
+      public_transport: 'raw',
+      load_balance_strategy: 'failover',
+    });
+  });
+
+  it('exports reality SNI rules with nginx_sni transport and normalized sni', () => {
+    const entry: ExportEntry = JSON.parse(buildExportJSON([mkRule({
+      name: 'op1',
+      listen_port: 443,
+      protocol: 'tcp_udp',
+      public_transport: 'nginx_sni',
+      node_transport: 'nginx_sni',
+      sni: '  OP1.Example.COM  ',
+      targets: [tgt('10.0.0.1', 55443, true, 1, 1, 1)],
+      load_balance_strategy: 'round_robin',
+    })]))[0];
+    expect(entry).toMatchObject({
+      dest: ['10.0.0.1:55443'],
+      listen_port: 443,
+      name: 'op1',
+      protocol: 'tcp',
+      public_transport: 'nginx_sni',
+      sni: 'op1.example.com',
+      load_balance_strategy: 'round_robin',
+    });
   });
 });
 
@@ -123,6 +160,32 @@ describe('parseDest', () => {
 describe('validateImportEntry', () => {
   it('accepts a well-formed entry', () => {
     expect(validateImportEntry({ name: 'r1', listen_port: 10000, dest: ['1.1.1.1:80'] })).toBeNull();
+  });
+  it('accepts a reality SNI entry', () => {
+    expect(validateImportEntry({
+      name: 'op1',
+      listen_port: 443,
+      dest: ['1.1.1.1:55443'],
+      public_transport: 'nginx_sni',
+      sni: 'op1.example.com',
+      load_balance_strategy: 'round_robin',
+    })).toBeNull();
+  });
+  it('rejects nginx_sni without sni', () => {
+    expect(validateImportEntry({
+      name: 'op1',
+      listen_port: 443,
+      dest: ['1.1.1.1:55443'],
+      public_transport: 'nginx_sni',
+    })).toMatch(/sni/);
+  });
+  it('rejects invalid load-balance strategy', () => {
+    expect(validateImportEntry({
+      name: 'op1',
+      listen_port: 443,
+      dest: ['1.1.1.1:55443'],
+      load_balance_strategy: 'random',
+    })).toMatch(/load_balance_strategy/);
   });
   it('rejects an empty/missing name', () => {
     expect(validateImportEntry({ name: '', listen_port: 10000, dest: ['1.1.1.1:80'] })).toMatch(/name/);
@@ -195,6 +258,22 @@ describe('asValidatedEntry', () => {
     expect(typed.name).toBe('r1');
     expect(typed.listen_port).toBe(10000);
     expect(typed.dest).toEqual(['1.1.1.1:80']);
+  });
+
+  it('coerces reality SNI entries and normalizes sni', () => {
+    const e = {
+      name: 'op1',
+      listen_port: 443,
+      dest: ['1.1.1.1:55443'],
+      public_transport: 'nginx_sni',
+      sni: ' OP1.Example.COM ',
+      load_balance_strategy: 'failover',
+    };
+    expect(validateImportEntry(e)).toBeNull();
+    const typed = asValidatedEntry(e);
+    expect(typed.public_transport).toBe('nginx_sni');
+    expect(typed.sni).toBe('op1.example.com');
+    expect(typed.load_balance_strategy).toBe('failover');
   });
 });
 
