@@ -22,6 +22,8 @@ const dash = <span style={{ color: 'var(--rp-text-tertiary)' }}>-</span>;
 
 interface InstallCommandOptions {
   nginxSni?: boolean;
+  nginxDocker?: boolean;
+  nginxDockerImage?: string;
   openlistPort?: number | null;
   fallbackPort?: number | null;
   fallbackName?: string;
@@ -48,6 +50,12 @@ function buildInstallCommand(token: string, panelUrl: string, options: InstallCo
   ];
   if (options.nginxSni) {
     args.push('--nginx-sni');
+    if (options.nginxDocker) {
+      args.push('--nginx-docker');
+      if (options.nginxDockerImage?.trim() && options.nginxDockerImage.trim() !== 'nginx:1.27-alpine') {
+        args.push(`--nginx-docker-image ${shellArg(options.nginxDockerImage.trim())}`);
+      }
+    }
     if (options.openlistPort) args.push(`--openlist-port ${options.openlistPort}`);
     if (options.fallbackPort) args.push(`--fallback-port ${options.fallbackPort}`);
     if (options.fallbackName?.trim()) args.push(`--fallback-name ${shellArg(options.fallbackName.trim())}`);
@@ -77,6 +85,8 @@ export default function Groups() {
   const [installContext, setInstallContext] = useState<InstallCommandContext | null>(null);
   const [installOptions, setInstallOptions] = useState<InstallCommandOptions>({
     nginxSni: true,
+    nginxDocker: true,
+    nginxDockerImage: 'nginx:1.27-alpine',
     openlistPort: 5244,
     fallbackPort: 8443,
     certbotStaging: false,
@@ -241,6 +251,8 @@ export default function Groups() {
     setInstallContext({ token: g.token, panelUrl });
     setInstallOptions({
       nginxSni: true,
+      nginxDocker: true,
+      nginxDockerImage: 'nginx:1.27-alpine',
       openlistPort: 5244,
       fallbackPort: 8443,
       certbotStaging: false,
@@ -548,6 +560,21 @@ export default function Groups() {
               </Form.Item>
               {installOptions.nginxSni && (
                 <>
+                  <Form.Item label={t('installNginxDockerMode')}>
+                    <Switch
+                      checked={!!installOptions.nginxDocker}
+                      onChange={(checked) => setInstallOptions(o => ({ ...o, nginxDocker: checked }))}
+                    />
+                  </Form.Item>
+                  {installOptions.nginxDocker && (
+                    <Form.Item label={t('installNginxDockerImage')}>
+                      <Input
+                        value={installOptions.nginxDockerImage}
+                        placeholder="nginx:1.27-alpine"
+                        onChange={(e) => setInstallOptions(o => ({ ...o, nginxDockerImage: e.target.value }))}
+                      />
+                    </Form.Item>
+                  )}
                   <Form.Item label={t('installOpenlistPort')}>
                     <InputNumber
                       min={1}

@@ -409,6 +409,8 @@ export const enUS: Dict = {
   installCommandTitle: 'Node Install Command',
   installCommandCopied: 'Install command copied',
   installRealitySniMode: 'Enable Reality SNI forwarding',
+  installNginxDockerMode: 'Use Docker Nginx',
+  installNginxDockerImage: 'Nginx Docker image',
   installOpenlistPort: 'OpenList HTTP port',
   installFallbackPort: 'Local HTTPS fallback port',
   installFallbackName: 'Fallback domain / server_name',

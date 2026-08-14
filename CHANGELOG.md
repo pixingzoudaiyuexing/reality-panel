@@ -8,6 +8,27 @@ independent `v*` / `node-v*` tracks since this release).
 
 ---
 
+## [1.2.9] - 2026-08-14
+
+Panel-only update. The node binary remains `node-v1.2.2`; this release updates
+the installer script, install-command generator, docs, and panel image.
+
+### Added
+
+- **Dockerized Nginx SNI router.** The node installer now supports
+  `--nginx-docker`, `--nginx-mode docker`, `--nginx-docker-image`, and
+  `--nginx-container-name`. Docker mode stores managed Nginx config, logs, and
+  self-signed fallback certificates under `/opt/relay-node/nginx`, runs the
+  container with host networking so dynamic listen ports work, and configures
+  relay-node to validate/reload Nginx through `docker exec`.
+- **Easy Nginx cleanup.** Docker mode writes
+  `/opt/relay-node/uninstall-nginx-docker.sh` so the SNI router container and
+  managed Nginx files can be removed without touching relay-node itself.
+- **Docker Nginx install UI.** The Device Groups install-command modal now
+  defaults Reality SNI installs to Docker Nginx and exposes the image setting.
+
+---
+
 ## [1.2.8] - 2026-08-13
 
 Panel-only update. The node binary remains `node-v1.2.2`; the installer script

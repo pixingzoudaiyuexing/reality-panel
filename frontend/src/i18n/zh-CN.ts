@@ -406,6 +406,8 @@ export const zhCN = {
   installCommandTitle: '节点对接命令',
   installCommandCopied: '已复制对接命令',
   installRealitySniMode: '启用 Reality SNI 转发',
+  installNginxDockerMode: '使用 Docker Nginx',
+  installNginxDockerImage: 'Nginx Docker 镜像',
   installOpenlistPort: 'OpenList HTTP 端口',
   installFallbackPort: '本地 HTTPS fallback 端口',
   installFallbackName: 'fallback 域名 / server_name',

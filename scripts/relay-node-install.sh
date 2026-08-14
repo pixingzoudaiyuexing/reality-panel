@@ -13,6 +13,7 @@
 #   -p, --proxy         Proxy for downloads, e.g. socks5://127.0.0.1:10808
 #                       (or set RELAY_PROXY env var)
 #   --nginx-sni         Enable Nginx Stream SNI mode.
+#   --nginx-docker      Run the Nginx SNI router as a Docker container.
 #   --openlist-port N   Use an existing local OpenList HTTP Docker site as the
 #                       fallback, e.g. 5244 maps to http://127.0.0.1:5244.
 #   --fallback-backend  Direct TLS fallback backend, e.g. 127.0.0.1:8443.
@@ -59,6 +60,9 @@ PANEL_URL=""
 SERVICE_NAME="relay-node"
 PROXY="${RELAY_PROXY:-}"
 NGINX_SNI="${NGINX_SNI:-0}"
+SNI_NGINX_MODE="${NGINX_SNI_MODE:-host}"
+SNI_NGINX_DOCKER_IMAGE="${NGINX_SNI_DOCKER_IMAGE:-nginx:1.27-alpine}"
+SNI_NGINX_DOCKER_NAME="${NGINX_SNI_DOCKER_NAME:-}"
 SNI_FALLBACK_PORT="${SNI_FALLBACK_PORT:-8443}"
 SNI_FALLBACK_SERVER_NAME="${SNI_FALLBACK_SERVER_NAME:-localhost}"
 SNI_FALLBACK_HTTP_UPSTREAM="${SNI_FALLBACK_HTTP_UPSTREAM:-}"
@@ -82,6 +86,10 @@ while [[ $# -gt 0 ]]; do
         -p|--proxy)         PROXY="$2"; shift 2 ;;
         --version)          TARGET_VERSION="$2"; shift 2 ;;
         --nginx-sni)        NGINX_SNI="1"; shift ;;
+        --nginx-docker)     NGINX_SNI="1"; SNI_NGINX_MODE="docker"; shift ;;
+        --nginx-mode)       SNI_NGINX_MODE="$2"; shift 2 ;;
+        --nginx-docker-image) SNI_NGINX_DOCKER_IMAGE="$2"; shift 2 ;;
+        --nginx-container-name) SNI_NGINX_DOCKER_NAME="$2"; shift 2 ;;
         --fallback-backend) SNI_DEFAULT_BACKEND="$2"; shift 2 ;;
         --fallback-http-upstream) SNI_FALLBACK_HTTP_UPSTREAM="$2"; shift 2 ;;
         --openlist-port)    SNI_FALLBACK_HTTP_UPSTREAM="127.0.0.1:$2"; shift 2 ;;
@@ -102,6 +110,12 @@ while [[ $# -gt 0 ]]; do
             echo "  -p, --proxy         Download proxy, e.g. socks5://127.0.0.1:10808"
             echo "  --version X.Y.Z     Install a specific node version (default: latest node-v* from GitHub)"
             echo "  --nginx-sni         Configure Nginx Stream SNI routing"
+            echo "  --nginx-docker      Run the Nginx SNI router as a Docker container"
+            echo "  --nginx-mode MODE   Nginx runtime for --nginx-sni: host or docker (default: host)"
+            echo "  --nginx-docker-image IMAGE"
+            echo "                       Docker image for --nginx-docker (default: nginx:1.27-alpine)"
+            echo "  --nginx-container-name NAME"
+            echo "                       Container name for --nginx-docker (default: <service-name>-nginx)"
             echo "  --openlist-port N   Use local OpenList HTTP Docker site as fallback, e.g. 5244"
             echo "  --fallback-http-upstream HOST:PORT"
             echo "                       HTTP upstream to wrap with local HTTPS, e.g. 127.0.0.1:5244"
@@ -122,6 +136,9 @@ while [[ $# -gt 0 ]]; do
             echo "  RELAY_PROXY           Same as -p"
             echo "  RELAY_NODE_BASE_URL   Custom mirror for binary downloads"
             echo "  NGINX_SNI=1           Same as --nginx-sni"
+            echo "  NGINX_SNI_MODE=docker Same as --nginx-docker"
+            echo "  NGINX_SNI_DOCKER_IMAGE / NGINX_SNI_DOCKER_NAME"
+            echo "                         Same as --nginx-docker-image/--nginx-container-name"
             echo "  SNI_FALLBACK_HTTP_UPSTREAM Same as --fallback-http-upstream"
             echo "  NGINX_SNI_DEFAULT_BACKEND Same as --fallback-backend"
             echo "  SNI_FALLBACK_PORT     Same as --fallback-port"
@@ -144,6 +161,16 @@ if [ -z "$NODE_TOKEN" ]; then
 fi
 if [ -z "$PANEL_URL" ]; then
     fail "Missing required option: -u/--url. Example: http://203.0.113.10:18888"
+fi
+case "$SNI_NGINX_MODE" in
+    host|docker) ;;
+    *) fail "--nginx-mode / NGINX_SNI_MODE must be either 'host' or 'docker'" ;;
+esac
+if [ -n "$SNI_NGINX_DOCKER_NAME" ] && ! [[ "$SNI_NGINX_DOCKER_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
+    fail "--nginx-container-name / NGINX_SNI_DOCKER_NAME must contain only letters, numbers, dot, underscore, or dash"
+fi
+if [ -z "$SNI_NGINX_DOCKER_IMAGE" ]; then
+    fail "--nginx-docker-image / NGINX_SNI_DOCKER_IMAGE cannot be empty"
 fi
 if ! [[ "$SNI_FALLBACK_PORT" =~ ^[0-9]+$ ]] || [ "$SNI_FALLBACK_PORT" -lt 1 ] || [ "$SNI_FALLBACK_PORT" -gt 65535 ]; then
     fail "--fallback-port must be an integer from 1 to 65535"
@@ -230,6 +257,29 @@ install_pkg() {
     fi
 }
 
+install_nginx_support_packages() {
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -y -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssl ca-certificates
+    else
+        install_pkg openssl ca-certificates
+    fi
+}
+
+ensure_docker_engine() {
+    if ! command -v docker >/dev/null 2>&1; then
+        info "Docker not found - installing via get.docker.com ..."
+        command -v curl >/dev/null 2>&1 || install_pkg curl ca-certificates
+        curl -fsSL https://get.docker.com | sh
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now docker || true
+    fi
+    if ! docker info >/dev/null 2>&1; then
+        fail "Docker daemon is not running. Start Docker and re-run the installer."
+    fi
+}
+
 ensure_line_in_file() {
     local file="$1"
     local line="$2"
@@ -249,6 +299,87 @@ set_env_var() {
     printf '%s=%s\n' "$key" "$(shell_quote "$value")" >> "$file"
 }
 
+write_nginx_docker_base_config() {
+    mkdir -p "$NGINX_DOCKER_HTTP_DIR" "$NGINX_DOCKER_STREAM_DIR" "$NGINX_DOCKER_CERT_DIR" "$NGINX_DOCKER_LOG_DIR"
+    touch "$NGINX_DOCKER_STREAM_CONF"
+    cat > "$NGINX_DOCKER_CONF" <<NGINXEOF
+user nginx;
+worker_processes auto;
+error_log ${NGINX_DOCKER_LOG_DIR}/error.log warn;
+pid /tmp/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+stream {
+    include /etc/nginx/stream.d/*.conf;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    access_log ${NGINX_DOCKER_LOG_DIR}/access.log;
+    sendfile on;
+    keepalive_timeout 65;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+NGINXEOF
+}
+
+start_nginx_docker_container() {
+    ensure_docker_engine
+    write_nginx_docker_base_config
+    mkdir -p /etc/letsencrypt /var/www/relay-panel-certbot
+
+    if ! docker image inspect "$SNI_NGINX_DOCKER_IMAGE" >/dev/null 2>&1; then
+        info "Pulling Nginx Docker image: ${SNI_NGINX_DOCKER_IMAGE}"
+        docker pull "$SNI_NGINX_DOCKER_IMAGE"
+    fi
+
+    docker rm -f "$SNI_NGINX_DOCKER_NAME" >/dev/null 2>&1 || true
+    docker run -d \
+        --name "$SNI_NGINX_DOCKER_NAME" \
+        --restart unless-stopped \
+        --network host \
+        -v "${NGINX_DOCKER_CONF}:/etc/nginx/nginx.conf:ro" \
+        -v "${NGINX_DOCKER_HTTP_DIR}:/etc/nginx/conf.d:ro" \
+        -v "${NGINX_DOCKER_STREAM_DIR}:/etc/nginx/stream.d:ro" \
+        -v "${NGINX_DOCKER_CERT_DIR}:/etc/nginx/relay-panel-certs:ro" \
+        -v "/etc/letsencrypt:/etc/letsencrypt:ro" \
+        -v "/var/www/relay-panel-certbot:/var/www/relay-panel-certbot:ro" \
+        -v "${NGINX_DOCKER_LOG_DIR}:${NGINX_DOCKER_LOG_DIR}" \
+        "$SNI_NGINX_DOCKER_IMAGE" >/dev/null
+    info "Nginx Docker container is running: ${SNI_NGINX_DOCKER_NAME}"
+}
+
+nginx_runtime_test() {
+    if [ "$SNI_NGINX_MODE" = "docker" ]; then
+        docker exec "$SNI_NGINX_DOCKER_NAME" nginx -t
+    else
+        nginx -t
+    fi
+}
+
+nginx_runtime_reload() {
+    if [ "$SNI_NGINX_MODE" = "docker" ]; then
+        docker exec "$SNI_NGINX_DOCKER_NAME" nginx -s reload || docker restart "$SNI_NGINX_DOCKER_NAME"
+    else
+        systemctl reload nginx || systemctl restart nginx
+    fi
+}
+
+nginx_runtime_restart() {
+    if [ "$SNI_NGINX_MODE" = "docker" ]; then
+        start_nginx_docker_container
+    else
+        systemctl enable nginx
+        systemctl restart nginx
+    fi
+}
+
 install_certbot_if_needed() {
     command -v certbot >/dev/null 2>&1 && return 0
 
@@ -264,7 +395,20 @@ install_certbot_if_needed() {
 configure_certbot_renew_hook() {
     local hook="/etc/letsencrypt/renewal-hooks/deploy/relay-panel-nginx-reload.sh"
     mkdir -p "$(dirname "$hook")"
-    cat > "$hook" <<'HOOKEOF'
+    if [ "$SNI_NGINX_MODE" = "docker" ]; then
+        cat > "$hook" <<HOOKEOF
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -Fxq '${SNI_NGINX_DOCKER_NAME}'; then
+    docker exec '${SNI_NGINX_DOCKER_NAME}' nginx -s reload || docker restart '${SNI_NGINX_DOCKER_NAME}'
+elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files nginx.service >/dev/null 2>&1; then
+    systemctl reload nginx || systemctl restart nginx
+elif command -v nginx >/dev/null 2>&1; then
+    nginx -s reload
+fi
+HOOKEOF
+    else
+        cat > "$hook" <<'HOOKEOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files nginx.service >/dev/null 2>&1; then
@@ -273,6 +417,7 @@ elif command -v nginx >/dev/null 2>&1; then
     nginx -s reload
 fi
 HOOKEOF
+    fi
     chmod 755 "$hook"
 }
 
@@ -321,7 +466,8 @@ issue_fallback_certbot_certificate() {
     else
         info "Requesting Let's Encrypt certificate for ${domain} via nginx webroot ..."
         mkdir -p /var/www/relay-panel-certbot/.well-known/acme-challenge
-        cat > /etc/nginx/conf.d/relay-panel-certbot-http.conf <<NGINXEOF
+        mkdir -p "$NGINX_HTTP_CONF_DIR"
+        cat > "${NGINX_HTTP_CONF_DIR}/relay-panel-certbot-http.conf" <<NGINXEOF
 server {
     listen 80;
     server_name ${domain};
@@ -336,9 +482,8 @@ server {
     }
 }
 NGINXEOF
-        nginx -t
-        systemctl enable nginx
-        systemctl reload nginx || systemctl restart nginx
+        nginx_runtime_test
+        nginx_runtime_reload
 
         local email_args=(--register-unsafely-without-email)
         if [ -n "$SNI_FALLBACK_CERTBOT_EMAIL" ]; then
@@ -376,42 +521,86 @@ NGINXEOF
 configure_nginx_sni() {
     [ "$NGINX_SNI" = "1" ] || return 0
 
-    info "Configuring Nginx Stream SNI mode ..."
-    if command -v apt-get >/dev/null 2>&1; then
-        DEBIAN_FRONTEND=noninteractive apt-get update -y -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx openssl ca-certificates
-        if apt-cache show libnginx-mod-stream >/dev/null 2>&1; then
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libnginx-mod-stream
-        fi
-    else
-        install_pkg nginx openssl ca-certificates
-    fi
-    mkdir -p /etc/nginx/stream.d /etc/nginx/relay-panel-certs /var/log/nginx
+    info "Configuring Nginx Stream SNI mode (${SNI_NGINX_MODE}) ..."
+    install_nginx_support_packages
 
-    ensure_nginx_stream_include
+    if [ "$SNI_NGINX_MODE" = "docker" ]; then
+        NGINX_HTTP_CONF_DIR="$NGINX_DOCKER_HTTP_DIR"
+        NGINX_STREAM_CONF_DIR="$NGINX_DOCKER_STREAM_DIR"
+        NGINX_CERT_DIR="$NGINX_DOCKER_CERT_DIR"
+        NGINX_ACCESS_LOG_PATH="$NGINX_DOCKER_LOG_DIR/sni-router.log"
+        NGINX_SNI_CONF_PATH="$NGINX_DOCKER_STREAM_CONF"
+        rm -f "${NGINX_DOCKER_HTTP_DIR}/relay-panel-fallback.conf"
+        start_nginx_docker_container
+    else
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get update -y -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx openssl ca-certificates
+            if apt-cache show libnginx-mod-stream >/dev/null 2>&1; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libnginx-mod-stream
+            fi
+        else
+            install_pkg nginx openssl ca-certificates
+        fi
+        NGINX_HTTP_CONF_DIR="/etc/nginx/conf.d"
+        NGINX_STREAM_CONF_DIR="/etc/nginx/stream.d"
+        NGINX_CERT_DIR="/etc/nginx/relay-panel-certs"
+        NGINX_ACCESS_LOG_PATH="/var/log/nginx/sni-router.log"
+        NGINX_SNI_CONF_PATH="/etc/nginx/stream.d/relay-panel-sni.conf"
+        mkdir -p "$NGINX_STREAM_CONF_DIR" "$NGINX_CERT_DIR" /var/log/nginx
+        ensure_nginx_stream_include
+    fi
 
     if [ -n "$SNI_FALLBACK_HTTP_UPSTREAM" ]; then
         info "Configuring local HTTPS fallback wrapper -> http://${SNI_FALLBACK_HTTP_UPSTREAM}"
         issue_fallback_certbot_certificate
-        local cert="${SNI_FALLBACK_CERT:-/etc/nginx/relay-panel-certs/fallback.crt}"
-        local key="${SNI_FALLBACK_KEY:-/etc/nginx/relay-panel-certs/fallback.key}"
+        local cert_host="${SNI_FALLBACK_CERT:-${NGINX_CERT_DIR}/fallback.crt}"
+        local key_host="${SNI_FALLBACK_KEY:-${NGINX_CERT_DIR}/fallback.key}"
+        local cert_nginx="$cert_host"
+        local key_nginx="$key_host"
+        if [ "$SNI_NGINX_MODE" = "docker" ]; then
+            if [ -n "$SNI_FALLBACK_CERT" ] || [ -n "$SNI_FALLBACK_KEY" ]; then
+                if [[ "$cert_host" == /etc/letsencrypt/* && "$key_host" == /etc/letsencrypt/* ]]; then
+                    cert_nginx="$cert_host"
+                    key_nginx="$key_host"
+                elif [[ "$cert_host" == "$NGINX_DOCKER_CERT_DIR/"* && "$key_host" == "$NGINX_DOCKER_CERT_DIR/"* ]]; then
+                    cert_nginx="/etc/nginx/relay-panel-certs/${cert_host#"$NGINX_DOCKER_CERT_DIR/"}"
+                    key_nginx="/etc/nginx/relay-panel-certs/${key_host#"$NGINX_DOCKER_CERT_DIR/"}"
+                else
+                    [ -s "$cert_host" ] || fail "Fallback certificate not found or empty: $cert_host"
+                    [ -s "$key_host" ] || fail "Fallback key not found or empty: $key_host"
+                    cp "$cert_host" "$NGINX_DOCKER_CERT_DIR/custom-fullchain.pem"
+                    cp "$key_host" "$NGINX_DOCKER_CERT_DIR/custom-privkey.pem"
+                    chmod 600 "$NGINX_DOCKER_CERT_DIR/custom-privkey.pem"
+                    cert_host="$NGINX_DOCKER_CERT_DIR/custom-fullchain.pem"
+                    key_host="$NGINX_DOCKER_CERT_DIR/custom-privkey.pem"
+                    cert_nginx="/etc/nginx/relay-panel-certs/custom-fullchain.pem"
+                    key_nginx="/etc/nginx/relay-panel-certs/custom-privkey.pem"
+                    warn "Copied explicit fallback cert/key into ${NGINX_DOCKER_CERT_DIR}; re-run the installer after renewing those external files."
+                fi
+            else
+                cert_nginx="/etc/nginx/relay-panel-certs/fallback.crt"
+                key_nginx="/etc/nginx/relay-panel-certs/fallback.key"
+            fi
+        fi
         if [ -n "$SNI_FALLBACK_CERT" ] || [ -n "$SNI_FALLBACK_KEY" ]; then
-            [ -s "$cert" ] || fail "Fallback certificate not found or empty: $cert"
-            [ -s "$key" ] || fail "Fallback key not found or empty: $key"
-        elif [ ! -s "$cert" ] || [ ! -s "$key" ]; then
+            [ -s "$cert_host" ] || fail "Fallback certificate not found or empty: $cert_host"
+            [ -s "$key_host" ] || fail "Fallback key not found or empty: $key_host"
+        elif [ ! -s "$cert_host" ] || [ ! -s "$key_host" ]; then
             openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
                 -subj "/CN=${SNI_FALLBACK_SERVER_NAME}" \
-                -keyout "$key" -out "$cert" >/dev/null 2>&1
-            chmod 600 "$key"
+                -keyout "$key_host" -out "$cert_host" >/dev/null 2>&1
+            chmod 600 "$key_host"
         fi
 
-        cat > /etc/nginx/conf.d/relay-panel-fallback.conf <<NGINXEOF
+        mkdir -p "$NGINX_HTTP_CONF_DIR"
+        cat > "${NGINX_HTTP_CONF_DIR}/relay-panel-fallback.conf" <<NGINXEOF
 server {
     listen 127.0.0.1:${SNI_FALLBACK_PORT} ssl;
     server_name ${SNI_FALLBACK_SERVER_NAME};
 
-    ssl_certificate ${cert};
-    ssl_certificate_key ${key};
+    ssl_certificate ${cert_nginx};
+    ssl_certificate_key ${key_nginx};
 
     location / {
         proxy_http_version 1.1;
@@ -432,14 +621,28 @@ NGINXEOF
         SNI_DEFAULT_BACKEND="127.0.0.1:9"
     fi
 
-    nginx -t
-    systemctl enable nginx
-    systemctl restart nginx
+    nginx_runtime_test
+    nginx_runtime_restart
 }
 
 # ---------- Install dirs ----------
 INSTALL_DIR="/opt/${SERVICE_NAME}"
 BINARY="${INSTALL_DIR}/relay-node"
+if [ -z "$SNI_NGINX_DOCKER_NAME" ]; then
+    SNI_NGINX_DOCKER_NAME="${SERVICE_NAME}-nginx"
+fi
+NGINX_DOCKER_ROOT="${INSTALL_DIR}/nginx"
+NGINX_DOCKER_CONF="${NGINX_DOCKER_ROOT}/nginx.conf"
+NGINX_DOCKER_HTTP_DIR="${NGINX_DOCKER_ROOT}/conf.d"
+NGINX_DOCKER_STREAM_DIR="${NGINX_DOCKER_ROOT}/stream.d"
+NGINX_DOCKER_STREAM_CONF="${NGINX_DOCKER_STREAM_DIR}/relay-panel-sni.conf"
+NGINX_DOCKER_CERT_DIR="${NGINX_DOCKER_ROOT}/certs"
+NGINX_DOCKER_LOG_DIR="${NGINX_DOCKER_ROOT}/logs"
+NGINX_HTTP_CONF_DIR="/etc/nginx/conf.d"
+NGINX_STREAM_CONF_DIR="/etc/nginx/stream.d"
+NGINX_CERT_DIR="/etc/nginx/relay-panel-certs"
+NGINX_ACCESS_LOG_PATH="/var/log/nginx/sni-router.log"
+NGINX_SNI_CONF_PATH="/etc/nginx/stream.d/relay-panel-sni.conf"
 # Temp download target. We never curl directly onto $BINARY because if the
 # service is running, the kernel refuses writes to the executing file with
 # ETXTBSY ("Text file busy"). Downloading to .tmp sidesteps that entirely;
@@ -805,6 +1008,8 @@ if [ ! -f "$ENV_FILE" ]; then
 # The installer can populate these automatically with --nginx-sni.
 # For an OpenList Docker site on 127.0.0.1:5244, run with:
 #   --nginx-sni --openlist-port 5244
+# Or keep the SNI router itself in Docker:
+#   --nginx-sni --nginx-docker --openlist-port 5244
 #   NGINX_SNI_ENABLED=1
 #   NGINX_SNI_CONF_PATH=/etc/nginx/stream.d/relay-panel-sni.conf
 #   NGINX_SNI_DEFAULT_BACKEND=127.0.0.1:8443
@@ -818,23 +1023,44 @@ configure_nginx_sni
 if [ "$NGINX_SNI" = "1" ]; then
     info "Writing nginx_sni environment to $ENV_FILE"
     set_env_var "$ENV_FILE" "NGINX_SNI_ENABLED" "1"
-    set_env_var "$ENV_FILE" "NGINX_SNI_CONF_PATH" "/etc/nginx/stream.d/relay-panel-sni.conf"
+    set_env_var "$ENV_FILE" "NGINX_SNI_CONF_PATH" "$NGINX_SNI_CONF_PATH"
     set_env_var "$ENV_FILE" "NGINX_SNI_DEFAULT_BACKEND" "$SNI_DEFAULT_BACKEND"
-    set_env_var "$ENV_FILE" "NGINX_SNI_TEST_CMD" "nginx -t"
-    set_env_var "$ENV_FILE" "NGINX_SNI_RELOAD_CMD" "systemctl reload nginx"
-    set_env_var "$ENV_FILE" "NGINX_SNI_ACCESS_LOG_PATH" "/var/log/nginx/sni-router.log"
+    if [ "$SNI_NGINX_MODE" = "docker" ]; then
+        set_env_var "$ENV_FILE" "NGINX_SNI_TEST_CMD" "docker exec ${SNI_NGINX_DOCKER_NAME} nginx -t"
+        set_env_var "$ENV_FILE" "NGINX_SNI_RELOAD_CMD" "docker exec ${SNI_NGINX_DOCKER_NAME} nginx -s reload"
+    else
+        set_env_var "$ENV_FILE" "NGINX_SNI_TEST_CMD" "nginx -t"
+        set_env_var "$ENV_FILE" "NGINX_SNI_RELOAD_CMD" "systemctl reload nginx"
+    fi
+    set_env_var "$ENV_FILE" "NGINX_SNI_ACCESS_LOG_PATH" "$NGINX_ACCESS_LOG_PATH"
     set_env_var "$ENV_FILE" "NGINX_SNI_TRAFFIC_STATE_PATH" "${INSTALL_DIR}/nginx-sni-log.offset"
     chmod 600 "$ENV_FILE"
+    if [ "$SNI_NGINX_MODE" = "docker" ]; then
+        cat > "${INSTALL_DIR}/uninstall-nginx-docker.sh" <<UNINSTALLEOF
+#!/usr/bin/env bash
+set -euo pipefail
+docker rm -f '${SNI_NGINX_DOCKER_NAME}' >/dev/null 2>&1 || true
+rm -rf '${NGINX_DOCKER_ROOT}'
+echo "Removed Nginx Docker container and files for RelayPanel."
+UNINSTALLEOF
+        chmod 700 "${INSTALL_DIR}/uninstall-nginx-docker.sh"
+    fi
 fi
 
 # ---------- Write systemd service ----------
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+SERVICE_AFTER="network-online.target"
+SERVICE_WANTS="network-online.target"
+if [ "$NGINX_SNI" = "1" ] && [ "$SNI_NGINX_MODE" = "docker" ]; then
+    SERVICE_AFTER="network-online.target docker.service"
+    SERVICE_WANTS="network-online.target docker.service"
+fi
 info "Writing systemd service: $SERVICE_FILE"
 cat > "$SERVICE_FILE" <<SVCEOF
 [Unit]
 Description=RelayNode forwarding service
-After=network-online.target
-Wants=network-online.target
+After=${SERVICE_AFTER}
+Wants=${SERVICE_WANTS}
 
 [Service]
 Type=simple
@@ -883,4 +1109,8 @@ echo "  Stop:      systemctl stop ${SERVICE_NAME}"
 echo "  Restart:   systemctl restart ${SERVICE_NAME}"
 echo "  Upgrade:   re-run this installer with the same -t/-u flags"
 echo "  Uninstall: systemctl disable --now ${SERVICE_NAME}; rm -f ${SERVICE_FILE}; rm -rf ${INSTALL_DIR}"
+if [ "$NGINX_SNI" = "1" ] && [ "$SNI_NGINX_MODE" = "docker" ]; then
+    echo "  Nginx:     docker ps --filter name=${SNI_NGINX_DOCKER_NAME}"
+    echo "  Remove Nginx Docker: docker rm -f ${SNI_NGINX_DOCKER_NAME}; rm -rf ${NGINX_DOCKER_ROOT}"
+fi
 echo ""

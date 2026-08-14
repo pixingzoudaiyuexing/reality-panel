@@ -103,7 +103,7 @@ docker compose -f docker-compose.release.yaml up -d
 默认镜像：
 
 ```text
-ghcr.io/pixingzoudaiyuexing/relay-panel-panel:1.2.8
+ghcr.io/pixingzoudaiyuexing/relay-panel-panel:1.2.9
 ghcr.io/pixingzoudaiyuexing/relay-panel-node:1.2.2
 ```
 
@@ -117,7 +117,8 @@ ghcr.io/pixingzoudaiyuexing/relay-panel-node:1.2.2
 bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
   -t <NODE_TOKEN> \
   -u http://<PANEL_IP>:18888 \
-  --nginx-sni
+  --nginx-sni \
+  --nginx-docker
 ```
 
 安装完成后，节点会运行 systemd 服务：
@@ -154,8 +155,23 @@ bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-pa
   -t <NODE_TOKEN> \
   -u http://<PANEL_IP>:18888 \
   --nginx-sni \
+  --nginx-docker \
   --openlist-port 5244 \
   --fallback-name op1.example.com
+```
+
+`--nginx-docker` 会用 Docker 运行 SNI 分流 Nginx，默认镜像为 `nginx:1.27-alpine`，容器名为 `relay-node-nginx`。容器使用 host network，这样面板后续下发新的监听端口时，不需要重新做 Docker 端口映射。
+
+Docker Nginx 的文件会放在：
+
+```text
+/opt/relay-node/nginx/
+```
+
+卸载 Nginx 容器可以执行：
+
+```bash
+/opt/relay-node/uninstall-nginx-docker.sh
 ```
 
 这个模式会在节点本机创建一个 HTTPS wrapper：
@@ -173,6 +189,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-pa
   -t <NODE_TOKEN> \
   -u http://<PANEL_IP>:18888 \
   --nginx-sni \
+  --nginx-docker \
   --fallback-backend 127.0.0.1:8443
 ```
 
@@ -183,6 +200,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-pa
   -t <NODE_TOKEN> \
   -u http://<PANEL_IP>:18888 \
   --nginx-sni \
+  --nginx-docker \
   --openlist-port 5244 \
   --fallback-certbot-domain op1.example.com \
   --fallback-certbot-email admin@example.com
