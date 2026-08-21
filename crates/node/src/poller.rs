@@ -1,6 +1,11 @@
 use crate::config::NodeConfig;
-use relay_shared::protocol::{NodeConfigResponse, CONFIG_PROTOCOL_VERSION};
-use std::path::PathBuf;
+use crate::forwarder::ForwarderManager;
+use relay_shared::protocol::{NodeConfigResponse, NodeTransport, CONFIG_PROTOCOL_VERSION};
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Path for the config cache file. Used when the panel is unreachable.
 const CACHE_FILE: &str = "config-cache.json";
@@ -16,7 +21,7 @@ const NODE_ID_FILE: &str = "node-id";
 /// to decide the poll interval: 426 → long backoff (upgrade needed), transient
 /// → keep the normal interval.
 pub enum FetchResult {
-    /// A valid config was received and cached.
+    /// A valid config was received. It is cached only after the manager applies it.
     Ok(NodeConfigResponse),
     /// The panel reports a permanent config-protocol mismatch (426). The node
     /// keeps its cached config; the caller should back off (the only fix is an
@@ -70,9 +75,13 @@ pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
     }
 
     match resp.json::<NodeConfigResponse>().await {
-        Ok(cfg) => {
-            save_cache(&cfg);
-            FetchResult::Ok(cfg)
+        Ok(cfg) if validate_config(&cfg).is_ok() => FetchResult::Ok(cfg),
+        Ok(e) => {
+            tracing::warn!(
+                "fetch_config: response validation failed: {}",
+                validate_config(&e).unwrap_err()
+            );
+            FetchResult::Transient
         }
         Err(e) => {
             tracing::warn!("fetch_config: response parse failed: {}", e);
@@ -81,32 +90,185 @@ pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
     }
 }
 
-/// Load cached config from config-cache.json.
-/// Returns None if file doesn't exist or is corrupt.
-pub fn load_cache() -> Option<NodeConfigResponse> {
-    let path = cache_path();
-    let data = std::fs::read_to_string(&path).ok()?;
-    let resp: NodeConfigResponse = serde_json::from_str(&data).ok()?;
-    tracing::info!(
-        "Loaded cached config from {} ({} listeners)",
-        path.display(),
-        resp.listeners.len()
-    );
-    Some(resp)
+/// The three files that make the last-known-good cache durable.
+#[derive(Clone, Debug)]
+pub(crate) struct CachePaths {
+    pub primary: PathBuf,
+    pub backup: PathBuf,
+    pub tmp: PathBuf,
 }
 
-/// Save config to config-cache.json (next to the binary or in working dir).
-fn save_cache(config: &NodeConfigResponse) {
-    let path = cache_path();
-    match serde_json::to_string_pretty(config) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                tracing::warn!("Failed to write config cache to {}: {}", path.display(), e);
+/// Apply first, then commit the snapshot as LKG while holding the same manager
+/// mutex. HTTP polls and WebSocket snapshots both use this path so an older
+/// snapshot cannot finish its cache write after a newer one.
+pub async fn apply_and_commit(
+    manager: &Arc<Mutex<ForwarderManager>>,
+    config: &NodeConfigResponse,
+) -> bool {
+    apply_and_commit_at(manager, config, &cache_paths()).await
+}
+
+pub(crate) async fn apply_and_commit_at(
+    manager: &Arc<Mutex<ForwarderManager>>,
+    config: &NodeConfigResponse,
+    paths: &CachePaths,
+) -> bool {
+    if let Err(e) = validate_config(config) {
+        tracing::warn!("refusing invalid node config: {}", e);
+        return false;
+    }
+
+    // Keep the lock through the durable commit. This is intentionally small
+    // serialisation, not a revision system: apply order and LKG commit order
+    // must be identical.
+    let mut mgr = manager.lock().await;
+    if !mgr.apply_config(config).await {
+        tracing::warn!("config apply failed; preserving existing LKG");
+        return false;
+    }
+    match commit_cache_at(config, paths) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!("config applied but LKG commit failed: {}", e);
+            false
+        }
+    }
+}
+
+/// Load the primary cache if valid, otherwise fall back to the last healthy
+/// backup. A startup load is deliberately not committed again.
+pub fn load_cache() -> Option<NodeConfigResponse> {
+    load_cache_at(&cache_paths())
+}
+
+pub(crate) fn load_cache_at(paths: &CachePaths) -> Option<NodeConfigResponse> {
+    for path in [&paths.primary, &paths.backup] {
+        match read_valid_cache(path) {
+            Ok(config) => {
+                tracing::info!(
+                    "Loaded cached config from {} ({} listeners)",
+                    path.display(),
+                    config.listeners.len()
+                );
+                return Some(config);
+            }
+            Err(e) => {
+                tracing::warn!("cached config {} unavailable: {}", path.display(), e);
             }
         }
-        Err(e) => {
-            tracing::warn!("Failed to serialize config cache: {}", e);
+    }
+    tracing::warn!("no usable cached config; waiting for panel configuration");
+    None
+}
+
+pub(crate) fn commit_cache_at(
+    config: &NodeConfigResponse,
+    paths: &CachePaths,
+) -> Result<(), String> {
+    validate_config(config)?;
+    let json = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
+    // Validate the serialized representation before it can replace any LKG.
+    let _: NodeConfigResponse = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
+
+    write_durable(&paths.tmp, &json).map_err(|e| e.to_string())?;
+    if let Err(e) = read_valid_cache(&paths.tmp) {
+        let _ = fs::remove_file(&paths.tmp);
+        return Err(format!("temporary cache validation failed: {}", e));
+    }
+
+    // A corrupt primary is never promoted into backup. Preserve any healthy
+    // backup for recovery before replacing the primary.
+    if read_valid_cache(&paths.primary).is_ok() {
+        let old_primary = fs::read(&paths.primary).map_err(|e| e.to_string())?;
+        if let Err(e) = replace_durably(&paths.backup, &old_primary) {
+            let _ = fs::remove_file(&paths.tmp);
+            return Err(e.to_string());
         }
+    }
+
+    if let Err(e) = fs::rename(&paths.tmp, &paths.primary).and_then(|_| sync_parent(&paths.primary))
+    {
+        let _ = fs::remove_file(&paths.tmp);
+        return Err(e.to_string());
+    }
+    Ok(())
+}
+
+fn validate_config(config: &NodeConfigResponse) -> Result<(), String> {
+    for listener in &config.listeners {
+        if listener.port == 0 {
+            return Err(format!("rule {} has port 0", listener.rule_id));
+        }
+        if listener.targets.is_empty()
+            || listener
+                .targets
+                .iter()
+                .any(|target| target.trim().is_empty())
+        {
+            return Err(format!("rule {} has no valid target", listener.rule_id));
+        }
+        if listener.node_transport == NodeTransport::NginxSni
+            && listener
+                .sni
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            return Err(format!("nginx_sni rule {} has no SNI", listener.rule_id));
+        }
+    }
+    Ok(())
+}
+
+fn read_valid_cache(path: &Path) -> Result<NodeConfigResponse, String> {
+    let data = fs::read(path).map_err(|e| e.to_string())?;
+    let config = serde_json::from_slice::<NodeConfigResponse>(&data).map_err(|e| e.to_string())?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+fn write_durable(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    fs::create_dir_all(parent_dir(path))?;
+    let mut file = File::create(path)?;
+    file.write_all(contents)?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn replace_durably(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    write_durable(&temp, contents)?;
+    fs::rename(&temp, path)?;
+    sync_parent(path)
+}
+
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    File::open(parent_dir(path))?.sync_all()
+}
+
+/// `Path::parent()` is an empty path for a filename in the current directory.
+/// Treat that as `.` so development-mode caches remain durable too.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+fn cache_paths() -> CachePaths {
+    let primary = cache_path();
+    let parent = primary
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    CachePaths {
+        primary,
+        backup: parent.join("config-cache.backup.json"),
+        tmp: parent.join("config-cache.json.tmp"),
     }
 }
 
@@ -265,5 +427,182 @@ mod tests {
         let id = get_or_create_node_id_at(&path);
         assert_eq!(id, "my-fixed-id-12345");
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn cache_paths_for_test(label: &str) -> CachePaths {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "relay-panel-lkg-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        CachePaths {
+            primary: dir.join("config-cache.json"),
+            backup: dir.join("config-cache.backup.json"),
+            tmp: dir.join("config-cache.json.tmp"),
+        }
+    }
+
+    fn cache_config(rule_id: i64) -> NodeConfigResponse {
+        NodeConfigResponse {
+            listeners: vec![relay_shared::protocol::ListenerConfig {
+                rule_id,
+                port: 20000 + rule_id as u16,
+                protocol: relay_shared::protocol::Protocol::Tcp,
+                node_transport: NodeTransport::Raw,
+                ws_path: None,
+                sni: None,
+                targets: vec!["127.0.0.1:9".to_string()],
+                load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
+                upload_limit_bps: None,
+                download_limit_bps: None,
+                max_connections: None,
+            }],
+        }
+    }
+
+    fn cleanup_cache(paths: &CachePaths) {
+        let _ = std::fs::remove_dir_all(paths.primary.parent().unwrap());
+    }
+
+    #[test]
+    fn relative_cache_paths_sync_the_current_directory() {
+        assert_eq!(parent_dir(Path::new("config-cache.json")), Path::new("."));
+    }
+
+    #[tokio::test]
+    async fn apply_success_commits_lkg_and_removes_tmp() {
+        let paths = cache_paths_for_test("apply-success");
+        let manager = Arc::new(Mutex::new(ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        )));
+        let empty = NodeConfigResponse { listeners: vec![] };
+
+        assert!(apply_and_commit_at(&manager, &empty, &paths).await);
+        assert!(paths.primary.exists());
+        assert!(
+            !paths.tmp.exists(),
+            "successful cache commit must not leave tmp"
+        );
+        assert!(load_cache_at(&paths).unwrap().listeners.is_empty());
+        cleanup_cache(&paths);
+    }
+
+    #[tokio::test]
+    async fn apply_failure_preserves_old_lkg() {
+        let paths = cache_paths_for_test("apply-failure");
+        let old = cache_config(1);
+        commit_cache_at(&old, &paths).unwrap();
+        let mut inner = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        inner.set_nginx_sni_config_for_test(crate::forwarder::nginx_sni::NginxSniConfig {
+            enabled: true,
+            conf_path: paths.primary.parent().unwrap().join("relay.conf"),
+            test_cmd: "false".to_string(),
+            reload_cmd: "true".to_string(),
+            default_backend: "127.0.0.1:9".to_string(),
+            access_log_path: "/tmp/relay-panel-test.log".to_string(),
+        });
+        let manager = Arc::new(Mutex::new(inner));
+        let failed = NodeConfigResponse {
+            listeners: vec![relay_shared::protocol::ListenerConfig {
+                rule_id: 2,
+                port: 443,
+                protocol: relay_shared::protocol::Protocol::Tcp,
+                node_transport: NodeTransport::NginxSni,
+                ws_path: None,
+                sni: Some("failed.example.com".to_string()),
+                targets: vec!["127.0.0.1:55443".to_string()],
+                load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
+                upload_limit_bps: None,
+                download_limit_bps: None,
+                max_connections: None,
+            }],
+        };
+
+        assert!(!apply_and_commit_at(&manager, &failed, &paths).await);
+        assert_eq!(load_cache_at(&paths).unwrap().listeners[0].rule_id, 1);
+        cleanup_cache(&paths);
+    }
+
+    #[tokio::test]
+    async fn raw_bind_failure_does_not_commit_lkg() {
+        let paths = cache_paths_for_test("raw-bind-failure");
+        let old = cache_config(1);
+        commit_cache_at(&old, &paths).unwrap();
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let mut inner = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        inner.set_listen_addresses_for_test("127.0.0.1", "");
+        let manager = Arc::new(Mutex::new(inner));
+        let mut failed = cache_config(2);
+        failed.listeners[0].port = port;
+
+        assert!(!apply_and_commit_at(&manager, &failed, &paths).await);
+        assert_eq!(load_cache_at(&paths).unwrap().listeners[0].rule_id, 1);
+        cleanup_cache(&paths);
+    }
+
+    #[tokio::test]
+    async fn successful_raw_bind_can_commit_lkg() {
+        let paths = cache_paths_for_test("raw-bind-success");
+        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+        let mut inner = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        inner.set_listen_addresses_for_test("127.0.0.1", "");
+        let manager = Arc::new(Mutex::new(inner));
+        let mut config = cache_config(3);
+        config.listeners[0].port = port;
+
+        assert!(apply_and_commit_at(&manager, &config, &paths).await);
+        assert_eq!(load_cache_at(&paths).unwrap().listeners[0].rule_id, 3);
+        assert!(
+            manager
+                .lock()
+                .await
+                .apply_config(&NodeConfigResponse { listeners: vec![] })
+                .await
+        );
+        cleanup_cache(&paths);
+    }
+
+    #[test]
+    fn primary_is_preferred_and_corrupt_primary_falls_back_to_backup() {
+        let paths = cache_paths_for_test("primary-backup");
+        commit_cache_at(&cache_config(1), &paths).unwrap();
+        commit_cache_at(&cache_config(2), &paths).unwrap();
+        assert_eq!(load_cache_at(&paths).unwrap().listeners[0].rule_id, 2);
+
+        std::fs::write(&paths.primary, b"not json").unwrap();
+        assert_eq!(load_cache_at(&paths).unwrap().listeners[0].rule_id, 1);
+        cleanup_cache(&paths);
+    }
+
+    #[test]
+    fn corrupt_primary_cannot_overwrite_healthy_backup() {
+        let paths = cache_paths_for_test("corrupt-primary");
+        commit_cache_at(&cache_config(1), &paths).unwrap();
+        commit_cache_at(&cache_config(2), &paths).unwrap();
+        std::fs::write(&paths.primary, b"corrupt").unwrap();
+
+        commit_cache_at(&cache_config(3), &paths).unwrap();
+        assert_eq!(
+            read_valid_cache(&paths.backup).unwrap().listeners[0].rule_id,
+            1,
+            "a corrupt primary must not replace the healthy backup"
+        );
+        cleanup_cache(&paths);
     }
 }

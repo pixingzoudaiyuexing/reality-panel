@@ -221,18 +221,17 @@ pub async fn node_ws_handler(
     }
 
     use relay_shared::models::DeviceGroup;
-    let group: Option<DeviceGroup> = match state.db.find_by_token(&token).await {
-        Ok(g) => g,
+    let group: DeviceGroup = match state.db.find_by_token(&token).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return axum::http::StatusCode::UNAUTHORIZED.into_response(),
         Err(e) => {
             tracing::error!("node_ws_handler: find_by_token failed: {}", e);
-            None
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-
-    let group = match group {
-        Some(g) => g,
-        None => return axum::http::StatusCode::UNAUTHORIZED.into_response(),
-    };
+    if group.group_type != "in" {
+        return axum::http::StatusCode::FORBIDDEN.into_response();
+    }
 
     let group_id = group.id;
     // v0.4.14: optional per-node identity. None for an older node that didn't

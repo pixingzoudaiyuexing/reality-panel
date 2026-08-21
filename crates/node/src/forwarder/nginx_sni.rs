@@ -1,5 +1,7 @@
 use relay_shared::protocol::{ListenerConfig, LoadBalanceStrategy, Protocol};
 use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -259,34 +261,85 @@ pub fn apply_plan(plan: &NginxSniPlan, cfg: &NginxSniConfig) -> Result<(), Apply
         return Ok(());
     }
 
-    let rendered = plan.render();
-    let current = std::fs::read_to_string(&cfg.conf_path).ok();
-    if current.as_deref() == Some(rendered.as_str()) {
-        tracing::debug!("nginx_sni config unchanged at {}", cfg.conf_path.display());
-        return Ok(());
-    }
-
     if let Some(parent) = cfg.conf_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
     }
 
-    let previous = current;
-    std::fs::write(&cfg.conf_path, rendered)?;
+    let previous = match fs::read(&cfg.conf_path) {
+        Ok(contents) => Some(contents),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    replace_durably(&cfg.conf_path, plan.render().as_bytes())?;
 
     if let Err(e) = run_shell(&cfg.test_cmd) {
-        if let Some(old) = previous {
-            let _ = std::fs::write(&cfg.conf_path, old);
-        } else {
-            let _ = std::fs::remove_file(&cfg.conf_path);
+        restore_previous(&cfg.conf_path, previous.as_deref())?;
+        return Err(e);
+    }
+    if let Err(e) = run_shell(&cfg.reload_cmd) {
+        restore_previous(&cfg.conf_path, previous.as_deref())?;
+        // The previous config is only a real rollback once Nginx has accepted
+        // and reloaded it again. Preserve the original apply failure either way.
+        if let Err(restore_err) = run_shell(&cfg.test_cmd).and_then(|_| run_shell(&cfg.reload_cmd))
+        {
+            tracing::error!(
+                "nginx_sni rollback runtime restore failed after reload failure: {}",
+                restore_err
+            );
         }
         return Err(e);
     }
-    run_shell(&cfg.reload_cmd)?;
     tracing::info!(
         "applied nginx_sni config: {} rule(s), path={}",
         plan.rules.len(),
         cfg.conf_path.display()
     );
+    Ok(())
+}
+
+fn temp_path(path: &std::path::Path) -> PathBuf {
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(".tmp");
+    PathBuf::from(temp)
+}
+
+/// Persist `contents` before atomically replacing `path`. The temp file lives
+/// beside the target so rename is atomic on the configured filesystem.
+fn replace_durably(path: &std::path::Path, contents: &[u8]) -> Result<(), ApplyError> {
+    let temp = temp_path(path);
+    let write_result = (|| -> Result<(), std::io::Error> {
+        let mut file = File::create(&temp)?;
+        file.write_all(contents)?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        sync_parent(path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    write_result.map_err(ApplyError::Io)
+}
+
+fn restore_previous(path: &std::path::Path, previous: Option<&[u8]>) -> Result<(), ApplyError> {
+    match previous {
+        Some(contents) => replace_durably(path, contents),
+        None => {
+            match fs::remove_file(path) {
+                Ok(()) => sync_parent(path)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            Ok(())
+        }
+    }
+}
+
+fn sync_parent(path: &std::path::Path) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -444,5 +497,112 @@ mod tests {
         );
         assert_eq!(plan.rule_id_for(443, "op1.example.com"), Some(7));
         assert_eq!(plan.rule_id_for(8443, "op1.example.com"), None);
+    }
+
+    fn unique_path(label: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "relay-panel-nginx-{label}-{}-{stamp}",
+            std::process::id()
+        ))
+    }
+
+    fn plan_for(sni: &str) -> NginxSniPlan {
+        NginxSniPlan::from_listeners(
+            &[listener(
+                1,
+                443,
+                sni,
+                &["127.0.0.1:55443"],
+                LoadBalanceStrategy::First,
+            )],
+            "127.0.0.1:9",
+            "/tmp/relay-panel-test.log",
+        )
+    }
+
+    fn test_config(path: PathBuf, test_cmd: &str, reload_cmd: &str) -> NginxSniConfig {
+        NginxSniConfig {
+            enabled: true,
+            conf_path: path,
+            test_cmd: test_cmd.to_string(),
+            reload_cmd: reload_cmd.to_string(),
+            default_backend: "127.0.0.1:9".to_string(),
+            access_log_path: "/tmp/relay-panel-test.log".to_string(),
+        }
+    }
+
+    fn cleanup(path: &PathBuf) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(temp_path(path));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn nginx_test_failure_restores_old_config() {
+        let path = unique_path("test-failure").join("relay.conf");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "old-config").unwrap();
+        let cfg = test_config(path.clone(), "false", "true");
+
+        assert!(apply_plan(&plan_for("new.example.com"), &cfg).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-config");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn nginx_test_failure_without_old_config_removes_new_file() {
+        let path = unique_path("test-no-old").join("relay.conf");
+        let cfg = test_config(path.clone(), "false", "true");
+
+        assert!(apply_plan(&plan_for("new.example.com"), &cfg).is_err());
+        assert!(
+            !path.exists(),
+            "failed first apply must restore file absence"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reload_failure_restores_disk_and_attempts_old_runtime_restore() {
+        let path = unique_path("reload-failure").join("relay.conf");
+        let marker = path.with_extension("runtime-restored");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "old-config").unwrap();
+        let reload_cmd = format!(
+            "if grep -q new.example.com {}; then exit 1; else printf restored > {}; fi",
+            path.display(),
+            marker.display()
+        );
+        let cfg = test_config(path.clone(), "true", &reload_cmd);
+
+        assert!(apply_plan(&plan_for("new.example.com"), &cfg).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-config");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "restored");
+        let _ = std::fs::remove_file(marker);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn matching_disk_content_does_not_skip_retry() {
+        let path = unique_path("same-content").join("relay.conf");
+        let marker = path.with_extension("reload-count");
+        let plan = plan_for("same.example.com");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, plan.render()).unwrap();
+        let reload_cmd = format!("printf x >> {}; false", marker.display());
+        let cfg = test_config(path.clone(), "true", &reload_cmd);
+
+        assert!(apply_plan(&plan, &cfg).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "xx",
+            "apply and old-runtime restore must both run reload despite matching disk content"
+        );
+        let _ = std::fs::remove_file(marker);
+        cleanup(&path);
     }
 }

@@ -141,6 +141,9 @@ pub struct ForwarderManager {
     /// Reality/SNI fork: node delegates TLS SNI routing to Nginx Stream.
     nginx_sni: NginxSniConfig,
     nginx_sni_plan: Option<NginxSniPlan>,
+    /// Guards the one best-effort rollback after a raw listener startup
+    /// failure. A broken previous config must not recurse forever.
+    restoring_previous_config: bool,
 }
 
 impl ForwarderManager {
@@ -158,6 +161,7 @@ impl ForwarderManager {
             source_ipv4: None,
             nginx_sni: NginxSniConfig::default(),
             nginx_sni_plan: None,
+            restoring_previous_config: false,
         }
     }
 
@@ -233,7 +237,22 @@ impl ForwarderManager {
         Arc::clone(&self.listener_errors)
     }
 
-    pub async fn apply_config(&mut self, config: &NodeConfigResponse) {
+    #[cfg(test)]
+    pub(crate) fn set_nginx_sni_config_for_test(&mut self, config: NginxSniConfig) {
+        self.nginx_sni = config;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_listen_addresses_for_test(&mut self, ipv4: &str, ipv6: &str) {
+        self.listen_ipv4 = ipv4.to_string();
+        self.listen_ipv6 = ipv6.to_string();
+    }
+
+    /// Apply a configuration snapshot. `true` means every synchronous
+    /// data-plane prerequisite succeeded and it is safe for the caller to make
+    /// this snapshot the last-known-good config.
+    pub async fn apply_config(&mut self, config: &NodeConfigResponse) -> bool {
+        let previous_config = self.last_config.clone();
         let sni_listeners: Vec<ListenerConfig> = config
             .listeners
             .iter()
@@ -264,6 +283,9 @@ impl ForwarderManager {
                         protocol: "tcp".to_string(),
                         error: format!("nginx_sni apply failed: {}", e),
                     });
+                    // Do not touch regular listeners or last_config after an
+                    // SNI transaction failed: the manager must remain at A.
+                    return false;
                 } else {
                     self.nginx_sni_plan = Some(sni_plan);
                 }
@@ -278,6 +300,7 @@ impl ForwarderManager {
                 protocol: "tcp".to_string(),
                 error: "nginx_sni disabled on this node".to_string(),
             });
+            return false;
         }
 
         // ── Step 1: recover dead listeners ──
@@ -549,7 +572,9 @@ impl ForwarderManager {
                             rule_id,
                             port
                         );
-                        continue;
+                        self.restore_previous_config_after_startup_failure(previous_config.clone())
+                            .await;
+                        return false;
                     }
                     let tgt = targets.clone();
                     let sel = selector.clone();
@@ -659,7 +684,9 @@ impl ForwarderManager {
                             rule_id,
                             port
                         );
-                        continue;
+                        self.restore_previous_config_after_startup_failure(previous_config.clone())
+                            .await;
+                        return false;
                     }
                     let tgt = targets.clone();
                     let sel = selector.clone();
@@ -803,6 +830,32 @@ impl ForwarderManager {
         // v1.2.0: remember the applied config so restart_rule can rebuild a
         // rule's listeners from it without a round-trip to the panel.
         self.last_config = Some(config.clone());
+        true
+    }
+
+    /// Re-apply A after B has already stopped/replaced some raw listeners. The
+    /// caller always returns the original B failure, even when this recovery
+    /// succeeds. Boxing the recursive call keeps the future finite, while the
+    /// guard prevents an unstartable A from recursively retrying itself.
+    async fn restore_previous_config_after_startup_failure(
+        &mut self,
+        previous_config: Option<NodeConfigResponse>,
+    ) {
+        let Some(previous_config) = previous_config else {
+            return;
+        };
+        if self.restoring_previous_config {
+            tracing::error!("raw listener startup failed while restoring the previous config");
+            return;
+        }
+
+        tracing::warn!("raw listener startup failed; attempting to restore previous config");
+        self.restoring_previous_config = true;
+        let restored = Box::pin(self.apply_config(&previous_config)).await;
+        self.restoring_previous_config = false;
+        if !restored {
+            tracing::error!("failed to restore previous config after raw listener startup failure");
+        }
     }
 
     pub fn nginx_sni_rule_id_for(&self, port: u16, sni: &str) -> Option<i64> {
@@ -969,6 +1022,10 @@ mod tests {
             Arc::new(TrafficCounter::new()),
             Arc::new(ConnectionTracker::new()),
         )
+    }
+
+    fn raw_config(port: u16, protocol: Protocol) -> NodeConfigResponse {
+        one_rule(port, protocol, NodeTransport::Raw)
     }
 
     /// v1.0.9: a rate-limit change (set OR cleared) must change the listener
@@ -1931,6 +1988,168 @@ mod tests {
         assert!(
             !counter.has_rule(1).await,
             "dead listener for a removed rule must prune its counter entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn nginx_reload_failure_does_not_advance_manager_plan() {
+        let mut mgr = fresh_mgr();
+        let dir = std::env::temp_dir().join(format!(
+            "relay-panel-manager-nginx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("relay.conf");
+        let reload_cmd = format!(
+            "if grep -q new.example.com {}; then exit 1; else true; fi",
+            path.display()
+        );
+        mgr.nginx_sni = NginxSniConfig {
+            enabled: true,
+            conf_path: path.clone(),
+            test_cmd: "true".to_string(),
+            reload_cmd,
+            default_backend: "127.0.0.1:9".to_string(),
+            access_log_path: "/tmp/relay-panel-test.log".to_string(),
+        };
+
+        let sni_config = |sni: &str| NodeConfigResponse {
+            listeners: vec![ListenerConfig {
+                rule_id: 7,
+                port: 443,
+                protocol: Protocol::Tcp,
+                node_transport: NodeTransport::NginxSni,
+                ws_path: None,
+                sni: Some(sni.to_string()),
+                targets: vec!["127.0.0.1:55443".to_string()],
+                load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
+                upload_limit_bps: None,
+                download_limit_bps: None,
+                max_connections: None,
+            }],
+        };
+
+        let old = sni_config("old.example.com");
+        assert!(mgr.apply_config(&old).await);
+        assert_eq!(mgr.nginx_sni_rule_id_for(443, "old.example.com"), Some(7));
+
+        let new = sni_config("new.example.com");
+        assert!(!mgr.apply_config(&new).await);
+        assert_eq!(
+            mgr.nginx_sni_rule_id_for(443, "old.example.com"),
+            Some(7),
+            "failed reload must keep the in-memory plan at A"
+        );
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("new.example.com"),
+            "failed reload must restore disk config A"
+        );
+        assert_eq!(
+            mgr.last_config.as_ref().unwrap().listeners[0]
+                .sni
+                .as_deref(),
+            Some("old.example.com"),
+            "failed reload must not advance manager config"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn raw_tcp_all_bind_failures_make_apply_fail() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let mut mgr = fresh_mgr();
+        mgr.set_listen_addresses_for_test("127.0.0.1", "");
+
+        assert!(!mgr.apply_config(&raw_config(port, Protocol::Tcp)).await);
+        assert!(mgr.listener_keys().is_empty());
+        assert!(
+            mgr.last_config.is_none(),
+            "failed B must not become manager config"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_udp_all_bind_failures_make_apply_fail() {
+        let blocker = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        let mut mgr = fresh_mgr();
+        mgr.set_listen_addresses_for_test("127.0.0.1", "");
+
+        assert!(!mgr.apply_config(&raw_config(port, Protocol::Udp)).await);
+        assert!(mgr.listener_keys().is_empty());
+        assert!(
+            mgr.last_config.is_none(),
+            "failed B must not become manager config"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_family_failure_keeps_existing_dual_stack_degradation_semantics() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        // The existing outbound helper explicitly sets IPV6_V6ONLY. If IPv6 is
+        // unavailable on a host, there is no successful family to preserve.
+        if crate::forwarder::outbound::bind_tcp_listener("::1".parse().unwrap(), port).is_err() {
+            return;
+        }
+        // Release the probe socket before manager claims the successful v6 bind.
+        // It is scoped above, so use a second port selected by an IPv4 blocker.
+        drop(blocker);
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = blocker.local_addr().unwrap().port();
+        if crate::forwarder::outbound::bind_tcp_listener("::1".parse().unwrap(), port).is_err() {
+            return;
+        }
+        // The readiness probe consumed the port, so release it and reserve a
+        // fresh one for the actual manager test.
+        let probe =
+            crate::forwarder::outbound::bind_tcp_listener("::1".parse().unwrap(), port).unwrap();
+        drop(probe);
+        let mut mgr = fresh_mgr();
+        mgr.set_listen_addresses_for_test("127.0.0.1", "::1");
+
+        assert!(mgr.apply_config(&raw_config(port, Protocol::Tcp)).await);
+        assert_eq!(mgr.listener_keys().len(), 1);
+        assert!(mgr.last_config.is_some());
+        assert!(
+            mgr.apply_config(&NodeConfigResponse { listeners: vec![] })
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_bind_failure_restores_previous_manager_config() {
+        let reserve_a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port_a = reserve_a.local_addr().unwrap().port();
+        drop(reserve_a);
+        let blocker_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port_b = blocker_b.local_addr().unwrap().port();
+        let mut mgr = fresh_mgr();
+        mgr.set_listen_addresses_for_test("127.0.0.1", "");
+        let a = raw_config(port_a, Protocol::Tcp);
+        let b = raw_config(port_b, Protocol::Tcp);
+
+        assert!(mgr.apply_config(&a).await);
+        assert!(!mgr.apply_config(&b).await);
+        assert_eq!(
+            mgr.last_config.as_ref().unwrap().listeners[0].port,
+            port_a,
+            "B failure must leave A as the manager's successful config"
+        );
+        assert!(
+            mgr.listener_keys()
+                .contains(&(port_a, Protocol::Tcp, NodeTransport::Raw)),
+            "A listener must be rebuilt after B startup failure"
+        );
+        assert!(
+            mgr.apply_config(&NodeConfigResponse { listeners: vec![] })
+                .await
         );
     }
 }

@@ -59,11 +59,10 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
             .into_response();
     }
 
-    // Token comes ONLY from the Authorization header. No token → treat as
-    // "no matching group" and return an empty config (NOT an error: a node
-    // that hasn't been assigned a group yet should keep its cached config).
+    // An absent token is not an authoritative empty plan. Returning 200 with
+    // listeners=[] here would make a node delete its last known good config.
     let Some(token) = extract_node_token(&headers) else {
-        return Json(NodeConfigResponse { listeners: vec![] }).into_response();
+        return StatusCode::UNAUTHORIZED.into_response();
     };
 
     // Find device group by token.
@@ -80,16 +79,21 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     };
 
     let Some(group) = group else {
-        return Json(NodeConfigResponse { listeners: vec![] }).into_response();
+        return StatusCode::UNAUTHORIZED.into_response();
     };
 
     // v0.3.6: delegate to the shared `build_node_config`. This path and the WS
     // push path (ws.rs) now use the SAME function.
     //
-    // An empty Ok result is a legitimate "no matching rules" state. A DB Err is
-    // a transient backend failure → HTTP 503.
+    // Only an inbound group with genuinely no active rules yields Ok(empty).
     match crate::service::node_config::build_node_config(state.db.as_ref(), group.id).await {
         Ok(cfg) => Json(cfg).into_response(),
+        Err(crate::service::node_config::NodeConfigBuildError::NotInboundGroup) => {
+            StatusCode::FORBIDDEN.into_response()
+        }
+        Err(crate::service::node_config::NodeConfigBuildError::GroupNotFound) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
         Err(e) => {
             tracing::error!(
                 "get_config: build_node_config failed for group {}: {}",
@@ -453,6 +457,21 @@ mod tests {
         h
     }
 
+    fn config_headers(token: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Config-Protocol-Version",
+            relay_shared::protocol::CONFIG_PROTOCOL_VERSION
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        if let Some(token) = token {
+            headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        }
+        headers
+    }
+
     async fn user_traffic(pool: &SqlitePool, uid: i64) -> i64 {
         let (v,): (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id=?")
             .bind(uid)
@@ -650,7 +669,8 @@ mod tests {
     // behaviors, preserved for backward compat with all shipped nodes:
     //   - report_traffic / report_status: missing token → HTTP 200, business
     //     code 401 INSIDE the JSON body (nodes read `code`, not the HTTP status).
-    //   - get_config: missing token → HTTP 200, empty config (NOT an error).
+    //   - get_config: auth and group errors are real non-2xx responses; only a
+    //     valid inbound group with no active rules receives an empty config.
     //   - WebSocket upgrade: missing/invalid token → real HTTP 401 (WS upgrades
     //     must fail at the HTTP layer — the client never reads a JSON body).
     //
@@ -707,33 +727,84 @@ mod tests {
         assert_eq!(resp.code, 401, "missing token → business 401, not HTTP 401");
     }
 
-    /// get_config with NO Authorization header (but a valid config-protocol
-    /// header) → HTTP 200 with an EMPTY config, NOT an error. A node that
-    /// hasn't been assigned a group should keep its cached config.
+    /// A missing token must never be presented as an authoritative empty plan.
     #[tokio::test]
-    async fn node_http_status_compat_get_config_missing_token_returns_empty_config() {
+    async fn get_config_missing_token_is_not_authoritative_empty() {
         let (state, _pool) = seeded_state().await;
-        let mut h = HeaderMap::new();
-        // get_config gates on config-protocol FIRST; supply a matching one so
-        // we reach the token check (else it'd return 426, masking this path).
-        h.insert(
-            "X-Config-Protocol-Version",
-            relay_shared::protocol::CONFIG_PROTOCOL_VERSION
-                .to_string()
-                .parse()
-                .unwrap(),
-        );
-        // No Authorization header.
-        let resp = get_config(State(state.clone()), h).await;
-        // Pin: HTTP 200 (not 401/403) + an empty listeners array.
+        let resp = get_config(State(state.clone()), config_headers(None)).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_config_invalid_token_is_not_authoritative_empty() {
+        let (state, _pool) = seeded_state().await;
+        let resp = get_config(State(state.clone()), config_headers(Some("invalid"))).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_config_non_inbound_group_is_not_authoritative_empty() {
+        let (state, pool) = seeded_state().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) \
+             VALUES (20, 'outbound', 'out', 'tok-out', 2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let resp = get_config(State(state.clone()), config_headers(Some("tok-out"))).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn get_config_database_error_is_not_authoritative_empty() {
+        let (state, pool) = seeded_state().await;
+        sqlx::query("DROP TABLE forward_rules")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = get_config(State(state.clone()), config_headers(Some("tok-A"))).await;
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn valid_inbound_group_with_no_rules_returns_empty_config() {
+        let (state, pool) = seeded_state().await;
+        sqlx::query("DELETE FROM forward_rules")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = get_config(State(state.clone()), config_headers(Some("tok-A"))).await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            v["listeners"].as_array().map(|a| a.len()),
-            Some(0),
-            "missing token → empty config, not an error"
-        );
+        let response: NodeConfigResponse = serde_json::from_slice(&body).unwrap();
+        assert!(response.listeners.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_last_rule_returns_authoritative_empty_config() {
+        let (state, pool) = seeded_state().await;
+        let before = get_config(State(state.clone()), config_headers(Some("tok-A"))).await;
+        let before_body = axum::body::to_bytes(before.into_body(), 65536)
+            .await
+            .unwrap();
+        let before_config: NodeConfigResponse = serde_json::from_slice(&before_body).unwrap();
+        assert_eq!(before_config.listeners.len(), 1);
+
+        sqlx::query("DELETE FROM forward_rules WHERE id = 100")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let after = get_config(State(state.clone()), config_headers(Some("tok-A"))).await;
+        assert_eq!(after.status(), axum::http::StatusCode::OK);
+        let after_body = axum::body::to_bytes(after.into_body(), 65536)
+            .await
+            .unwrap();
+        let after_config: NodeConfigResponse = serde_json::from_slice(&after_body).unwrap();
+        assert!(after_config.listeners.is_empty());
     }
 
     /// WebSocket upgrade with NO Authorization header → real HTTP 401 (the one

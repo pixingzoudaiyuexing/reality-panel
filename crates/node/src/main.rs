@@ -226,7 +226,9 @@ async fn run() {
             cached.listeners.len()
         );
         let mut mgr = manager.lock().await;
-        mgr.apply_config(&cached).await;
+        if !mgr.apply_config(&cached).await {
+            tracing::error!("cached config could not be applied; waiting for panel configuration");
+        }
     } else {
         tracing::info!("No cached config found - will start forwarding after first panel sync");
     }
@@ -263,8 +265,9 @@ async fn run() {
 
         match poller::fetch_config(&config).await {
             poller::FetchResult::Ok(resp) => {
-                let mut mgr = manager.lock().await;
-                mgr.apply_config(&resp).await;
+                if !poller::apply_and_commit(&manager, &resp).await {
+                    tracing::warn!("HTTP config was not committed as last-known-good");
+                }
                 // Recovered from a mismatch: restore the normal poll interval.
                 if in_mismatch_backoff {
                     tracing::info!("config protocol OK again; restoring normal poll interval");

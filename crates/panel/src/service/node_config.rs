@@ -12,18 +12,40 @@
 //! [`build_node_config`], so the filter, target resolution, protocol expansion,
 //! transport derivation and ws_path passthrough are identical by construction.
 //!
-//! Error policy: a DB failure is surfaced as `Err(DbError)` instead of
-//! silently returning an empty config. An empty result that came from a real
-//! "no rules" state is indistinguishable from a DB failure under the old
-//! `unwrap_or_default()` — that masked real errors as "no rules", which is
-//! dangerous for quota enforcement. Callers decide how to render the error
-//! (HTTP returns an empty config + logs; WS skips the snapshot push + logs).
+//! Error policy: only a real inbound group with no active rules returns an
+//! empty config. Authentication, group state, and build failures are explicit
+//! errors so they can never tear down a node by masquerading as an empty plan.
 
 use crate::db::error::DbError;
 use crate::db::repo::{GroupRepository, ProfileScope, ResourceScope, TunnelProfileRepository};
 use crate::db::Repository;
 use relay_shared::models::{DeviceGroup, ForwardRule};
 use relay_shared::protocol::NodeConfigResponse;
+
+#[derive(Debug)]
+pub enum NodeConfigBuildError {
+    Database(DbError),
+    GroupNotFound,
+    NotInboundGroup,
+}
+
+impl std::fmt::Display for NodeConfigBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(e) => write!(f, "database error: {}", e),
+            Self::GroupNotFound => write!(f, "device group no longer exists"),
+            Self::NotInboundGroup => write!(f, "device group is not inbound"),
+        }
+    }
+}
+
+impl std::error::Error for NodeConfigBuildError {}
+
+impl From<DbError> for NodeConfigBuildError {
+    fn from(value: DbError) -> Self {
+        Self::Database(value)
+    }
+}
 
 /// Build the full [`NodeConfigResponse`] for a device group.
 ///
@@ -40,19 +62,20 @@ use relay_shared::protocol::NodeConfigResponse;
 /// 4. [`relay_shared::protocol::build_listeners_for_rule`] for protocol
 ///    expansion + transport derivation + ws_path passthrough.
 ///
-/// Returns `Ok(empty)` only for a legitimate empty state (non-`in` group, or an
-/// `in` group with no matching rules). A DB error is `Err`.
+/// Returns `Ok(empty)` only for an existing inbound group with no matching
+/// rules. Any other state is an explicit error.
 pub async fn build_node_config(
     db: &dyn Repository,
     group_id: i64,
-) -> Result<NodeConfigResponse, DbError> {
+) -> Result<NodeConfigResponse, NodeConfigBuildError> {
     // 1. Group + "in" gate. Non-`in` groups (out / monitor / chained_outbound)
     //    never receive listeners — they are egress/observation only.
     // find_by_id exists on both UserRepository and GroupRepository; we want the
     // group one, so qualify the call.
     let group = match GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await? {
         Some(g) if g.group_type == "in" => g,
-        _ => return Ok(NodeConfigResponse { listeners: vec![] }),
+        Some(_) => return Err(NodeConfigBuildError::NotInboundGroup),
+        None => return Err(NodeConfigBuildError::GroupNotFound),
     };
 
     // 2. Filtered rule query. The JOIN on users is the fix for the v0.3.5 WS
@@ -305,16 +328,19 @@ mod tests {
         assert!(cfg.listeners.is_empty(), "paused rule must be filtered");
     }
 
-    /// Non-`in` groups (out/monitor/chained_outbound) never receive listeners.
+    /// A non-inbound group is not an authoritative empty configuration. The
+    /// caller must reject it instead of telling a node to tear down listeners.
     #[tokio::test]
-    async fn non_in_group_yields_no_listeners() {
+    async fn non_in_group_is_explicit_error() {
         let pool = pool().await;
         add_user(&pool, 2).await;
         add_group(&pool, 10, "out", 2).await;
         add_rule(&pool, 100, 2, 10, 20000).await;
 
-        let cfg = build_node_config(&repo(&pool), 10).await.unwrap();
-        assert!(cfg.listeners.is_empty());
+        assert!(matches!(
+            build_node_config(&repo(&pool), 10).await,
+            Err(NodeConfigBuildError::NotInboundGroup)
+        ));
     }
 
     /// traffic_limit = 0 means unlimited — never filtered by quota even if

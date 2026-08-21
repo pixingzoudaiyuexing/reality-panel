@@ -247,16 +247,20 @@ async fn connect_and_run(
                                 "websocket: received config ({} listeners), applying",
                                 resp.listeners.len()
                             );
-                            let mut mgr = manager.lock().await;
-                            mgr.apply_config(&resp).await;
-                            tracing::info!("websocket: config applied");
+                            if apply_snapshot(manager, &resp).await {
+                                tracing::info!("websocket: config applied and committed as LKG");
+                            } else {
+                                tracing::warn!("websocket: config apply/commit failed; preserving LKG");
+                            }
                         } else if text.contains("config_changed") {
                             tracing::info!("websocket: config_changed received, re-fetching");
                             match poller::fetch_config(config).await {
                                 poller::FetchResult::Ok(resp) => {
-                                    let mut mgr = manager.lock().await;
-                                    mgr.apply_config(&resp).await;
-                                    tracing::info!("websocket: config applied after config_changed");
+                                    if apply_snapshot(manager, &resp).await {
+                                        tracing::info!("websocket: config applied after config_changed");
+                                    } else {
+                                        tracing::warn!("websocket: config_changed apply/commit failed; preserving LKG");
+                                    }
                                 }
                                 poller::FetchResult::ProtocolMismatch => {
                                     tracing::warn!("websocket: config fetch returned protocol mismatch; keeping cached config");
@@ -431,9 +435,35 @@ async fn connect_and_run(
     }
 }
 
+/// WebSocket snapshots intentionally share the HTTP poll's apply-then-commit
+/// path. The cache is never updated merely because a socket delivered JSON.
+async fn apply_snapshot(
+    manager: &std::sync::Arc<tokio::sync::Mutex<crate::forwarder::ForwarderManager>>,
+    config: &relay_shared::protocol::NodeConfigResponse,
+) -> bool {
+    poller::apply_and_commit(manager, config).await
+}
+
+#[cfg(test)]
+async fn apply_snapshot_at(
+    manager: &std::sync::Arc<tokio::sync::Mutex<crate::forwarder::ForwarderManager>>,
+    config: &relay_shared::protocol::NodeConfigResponse,
+    paths: &poller::CachePaths,
+) -> bool {
+    poller::apply_and_commit_at(manager, config, paths).await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::derive_ws_url;
+    use super::{apply_snapshot_at, derive_ws_url};
+    use crate::forwarder::ForwarderManager;
+    use crate::poller::{self, CachePaths};
+    use crate::reporter::{ConnectionTracker, TrafficCounter};
+    use relay_shared::protocol::{
+        ListenerConfig, LoadBalanceStrategy, NodeConfigResponse, NodeTransport, Protocol,
+    };
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     /// v0.4.16: the WSS control-channel URL is derived from PANEL_URL. The
     /// https→wss mapping is the half that crosses the TLS provider, so pin it
@@ -458,5 +488,73 @@ mod tests {
             derive_ws_url("127.0.0.1:18888"),
             "ws://127.0.0.1:18888/api/v1/node/ws"
         );
+    }
+
+    fn cache_paths(label: &str) -> CachePaths {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "relay-panel-ws-lkg-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        CachePaths {
+            primary: dir.join("config-cache.json"),
+            backup: dir.join("config-cache.backup.json"),
+            tmp: dir.join("config-cache.json.tmp"),
+        }
+    }
+
+    fn manager() -> Arc<Mutex<ForwarderManager>> {
+        Arc::new(Mutex::new(ForwarderManager::new(
+            Arc::new(TrafficCounter::new()),
+            Arc::new(ConnectionTracker::new()),
+        )))
+    }
+
+    #[tokio::test]
+    async fn ws_successful_snapshot_persists_lkg() {
+        let paths = cache_paths("success");
+        let snapshot = NodeConfigResponse { listeners: vec![] };
+
+        assert!(apply_snapshot_at(&manager(), &snapshot, &paths).await);
+        assert!(paths.primary.exists());
+        assert!(poller::load_cache_at(&paths).unwrap().listeners.is_empty());
+        let _ = std::fs::remove_dir_all(paths.primary.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn ws_failed_apply_does_not_replace_lkg() {
+        let paths = cache_paths("failure");
+        let old = NodeConfigResponse {
+            listeners: vec![ListenerConfig {
+                rule_id: 1,
+                port: 22001,
+                protocol: Protocol::Tcp,
+                node_transport: NodeTransport::Raw,
+                ws_path: None,
+                sni: None,
+                targets: vec!["127.0.0.1:9".to_string()],
+                load_balance_strategy: LoadBalanceStrategy::First,
+                upload_limit_bps: None,
+                download_limit_bps: None,
+                max_connections: None,
+            }],
+        };
+        poller::commit_cache_at(&old, &paths).unwrap();
+        let invalid = NodeConfigResponse {
+            listeners: vec![ListenerConfig {
+                port: 0,
+                ..old.listeners[0].clone()
+            }],
+        };
+
+        assert!(!apply_snapshot_at(&manager(), &invalid, &paths).await);
+        assert_eq!(
+            poller::load_cache_at(&paths).unwrap().listeners[0].rule_id,
+            1
+        );
+        let _ = std::fs::remove_dir_all(paths.primary.parent().unwrap());
     }
 }
