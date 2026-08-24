@@ -13,6 +13,7 @@ pub mod geoip;
 pub mod groups;
 pub mod middleware;
 pub mod node;
+pub mod node_deploy;
 pub mod notify;
 pub mod redeem;
 pub mod restart;
@@ -32,6 +33,7 @@ pub struct AppState {
     pub config: Config,
     pub release_cache: ReleaseCache,
     pub node_connections: ws::NodeConnections,
+    pub deployments: node_deploy::DeploymentRegistry,
     /// v0.4.8: in-memory rule-diagnosis task registry (request_id → run).
     pub diagnose: diagnose::DiagnoseRegistry,
     /// v0.4.15: GeoIP concurrent-lookup de-duplication (set of IPs being
@@ -92,6 +94,22 @@ pub fn routes() -> Router<AppState> {
         // v1.2.4: every user's orders, for the plan-management page. Admin-only
         // and paginated — this table only grows.
         .route("/admin/orders", axum::routing::get(admin::list_all_orders))
+        .route(
+            "/admin/node-deployments/fingerprint",
+            axum::routing::post(node_deploy::test_connection),
+        )
+        .route(
+            "/admin/node-deployments",
+            axum::routing::post(node_deploy::start_deployment),
+        )
+        .route(
+            "/admin/node-deployments/{id}",
+            axum::routing::get(node_deploy::deployment_status),
+        )
+        .route(
+            "/admin/node-deployments/{id}/logs",
+            axum::routing::get(node_deploy::deployment_logs),
+        )
         // v1.2.0: self-service balance top-up. Scoped to the caller's own id
         // from the token — there is no user_id in the body, so it can never
         // credit another account.

@@ -5,6 +5,7 @@ import {
   DashboardOutlined,
   ApiOutlined,
   CloudServerOutlined,
+  CloudUploadOutlined,
   UserOutlined,
   LogoutOutlined,
   LockOutlined,
@@ -72,6 +73,7 @@ export default function MainLayout() {
   ];
   const adminOnlyItems = [
     { key: '/groups', icon: <CloudServerOutlined />, label: t('deviceGroups') },
+    { key: '/node-bootstrap', icon: <CloudUploadOutlined />, label: t('nodeBootstrapTitle') },
     {
       key: 'grp-billing',
       icon: <TeamOutlined />,

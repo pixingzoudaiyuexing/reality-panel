@@ -409,6 +409,7 @@ mod tests {
             },
             release_cache: ReleaseCache::new(),
             node_connections: NodeConnections::new(),
+            deployments: crate::api::node_deploy::DeploymentRegistry::default(),
             diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
             geoip_in_flight: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashSet::new(),

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Spin, Result, Empty, Modal, message } from 'antd';
-import { LineChartOutlined } from '@ant-design/icons';
+import { Spin, Result, Empty, Modal, message, Button } from 'antd';
+import { CloudUploadOutlined, LineChartOutlined } from '@ant-design/icons';
+import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
 import type { ApiEnvelope, NodeStatus, SharedNodeSummary, NodeDisplayRow } from '../api/types';
 import { useI18n } from '../i18n/context';
@@ -44,6 +45,7 @@ function useIsMobile(breakpoint = 768): boolean {
 export default function NodeStatus() {
   const { t } = useI18n();
   const { isAdmin } = useAuth();
+  const navigate = useNavigate();
   const isMobile = useIsMobile();
 
   const [adminRows, setAdminRows] = useState<NodeStatus[] | null>(null);
@@ -151,13 +153,19 @@ export default function NodeStatus() {
   const groups = useMemo(() => (rows ? stableGroupedRows(rows) : null), [rows]);
 
   const title = t('nodeStatus');
+  const pageTitle = (
+    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+      <h2 className="rp-page-title"><LineChartOutlined /> {title}</h2>
+      {isAdmin && <Button type="primary" icon={<CloudUploadOutlined />} onClick={() => navigate('/node-bootstrap')}>{t('nodeBootstrapTitle')}</Button>}
+    </div>
+  );
 
   // Load failure (DB error / request failure) — not a normal empty state.
   // v0.4.15 PR3: applies to admins too (loadAdmin now surfaces failures).
   if (loadFailed) {
     return (
       <>
-        <h2 className="rp-page-title"><LineChartOutlined /> {title}</h2>
+        {pageTitle}
         <Result status="warning" title={t('loadFailed')} subTitle={t('loadFailedRetry')} />
       </>
     );
@@ -171,7 +179,7 @@ export default function NodeStatus() {
   if (groups.length === 0) {
     return (
       <>
-        <h2 className="rp-page-title"><LineChartOutlined /> {title}</h2>
+        {pageTitle}
         <Result
           status="info"
           icon={<Empty image={Empty.PRESENTED_IMAGE_SIMPLE} />}
@@ -197,7 +205,7 @@ export default function NodeStatus() {
 
   return (
     <>
-      <h2 className="rp-page-title"><LineChartOutlined /> {title}</h2>
+      {pageTitle}
       {groups.map(([gid, groupRows]) => (
         <NodeGroupSection
           key={gid}

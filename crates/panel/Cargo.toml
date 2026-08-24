@@ -30,6 +30,13 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # rustls (matching reqwest above) instead of pulling in native-tls/OpenSSL,
 # which would break the static musl node/panel builds.
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls-tls", "hostname"] }
+# Stage 1 uses SSH password authentication only inside the in-memory deployment
+# worker. ssh2 exposes the server host key before authentication, which lets us
+# enforce the administrator-confirmed SHA-256 fingerprint before any mutation.
+ssh2 = "0.9"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
 
 [dev-dependencies]
 # tower::ServiceExt (.oneshot) for the security-headers router tests. Already in
