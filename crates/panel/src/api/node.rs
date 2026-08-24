@@ -282,6 +282,8 @@ pub async fn report_status(
             // hiding the upgrade button on legitimately systemd-managed nodes.
             "install_method": req.install_method,
             "architecture": req.architecture,
+            "camouflage_sites": req.camouflage_sites,
+            "active_listener_rule_ids": req.active_listener_rule_ids,
         });
         // Status persistence is best-effort: the original used .ok() to swallow
         // any DB error so a transient failure never broke the report cycle.
@@ -726,6 +728,8 @@ mod tests {
             listener_errors: None,
             install_method: None,
             architecture: None,
+            camouflage_sites: None,
+            active_listener_rule_ids: None,
         };
         let Json(resp) = report_status(State(state.clone()), h, Json(req)).await;
         assert_eq!(resp.code, 401, "missing token → business 401, not HTTP 401");
@@ -811,6 +815,44 @@ mod tests {
         assert!(after_config.listeners.is_empty());
     }
 
+    #[tokio::test]
+    async fn http_and_ws_use_identical_typed_camouflage_config() {
+        let (state, pool) = seeded_state().await;
+        sqlx::query("UPDATE device_groups SET connect_host='203.0.113.10' WHERE id=10")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE forward_rules SET listen_port=443, protocol='tcp', \
+             public_transport='nginx_sni', node_transport='nginx_sni', \
+             entry_transport='nginx_sni', sni='op1.example.com', \
+             camouflage_enabled=1, target_addr='198.51.100.20', target_port=55443 \
+             WHERE id=100",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let http = get_config(State(state.clone()), config_headers(Some("tok-A"))).await;
+        assert_eq!(http.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(http.into_body(), 65536).await.unwrap();
+        let http_config: NodeConfigResponse = serde_json::from_slice(&body).unwrap();
+        let ws_config = crate::api::ws::build_config_snapshot(state.db.as_ref(), 10)
+            .await
+            .expect("WS snapshot");
+
+        assert_eq!(
+            serde_json::to_value(&http_config).unwrap(),
+            serde_json::to_value(&ws_config).unwrap()
+        );
+        assert_eq!(http_config.camouflage_sites.len(), 1);
+        assert!(http_config.listeners[0].camouflage_required);
+        let serialized = serde_json::to_string(&http_config).unwrap();
+        for forbidden in ["PRIVATE KEY", "privkey.pem", "NODE_TOKEN", "Bearer", "uuid"] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+
     /// WebSocket upgrade with NO Authorization header → real HTTP 401 (the one
     /// exception to the "business code in JSON" rule — WS upgrades must fail at
     /// the HTTP layer). We assert via node_ws_handler's IntoResponse output,
@@ -868,6 +910,20 @@ mod tests {
             listener_errors: None,
             install_method: Some("systemd".into()),
             architecture: Some("x86_64".into()),
+            camouflage_sites: Some(vec![relay_shared::protocol::CamouflageSiteStatus {
+                site_id: "op1_example_com".into(),
+                sni: "op1.example.com".into(),
+                site_status: "active".into(),
+                certificate_status: "active".into(),
+                issuer: Some("CN=Test CA".into()),
+                valid_from: Some("2026-08-01T00:00:00Z".into()),
+                valid_until: Some("2026-11-01T00:00:00Z".into()),
+                last_success: None,
+                last_attempt: None,
+                last_error: None,
+                active_generation: Some("generation-1".into()),
+            }]),
+            active_listener_rule_ids: Some(vec![42]),
         };
         let Json(resp) =
             report_status(State(state.clone()), auth_headers("tok-A"), Json(req)).await;
@@ -881,6 +937,14 @@ mod tests {
             .expect("kvs get")
             .expect("status row must exist after a successful report");
         let v: serde_json::Value = serde_json::from_str(&raw).expect("stored status is JSON");
+        assert_eq!(
+            v["camouflage_sites"][0]["sni"].as_str(),
+            Some("op1.example.com")
+        );
+        assert_eq!(v["active_listener_rule_ids"][0].as_i64(), Some(42));
+        for forbidden in ["PRIVATE KEY", "privkey.pem", "NODE_TOKEN", "Bearer"] {
+            assert!(!raw.contains(forbidden));
+        }
         assert_eq!(
             v.get("install_method").and_then(|x| x.as_str()),
             Some("systemd"),

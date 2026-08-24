@@ -393,7 +393,7 @@ async fn handle_node_ws(
     }
 }
 
-async fn build_config_snapshot(
+pub(crate) async fn build_config_snapshot(
     db: &dyn crate::db::Repository,
     group_id: i64,
 ) -> Option<NodeConfigResponse> {

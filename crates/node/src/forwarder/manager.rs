@@ -267,6 +267,7 @@ impl ForwarderManager {
             .collect();
         let effective_config = NodeConfigResponse {
             listeners: normal_listeners,
+            camouflage_sites: config.camouflage_sites.clone(),
         };
 
         let sni_plan = match NginxSniPlan::from_listeners(
@@ -839,6 +840,23 @@ impl ForwarderManager {
         true
     }
 
+    pub fn active_rule_ids(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self
+            .last_config
+            .as_ref()
+            .map(|config| {
+                config
+                    .listeners
+                    .iter()
+                    .map(|listener| listener.rule_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Re-apply A after B has already stopped/replaced some raw listeners. The
     /// caller always returns the original B failure, even when this recovery
     /// succeeds. Boxing the recursive call keeps the future finite, while the
@@ -983,7 +1001,9 @@ mod tests {
     /// exercise hot-update pass explicit targets.
     fn one_rule(port: u16, proto: Protocol, transport: NodeTransport) -> NodeConfigResponse {
         NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
+                camouflage_required: false,
                 rule_id: 1,
                 port,
                 protocol: proto,
@@ -1007,7 +1027,9 @@ mod tests {
         ws_path: Option<&str>,
     ) -> NodeConfigResponse {
         NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
+                camouflage_required: false,
                 rule_id: 1,
                 port,
                 protocol: proto,
@@ -1261,8 +1283,11 @@ mod tests {
         );
 
         // Removing the rule drops its runtime (which cancels its connections).
-        mgr.apply_config(&NodeConfigResponse { listeners: vec![] })
-            .await;
+        mgr.apply_config(&NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners: vec![],
+        })
+        .await;
         assert!(
             !mgr.rule_runtime.contains_key(&1),
             "a removed rule must not leak its runtime"
@@ -1273,8 +1298,10 @@ mod tests {
     async fn raw_tcp_and_udp_are_scheduled() {
         let mut mgr = fresh_mgr();
         let c = NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![
                 ListenerConfig {
+                    camouflage_required: false,
                     rule_id: 1,
                     port: 40001,
                     protocol: Protocol::Tcp,
@@ -1288,6 +1315,7 @@ mod tests {
                     max_connections: None,
                 },
                 ListenerConfig {
+                    camouflage_required: false,
                     rule_id: 2,
                     port: 40002,
                     protocol: Protocol::Udp,
@@ -1355,8 +1383,10 @@ mod tests {
     async fn same_port_tcp_and_udp_are_distinct_listeners() {
         let mut mgr = fresh_mgr();
         let c = NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![
                 ListenerConfig {
+                    camouflage_required: false,
                     rule_id: 1,
                     port: 40050,
                     protocol: Protocol::Tcp,
@@ -1370,6 +1400,7 @@ mod tests {
                     max_connections: None,
                 },
                 ListenerConfig {
+                    camouflage_required: false,
                     rule_id: 2,
                     port: 40050,
                     protocol: Protocol::Udp,
@@ -1491,7 +1522,9 @@ mod tests {
     async fn strategy_change_restarts_listener() {
         let mut mgr = fresh_mgr();
         let mk = |strategy: LoadBalanceStrategy| NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
+                camouflage_required: false,
                 rule_id: 1,
                 port: 40065,
                 protocol: Protocol::Tcp,
@@ -1525,7 +1558,9 @@ mod tests {
     async fn transport_change_to_disabled_stops_listener() {
         let mut mgr = fresh_mgr();
         let mk = |transport: NodeTransport| NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
+                camouflage_required: false,
                 rule_id: 1,
                 port: 40066,
                 protocol: Protocol::Tcp,
@@ -1576,8 +1611,11 @@ mod tests {
         mgr.apply_config(&c1).await;
         assert_eq!(mgr.listener_keys().len(), 1);
         // Empty config = rule removed.
-        mgr.apply_config(&NodeConfigResponse { listeners: vec![] })
-            .await;
+        mgr.apply_config(&NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners: vec![],
+        })
+        .await;
         assert!(mgr.listener_keys().is_empty(), "removed rule must stop");
     }
 
@@ -1588,8 +1626,10 @@ mod tests {
     async fn unrelated_change_does_not_restart_other_listeners() {
         let mut mgr = fresh_mgr();
         let c1 = NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![
                 ListenerConfig {
+                    camouflage_required: false,
                     rule_id: 1,
                     port: 40070,
                     protocol: Protocol::Tcp,
@@ -1603,6 +1643,7 @@ mod tests {
                     max_connections: None,
                 },
                 ListenerConfig {
+                    camouflage_required: false,
                     rule_id: 2,
                     port: 40071,
                     protocol: Protocol::Tcp,
@@ -1623,8 +1664,10 @@ mod tests {
             .unwrap();
         // Change rule 2's target only; rule 1 (port 40070) must be untouched.
         let c2 = NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![
                 ListenerConfig {
+                    camouflage_required: false,
                     rule_id: 1,
                     port: 40070,
                     protocol: Protocol::Tcp,
@@ -1638,6 +1681,7 @@ mod tests {
                     max_connections: None,
                 },
                 ListenerConfig {
+                    camouflage_required: false,
                     rule_id: 2,
                     port: 40071,
                     protocol: Protocol::Tcp,
@@ -1877,6 +1921,7 @@ mod tests {
             }
         }
         mgr.apply_config(&NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: Vec::new(),
         })
         .await;
@@ -1903,8 +1948,10 @@ mod tests {
 
         // tcp_udp rule: two listeners share rule_id 1.
         let tcp_udp_cfg = NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![
                 ListenerConfig {
+                    camouflage_required: false,
                     rule_id: 1,
                     port: 40004,
                     protocol: Protocol::Tcp,
@@ -1918,6 +1965,7 @@ mod tests {
                     max_connections: None,
                 },
                 ListenerConfig {
+                    camouflage_required: false,
                     rule_id: 1,
                     port: 40004,
                     protocol: Protocol::Udp,
@@ -1938,7 +1986,9 @@ mod tests {
 
         // Change to tcp-only: remove the UDP listener for rule 1.
         let tcp_cfg = NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
+                camouflage_required: false,
                 rule_id: 1,
                 port: 40004,
                 protocol: Protocol::Tcp,
@@ -1987,6 +2037,7 @@ mod tests {
 
         // Apply empty config — step 1 finds the dead listener and removes it.
         mgr.apply_config(&NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: Vec::new(),
         })
         .await;
@@ -2023,7 +2074,9 @@ mod tests {
         };
 
         let sni_config = |sni: &str| NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
+                camouflage_required: false,
                 rule_id: 7,
                 port: 443,
                 protocol: Protocol::Tcp,
@@ -2124,8 +2177,11 @@ mod tests {
         assert_eq!(mgr.listener_keys().len(), 1);
         assert!(mgr.last_config.is_some());
         assert!(
-            mgr.apply_config(&NodeConfigResponse { listeners: vec![] })
-                .await
+            mgr.apply_config(&NodeConfigResponse {
+                camouflage_sites: vec![],
+                listeners: vec![]
+            })
+            .await
         );
     }
 
@@ -2154,8 +2210,11 @@ mod tests {
             "A listener must be rebuilt after B startup failure"
         );
         assert!(
-            mgr.apply_config(&NodeConfigResponse { listeners: vec![] })
-                .await
+            mgr.apply_config(&NodeConfigResponse {
+                camouflage_sites: vec![],
+                listeners: vec![]
+            })
+            .await
         );
     }
 }

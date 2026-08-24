@@ -32,7 +32,10 @@ use serde::{Deserialize, Serialize};
 /// upgrade. Also adds node_transport to the listener fingerprint.
 /// v5 = reality-sni fork: ListenerConfig gains optional `sni`, and nodes may
 /// receive node_transport=nginx_sni for generated Nginx Stream SNI routing.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 5;
+/// v6 = corrected Stage 3.3: NodeConfigResponse gains typed camouflage desired
+/// state and nginx_sni listeners can declare that their route depends on the
+/// matching Relay-local camouflage site being active.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 6;
 
 // === Auth ===
 #[derive(Debug, Serialize, Deserialize)]
@@ -134,6 +137,45 @@ pub struct NodeConfigRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfigResponse {
     pub listeners: Vec<ListenerConfig>,
+    /// Relay-local TLS camouflage desired state. This contains no certificate
+    /// material or filesystem paths; relay-node owns ACME generations and LKG.
+    #[serde(default)]
+    pub camouflage_sites: Vec<CamouflageSiteDesired>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CamouflageSiteDesired {
+    /// Stable Node-local identity. For Stage 3.3 this is the normalized SNI.
+    pub site_id: String,
+    pub sni: String,
+    pub tls_listener_port: u16,
+    pub local_backend: CamouflageLocalBackend,
+    pub certificate: CamouflageCertificatePolicy,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CamouflageLocalBackend {
+    OpenList,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CamouflageCertificatePolicy {
+    pub domain: String,
+    /// Public Relay IP that DNS must resolve to before ACME is invoked.
+    pub expected_public_ip: String,
+    #[serde(default = "default_renew_before_days")]
+    pub renew_before_days: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_renew_before_days() -> u32 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +205,11 @@ pub struct ListenerConfig {
     /// TLS SNI hostname used by node_transport=nginx_sni.
     #[serde(default)]
     pub sni: Option<String>,
+    /// When true, relay-node must not activate this nginx_sni route until the
+    /// matching desired camouflage site is active. Legacy nginx_sni rules keep
+    /// the old immediate-activation behaviour via the false default.
+    #[serde(default)]
+    pub camouflage_required: bool,
     pub targets: Vec<String>,
     /// v0.4.6: how the node picks among `targets` for each new connection /
     /// UDP session. Defaults to `First` so old configs and v0.4.5 rows behave
@@ -253,6 +300,7 @@ pub fn build_listeners_for_rule(
             // Per-rule WS path override; None → node uses its built-in "/relay".
             ws_path: rule.ws_path.clone(),
             sni: rule.sni.clone(),
+            camouflage_required: rule.camouflage_enabled,
             targets: targets.clone(),
             load_balance_strategy: LoadBalanceStrategy::from_db_str(&rule.load_balance_strategy),
             // v0.4.6: convert the user-facing Mbps caps to bytes/sec here so the
@@ -565,6 +613,38 @@ pub struct StatusReport {
     /// guessing an architecture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub architecture: Option<String>,
+    /// Observed Relay-local camouflage/certificate state. No PEM, private-key
+    /// path, token, or Reality secret is present in this wire model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camouflage_sites: Option<Vec<CamouflageSiteStatus>>,
+    /// Rule IDs present in the Node's last successfully applied effective
+    /// listener config. This lets the Panel distinguish configured from active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_listener_rule_ids: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CamouflageSiteStatus {
+    pub site_id: String,
+    pub sni: String,
+    /// "preparing" | "active" | "failed"
+    pub site_status: String,
+    /// "pending" | "active" | "failed"
+    pub certificate_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_generation: Option<String>,
 }
 
 /// One listener bind failure reported by a node. Carries enough context for the
@@ -904,7 +984,7 @@ fn default_target_enabled() -> bool {
     true
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRuleRequest {
     pub name: String,
     /// If None, the server auto-assigns a free port from 10000-65535.
@@ -941,6 +1021,10 @@ pub struct CreateRuleRequest {
     /// Required for nginx_sni rules. Ignored for normal raw/ws/tls_simple rules.
     #[serde(default)]
     pub sni: Option<String>,
+    /// Enable the Relay-local :8443/OpenList camouflage dependency for an
+    /// nginx_sni Reality relay rule. Admin-only at the API boundary.
+    #[serde(default)]
+    pub camouflage_enabled: bool,
     pub target_addr: String,
     pub target_port: u16,
     /// v0.4.6: optional multi-target list. Omitted means use the legacy
@@ -994,6 +1078,9 @@ pub struct UpdateRuleRequest {
     /// omitted to keep the stored value.
     #[serde(default)]
     pub sni: Option<Option<String>>,
+    /// Toggle the Relay-local camouflage dependency. Omitted keeps current.
+    #[serde(default)]
+    pub camouflage_enabled: Option<bool>,
     pub target_addr: Option<String>,
     pub target_port: Option<u16>,
     /// v0.4.6: replace the rule's target list. Omitted keeps current targets.
@@ -1343,6 +1430,7 @@ mod tests {
             ws_path: None,
             ws_host: None,
             sni: None,
+            camouflage_enabled: false,
             target_addr: "127.0.0.1".into(),
             target_port: 53,
             targets: Vec::new(),

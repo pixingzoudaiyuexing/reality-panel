@@ -20,7 +20,10 @@ use crate::db::error::DbError;
 use crate::db::repo::{GroupRepository, ProfileScope, ResourceScope, TunnelProfileRepository};
 use crate::db::Repository;
 use relay_shared::models::{DeviceGroup, ForwardRule};
-use relay_shared::protocol::NodeConfigResponse;
+use relay_shared::protocol::{
+    CamouflageCertificatePolicy, CamouflageLocalBackend, CamouflageSiteDesired, NodeConfigResponse,
+};
+use std::collections::BTreeMap;
 
 #[derive(Debug)]
 pub enum NodeConfigBuildError {
@@ -95,6 +98,7 @@ pub async fn build_node_config(
     //    delegated to the shared `build_listeners_for_rule` so that part can never
     //    drift between paths.
     let mut listeners = Vec::new();
+    let mut camouflage_by_sni = BTreeMap::<String, CamouflageSiteDesired>::new();
     for rule in &rules {
         // v0.4.7: if the rule is bound to a tunnel profile, the profile is the
         // source of transport config (node_transport + ws_path). We resolve it
@@ -144,9 +148,36 @@ pub async fn build_node_config(
             &effective_rule,
             targets,
         ));
+        let camouflage_sni = effective_rule
+            .sni
+            .as_deref()
+            .map(str::trim)
+            .filter(|sni| !sni.is_empty())
+            .map(str::to_ascii_lowercase);
+        if effective_rule.camouflage_enabled && effective_rule.node_transport == "nginx_sni" {
+            if let Some(sni) = camouflage_sni {
+                camouflage_by_sni
+                    .entry(sni.clone())
+                    .or_insert_with(|| CamouflageSiteDesired {
+                        site_id: sni.replace('.', "_"),
+                        sni: sni.clone(),
+                        tls_listener_port: 8443,
+                        local_backend: CamouflageLocalBackend::OpenList,
+                        certificate: CamouflageCertificatePolicy {
+                            domain: sni,
+                            expected_public_ip: group.connect_host.trim().to_string(),
+                            renew_before_days: 30,
+                        },
+                        enabled: true,
+                    });
+            }
+        }
     }
 
-    Ok(NodeConfigResponse { listeners })
+    Ok(NodeConfigResponse {
+        listeners,
+        camouflage_sites: camouflage_by_sni.into_values().collect(),
+    })
 }
 
 /// Resolve a rule's target address list.
@@ -178,7 +209,7 @@ async fn resolve_targets(db: &dyn Repository, rule: &ForwardRule) -> Result<Vec<
     match (rule.forward_mode.as_str(), rule.device_group_out) {
         ("direct", _) | (_, None) => Ok(targets
             .into_iter()
-            .map(|t| format!("{}:{}", t.host, t.port))
+            .map(|t| format_target_endpoint(&t.host, t.port))
             .collect()),
         (_, Some(out_id)) => {
             // Qualify: find_by_id is on both UserRepository and GroupRepository.
@@ -186,14 +217,22 @@ async fn resolve_targets(db: &dyn Repository, rule: &ForwardRule) -> Result<Vec<
             Ok(match og {
                 Some(DeviceGroup { connect_host, .. }) if !connect_host.is_empty() => targets
                     .into_iter()
-                    .map(|t| format!("{}:{}", connect_host, t.port))
+                    .map(|t| format_target_endpoint(&connect_host, t.port))
                     .collect(),
                 _ => targets
                     .into_iter()
-                    .map(|t| format!("{}:{}", t.host, t.port))
+                    .map(|t| format_target_endpoint(&t.host, t.port))
                     .collect(),
             })
         }
+    }
+}
+
+fn format_target_endpoint(host: &str, port: i32) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -444,6 +483,66 @@ mod tests {
         assert!(
             cfg.listeners.is_empty(),
             "a rule bound to a missing profile must be skipped, not downgraded"
+        );
+    }
+
+    #[tokio::test]
+    async fn camouflage_rule_builds_typed_site_and_dependent_listener_without_secrets() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        add_group(&pool, 10, "in", 2).await;
+        add_rule(&pool, 100, 2, 10, 443).await;
+        add_rule(&pool, 101, 2, 10, 444).await;
+        sqlx::query("UPDATE device_groups SET connect_host = '203.0.113.10' WHERE id = 10")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE forward_rules SET protocol='tcp', public_transport='nginx_sni', \
+             node_transport='nginx_sni', entry_transport='nginx_sni', \
+             sni='op1.example.com', camouflage_enabled=1, \
+             target_addr='198.51.100.20', target_port=55443 WHERE id IN (100, 101)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cfg = build_node_config(&repo(&pool), 10).await.unwrap();
+        assert_eq!(cfg.listeners.len(), 2);
+        assert!(cfg.listeners[0].camouflage_required);
+        assert_eq!(cfg.listeners[0].targets, vec!["198.51.100.20:55443"]);
+        assert_eq!(cfg.camouflage_sites.len(), 1);
+        let site = &cfg.camouflage_sites[0];
+        assert_eq!(site.site_id, "op1_example_com");
+        assert_eq!(site.sni, "op1.example.com");
+        assert_eq!(site.tls_listener_port, 8443);
+        assert_eq!(site.certificate.expected_public_ip, "203.0.113.10");
+        assert_eq!(site.certificate.renew_before_days, 30);
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        for forbidden in [
+            "private_key",
+            "privkey",
+            "certificate_pem",
+            "uuid",
+            "short_id",
+            "flow",
+            "xray",
+            "NODE_TOKEN",
+        ] {
+            assert!(!json.contains(forbidden), "wire config leaked {forbidden}");
+        }
+
+        sqlx::query(
+            "UPDATE forward_rules SET target_addr='198.51.100.21', target_port=55444 WHERE id=100",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let backend_update = build_node_config(&repo(&pool), 10).await.unwrap();
+        assert_eq!(
+            backend_update.camouflage_sites, cfg.camouflage_sites,
+            "same-SNI backend changes must not recreate certificate desired state"
         );
     }
 }

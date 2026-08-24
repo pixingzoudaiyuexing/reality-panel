@@ -83,6 +83,10 @@ pub struct ForwardRule {
     pub ws_path: Option<String>,
     pub ws_host: Option<String>,
     pub sni: Option<String>,
+    /// Corrected Stage 3.3: this nginx_sni route is activated only after the
+    /// matching Relay-local CamouflageSite is active.
+    #[serde(default)]
+    pub camouflage_enabled: bool,
     pub target_addr: String,
     pub target_port: i32,
     #[serde(default)]

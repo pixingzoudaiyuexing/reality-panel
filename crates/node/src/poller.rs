@@ -1,4 +1,5 @@
 use crate::config::NodeConfig;
+use crate::forwarder::camouflage_site::CamouflageSiteManager;
 use crate::forwarder::ForwarderManager;
 use relay_shared::protocol::{NodeConfigResponse, NodeTransport, CONFIG_PROTOCOL_VERSION};
 use std::fs::{self, File};
@@ -101,13 +102,146 @@ pub(crate) struct CachePaths {
 /// Apply first, then commit the snapshot as LKG while holding the same manager
 /// mutex. HTTP polls and WebSocket snapshots both use this path so an older
 /// snapshot cannot finish its cache write after a newer one.
-pub async fn apply_and_commit(
+pub async fn apply_and_commit_coordinated(
     manager: &Arc<Mutex<ForwarderManager>>,
+    camouflage: &Arc<Mutex<CamouflageSiteManager>>,
     config: &NodeConfigResponse,
 ) -> bool {
-    apply_and_commit_at(manager, config, &cache_paths()).await
+    apply_and_commit_coordinated_at(manager, camouflage, config, &cache_paths()).await
 }
 
+pub(crate) async fn apply_and_commit_coordinated_at(
+    manager: &Arc<Mutex<ForwarderManager>>,
+    camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    config: &NodeConfigResponse,
+    paths: &CachePaths,
+) -> bool {
+    let previous = load_cache_at(paths);
+    apply_coordinated(manager, camouflage, config, previous.as_ref(), Some(paths)).await
+}
+
+pub async fn apply_cached_coordinated(
+    manager: &Arc<Mutex<ForwarderManager>>,
+    camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    config: &NodeConfigResponse,
+) -> bool {
+    apply_coordinated(manager, camouflage, config, Some(config), None).await
+}
+
+async fn apply_coordinated(
+    manager: &Arc<Mutex<ForwarderManager>>,
+    camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    desired: &NodeConfigResponse,
+    previous: Option<&NodeConfigResponse>,
+    commit_paths: Option<&CachePaths>,
+) -> bool {
+    if let Err(error) = validate_config(desired) {
+        tracing::warn!("refusing invalid node config: {}", error);
+        return false;
+    }
+
+    // Keep the camouflage lock through listener apply, listener LKG commit,
+    // and stale-site finalization. HTTP polling and WebSocket pushes can race;
+    // this makes the two-resource transaction observe one desired snapshot.
+    let mut sites = camouflage.lock().await;
+    let active_snis = sites.prepare_desired(&desired.camouflage_sites);
+    let (effective, referenced_snis) = build_effective_config(desired, previous, &active_snis);
+
+    let mut forwarders = manager.lock().await;
+    if !forwarders.apply_config(&effective).await {
+        tracing::warn!("coordinated listener apply failed; preserving listener LKG");
+        return false;
+    }
+    if let Some(paths) = commit_paths {
+        if let Err(error) = commit_cache_at(&effective, paths) {
+            tracing::error!(
+                "coordinated config applied but LKG commit failed: {}",
+                error
+            );
+            return false;
+        }
+    }
+    drop(forwarders);
+
+    if !sites.finalize_for_listener_snis(&referenced_snis) {
+        tracing::warn!("listener applied, but stale camouflage finalization failed");
+        return false;
+    }
+    true
+}
+
+fn build_effective_config(
+    desired: &NodeConfigResponse,
+    previous: Option<&NodeConfigResponse>,
+    active_snis: &std::collections::HashSet<String>,
+) -> (NodeConfigResponse, std::collections::HashSet<String>) {
+    let mut listeners = Vec::new();
+    let mut preserved_rules = std::collections::HashSet::new();
+    for listener in &desired.listeners {
+        let ready = !listener.camouflage_required
+            || listener
+                .sni
+                .as_deref()
+                .map(|sni| active_snis.contains(sni))
+                .unwrap_or(false);
+        if ready {
+            listeners.push(listener.clone());
+            continue;
+        }
+        if !preserved_rules.insert(listener.rule_id) {
+            continue;
+        }
+        if let Some(previous) = previous {
+            listeners.extend(
+                previous
+                    .listeners
+                    .iter()
+                    .filter(|old| {
+                        old.rule_id == listener.rule_id
+                            && old.camouflage_required
+                            && old
+                                .sni
+                                .as_deref()
+                                .map(|sni| active_snis.contains(sni))
+                                .unwrap_or(false)
+                    })
+                    .cloned(),
+            );
+        }
+    }
+    let referenced_snis: std::collections::HashSet<String> = listeners
+        .iter()
+        .filter(|listener| listener.camouflage_required)
+        .filter_map(|listener| listener.sni.clone())
+        .collect();
+    let mut camouflage_sites = desired.camouflage_sites.clone();
+    if let Some(previous) = previous {
+        for sni in &referenced_snis {
+            if camouflage_sites
+                .iter()
+                .any(|site| site.enabled && site.sni == *sni)
+            {
+                continue;
+            }
+            if let Some(site) = previous
+                .camouflage_sites
+                .iter()
+                .find(|site| site.enabled && site.sni == *sni)
+            {
+                camouflage_sites.push(site.clone());
+            }
+        }
+    }
+    (
+        NodeConfigResponse {
+            listeners,
+            camouflage_sites,
+        },
+        referenced_snis,
+    )
+}
+
+#[cfg(test)]
 pub(crate) async fn apply_and_commit_at(
     manager: &Arc<Mutex<ForwarderManager>>,
     config: &NodeConfigResponse,
@@ -218,7 +352,63 @@ fn validate_config(config: &NodeConfigResponse) -> Result<(), String> {
             return Err(format!("nginx_sni rule {} has no SNI", listener.rule_id));
         }
     }
+    let mut site_ids = std::collections::HashSet::new();
+    let mut site_snis = std::collections::HashSet::new();
+    for site in &config.camouflage_sites {
+        if !site.enabled {
+            continue;
+        }
+        if site.site_id.is_empty()
+            || site.site_id.len() > 64
+            || !site
+                .site_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            || !valid_domain(&site.sni)
+            || site.tls_listener_port != 8443
+            || site.certificate.domain != site.sni
+            || site
+                .certificate
+                .expected_public_ip
+                .parse::<std::net::IpAddr>()
+                .is_err()
+            || !(1..=365).contains(&site.certificate.renew_before_days)
+        {
+            return Err("invalid camouflage desired state".into());
+        }
+        if !site_ids.insert(site.site_id.clone()) || !site_snis.insert(site.sni.clone()) {
+            return Err("duplicate camouflage desired state".into());
+        }
+    }
+    for listener in &config.listeners {
+        if listener.camouflage_required
+            && !listener
+                .sni
+                .as_ref()
+                .map(|sni| site_snis.contains(sni))
+                .unwrap_or(false)
+        {
+            return Err(format!(
+                "rule {} requires missing camouflage desired state",
+                listener.rule_id
+            ));
+        }
+    }
     Ok(())
+}
+
+fn valid_domain(value: &str) -> bool {
+    value.len() <= 253
+        && value.split('.').count() >= 2
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
 }
 
 fn read_valid_cache(path: &Path) -> Result<NodeConfigResponse, String> {
@@ -447,7 +637,9 @@ mod tests {
 
     fn cache_config(rule_id: i64) -> NodeConfigResponse {
         NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![relay_shared::protocol::ListenerConfig {
+                camouflage_required: false,
                 rule_id,
                 port: 20000 + rule_id as u16,
                 protocol: relay_shared::protocol::Protocol::Tcp,
@@ -479,7 +671,10 @@ mod tests {
             Arc::new(crate::reporter::TrafficCounter::new()),
             Arc::new(crate::reporter::ConnectionTracker::new()),
         )));
-        let empty = NodeConfigResponse { listeners: vec![] };
+        let empty = NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners: vec![],
+        };
 
         assert!(apply_and_commit_at(&manager, &empty, &paths).await);
         assert!(paths.primary.exists());
@@ -510,7 +705,9 @@ mod tests {
         });
         let manager = Arc::new(Mutex::new(inner));
         let failed = NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![relay_shared::protocol::ListenerConfig {
+                camouflage_required: false,
                 rule_id: 2,
                 port: 443,
                 protocol: relay_shared::protocol::Protocol::Tcp,
@@ -572,7 +769,10 @@ mod tests {
             manager
                 .lock()
                 .await
-                .apply_config(&NodeConfigResponse { listeners: vec![] })
+                .apply_config(&NodeConfigResponse {
+                    camouflage_sites: vec![],
+                    listeners: vec![]
+                })
                 .await
         );
         cleanup_cache(&paths);
@@ -604,5 +804,151 @@ mod tests {
             "a corrupt primary must not replace the healthy backup"
         );
         cleanup_cache(&paths);
+    }
+
+    fn camouflage_site(sni: &str) -> relay_shared::protocol::CamouflageSiteDesired {
+        relay_shared::protocol::CamouflageSiteDesired {
+            site_id: sni.replace('.', "_"),
+            sni: sni.into(),
+            tls_listener_port: 8443,
+            local_backend: relay_shared::protocol::CamouflageLocalBackend::OpenList,
+            certificate: relay_shared::protocol::CamouflageCertificatePolicy {
+                domain: sni.into(),
+                expected_public_ip: "203.0.113.10".into(),
+                renew_before_days: 30,
+            },
+            enabled: true,
+        }
+    }
+
+    fn dependent_listener(
+        rule_id: i64,
+        sni: &str,
+        target: &str,
+    ) -> relay_shared::protocol::ListenerConfig {
+        relay_shared::protocol::ListenerConfig {
+            camouflage_required: true,
+            rule_id,
+            port: 443,
+            protocol: relay_shared::protocol::Protocol::Tcp,
+            node_transport: NodeTransport::NginxSni,
+            ws_path: None,
+            sni: Some(sni.into()),
+            targets: vec![target.into()],
+            load_balance_strategy: relay_shared::protocol::LoadBalanceStrategy::First,
+            upload_limit_bps: None,
+            download_limit_bps: None,
+            max_connections: None,
+        }
+    }
+
+    #[test]
+    fn new_route_is_withheld_until_camouflage_is_active() {
+        let desired = NodeConfigResponse {
+            camouflage_sites: vec![camouflage_site("op1.example.com")],
+            listeners: vec![dependent_listener(
+                1,
+                "op1.example.com",
+                "198.51.100.1:55443",
+            )],
+        };
+        let (waiting, refs) = build_effective_config(&desired, None, &Default::default());
+        assert!(waiting.listeners.is_empty());
+        assert!(refs.is_empty());
+
+        let active = std::collections::HashSet::from(["op1.example.com".to_string()]);
+        let (ready, refs) = build_effective_config(&desired, None, &active);
+        assert_eq!(ready.listeners.len(), 1);
+        assert!(refs.contains("op1.example.com"));
+    }
+
+    #[test]
+    fn preparing_second_sni_does_not_disturb_active_route_on_shared_port() {
+        let desired = NodeConfigResponse {
+            camouflage_sites: vec![
+                camouflage_site("op1.example.com"),
+                camouflage_site("op2.example.com"),
+            ],
+            listeners: vec![
+                dependent_listener(1, "op1.example.com", "198.51.100.1:55443"),
+                dependent_listener(2, "op2.example.com", "198.51.100.2:55443"),
+            ],
+        };
+        let active = std::collections::HashSet::from(["op1.example.com".to_string()]);
+
+        let (effective, refs) = build_effective_config(&desired, None, &active);
+
+        assert_eq!(effective.listeners.len(), 1);
+        assert_eq!(effective.listeners[0].rule_id, 1);
+        assert_eq!(effective.listeners[0].port, 443);
+        assert_eq!(
+            effective.listeners[0].sni.as_deref(),
+            Some("op1.example.com")
+        );
+        assert_eq!(effective.listeners[0].targets, vec!["198.51.100.1:55443"]);
+        assert_eq!(effective.camouflage_sites.len(), 2);
+        assert_eq!(
+            refs,
+            std::collections::HashSet::from(["op1.example.com".to_string()])
+        );
+        assert!(validate_config(&effective).is_ok());
+    }
+
+    #[test]
+    fn failed_sni_change_preserves_previous_route_until_new_site_is_active() {
+        let previous = NodeConfigResponse {
+            camouflage_sites: vec![camouflage_site("old.example.com")],
+            listeners: vec![dependent_listener(
+                7,
+                "old.example.com",
+                "198.51.100.1:55443",
+            )],
+        };
+        let desired = NodeConfigResponse {
+            camouflage_sites: vec![camouflage_site("new.example.com")],
+            listeners: vec![dependent_listener(
+                7,
+                "new.example.com",
+                "198.51.100.2:55444",
+            )],
+        };
+        let active = std::collections::HashSet::from(["old.example.com".to_string()]);
+        let (effective, refs) = build_effective_config(&desired, Some(&previous), &active);
+        assert_eq!(effective.listeners.len(), 1);
+        assert_eq!(
+            effective.listeners[0].sni.as_deref(),
+            Some("old.example.com")
+        );
+        assert_eq!(effective.listeners[0].targets, vec!["198.51.100.1:55443"]);
+        assert!(refs.contains("old.example.com"));
+        assert_eq!(effective.camouflage_sites.len(), 2);
+        assert!(effective
+            .camouflage_sites
+            .iter()
+            .any(|site| site.sni == "old.example.com"));
+        assert!(validate_config(&effective).is_ok());
+    }
+
+    #[test]
+    fn delete_removes_route_before_site_finalization() {
+        let previous = NodeConfigResponse {
+            camouflage_sites: vec![camouflage_site("op1.example.com")],
+            listeners: vec![dependent_listener(
+                9,
+                "op1.example.com",
+                "198.51.100.1:55443",
+            )],
+        };
+        let desired = NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners: vec![],
+        };
+        let active = std::collections::HashSet::from(["op1.example.com".to_string()]);
+        let (effective, refs) = build_effective_config(&desired, Some(&previous), &active);
+        assert!(effective.listeners.is_empty());
+        assert!(
+            refs.is_empty(),
+            "site removal is finalized only after this route apply"
+        );
     }
 }

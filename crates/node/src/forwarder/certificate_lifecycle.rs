@@ -74,6 +74,33 @@ pub enum LifecycleAction {
     Renewed,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CertificateMetadata {
+    pub issuer: String,
+    pub valid_from: String,
+    pub valid_until: String,
+}
+
+pub(crate) fn inspect_certificate(path: &Path) -> Result<CertificateMetadata, String> {
+    let data = fs::read(path).map_err(|_| "certificate is unavailable")?;
+    let (_, pem) = parse_x509_pem(&data).map_err(|_| "invalid certificate PEM")?;
+    let (_, certificate) =
+        X509Certificate::from_der(&pem.contents).map_err(|_| "invalid certificate DER")?;
+    Ok(CertificateMetadata {
+        issuer: certificate.issuer().to_string(),
+        valid_from: certificate
+            .validity()
+            .not_before
+            .to_rfc2822()
+            .map_err(|_| "invalid certificate not-before")?,
+        valid_until: certificate
+            .validity()
+            .not_after
+            .to_rfc2822()
+            .map_err(|_| "invalid certificate not-after")?,
+    })
+}
+
 /// Local-only guard for scheduler work. A failed renewal drops its lease, so a
 /// later tick can retry; concurrent work for the same camouflage site cannot
 /// invoke Certbot twice.

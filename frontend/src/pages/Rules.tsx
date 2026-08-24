@@ -4,7 +4,7 @@ import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse } from '../api/types';
+import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, NodeStatus, CamouflageSiteStatus } from '../api/types';
 import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
@@ -46,6 +46,65 @@ function normalizeSni(value?: string | null): string | undefined {
   return s || undefined;
 }
 
+export function deriveCamouflageStatus(
+  rule: Pick<ForwardRule, 'id' | 'camouflage_enabled' | 'sni' | 'device_group_in'>,
+  nodes: NodeStatus[],
+): { state: 'disabled' | 'preparing' | 'active' | 'failed'; certificate?: CamouflageSiteStatus } {
+  if (!rule.camouflage_enabled) return { state: 'disabled' };
+  const relevantNodes = nodes.filter(node =>
+    node.group_id === rule.device_group_in && node.online !== false);
+  const observed = relevantNodes
+    .flatMap(node => node.camouflage_sites ?? [])
+    .filter(site => site.sni === normalizeSni(rule.sni));
+  const failed = observed.find(site => site.site_status === 'failed' || site.certificate_status === 'failed');
+  if (failed) return { state: 'failed', certificate: failed };
+  for (const node of relevantNodes) {
+    const active = (node.camouflage_sites ?? []).find(site =>
+      site.sni === normalizeSni(rule.sni)
+        && site.site_status === 'active'
+        && site.certificate_status === 'active');
+    if (active && (node.active_listener_rule_ids ?? []).includes(rule.id)) {
+      return { state: 'active', certificate: active };
+    }
+  }
+  return { state: 'preparing', certificate: observed[0] };
+}
+
+export function CamouflageFormFields({
+  enabled,
+  initialValue,
+  isAdmin,
+  t,
+}: {
+  enabled: boolean;
+  initialValue?: boolean;
+  isAdmin: boolean;
+  t: (key: string) => string;
+}) {
+  return (
+    <>
+      <Form.Item
+        name="camouflage_enabled"
+        label={t('camouflage')}
+        valuePropName="checked"
+        initialValue={initialValue}
+        extra={!isAdmin ? t('camouflageAdminOnly') : undefined}
+      >
+        <Switch aria-label={t('camouflage')} disabled={!isAdmin} />
+      </Form.Item>
+      <Form.Item label={t('camouflageTlsPort')}>
+        <InputNumber aria-label={t('camouflageTlsPort')} value={8443} disabled style={{ width: '100%' }} />
+      </Form.Item>
+      <Form.Item label={t('certificateRenewBefore')}>
+        <InputNumber aria-label={t('certificateRenewBefore')} value={30} addonAfter={t('days')} disabled style={{ width: '100%' }} />
+      </Form.Item>
+      {enabled && (
+        <Alert type="info" showIcon title={t('remoteRealityFallbackHint')} style={{ marginBottom: 12 }} />
+      )}
+    </>
+  );
+}
+
 /** Trigger a browser download of a text file. */
 function downloadText(filename: string, text: string) {
   const blob = new Blob([text], { type: 'application/json' });
@@ -59,7 +118,7 @@ function downloadText(filename: string, text: string) {
 
 export default function Rules() {
   const { t } = useI18n();
-  const { isAdmin, user } = useAuth();
+  const { isAdmin, user, refreshCurrentUser } = useAuth();
   const [searchParams] = useSearchParams();
   // v0.4.20: admin can manage another user's rules via /rules?owner_uid=X.
   const filterOwnerUid: number | null = isAdmin
@@ -74,6 +133,7 @@ export default function Rules() {
   // of a misleading empty inbound dropdown.
   const [sharedLoadFailed, setSharedLoadFailed] = useState(false);
   const [users, setUsers] = useState<User[]>([]);
+  const [nodeStatuses, setNodeStatuses] = useState<NodeStatus[]>([]);
   // v1.0.7: a regular user's own traffic quota (admins read each owner's quota
   // from `users` instead). Used to flag rules whose owner is out of traffic —
   // those rules stop forwarding even though their `paused` flag stays false.
@@ -99,6 +159,10 @@ export default function Rules() {
   // (owner-scoped) set, so searching needs no round-trip.
   const [ruleSearch, setRuleSearch] = useState('');
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([]);
+
+  useEffect(() => {
+    void refreshCurrentUser();
+  }, [refreshCurrentUser]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -127,9 +191,16 @@ export default function Rules() {
           // Non-fatal: owner column falls back to "#uid" labels.
           setUsers([]);
         }
+        try {
+          const n = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes');
+          setNodeStatuses(n.data || []);
+        } catch {
+          setNodeStatuses([]);
+        }
         setSelfQuota(null);
       } else {
         setUsers([]);
+        setNodeStatuses([]);
         // v1.0.7: a regular user only ever sees their own rules, so one /user/me
         // read gives the quota needed to flag all of them. Non-fatal on failure.
         try {
@@ -230,6 +301,7 @@ export default function Rules() {
     tunnel_profile_id?: number | null;
     owner_uid?: number | null;
     sni?: string;
+    camouflage_enabled?: boolean;
   }) => {
     const transport = values.public_transport === 'nginx_sni' ? 'nginx_sni' : 'raw';
     const sni = normalizeSni(values.sni);
@@ -252,6 +324,7 @@ export default function Rules() {
       protocol: transport === 'nginx_sni' ? 'tcp' : values.protocol,
       public_transport: transport,
       sni,
+      camouflage_enabled: transport === 'nginx_sni' && values.camouflage_enabled === true,
       tunnel_profile_id: null,
       forward_mode: 'direct',
       route_mode: 'direct',
@@ -274,6 +347,7 @@ export default function Rules() {
       name: r.name, listen_port: r.listen_port, protocol: r.protocol,
       public_transport: r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni' ? 'nginx_sni' : 'raw',
       sni: r.sni ?? undefined,
+      camouflage_enabled: r.camouflage_enabled === true,
       device_group_in: r.device_group_in,
       target_addr: r.target_addr, target_port: r.target_port,
       targets: ruleTargets(r),
@@ -295,6 +369,7 @@ export default function Rules() {
       protocol: r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni' ? 'tcp' : r.protocol,
       public_transport: r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni' ? 'nginx_sni' : 'raw',
       sni: r.sni ?? undefined,
+      camouflage_enabled: r.camouflage_enabled === true,
       device_group_in: r.device_group_in,
       target_addr: r.target_addr,
       target_port: r.target_port,
@@ -397,6 +472,7 @@ const IMPORT_DEFAULTS = {
     auto_restart_minutes?: number;
     public_transport?: string;
     sni?: string;
+    camouflage_enabled?: boolean;
   }) => {
     if (!editing) return;
     const payload: Record<string, unknown> = {};
@@ -414,6 +490,8 @@ const IMPORT_DEFAULTS = {
     if (newTransport !== oldTransport) payload.public_transport = newTransport;
     if (newTransport === 'nginx_sni' && newSni !== normalizeSni(editing.sni)) payload.sni = newSni;
     if (newTransport === 'raw' && oldTransport === 'nginx_sni') payload.sni = null;
+    const newCamouflage = newTransport === 'nginx_sni' && values.camouflage_enabled === true;
+    if (newCamouflage !== (editing.camouflage_enabled === true)) payload.camouflage_enabled = newCamouflage;
     if (values.device_group_in !== undefined && values.device_group_in !== editing.device_group_in) payload.device_group_in = values.device_group_in;
     const newTargets = formTargets(values);
     const oldTargets = ruleTargets(editing);
@@ -686,6 +764,37 @@ const IMPORT_DEFAULTS = {
       },
     },
     {
+      title: t('camouflage'), key: 'camouflage', width: 220,
+      render: (_: unknown, r: ForwardRule) => {
+        const view = deriveCamouflageStatus(r, nodeStatuses);
+        if (view.state === 'disabled') return <Text type="secondary">-</Text>;
+        const status = view.certificate;
+        const days = status?.valid_until
+          ? Math.max(0, Math.floor((new Date(status.valid_until).getTime() - Date.now()) / 86_400_000))
+          : null;
+        return (
+          <Space orientation="vertical" size={2}>
+            <Space size={4}>
+              <Tag color={view.state === 'active' ? 'green' : view.state === 'failed' ? 'red' : 'gold'}>
+                {view.state === 'active' ? t('routeActive') : view.state === 'failed' ? t('routeFailed') : t('routeWaiting')}
+              </Tag>
+              <Tag color={status?.certificate_status === 'active' ? 'green' : status?.certificate_status === 'failed' ? 'red' : 'gold'}>
+                {t('certificate')}: {status?.certificate_status ?? t('preparing')}
+              </Tag>
+            </Space>
+            {status?.issuer && <Text type="secondary">{status.issuer}</Text>}
+            {status?.valid_until && <Text type="secondary">{t('expires')}: {new Date(status.valid_until).toLocaleDateString()} ({days}d)</Text>}
+            {status?.last_success && <Text type="secondary">{t('lastCertificateSuccess')}: {new Date(status.last_success).toLocaleString()}</Text>}
+            {status?.last_error && (
+              <Text type="danger">
+                {status.last_error.toLowerCase().includes('dns') ? t('camouflageDnsMismatch') : status.last_error}
+              </Text>
+            )}
+          </Space>
+        );
+      },
+    },
+    {
       // v0.4.14 PR3: owner is the rule's OWN uid — NOT the inbound group's uid.
       // An admin can create a rule on behalf of a user, and a regular user can
       // attach to an admin-owned shared group, so the rule owner and the group
@@ -770,6 +879,8 @@ const IMPORT_DEFAULTS = {
   const editTransport = Form.useWatch('public_transport', editForm);
   const createIsSni = createTransport === 'nginx_sni';
   const editIsSni = editTransport === 'nginx_sni';
+  const createCamouflage = Form.useWatch('camouflage_enabled', createForm) === true;
+  const editCamouflage = Form.useWatch('camouflage_enabled', editForm) === true;
 
   const hostForForm = (gid?: number) => {
     if (!gid) return '';
@@ -791,12 +902,16 @@ const IMPORT_DEFAULTS = {
   const handleCreateTransportChange = (v: string) => {
     if (v === 'nginx_sni') {
       createForm.setFieldsValue({ protocol: 'tcp', listen_port: createForm.getFieldValue('listen_port') ?? 443 });
+    } else {
+      createForm.setFieldValue('camouflage_enabled', false);
     }
   };
 
   const handleEditTransportChange = (v: string) => {
     if (v === 'nginx_sni') {
       editForm.setFieldsValue({ protocol: 'tcp', listen_port: editForm.getFieldValue('listen_port') ?? 443 });
+    } else {
+      editForm.setFieldValue('camouflage_enabled', false);
     }
   };
 
@@ -885,17 +1000,17 @@ const IMPORT_DEFAULTS = {
     </Form.Item>
   );
 
-  const renderTargetsEditor = () => (
+  const renderTargetsEditor = (realityRelay = false) => (
     <Form.List name="targets" initialValue={[{ host: '', port: undefined as unknown as number, enabled: true }]}>
       {(fields, { add, remove, move }) => (
         <Space orientation="vertical" style={{ width: '100%' }}>
-          <Text strong>{t('targets')}</Text>
+          <Text strong>{realityRelay ? t('remoteRealityBackend') : t('targets')}</Text>
           {fields.map((field, index) => (
             <Space key={field.key} align="baseline" wrap>
               <Form.Item
                 {...field}
                 name={[field.name, 'host']}
-                label={t('address')}
+                label={realityRelay ? t('remoteRealityAddress') : t('address')}
                 rules={[{ required: true }]}
                 style={{ marginBottom: 8 }}
               >
@@ -906,7 +1021,7 @@ const IMPORT_DEFAULTS = {
               <Form.Item
                 {...field}
                 name={[field.name, 'port']}
-                label={t('port')}
+                label={realityRelay ? t('remoteRealityPort') : t('port')}
                 rules={[
                   { required: true, message: t('targetPortInvalid') },
                   {
@@ -1067,14 +1182,22 @@ const IMPORT_DEFAULTS = {
                   <Select options={transportOptions} onChange={handleCreateTransportChange} />
                 </Form.Item>
                 {createIsSni && (
-                  <Form.Item
-                    name="sni"
-                    label={t('sni')}
-                    extra={t('sniHint')}
-                    rules={[{ required: true, message: t('sniRequired') }]}
-                  >
-                    <Input placeholder="op1.example.com" />
-                  </Form.Item>
+                  <>
+                    <Form.Item
+                      name="sni"
+                      label={t('sni')}
+                      extra={t('sniHint')}
+                      rules={[{ required: true, message: t('sniRequired') }]}
+                    >
+                      <Input placeholder="op1.example.com" />
+                    </Form.Item>
+                    <CamouflageFormFields
+                      enabled={createCamouflage}
+                      initialValue={false}
+                      isAdmin={isAdmin}
+                      t={t}
+                    />
+                  </>
                 )}
                 <Form.Item name="protocol" label={t('protocol')} rules={[{ required: true }]} initialValue="tcp_udp"
                   extra={createIsSni ? t('sniTcpOnly') : (isUdp(createProto) ? t('entryTransportUdpOnlyRaw') : undefined)}>
@@ -1094,7 +1217,7 @@ const IMPORT_DEFAULTS = {
               key: 'forward',
               label: t('tabForward'),
               children: (<>
-                {renderTargetsEditor()}
+                {renderTargetsEditor(createIsSni)}
                 {renderStrategyField()}
                 <Form.Item
                   label={<span>{t('rateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
@@ -1133,14 +1256,21 @@ const IMPORT_DEFAULTS = {
                   <Select options={transportOptions} onChange={handleEditTransportChange} />
                 </Form.Item>
                 {editIsSni && (
-                  <Form.Item
-                    name="sni"
-                    label={t('sni')}
-                    extra={t('sniHint')}
-                    rules={[{ required: true, message: t('sniRequired') }]}
-                  >
-                    <Input placeholder="op1.example.com" />
-                  </Form.Item>
+                  <>
+                    <Form.Item
+                      name="sni"
+                      label={t('sni')}
+                      extra={t('sniHint')}
+                      rules={[{ required: true, message: t('sniRequired') }]}
+                    >
+                      <Input placeholder="op1.example.com" />
+                    </Form.Item>
+                    <CamouflageFormFields
+                      enabled={editCamouflage}
+                      isAdmin={isAdmin}
+                      t={t}
+                    />
+                  </>
                 )}
                 <Form.Item name="protocol" label={t('protocol')}
                   extra={editIsSni ? t('sniTcpOnly') : (isUdp(editProto) ? t('entryTransportUdpOnlyRaw') : undefined)}>
@@ -1164,7 +1294,7 @@ const IMPORT_DEFAULTS = {
               forceRender: true,
               label: t('tabForward'),
               children: (<>
-                {renderTargetsEditor()}
+                {renderTargetsEditor(editIsSni)}
                 {renderStrategyField()}
                 <Form.Item
                   label={<span>{t('rateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}

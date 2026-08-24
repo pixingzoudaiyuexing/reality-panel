@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     ws_path TEXT,
     ws_host TEXT,
     sni TEXT,
+    camouflage_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     target_addr TEXT NOT NULL,
     target_port INTEGER NOT NULL,
     load_balance_strategy TEXT NOT NULL DEFAULT 'first',
@@ -382,7 +383,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 28;
+pub const PG_SCHEMA_VERSION: i32 = 29;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1478,6 +1479,20 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 28: enabled nginx_sni per-SNI uniqueness");
     }
 
+    if current < 29 {
+        sqlx::query(
+            "ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS camouflage_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (29) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+        tracing::info!("PG migration 29: forward_rules.camouflage_enabled present");
+    }
+
     Ok(())
 }
 
@@ -1538,7 +1553,7 @@ mod tests {
 
     #[test]
     fn pg_schema_version_matches_latest_migration() {
-        assert_eq!(PG_SCHEMA_VERSION, 28);
+        assert_eq!(PG_SCHEMA_VERSION, 29);
     }
 
     // The real baseline schema must split into runnable statements, and no

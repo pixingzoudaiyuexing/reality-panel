@@ -39,6 +39,12 @@ pub async fn create_rule(
     State(state): State<AppState>,
     Json(req): Json<CreateRuleRequest>,
 ) -> Json<ApiResponse<()>> {
+    if req.camouflage_enabled && !user.admin {
+        return Json(err(
+            403,
+            "camouflage-enabled Reality relay rules are admin-only",
+        ));
+    }
     // v1.0.4: non-admin users with a RESTRICTED permission group (group set +
     // allow_all_groups=false) can only create rules on authorized device
     // groups. An empty authorized list means "no groups allowed" → deny. Legacy
@@ -68,7 +74,25 @@ pub async fn create_rule(
     match crate::service::rules::create_rule(state.db.as_ref(), user.user_id, user.admin, &req)
         .await
     {
-        Ok(()) => {
+        Ok(rule_id) => {
+            if req.camouflage_enabled {
+                let detail = format!(
+                    "sni={} public_port={} remote={}:{} camouflage=enabled result=success",
+                    req.sni.as_deref().unwrap_or_default(),
+                    req.listen_port.unwrap_or_default(),
+                    req.target_addr,
+                    req.target_port
+                );
+                crate::service::audit::record(
+                    &state,
+                    Some(user.user_id),
+                    "create_reality_relay_rule",
+                    "rule",
+                    rule_id,
+                    &detail,
+                )
+                .await;
+            }
             state
                 .node_connections
                 .broadcast_all(r#"{"type":"config_changed"}"#)
@@ -94,6 +118,25 @@ pub async fn update_rule(
     Json(req): Json<UpdateRuleRequest>,
 ) -> Json<ApiResponse<()>> {
     let scope = user.resource_scope();
+    let existing_snapshot = match state.db.find_rule_by_id(id, &scope).await {
+        Ok(rule) => rule,
+        Err(e) => {
+            tracing::error!("update_rule: rule lookup failed: {}", e);
+            return Json(err(500, "数据库错误"));
+        }
+    };
+    if !user.admin
+        && (existing_snapshot
+            .as_ref()
+            .map(|rule| rule.camouflage_enabled)
+            .unwrap_or(false)
+            || req.camouflage_enabled == Some(true))
+    {
+        return Json(err(
+            403,
+            "camouflage-enabled Reality relay rules are admin-only",
+        ));
+    }
     // v1.0.4: restricted non-admin users can only switch to authorized device
     // groups. Legacy/allow-all users skip this. DB error → 500.
     if !user.admin {
@@ -160,6 +203,37 @@ pub async fn update_rule(
     }
     match crate::service::rules::update_rule(state.db.as_ref(), id, &scope, &req).await {
         Ok(()) => {
+            if user.admin
+                && (existing_snapshot
+                    .as_ref()
+                    .map(|rule| rule.camouflage_enabled)
+                    .unwrap_or(false)
+                    || req.camouflage_enabled == Some(true))
+            {
+                if let Ok(Some(rule)) = state.db.find_rule_by_id(id, &scope).await {
+                    let detail = format!(
+                        "sni={} public_port={} remote={}:{} camouflage={} result=success",
+                        rule.sni.as_deref().unwrap_or_default(),
+                        rule.listen_port,
+                        rule.target_addr,
+                        rule.target_port,
+                        if rule.camouflage_enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                    crate::service::audit::record(
+                        &state,
+                        Some(user.user_id),
+                        "update_reality_relay_rule",
+                        "rule",
+                        id,
+                        &detail,
+                    )
+                    .await;
+                }
+            }
             state
                 .node_connections
                 .broadcast_all(r#"{"type":"config_changed"}"#)
@@ -185,10 +259,25 @@ pub async fn delete_rule(
     let scope = user.resource_scope();
     // Snapshot the name before the delete — afterwards there is no row to read
     // it from, and "rule 12" alone doesn't answer "who deleted my rule".
-    let rule_name = match state.db.find_rule_by_id(id, &scope).await {
-        Ok(Some(r)) => r.name,
-        _ => String::new(),
+    let rule_snapshot = match state.db.find_rule_by_id(id, &scope).await {
+        Ok(rule) => rule,
+        Err(_) => None,
     };
+    if !user.admin
+        && rule_snapshot
+            .as_ref()
+            .map(|rule| rule.camouflage_enabled)
+            .unwrap_or(false)
+    {
+        return Json(err(
+            403,
+            "camouflage-enabled Reality relay rules are admin-only",
+        ));
+    }
+    let rule_name = rule_snapshot
+        .as_ref()
+        .map(|rule| rule.name.clone())
+        .unwrap_or_default();
     // v0.3.6: check rows_affected(). A non-existent rule previously returned
     // success AND broadcast config_changed — a no-op mutation that needlessly
     // triggered a node re-fetch. Now 404 + no broadcast when nothing was deleted.
@@ -215,6 +304,24 @@ pub async fn delete_rule(
                 &rule_name,
             )
             .await;
+            if let Some(rule) = rule_snapshot.filter(|rule| rule.camouflage_enabled) {
+                let detail = format!(
+                    "sni={} public_port={} remote={}:{} camouflage=enabled result=success",
+                    rule.sni.as_deref().unwrap_or_default(),
+                    rule.listen_port,
+                    rule.target_addr,
+                    rule.target_port
+                );
+                crate::service::audit::record(
+                    &state,
+                    Some(user.user_id),
+                    "delete_reality_relay_rule",
+                    "rule",
+                    id,
+                    &detail,
+                )
+                .await;
+            }
             state
                 .node_connections
                 .broadcast_all(r#"{"type":"config_changed"}"#)

@@ -66,6 +66,8 @@ export interface ForwardRule {
   ws_path?: string | null;
   /** Required when public_transport/node_transport is "nginx_sni". */
   sni?: string | null;
+  /** Relay-local :8443/OpenList camouflage dependency for Reality SNI rules. */
+  camouflage_enabled?: boolean;
   device_group_in: number;
   device_group_out: number | null;
   forward_mode: string;
@@ -434,6 +436,20 @@ export interface ListenerError {
   error: string;
 }
 
+export interface CamouflageSiteStatus {
+  site_id: string;
+  sni: string;
+  site_status: 'preparing' | 'active' | 'failed' | string;
+  certificate_status: 'pending' | 'active' | 'failed' | string;
+  issuer?: string | null;
+  valid_from?: string | null;
+  valid_until?: string | null;
+  last_success?: string | null;
+  last_attempt?: string | null;
+  last_error?: string | null;
+  active_generation?: string | null;
+}
+
 export interface NodeStatus {
   group_id: number;
   /** Per-node identity. Null/undefined for legacy single-node status rows. */
@@ -490,6 +506,8 @@ export interface NodeStatus {
    *  denied, etc.). Missing/empty = all listeners healthy. Older nodes don't
    *  report it; render "ok" for them. */
   listener_errors?: ListenerError[] | null;
+  camouflage_sites?: CamouflageSiteStatus[] | null;
+  active_listener_rule_ids?: number[] | null;
 }
 
 export interface LoginResponse {

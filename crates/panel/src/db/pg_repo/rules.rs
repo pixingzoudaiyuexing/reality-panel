@@ -37,6 +37,7 @@ impl PgRepository {
             entry_transport,
             ws_path,
             None,
+            false,
             device_group_in,
             device_group_out,
             forward_mode,
@@ -81,6 +82,7 @@ impl PgRepository {
             entry_transport,
             ws_path,
             None,
+            false,
             device_group_in,
             device_group_out,
             forward_mode,
@@ -127,6 +129,7 @@ impl PgRepository {
             entry_transport,
             route_mode,
             ws_path,
+            None,
             None,
             device_group_in,
             device_group_out,
@@ -429,6 +432,7 @@ impl RuleRepository for PgRepository {
         entry_transport: &str,
         ws_path: Option<&str>,
         sni: Option<&str>,
+        camouflage_enabled: bool,
         device_group_in: i64,
         device_group_out: Option<i64>,
         forward_mode: &str,
@@ -504,17 +508,17 @@ impl RuleRepository for PgRepository {
             }
         }
 
-        // 14 row-value binds ($1..$14) + 3 uid binds for the WHERE subqueries
-        // ($15..$17). Same atomic quota-guarded INSERT shape as SQLite.
+        // 16 row-value binds + 3 uid binds for the WHERE subqueries. Same
+        // atomic quota-guarded INSERT shape as SQLite.
         let result = sqlx::query(
             "INSERT INTO forward_rules \
                (name, uid, listen_port, protocol, public_transport, node_transport, \
-                route_mode, entry_transport, ws_path, sni, \
+                route_mode, entry_transport, ws_path, sni, camouflage_enabled, \
                 device_group_in, device_group_out, forward_mode, target_addr, target_port) \
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15 \
-             WHERE (SELECT max_rules FROM users WHERE id = $16) = 0 \
-                OR (SELECT COUNT(*) FROM forward_rules WHERE uid = $17) \
-                   < (SELECT max_rules FROM users WHERE id = $18)",
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16 \
+             WHERE (SELECT max_rules FROM users WHERE id = $17) = 0 \
+                OR (SELECT COUNT(*) FROM forward_rules WHERE uid = $18) \
+                   < (SELECT max_rules FROM users WHERE id = $19)",
         )
         .bind(name)
         .bind(uid)
@@ -526,6 +530,7 @@ impl RuleRepository for PgRepository {
         .bind(entry_transport)
         .bind(ws_path)
         .bind(sni)
+        .bind(camouflage_enabled)
         .bind(device_group_in)
         .bind(device_group_out)
         .bind(forward_mode)
@@ -563,6 +568,7 @@ impl RuleRepository for PgRepository {
         entry_transport: &str,
         ws_path: Option<&str>,
         sni: Option<&str>,
+        camouflage_enabled: bool,
         device_group_in: i64,
         device_group_out: Option<i64>,
         forward_mode: &str,
@@ -655,12 +661,12 @@ impl RuleRepository for PgRepository {
             sqlx::query_scalar(
                 "INSERT INTO forward_rules \
                    (name, uid, listen_port, protocol, public_transport, node_transport, \
-                    route_mode, entry_transport, ws_path, sni, \
+                    route_mode, entry_transport, ws_path, sni, camouflage_enabled, \
                     device_group_in, device_group_out, forward_mode, target_addr, target_port) \
-                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15 \
-                 WHERE (SELECT max_rules FROM users WHERE id = $16) = 0 \
-                    OR (SELECT COUNT(*) FROM forward_rules WHERE uid = $17) \
-                       < (SELECT max_rules FROM users WHERE id = $18) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16 \
+                 WHERE (SELECT max_rules FROM users WHERE id = $17) = 0 \
+                    OR (SELECT COUNT(*) FROM forward_rules WHERE uid = $18) \
+                       < (SELECT max_rules FROM users WHERE id = $19) \
                  RETURNING id",
             )
             .bind(name)
@@ -673,6 +679,7 @@ impl RuleRepository for PgRepository {
             .bind(entry_transport)
             .bind(ws_path)
             .bind(sni)
+            .bind(camouflage_enabled)
             .bind(device_group_in)
             .bind(device_group_out)
             .bind(forward_mode)
@@ -810,6 +817,7 @@ impl RuleRepository for PgRepository {
         route_mode: Option<&str>,
         ws_path: Option<Option<&str>>,
         sni: Option<Option<&str>>,
+        camouflage_enabled: Option<bool>,
         device_group_in: Option<i64>,
         device_group_out: Option<Option<i64>>,
         forward_mode: Option<&str>,
@@ -843,6 +851,9 @@ impl RuleRepository for PgRepository {
         }
         if sni.is_some() {
             sets.push("sni = ");
+        }
+        if camouflage_enabled.is_some() {
+            sets.push("camouflage_enabled = ");
         }
         if device_group_in.is_some() {
             sets.push("device_group_in = ");
@@ -920,6 +931,9 @@ impl RuleRepository for PgRepository {
             q = q.bind(v);
         }
         if let Some(v) = sni {
+            q = q.bind(v);
+        }
+        if let Some(v) = camouflage_enabled {
             q = q.bind(v);
         }
         if let Some(v) = device_group_in {

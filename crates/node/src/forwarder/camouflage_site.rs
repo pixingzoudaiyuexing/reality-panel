@@ -5,11 +5,13 @@
 //! used by dedicated REALITY servers as their fallback target.
 
 use super::certificate_lifecycle::{
-    CertificateLifecycle, CertificateLifecycleConfig, LifecycleAction, RenewalGate,
+    inspect_certificate, CertificateLifecycle, CertificateLifecycleConfig,
+    CertificateLifecyclePolicy, LifecycleAction, RenewalGate,
 };
 use super::nginx_sni::{self, NginxSniConfig};
+use relay_shared::protocol::{CamouflageLocalBackend, CamouflageSiteDesired, CamouflageSiteStatus};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -56,6 +58,9 @@ pub struct CamouflageSiteManager {
     config: CamouflageSiteConfig,
     active: Option<CamouflageSitesManifest>,
     renewal_gate: Arc<RenewalGate>,
+    desired: Vec<CamouflageSiteDesired>,
+    last_errors: HashMap<String, String>,
+    panel_authority_established: bool,
 }
 
 impl CamouflageSiteManager {
@@ -64,6 +69,9 @@ impl CamouflageSiteManager {
             config,
             active: None,
             renewal_gate: Arc::new(RenewalGate::default()),
+            desired: Vec::new(),
+            last_errors: HashMap::new(),
+            panel_authority_established: false,
         }
     }
 
@@ -91,25 +99,15 @@ impl CamouflageSiteManager {
             }
         }
 
+        // A successfully restored LKG is authoritative at startup. The source
+        // manifest may predate Panel ownership and must only be a recovery
+        // fallback when no healthy LKG can be activated.
+        if recovered_applied {
+            return true;
+        }
+
         match self.load_manifest() {
-            Ok(manifest) if !recovered_applied || recovered.as_ref() != Some(&manifest) => {
-                if self.reconcile_and_apply_manifest(manifest) {
-                    true
-                } else if recovered_applied {
-                    tracing::warn!("camouflage source candidate failed; retained healthy site LKG");
-                    true
-                } else {
-                    false
-                }
-            }
-            Ok(_) => true,
-            Err(error) if recovered_applied => {
-                tracing::warn!(
-                    "camouflage source manifest unavailable; retained site LKG: {}",
-                    error
-                );
-                true
-            }
+            Ok(manifest) => self.reconcile_and_apply_manifest(manifest),
             Err(error) => {
                 tracing::warn!("camouflage sites unavailable: {}", error);
                 false
@@ -133,7 +131,207 @@ impl CamouflageSiteManager {
         self.reconcile_and_apply_manifest(manifest)
     }
 
-    fn reconcile_and_apply_manifest(&mut self, mut manifest: CamouflageSitesManifest) -> bool {
+    /// Scheduler path after Panel ownership has been established. The active
+    /// LKG carries both the Node-owned generation and lifecycle policy, so it
+    /// remains renewable while the Panel is unavailable.
+    pub fn reconcile_active(&mut self) -> bool {
+        let Some(manifest) = self.active.clone() else {
+            return self.reconcile_from_source();
+        };
+        self.reconcile_and_apply_manifest(manifest)
+    }
+
+    /// Prepare all Panel-desired sites while retaining old active sites. The
+    /// caller activates dependent :443 listeners only for the returned SNI set,
+    /// then calls `finalize_for_listener_snis` to remove unreferenced wrappers.
+    pub fn prepare_desired(&mut self, desired: &[CamouflageSiteDesired]) -> HashSet<String> {
+        self.desired = desired
+            .iter()
+            .filter(|site| site.enabled)
+            .cloned()
+            .collect();
+        if !self.desired.is_empty() {
+            self.panel_authority_established = true;
+        }
+        let mut candidate = self
+            .active
+            .clone()
+            .unwrap_or(CamouflageSitesManifest { sites: Vec::new() });
+
+        for desired_site in &self.desired {
+            if let Err(error) = validate_desired(desired_site) {
+                self.last_errors
+                    .insert(desired_site.site_id.clone(), sanitize_error(&error));
+                continue;
+            }
+            let previous = candidate
+                .sites
+                .iter()
+                .find(|site| site.id == desired_site.site_id || site.sni == desired_site.sni)
+                .cloned();
+            let lifecycle = Some(CertificateLifecyclePolicy {
+                domain: desired_site.certificate.domain.clone(),
+                email: None,
+                expected_public_ip: desired_site.certificate.expected_public_ip.clone(),
+                renew_before_days: desired_site.certificate.renew_before_days,
+            });
+            let certificate = previous
+                .as_ref()
+                .map(|site| {
+                    let mut certificate = site.certificate.clone();
+                    certificate.lifecycle = lifecycle.clone();
+                    certificate
+                })
+                .or_else(|| {
+                    latest_installed_certificate(
+                        &self.config.certificate_lifecycle.state_dir,
+                        &desired_site.site_id,
+                        lifecycle.clone(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    let pending = self
+                        .config
+                        .certificate_lifecycle
+                        .state_dir
+                        .join("pending")
+                        .join(&desired_site.site_id);
+                    CertificateReference {
+                        cert_path: pending.join("fullchain.pem"),
+                        key_path: pending.join("privkey.pem"),
+                        lifecycle,
+                    }
+                });
+            candidate
+                .sites
+                .retain(|site| site.id != desired_site.site_id && site.sni != desired_site.sni);
+            candidate.sites.push(CamouflageSite {
+                id: desired_site.site_id.clone(),
+                sni: desired_site.sni.clone(),
+                tls_listener_port: desired_site.tls_listener_port,
+                local_backend: OPENLIST_BACKEND.to_string(),
+                certificate,
+            });
+        }
+
+        match self.try_reconcile_and_apply_manifest(candidate) {
+            Ok(()) => {
+                for site in &self.desired {
+                    self.last_errors.remove(&site.site_id);
+                }
+            }
+            Err(error) => {
+                let error = sanitize_error(&error);
+                for site in &self.desired {
+                    if !self.active_snis().contains(&site.sni) {
+                        self.last_errors.insert(site.site_id.clone(), error.clone());
+                    }
+                }
+            }
+        }
+        self.active_snis()
+    }
+
+    /// Remove sites only after the effective listener transaction succeeded.
+    pub fn finalize_for_listener_snis(&mut self, referenced_snis: &HashSet<String>) -> bool {
+        if !self.panel_authority_established && self.desired.is_empty() {
+            return true;
+        }
+        let Some(active) = self.active.clone() else {
+            return referenced_snis.is_empty();
+        };
+        let candidate = CamouflageSitesManifest {
+            sites: active
+                .sites
+                .into_iter()
+                .filter(|site| referenced_snis.contains(&site.sni))
+                .collect(),
+        };
+        if self.active.as_ref() == Some(&candidate) {
+            return true;
+        }
+        self.apply_candidate(candidate)
+    }
+
+    pub fn active_snis(&self) -> HashSet<String> {
+        self.active
+            .as_ref()
+            .map(|manifest| manifest.sites.iter().map(|site| site.sni.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn status_snapshot(&self) -> Vec<CamouflageSiteStatus> {
+        self.desired
+            .iter()
+            .map(|desired| {
+                let active = self.active.as_ref().and_then(|manifest| {
+                    manifest
+                        .sites
+                        .iter()
+                        .find(|site| site.id == desired.site_id && site.sni == desired.sni)
+                });
+                let metadata =
+                    active.and_then(|site| inspect_certificate(&site.certificate.cert_path).ok());
+                let error = self.last_errors.get(&desired.site_id).cloned();
+                let is_active = active.is_some() && metadata.is_some();
+                let failed = !is_active && error.is_some();
+                CamouflageSiteStatus {
+                    site_id: desired.site_id.clone(),
+                    sni: desired.sni.clone(),
+                    site_status: if is_active {
+                        "active"
+                    } else if failed {
+                        "failed"
+                    } else {
+                        "preparing"
+                    }
+                    .into(),
+                    certificate_status: if is_active {
+                        "active"
+                    } else if failed {
+                        "failed"
+                    } else {
+                        "pending"
+                    }
+                    .into(),
+                    issuer: metadata.as_ref().map(|value| value.issuer.clone()),
+                    valid_from: metadata.as_ref().map(|value| value.valid_from.clone()),
+                    valid_until: metadata.as_ref().map(|value| value.valid_until.clone()),
+                    // The certificate not-before is the durable Node-local
+                    // issuance/renewal timestamp available after restart.
+                    last_success: metadata.as_ref().map(|value| value.valid_from.clone()),
+                    last_attempt: None,
+                    last_error: error,
+                    active_generation: active.and_then(|site| {
+                        site.certificate
+                            .cert_path
+                            .parent()
+                            .and_then(Path::file_name)
+                            .and_then(|value| value.to_str())
+                            .map(str::to_string)
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    fn reconcile_and_apply_manifest(&mut self, manifest: CamouflageSitesManifest) -> bool {
+        match self.try_reconcile_and_apply_manifest(manifest) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::error!(
+                    "camouflage certificate lifecycle failed; retained current certificate: {}",
+                    sanitize_error(&error)
+                );
+                false
+            }
+        }
+    }
+
+    fn try_reconcile_and_apply_manifest(
+        &mut self,
+        mut manifest: CamouflageSitesManifest,
+    ) -> Result<(), String> {
         let site_ids = manifest
             .sites
             .iter()
@@ -142,8 +340,7 @@ impl CamouflageSiteManager {
             .collect();
         let renewal_gate = Arc::clone(&self.renewal_gate);
         let Some(_renewal_lease) = renewal_gate.try_acquire(site_ids) else {
-            tracing::warn!("camouflage certificate renewal already in progress");
-            return false;
+            return Err("camouflage certificate renewal already in progress".into());
         };
         // The source manifest carries policy, while a healthy LKG carries the
         // active Node-owned generation. Do not regress a periodic check back
@@ -161,23 +358,18 @@ impl CamouflageSiteManager {
         }
 
         let lifecycle = CertificateLifecycle::new(self.config.certificate_lifecycle.clone());
-        let (candidate, actions) = match lifecycle.reconcile(&manifest) {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::error!(
-                    "camouflage certificate lifecycle failed; retained current certificate: {}",
-                    error
-                );
-                return false;
-            }
-        };
+        let (candidate, actions) = lifecycle.reconcile(&manifest)?;
         if actions
             .iter()
             .any(|action| *action != LifecycleAction::Unchanged)
         {
             tracing::info!("camouflage certificate lifecycle installed a validated generation");
         }
-        self.apply_candidate(candidate)
+        if self.apply_candidate(candidate) {
+            Ok(())
+        } else {
+            Err("camouflage runtime validation or LKG commit failed".into())
+        }
     }
 
     pub fn apply_candidate(&mut self, candidate: CamouflageSitesManifest) -> bool {
@@ -305,9 +497,6 @@ impl CamouflageSiteManager {
 }
 
 pub fn validate_manifest(manifest: &CamouflageSitesManifest) -> Result<(), String> {
-    if manifest.sites.is_empty() {
-        return Err("camouflage site manifest is empty".to_string());
-    }
     let mut ids = HashSet::new();
     let mut names = HashSet::new();
     for site in &manifest.sites {
@@ -336,6 +525,56 @@ pub fn validate_manifest(manifest: &CamouflageSitesManifest) -> Result<(), Strin
         }
     }
     Ok(())
+}
+
+fn validate_desired(site: &CamouflageSiteDesired) -> Result<(), String> {
+    if !is_safe_id(&site.site_id) || !is_valid_domain(&site.sni) {
+        return Err("invalid camouflage desired identity".into());
+    }
+    if site.tls_listener_port != CAMOUFLAGE_TLS_PORT
+        || site.local_backend != CamouflageLocalBackend::OpenList
+    {
+        return Err("invalid camouflage desired endpoint".into());
+    }
+    if site.certificate.domain != site.sni
+        || site
+            .certificate
+            .expected_public_ip
+            .parse::<std::net::IpAddr>()
+            .is_err()
+        || !(1..=365).contains(&site.certificate.renew_before_days)
+    {
+        return Err("invalid camouflage certificate policy".into());
+    }
+    Ok(())
+}
+
+fn sanitize_error(error: &str) -> String {
+    let compact = error.replace(['\r', '\n'], " ");
+    compact.chars().take(240).collect()
+}
+
+fn latest_installed_certificate(
+    state_dir: &Path,
+    site_id: &str,
+    lifecycle: Option<CertificateLifecyclePolicy>,
+) -> Option<CertificateReference> {
+    let generations = state_dir.join("generations").join(site_id);
+    let mut entries: Vec<_> = fs::read_dir(generations)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    entries.into_iter().rev().find_map(|entry| {
+        let cert_path = entry.path().join("fullchain.pem");
+        let key_path = entry.path().join("privkey.pem");
+        (cert_path.is_file() && key_path.is_file()).then_some(CertificateReference {
+            cert_path,
+            key_path,
+            lifecycle: lifecycle.clone(),
+        })
+    })
 }
 
 pub fn render_camouflage_config(manifest: &CamouflageSitesManifest) -> Result<Vec<u8>, String> {
@@ -774,6 +1013,39 @@ mod tests {
         assert_eq!(restarted.active, Some(expected));
         let runtime = fs::read_to_string(&restarted.config.nginx.conf_path).unwrap();
         assert!(runtime.contains("op1.example.com"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restart_keeps_healthy_panel_lkg_when_source_manifest_is_stale() {
+        let dir = unique_dir("stale-source-restart");
+        let mut first = manager(&dir, "true", "true");
+        let panel_lkg = CamouflageSitesManifest {
+            sites: vec![site(&dir, "panel-site", "op1.example.com")],
+        };
+        assert!(first.apply_candidate(panel_lkg.clone()));
+        let lkg_before = fs::read(first.lkg_path()).unwrap();
+
+        let stale_source = CamouflageSitesManifest {
+            sites: vec![site(&dir, "old-local-site", "op1.example.com")],
+        };
+        write_private_file(
+            &first.config.manifest_path,
+            &serde_json::to_vec_pretty(&stale_source).unwrap(),
+        )
+        .unwrap();
+
+        let mut restarted = manager(&dir, "true", "true");
+        assert!(restarted.restore_and_apply());
+        assert_eq!(restarted.active, Some(panel_lkg.clone()));
+        assert_eq!(fs::read(restarted.lkg_path()).unwrap(), lkg_before);
+        assert_eq!(
+            restarted.active.as_ref().unwrap().sites[0].certificate,
+            panel_lkg.sites[0].certificate
+        );
+        let runtime = fs::read_to_string(&restarted.config.nginx.conf_path).unwrap();
+        assert!(runtime.contains("panel-site.crt"));
+        assert!(!runtime.contains("old-local-site.crt"));
         let _ = fs::remove_dir_all(dir);
     }
 

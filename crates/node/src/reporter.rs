@@ -2,7 +2,7 @@ use crate::config::NodeConfig;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use relay_shared::protocol::{
-    ApiResponse, ListenerError, StatusReport, TrafficEntry, TrafficReport,
+    ApiResponse, CamouflageSiteStatus, ListenerError, StatusReport, TrafficEntry, TrafficReport,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -802,6 +802,8 @@ pub async fn report_status(
     start_time: Instant,
     node_id: &str,
     listener_errors: Vec<ListenerError>,
+    camouflage_sites: Vec<CamouflageSiteStatus>,
+    active_listener_rule_ids: Vec<i64>,
 ) {
     let snap = metrics.snapshot().await;
     let active_connections = connections.current().await;
@@ -846,6 +848,8 @@ pub async fn report_status(
         // self-upgrade to systemd nodes (docker → update image; manual → none).
         install_method: Some(crate::updater::install_method().to_string()),
         architecture: Some(std::env::consts::ARCH.to_string()),
+        camouflage_sites: Some(camouflage_sites),
+        active_listener_rule_ids: Some(active_listener_rule_ids),
     };
 
     // debug, not info: this runs every poll cycle (default 10s). Keeping it
@@ -1248,6 +1252,7 @@ mod tests {
         // and completes in bounded time.
         let listeners: Vec<ListenerConfig> = (0..1000)
             .map(|i| ListenerConfig {
+                camouflage_required: false,
                 rule_id: i,
                 port: 40000 + (i as u16),
                 protocol: relay_shared::protocol::Protocol::Tcp,
@@ -1261,7 +1266,10 @@ mod tests {
                 max_connections: None,
             })
             .collect();
-        let cfg = NodeConfigResponse { listeners };
+        let cfg = NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners,
+        };
 
         // apply_config should return promptly even for 1000 rules — the diff
         // is O(n) and binding happens in spawned tasks, not inline.

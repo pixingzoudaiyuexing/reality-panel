@@ -1,4 +1,5 @@
 use crate::config::NodeConfig;
+use crate::forwarder::camouflage_site::CamouflageSiteManager;
 use crate::forwarder::ForwarderManager;
 use crate::poller;
 use std::future::Future;
@@ -52,6 +53,7 @@ fn derive_ws_url(panel_url: &str) -> String {
 pub async fn run_ws_loop(
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
+    camouflage: &Arc<Mutex<CamouflageSiteManager>>,
     node_id: &str,
 ) {
     let ws_url = derive_ws_url(&config.panel_url);
@@ -64,7 +66,8 @@ pub async fn run_ws_loop(
     loop {
         tracing::info!("websocket connecting to {} ...", ws_url);
 
-        let exit = connect_and_run(&ws_url, &config.token, config, manager, node_id).await;
+        let exit =
+            connect_and_run(&ws_url, &config.token, config, manager, camouflage, node_id).await;
         match exit {
             WsExit::ConfigChanged => {
                 tracing::info!("websocket: config_changed received, reconnecting immediately");
@@ -162,6 +165,7 @@ async fn connect_and_run(
     token: &str,
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
+    camouflage: &Arc<Mutex<CamouflageSiteManager>>,
     node_id: &str,
 ) -> WsExit {
     use futures_util::{SinkExt, StreamExt};
@@ -286,7 +290,7 @@ async fn connect_and_run(
                                 "websocket: received config ({} listeners), applying",
                                 resp.listeners.len()
                             );
-                            if apply_snapshot(manager, &resp).await {
+                            if apply_snapshot(manager, camouflage, &resp).await {
                                 tracing::info!("websocket: config applied and committed as LKG");
                             } else {
                                 tracing::warn!("websocket: config apply/commit failed; preserving LKG");
@@ -295,7 +299,7 @@ async fn connect_and_run(
                             tracing::info!("websocket: config_changed received, re-fetching");
                             match poller::fetch_config(config).await {
                                 poller::FetchResult::Ok(resp) => {
-                                    if apply_snapshot(manager, &resp).await {
+                                    if apply_snapshot(manager, camouflage, &resp).await {
                                         tracing::info!("websocket: config applied after config_changed");
                                     } else {
                                         tracing::warn!("websocket: config_changed apply/commit failed; preserving LKG");
@@ -510,9 +514,10 @@ async fn connect_and_run(
 /// path. The cache is never updated merely because a socket delivered JSON.
 async fn apply_snapshot(
     manager: &std::sync::Arc<tokio::sync::Mutex<crate::forwarder::ForwarderManager>>,
+    camouflage: &std::sync::Arc<tokio::sync::Mutex<CamouflageSiteManager>>,
     config: &relay_shared::protocol::NodeConfigResponse,
 ) -> bool {
-    poller::apply_and_commit(manager, config).await
+    poller::apply_and_commit_coordinated(manager, camouflage, config).await
 }
 
 #[cfg(test)]
@@ -604,7 +609,10 @@ mod tests {
     #[tokio::test]
     async fn ws_successful_snapshot_persists_lkg() {
         let paths = cache_paths("success");
-        let snapshot = NodeConfigResponse { listeners: vec![] };
+        let snapshot = NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners: vec![],
+        };
 
         assert!(apply_snapshot_at(&manager(), &snapshot, &paths).await);
         assert!(paths.primary.exists());
@@ -616,7 +624,9 @@ mod tests {
     async fn ws_failed_apply_does_not_replace_lkg() {
         let paths = cache_paths("failure");
         let old = NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
+                camouflage_required: false,
                 rule_id: 1,
                 port: 22001,
                 protocol: Protocol::Tcp,
@@ -632,7 +642,9 @@ mod tests {
         };
         poller::commit_cache_at(&old, &paths).unwrap();
         let invalid = NodeConfigResponse {
+            camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
+                camouflage_required: false,
                 port: 0,
                 ..old.listeners[0].clone()
             }],

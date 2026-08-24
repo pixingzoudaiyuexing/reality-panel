@@ -11,6 +11,7 @@ use crate::db::repo::{GroupRepository, ProfileScope, Repository, ResourceScope};
 use relay_shared::protocol::{
     CreateRuleRequest, GroupType, Protocol, PublicTransport, RuleTargetRequest, UpdateRuleRequest,
 };
+use std::net::IpAddr;
 
 /// v0.4.20: forward_mode is locked to "direct" at the API boundary
 /// (create_rule / update_rule reject group/chain). This validator is retained
@@ -78,14 +79,21 @@ pub fn normalize_sni(sni: Option<&str>) -> Option<String> {
 
 pub fn is_plausible_sni(sni: &str) -> bool {
     let s = sni.trim();
-    if s.is_empty() || s.len() > 253 || s.contains("://") || s.contains('/') {
+    if s.is_empty()
+        || s.len() > 253
+        || s.contains("://")
+        || s.contains('/')
+        || s.split('.').count() < 2
+    {
         return false;
     }
-    if s.chars().any(char::is_whitespace) {
-        return false;
-    }
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+    s.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
 }
 
 fn rule_port_conflicts(
@@ -191,6 +199,19 @@ pub fn normalize_rule_targets(
         return Err("At least one target must be enabled");
     }
     Ok(out)
+}
+
+fn validate_reality_targets(targets: &[RuleTargetRequest]) -> Result<(), &'static str> {
+    for target in targets.iter().filter(|target| target.enabled) {
+        let host = target.host.trim();
+        if host.parse::<IpAddr>().is_err() && !is_plausible_sni(host) {
+            return Err("Remote Reality host must be an IP address or fully-qualified domain");
+        }
+        if target.port == 0 {
+            return Err("Remote Reality port must be between 1 and 65535");
+        }
+    }
+    Ok(())
 }
 
 /// Map GroupType enum to stable DB string.
@@ -393,12 +414,37 @@ async fn validate_owner_outbound_group(
     }
 }
 
+async fn validate_camouflage_relay_ip(
+    db: &dyn Repository,
+    gid: i64,
+    context: &str,
+) -> Result<(), CreateRuleError> {
+    let group = GroupRepository::find_by_id(db, gid, &ResourceScope::All)
+        .await
+        .map_err(|error| {
+            tracing::error!("{}: camouflage group lookup failed: {}", context, error);
+            CreateRuleError::Database(error)
+        })?
+        .ok_or_else(|| CreateRuleError::BadRequest("device_group_in not found".into()))?;
+    let ip: IpAddr = group.connect_host.trim().parse().map_err(|_| {
+        CreateRuleError::BadRequest(
+            "camouflage requires device_group_in.connect_host to be the Relay public IP".into(),
+        )
+    })?;
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Err(CreateRuleError::BadRequest(
+            "camouflage requires a routable Relay public IP".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn create_rule(
     db: &dyn Repository,
     caller_user_id: i64,
     caller_admin: bool,
     req: &CreateRuleRequest,
-) -> Result<(), CreateRuleError> {
+) -> Result<i64, CreateRuleError> {
     // v0.4.10: resolve the rule's owner. An admin may specify owner_uid to
     // create on behalf of another user; a non-admin's owner_uid is IGNORED and
     // the rule is attributed to themselves (defense against forgery).
@@ -549,6 +595,21 @@ pub async fn create_rule(
             ));
         }
     }
+    if req.camouflage_enabled {
+        if !caller_admin {
+            return Err(CreateRuleError::BadRequest(
+                "camouflage-enabled Reality relay rules are admin-only".into(),
+            ));
+        }
+        if req.public_transport != PublicTransport::NginxSni {
+            return Err(CreateRuleError::BadRequest(
+                "camouflage can only be enabled for nginx_sni transport".into(),
+            ));
+        }
+        validate_camouflage_relay_ip(db, req.device_group_in, "create_rule").await?;
+        validate_reality_targets(&targets)
+            .map_err(|message| CreateRuleError::BadRequest(message.into()))?;
+    }
     let ws_path: Option<String> = if req.public_transport == PublicTransport::Ws {
         req.ws_path
             .as_ref()
@@ -601,6 +662,7 @@ pub async fn create_rule(
                 (req.public_transport == PublicTransport::NginxSni)
                     .then_some(sni.as_deref())
                     .flatten(),
+                req.camouflage_enabled,
                 req.device_group_in,
                 req.device_group_out,
                 &req.forward_mode,
@@ -642,7 +704,7 @@ pub async fn create_rule(
                 current_count, max_rules
             )))
         }
-        Ok(Some(_)) => Ok(()),
+        Ok(Some(rule_id)) => Ok(rule_id),
         Err(DbError::PortConflict | DbError::UniqueViolation) => {
             Err(CreateRuleError::PortConflict(last_port.unwrap_or(0)))
         }
@@ -753,6 +815,7 @@ pub async fn update_rule(
         || req.route_mode.is_some()
         || req.ws_path.is_some()
         || req.sni.is_some()
+        || req.camouflage_enabled.is_some()
         || req.device_group_in.is_some()
         || req.device_group_out.is_some()
         || req.forward_mode.is_some()
@@ -776,6 +839,7 @@ pub async fn update_rule(
         || req.route_mode.is_some()
         || req.ws_path.is_some()
         || req.sni.is_some()
+        || req.camouflage_enabled.is_some()
         || req.device_group_in.is_some()
         || req.device_group_out.is_some()
         || req.forward_mode.is_some()
@@ -900,6 +964,51 @@ pub async fn update_rule(
             ));
         }
     }
+    let effective_camouflage = req
+        .camouflage_enabled
+        .unwrap_or(existing.camouflage_enabled);
+    if effective_camouflage {
+        if effective_transport != PublicTransport::NginxSni {
+            return Err(UpdateRuleError::BadRequest(
+                "camouflage can only be enabled for nginx_sni transport".into(),
+            ));
+        }
+        let group_id = req.device_group_in.unwrap_or(existing.device_group_in);
+        validate_camouflage_relay_ip(db, group_id, "update_rule")
+            .await
+            .map_err(map_create_rule_validation_error)?;
+        let effective_targets = if let Some(targets) = normalized_targets.as_ref() {
+            targets.clone()
+        } else {
+            let stored_targets = db
+                .list_enabled_rule_targets(id, scope)
+                .await
+                .map_err(UpdateRuleError::Database)?;
+            if stored_targets.is_empty() {
+                vec![RuleTargetRequest {
+                    host: req
+                        .target_addr
+                        .clone()
+                        .unwrap_or_else(|| existing.target_addr.clone()),
+                    port: req
+                        .target_port
+                        .unwrap_or_else(|| u16::try_from(existing.target_port).unwrap_or(0)),
+                    enabled: true,
+                }]
+            } else {
+                stored_targets
+                    .into_iter()
+                    .map(|target| RuleTargetRequest {
+                        host: target.host,
+                        port: u16::try_from(target.port).unwrap_or(0),
+                        enabled: target.enabled,
+                    })
+                    .collect()
+            }
+        };
+        validate_reality_targets(&effective_targets)
+            .map_err(|message| UpdateRuleError::BadRequest(message.into()))?;
+    }
 
     if let Some(new_proto) = req.protocol.as_ref() {
         let effective_pid = match req.tunnel_profile_id {
@@ -1010,6 +1119,7 @@ pub async fn update_rule(
             req.route_mode.as_ref().map(|r| r.to_db_str()),
             ws_path,
             sni_update,
+            req.camouflage_enabled,
             req.device_group_in,
             device_group_out_arg,
             req.forward_mode.as_deref(),
@@ -1147,6 +1257,9 @@ mod tests {
         assert!(!is_plausible_sni("*.example.com"));
         assert!(!is_plausible_sni("https://example.com"));
         assert!(!is_plausible_sni("example.com/path"));
+        assert!(!is_plausible_sni("single-label"));
+        assert!(!is_plausible_sni("bad..example.com"));
+        assert!(!is_plausible_sni("-bad.example.com"));
     }
 
     /// UDP / TCP+UDP over WS must be rejected (WS carries TCP only in alpha).
@@ -1232,6 +1345,19 @@ mod tests {
             enabled: true,
         }];
         assert!(normalize_rule_targets(Some(bad), "x", 1).is_err());
+
+        assert!(validate_reality_targets(&[RuleTargetRequest {
+            host: "::::".into(),
+            port: 55443,
+            enabled: true,
+        }])
+        .is_err());
+        assert!(validate_reality_targets(&[RuleTargetRequest {
+            host: "reality.example.com".into(),
+            port: 55443,
+            enabled: true,
+        }])
+        .is_ok());
     }
 
     /// v1.2.x: the unset / "全可转发" sentinel and any garbage fall back to the

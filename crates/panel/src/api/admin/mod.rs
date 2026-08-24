@@ -128,8 +128,8 @@ mod tests {
     use axum::Json;
     use relay_shared::protocol::{
         CreateGroupRequest, CreateRuleRequest, GroupType, Protocol, PublicTransport,
-        RegisterRequest, RegistrationSettingsRequest, UpdateGroupRequest, UpdateRuleRequest,
-        UpdateUserRequest,
+        RegisterRequest, RegistrationSettingsRequest, RuleTargetRequest, UpdateGroupRequest,
+        UpdateRuleRequest, UpdateUserRequest,
     };
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::SqlitePool;
@@ -1227,6 +1227,7 @@ mod tests {
             public_transport: Default::default(),
             ws_path: None,
             sni: None,
+            camouflage_enabled: false,
             target_addr: "127.0.0.1".into(),
             target_port: 80,
             targets: None,
@@ -1387,6 +1388,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owner.0, 3, "admin set owner to bob");
+    }
+
+    #[tokio::test]
+    async fn camouflage_reality_rule_is_admin_only_and_audited_without_secrets() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 11, 1, "relay-in").await;
+        sqlx::query("UPDATE device_groups SET connect_host='203.0.113.10' WHERE id=11")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut request = rule_req("reality", 443, 11, None);
+        request.public_transport = PublicTransport::NginxSni;
+        request.protocol = Protocol::Tcp;
+        request.sni = Some("op1.example.com".into());
+        request.camouflage_enabled = true;
+        request.target_addr = "198.51.100.20".into();
+        request.target_port = 55443;
+
+        let mut invalid_remote = request.clone();
+        invalid_remote.target_addr = "::::".into();
+        let Json(rejected) =
+            create_rule(auth(1, true), State(state.clone()), Json(invalid_remote)).await;
+        assert_eq!(rejected.code, 400);
+
+        let Json(denied) =
+            create_rule(auth(2, false), State(state.clone()), Json(request.clone())).await;
+        assert_eq!(denied.code, 403);
+
+        let Json(created) = create_rule(auth(1, true), State(state.clone()), Json(request)).await;
+        assert_eq!(created.code, 0, "{}", created.message);
+        let row: (i64, bool) =
+            sqlx::query_as("SELECT id, camouflage_enabled FROM forward_rules WHERE name='reality'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(row.1);
+
+        let audits = state.db.query_audit_log(None, 20, 0).await.unwrap();
+        let audit = audits
+            .iter()
+            .find(|entry| entry.action == "create_reality_relay_rule")
+            .expect("Reality create must be audited");
+        assert!(audit.detail.contains("op1.example.com"));
+        assert!(audit.detail.contains("198.51.100.20:55443"));
+        for forbidden in ["privateKey", "privkey", "NODE_TOKEN", "Bearer", "password"] {
+            assert!(!audit.detail.contains(forbidden));
+        }
+
+        let Json(updated) = update_rule(
+            auth(1, true),
+            State(state.clone()),
+            Path(row.0),
+            Json(UpdateRuleRequest {
+                target_addr: Some("198.51.100.21".into()),
+                target_port: Some(55444),
+                targets: Some(vec![RuleTargetRequest {
+                    host: "198.51.100.21".into(),
+                    port: 55444,
+                    enabled: true,
+                }]),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(updated.code, 0, "{}", updated.message);
+        let changed: (String, i32, bool) = sqlx::query_as(
+            "SELECT target_addr, target_port, camouflage_enabled FROM forward_rules WHERE id=?",
+        )
+        .bind(row.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(changed, ("198.51.100.21".into(), 55444, true));
+
+        let Json(deleted) = delete_rule(auth(1, true), State(state.clone()), Path(row.0)).await;
+        assert_eq!(deleted.code, 0, "{}", deleted.message);
+        let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM forward_rules WHERE id=?")
+            .bind(row.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining.0, 0);
+
+        let audits = state.db.query_audit_log(None, 50, 0).await.unwrap();
+        for action in [
+            "create_reality_relay_rule",
+            "update_reality_relay_rule",
+            "delete_reality_relay_rule",
+        ] {
+            assert!(audits.iter().any(|entry| entry.action == action));
+        }
     }
 
     /// create_rule enforces that the referenced inbound group belongs to the
@@ -2102,6 +2195,7 @@ mod tests {
             public_transport,
             ws_path: None,
             sni: None,
+            camouflage_enabled: false,
             target_addr: "127.0.0.1".into(),
             target_port: 80,
             targets: None,

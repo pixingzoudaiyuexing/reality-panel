@@ -161,6 +161,9 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     ws_path TEXT,
     ws_host TEXT,
     sni TEXT,
+    -- Corrected Stage 3.3: opt-in Relay-local :8443/OpenList camouflage
+    -- dependency for nginx_sni Reality relay rules.
+    camouflage_enabled INTEGER NOT NULL DEFAULT 0,
     target_addr TEXT NOT NULL,
     target_port INTEGER NOT NULL,
     -- v0.4.6: multi-target load-balancing strategy.
@@ -1817,6 +1820,19 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         "Migration 44: announcements table present ({} carried over from site config)",
         carried
     );
+
+    // ── Migration 45: corrected Reality relay camouflage desired state ──
+    // Existing nginx_sni rules remain legacy immediate routes until an admin
+    // explicitly enables camouflage. The fixed :8443/OpenList semantics live in
+    // typed config and are not stored as arbitrary paths/backends.
+    add_column_if_missing(
+        pool,
+        "forward_rules",
+        "camouflage_enabled",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    tracing::info!("Migration 45: forward_rules.camouflage_enabled present");
 
     Ok(())
 }

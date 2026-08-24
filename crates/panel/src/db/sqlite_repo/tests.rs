@@ -1027,6 +1027,7 @@ async fn rule_insert_quota_guarded_nginx_sni_shares_port_by_sni() {
                 "nginx_sni",
                 None,
                 Some(sni),
+                false,
                 1,
                 None,
                 "direct",

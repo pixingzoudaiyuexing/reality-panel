@@ -245,7 +245,7 @@ async fn run() {
             loop {
                 interval.tick().await;
                 let mut sites = camouflage_sites.lock().await;
-                if !sites.reconcile_from_source() {
+                if !sites.reconcile_active() {
                     tracing::warn!(
                         "camouflage certificate lifecycle check failed; keeping active runtime"
                     );
@@ -263,8 +263,7 @@ async fn run() {
             "Loaded cached config ({} listeners) - starting forwarding immediately",
             cached.listeners.len()
         );
-        let mut mgr = manager.lock().await;
-        if !mgr.apply_config(&cached).await {
+        if !poller::apply_cached_coordinated(&manager, &camouflage_sites, &cached).await {
             tracing::error!("cached config could not be applied; waiting for panel configuration");
         }
     } else {
@@ -280,9 +279,10 @@ async fn run() {
     {
         let config_ws = config.clone();
         let manager_ws = manager.clone();
+        let camouflage_ws = camouflage_sites.clone();
         let node_id_ws = node_id.clone();
         tokio::spawn(async move {
-            ws_client::run_ws_loop(&config_ws, &manager_ws, &node_id_ws).await;
+            ws_client::run_ws_loop(&config_ws, &manager_ws, &camouflage_ws, &node_id_ws).await;
         });
     }
 
@@ -303,7 +303,7 @@ async fn run() {
 
         match poller::fetch_config(&config).await {
             poller::FetchResult::Ok(resp) => {
-                if !poller::apply_and_commit(&manager, &resp).await {
+                if !poller::apply_and_commit_coordinated(&manager, &camouflage_sites, &resp).await {
                     tracing::warn!("HTTP config was not committed as last-known-good");
                 }
                 // Recovered from a mismatch: restore the normal poll interval.
@@ -345,10 +345,11 @@ async fn run() {
         // Drain any listener bind/runtime errors captured since the last cycle
         // and forward them to the panel so an operator can see WHY a rule isn't
         // forwarding (port in use, permission denied, etc.).
-        let listener_errors = {
+        let (listener_errors, active_listener_rule_ids) = {
             let mgr = manager.lock().await;
-            mgr.take_listener_errors().await
+            (mgr.take_listener_errors().await, mgr.active_rule_ids())
         };
+        let camouflage_status = camouflage_sites.lock().await.status_snapshot();
         reporter::report_status(
             &config,
             &metrics,
@@ -356,6 +357,8 @@ async fn run() {
             start_time,
             &node_id,
             listener_errors,
+            camouflage_status,
+            active_listener_rule_ids,
         )
         .await;
     }

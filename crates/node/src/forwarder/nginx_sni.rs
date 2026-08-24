@@ -409,6 +409,7 @@ mod tests {
         load_balance_strategy: LoadBalanceStrategy,
     ) -> ListenerConfig {
         ListenerConfig {
+            camouflage_required: false,
             rule_id,
             port,
             protocol: Protocol::Tcp,
