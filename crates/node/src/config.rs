@@ -34,6 +34,13 @@ pub struct NodeConfig {
     pub camouflage_sites_manifest_path: String,
     pub camouflage_sites_state_dir: String,
     pub camouflage_wrapper_conf_path: String,
+    pub certificate_lifecycle_enabled: bool,
+    pub certificate_lifecycle_check_interval_secs: u64,
+    pub certbot_binary_path: String,
+    pub certbot_live_dir: String,
+    pub certificate_http01_webroot: String,
+    pub certificate_http01_conf_path: String,
+    pub certificate_state_dir: String,
 }
 
 impl NodeConfig {
@@ -114,6 +121,34 @@ impl NodeConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "/etc/nginx/conf.d/relay-panel-fallback.conf".to_string()),
+            certificate_lifecycle_enabled: parse_bool_env("CERTIFICATE_LIFECYCLE_ENABLED", false),
+            certificate_lifecycle_check_interval_secs: std::env::var(
+                "CERTIFICATE_LIFECYCLE_CHECK_INTERVAL_SECS",
+            )
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value >= 60)
+            .unwrap_or(43_200),
+            certbot_binary_path: std::env::var("CERTBOT_BINARY_PATH")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "/usr/bin/certbot".to_string()),
+            certbot_live_dir: std::env::var("CERTBOT_LIVE_DIR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "/etc/letsencrypt/live".to_string()),
+            certificate_http01_webroot: std::env::var("CERTIFICATE_HTTP01_WEBROOT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "/var/www/relay-panel-acme".to_string()),
+            certificate_http01_conf_path: std::env::var("CERTIFICATE_HTTP01_CONF_PATH")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "/etc/nginx/conf.d/relay-panel-acme.conf".to_string()),
+            certificate_state_dir: std::env::var("CERTIFICATE_STATE_DIR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "/opt/relay-node/certificates".to_string()),
         };
         cfg.validate();
         cfg
@@ -145,6 +180,22 @@ impl NodeConfig {
                 default_backend: self.nginx_sni_default_backend.clone(),
                 access_log_path: self.nginx_sni_access_log_path.clone(),
             },
+            certificate_lifecycle:
+                crate::forwarder::certificate_lifecycle::CertificateLifecycleConfig {
+                    enabled: self.certificate_lifecycle_enabled,
+                    certbot_binary: PathBuf::from(&self.certbot_binary_path),
+                    certbot_live_dir: PathBuf::from(&self.certbot_live_dir),
+                    webroot: PathBuf::from(&self.certificate_http01_webroot),
+                    state_dir: PathBuf::from(&self.certificate_state_dir),
+                    http01_nginx: crate::forwarder::nginx_sni::NginxSniConfig {
+                        enabled: self.nginx_sni_enabled,
+                        conf_path: PathBuf::from(&self.certificate_http01_conf_path),
+                        test_cmd: self.nginx_sni_test_cmd.clone(),
+                        reload_cmd: self.nginx_sni_reload_cmd.clone(),
+                        default_backend: self.nginx_sni_default_backend.clone(),
+                        access_log_path: self.nginx_sni_access_log_path.clone(),
+                    },
+                },
         }
     }
 

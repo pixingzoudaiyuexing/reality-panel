@@ -228,12 +228,30 @@ async fn run() {
     // Corrected Stage 3.1: restore the Relay-local camouflage endpoint before
     // activating listener LKG routes that may send browser fallback traffic
     // back to this node. This has no dependency on the Panel control channel.
-    let mut camouflage_sites =
-        forwarder::camouflage_site::CamouflageSiteManager::new(config.camouflage_site_config());
-    if config.camouflage_sites_enabled && !camouflage_sites.restore_and_apply() {
+    let camouflage_sites = Arc::new(Mutex::new(
+        forwarder::camouflage_site::CamouflageSiteManager::new(config.camouflage_site_config()),
+    ));
+    if config.camouflage_sites_enabled && !camouflage_sites.lock().await.restore_and_apply() {
         tracing::error!(
             "camouflage site LKG was not restored; continuing without local TLS fallback"
         );
+    }
+    if config.camouflage_sites_enabled && config.certificate_lifecycle_enabled {
+        let camouflage_sites = camouflage_sites.clone();
+        let interval_secs = config.certificate_lifecycle_check_interval_secs;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let mut sites = camouflage_sites.lock().await;
+                if !sites.reconcile_from_source() {
+                    tracing::warn!(
+                        "camouflage certificate lifecycle check failed; keeping active runtime"
+                    );
+                }
+            }
+        });
     }
 
     // --- Offline resilience: load cached config on startup ---

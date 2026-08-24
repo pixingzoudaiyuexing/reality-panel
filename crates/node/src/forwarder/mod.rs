@@ -1,5 +1,6 @@
 pub mod camouflage_site;
 pub mod cert_reloader;
+pub mod certificate_lifecycle;
 pub mod gate;
 pub mod limiter;
 pub mod manager;

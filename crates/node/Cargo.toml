@@ -50,6 +50,7 @@ sha2 = "0.10"
 # compromised panel must not be able to roll a node back to an old, vulnerable
 # release).
 semver = "1"
+x509-parser = "0.16"
 
 [dev-dependencies]
 # v0.4.16: test-only cert generator for the real WSS (wss://) regression test.

@@ -4,6 +4,9 @@
 //! the Panel and listener LKG. This module owns only the public TLS wrapper
 //! used by dedicated REALITY servers as their fallback target.
 
+use super::certificate_lifecycle::{
+    CertificateLifecycle, CertificateLifecycleConfig, LifecycleAction, RenewalGate,
+};
 use super::nginx_sni::{self, NginxSniConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -11,6 +14,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 pub const CAMOUFLAGE_TLS_PORT: u16 = 8443;
 pub const OPENLIST_BACKEND: &str = "127.0.0.1:5244";
@@ -33,6 +37,9 @@ pub struct CamouflageSite {
 pub struct CertificateReference {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    /// Lifecycle policy is Node-local and never crosses the Panel protocol.
+    #[serde(default)]
+    pub lifecycle: Option<super::certificate_lifecycle::CertificateLifecyclePolicy>,
 }
 
 #[derive(Clone, Debug)]
@@ -41,12 +48,14 @@ pub struct CamouflageSiteConfig {
     pub manifest_path: PathBuf,
     pub state_dir: PathBuf,
     pub nginx: NginxSniConfig,
+    pub certificate_lifecycle: CertificateLifecycleConfig,
 }
 
 #[derive(Debug)]
 pub struct CamouflageSiteManager {
     config: CamouflageSiteConfig,
     active: Option<CamouflageSitesManifest>,
+    renewal_gate: Arc<RenewalGate>,
 }
 
 impl CamouflageSiteManager {
@@ -54,6 +63,7 @@ impl CamouflageSiteManager {
         Self {
             config,
             active: None,
+            renewal_gate: Arc::new(RenewalGate::default()),
         }
     }
 
@@ -83,7 +93,7 @@ impl CamouflageSiteManager {
 
         match self.load_manifest() {
             Ok(manifest) if !recovered_applied || recovered.as_ref() != Some(&manifest) => {
-                if self.apply_candidate(manifest) {
+                if self.reconcile_and_apply_manifest(manifest) {
                     true
                 } else if recovered_applied {
                     tracing::warn!("camouflage source candidate failed; retained healthy site LKG");
@@ -105,6 +115,69 @@ impl CamouflageSiteManager {
                 false
             }
         }
+    }
+
+    /// Reconcile certificates from the Node-local source manifest. This is
+    /// called by the scheduler and never depends on the Panel control channel.
+    pub fn reconcile_from_source(&mut self) -> bool {
+        let manifest = match self.load_manifest() {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                tracing::warn!(
+                    "camouflage certificate source manifest unavailable: {}",
+                    error
+                );
+                return false;
+            }
+        };
+        self.reconcile_and_apply_manifest(manifest)
+    }
+
+    fn reconcile_and_apply_manifest(&mut self, mut manifest: CamouflageSitesManifest) -> bool {
+        let site_ids = manifest
+            .sites
+            .iter()
+            .filter(|site| site.certificate.lifecycle.is_some())
+            .map(|site| site.id.clone())
+            .collect();
+        let renewal_gate = Arc::clone(&self.renewal_gate);
+        let Some(_renewal_lease) = renewal_gate.try_acquire(site_ids) else {
+            tracing::warn!("camouflage certificate renewal already in progress");
+            return false;
+        };
+        // The source manifest carries policy, while a healthy LKG carries the
+        // active Node-owned generation. Do not regress a periodic check back
+        // to a Certbot live path after a successful install.
+        if let Some(active) = &self.active {
+            for site in &mut manifest.sites {
+                if let Some(previous) = active.sites.iter().find(|old| old.id == site.id) {
+                    if site.certificate.lifecycle.is_some() {
+                        let lifecycle = site.certificate.lifecycle.clone();
+                        site.certificate = previous.certificate.clone();
+                        site.certificate.lifecycle = lifecycle;
+                    }
+                }
+            }
+        }
+
+        let lifecycle = CertificateLifecycle::new(self.config.certificate_lifecycle.clone());
+        let (candidate, actions) = match lifecycle.reconcile(&manifest) {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(
+                    "camouflage certificate lifecycle failed; retained current certificate: {}",
+                    error
+                );
+                return false;
+            }
+        };
+        if actions
+            .iter()
+            .any(|action| *action != LifecycleAction::Unchanged)
+        {
+            tracing::info!("camouflage certificate lifecycle installed a validated generation");
+        }
+        self.apply_candidate(candidate)
     }
 
     pub fn apply_candidate(&mut self, candidate: CamouflageSitesManifest) -> bool {
@@ -471,6 +544,7 @@ mod tests {
         CertificateReference {
             cert_path,
             key_path,
+            lifecycle: None,
         }
     }
 
@@ -503,6 +577,7 @@ mod tests {
                 default_backend: "127.0.0.1:9".into(),
                 access_log_path: dir.join("stream.log").display().to_string(),
             },
+            certificate_lifecycle: CertificateLifecycleConfig::disabled_for_test(dir),
         })
     }
 
