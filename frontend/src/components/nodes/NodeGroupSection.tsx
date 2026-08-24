@@ -2,7 +2,7 @@
 import { Tag, Typography, Collapse } from 'antd';
 import { ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
 import type { NodeDisplayRow } from '../../api/types';
-import type { Tfn } from './types';
+import type { NodeLifecycleHandler, Tfn } from './types';
 import { NodeDesktopTable } from './NodeDesktopTable';
 import { NodeMobileList } from './NodeMobileList';
 import { formatBps } from '../../utils/format';
@@ -22,6 +22,8 @@ interface Props {
   openDetail: (row: NodeDisplayRow) => void;
   /** v1.0.10: admin-only per-node upgrade trigger (desktop table only). */
   onUpgrade?: (row: NodeDisplayRow) => void;
+  onLifecycle?: NodeLifecycleHandler;
+  artifactVersions?: Record<string, string>;
   onDelete?: (row: NodeDisplayRow) => void;
 }
 
@@ -41,7 +43,7 @@ function groupSummary(rows: NodeDisplayRow[]) {
 /** One group block: header bar (name · ID · online/total · aggregate ↑↓) +
  *  either a desktop table or mobile list. Collapsible. A group with only a
  *  placeholder row shows "no node reporting". */
-export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade, onDelete }: Props) {
+export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade, onLifecycle, artifactVersions, onDelete }: Props) {
   const head = rows[0];
   const { total, online, up, down } = groupSummary(rows);
   const region = head.region;
@@ -77,10 +79,12 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
         t={t}
         openDetail={openDetail}
         onUpgrade={onUpgrade}
+        onLifecycle={onLifecycle}
+        artifactVersions={artifactVersions}
       />
     </div>
   ) : (
-    <NodeDesktopTable rows={rows} panelProtocol={panelProtocol} latestNodeVersion={latestNodeVersion} nodeVersionCheckFailed={nodeVersionCheckFailed} t={t} openDetail={openDetail} onUpgrade={onUpgrade} onDelete={onDelete} />
+    <NodeDesktopTable rows={rows} panelProtocol={panelProtocol} latestNodeVersion={latestNodeVersion} nodeVersionCheckFailed={nodeVersionCheckFailed} t={t} openDetail={openDetail} onUpgrade={onUpgrade} onLifecycle={onLifecycle} artifactVersions={artifactVersions} onDelete={onDelete} />
   );
 
   return (

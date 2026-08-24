@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Spin, Result, Empty, Modal, message, Button } from 'antd';
-import { CloudUploadOutlined, LineChartOutlined } from '@ant-design/icons';
+import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typography } from 'antd';
+import { CloudUploadOutlined, LineChartOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, NodeStatus, SharedNodeSummary, NodeDisplayRow } from '../api/types';
+import type { ApiEnvelope, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
 import { NodeGroupSection } from '../components/nodes/NodeGroupSection';
@@ -11,19 +11,6 @@ import { NodeDetailDrawer } from '../components/nodes/NodeDetailDrawer';
 import { stableGroupedRows } from '../components/nodes/sort';
 
 type AnyNodeRow = NodeDisplayRow;
-
-interface VersionInfo {
-  current_version: string;
-  config_protocol_version?: number;
-  /** v1.2: the latest NODE release (bare, e.g. "1.1.0"), resolved from the
-   *  highest node-v* GitHub release. Nodes compare their version against THIS,
-   *  not the panel version. Empty when no node release exists. */
-  latest_node_version?: string;
-  /** v1.2: true when the node-version lookup failed. The UI must show an
-   *  "unknown / check failed" state instead of a green "up to date" or an
-   *  upgrade button. */
-  node_version_check_failed?: boolean;
-}
 
 /** Hook: is the viewport mobile-width? Re-evaluates on resize. */
 function useIsMobile(breakpoint = 768): boolean {
@@ -51,13 +38,12 @@ export default function NodeStatus() {
   const [adminRows, setAdminRows] = useState<NodeStatus[] | null>(null);
   const [userRows, setUserRows] = useState<SharedNodeSummary[] | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
-  // v1.2: nodes compare against the latest NODE release (latest_node_version),
-  // NOT the panel's current_version. Renamed from currentVersion to make the
-  // semantics obvious at every call site.
-  const [latestNodeVersion, setLatestNodeVersion] = useState('');
-  const [nodeVersionCheckFailed, setNodeVersionCheckFailed] = useState(false);
+  const [artifactVersions, setArtifactVersions] = useState<Record<string, string>>({});
   const [panelProtocol, setPanelProtocol] = useState(0);
   const [detailRow, setDetailRow] = useState<AnyNodeRow | null>(null);
+  const [activeOperation, setActiveOperation] = useState<NodeOperation | null>(null);
+  const [uninstallRow, setUninstallRow] = useState<AnyNodeRow | null>(null);
+  const [uninstallConfirmation, setUninstallConfirmation] = useState('');
   // Guards against overlapping polls: on a slow network (axios 10s timeout vs
   // 5s interval) a new tick could otherwise fire before the previous request
   // returned, stacking requests.
@@ -91,15 +77,16 @@ export default function NodeStatus() {
     }
   };
 
-  const loadVersion = async () => {
+  const loadLifecycleMetadata = async () => {
     try {
-      const res = await api.get<unknown, VersionInfo>('/system/version');
-      setPanelProtocol(res.config_protocol_version || 0);
-      // v1.2: the node upgrade target is the latest node release, not the
-      // panel version. A failed lookup sets the "check failed" flag so the UI
-      // shows an unknown state instead of a wrong upgrade button.
-      setLatestNodeVersion(res.latest_node_version || '');
-      setNodeVersionCheckFailed(!!res.node_version_check_failed);
+      const res = await api.get<unknown, ApiEnvelope<NodeArtifactCatalog>>('/admin/node-artifacts');
+      if (res.code !== 0 || !res.data) return;
+      setPanelProtocol(res.data.config_protocol_version || 0);
+      setArtifactVersions(Object.fromEntries(
+        res.data.artifacts
+          .filter((artifact) => artifact.available && artifact.version)
+          .map((artifact) => [artifact.architecture, artifact.version as string]),
+      ));
     } catch { /* ignore */ }
   };
 
@@ -120,32 +107,69 @@ export default function NodeStatus() {
   // load* fns), so a transient poll failure no longer flashes the error page
   // back to stale data every 5s.
   useEffect(() => {
-    if (isAdmin) loadVersion();
+    if (isAdmin) loadLifecycleMetadata();
     refresh();
     const ti = setInterval(refresh, 5000);
     return () => clearInterval(ti);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAdmin]);
 
-  // v1.0.10: admin triggers a directed node self-upgrade. Confirm first (the
-  // node restarts, so its forwarding blips for a few seconds).
-  const handleUpgrade = (row: AnyNodeRow) => {
+  const errorMessage = (error: unknown) => {
+    const payload = (error as { response?: { data?: { message?: string } } })?.response?.data;
+    return payload?.message || t('nodeOperationFailed');
+  };
+
+  const pollOperation = async (row: AnyNodeRow, operationId: string) => {
     if (!row.node_id) return;
-    Modal.confirm({
-      title: t('nodeUpgradeConfirmTitle'),
-      content: t('nodeUpgradeConfirm').replace('{v}', latestNodeVersion || 'latest'),
-      okText: t('nodeUpgradeOk'),
-      cancelText: t('cancel'),
-      onOk: async () => {
-        try {
-          const res = await api.post<unknown, ApiEnvelope<null>>(
-            `/nodes/${row.group_id}/upgrade/${row.node_id}`,
-            {},
+    try {
+      const res = await api.get<unknown, ApiEnvelope<NodeOperation>>(
+        `/admin/nodes/${row.group_id}/${row.node_id}/operations/${operationId}`,
+      );
+      if (res.code !== 0 || !res.data) throw new Error(res.message);
+      setActiveOperation(res.data);
+      if (!['SUCCESS', 'FAILED', 'TIMEOUT'].includes(res.data.status)) {
+        window.setTimeout(() => pollOperation(row, operationId), 1000);
+      }
+    } catch (error) {
+      message.error(errorMessage(error));
+    }
+  };
+
+  const startOperation = async (row: AnyNodeRow, action: NodeLifecycleAction, confirmation?: string) => {
+    if (!row.node_id) return;
+    try {
+      const res = action === 'logs'
+        ? await api.get<unknown, ApiEnvelope<NodeOperation>>(`/admin/nodes/${row.group_id}/${row.node_id}/logs?lines=200`)
+        : await api.post<unknown, ApiEnvelope<NodeOperation>>(
+            `/admin/nodes/${row.group_id}/${row.node_id}/operations/${action}`,
+            confirmation ? { confirmation } : {},
           );
-          if (res.code !== 0) { message.error(res.message); return; }
-          message.success(t('nodeUpgradeSent'));
-        } catch { message.error(t('nodeUpgradeFailed')); }
-      },
+      if (res.code !== 0 || !res.data) { message.error(res.message); return; }
+      setActiveOperation(res.data);
+      void pollOperation(row, res.data.id);
+    } catch (error) {
+      message.error(errorMessage(error));
+    }
+  };
+
+  const handleLifecycle = (row: AnyNodeRow, action: NodeLifecycleAction) => {
+    if (action === 'logs') { void startOperation(row, action); return; }
+    if (action === 'uninstall') {
+      setUninstallConfirmation('');
+      setUninstallRow(row);
+      return;
+    }
+    const target = action === 'upgrade'
+      ? artifactVersions[row.architecture === 'x86_64' ? 'amd64' : row.architecture === 'aarch64' ? 'arm64' : (row.architecture || '')]
+      : undefined;
+    Modal.confirm({
+      title: action === 'restart' ? t('nodeRestartConfirmTitle') : t('nodeUpgradeConfirmTitle'),
+      content: action === 'restart'
+        ? t('nodeRestartConfirm')
+        : t('nodeUpgradeConfirm').replace('{v}', target || '-'),
+      okText: action === 'restart' ? t('nodeRestart') : t('nodeUpgradeOk'),
+      cancelText: t('cancel'),
+      onOk: () => startOperation(row, action),
     });
   };
 
@@ -211,12 +235,13 @@ export default function NodeStatus() {
           key={gid}
           rows={groupRows}
           panelProtocol={panelProtocol}
-          latestNodeVersion={latestNodeVersion}
-          nodeVersionCheckFailed={nodeVersionCheckFailed}
+          latestNodeVersion=""
+          nodeVersionCheckFailed={false}
           isMobile={isMobile}
           t={t}
           openDetail={setDetailRow}
-          onUpgrade={isAdmin ? handleUpgrade : undefined}
+          onLifecycle={isAdmin ? handleLifecycle : undefined}
+          artifactVersions={artifactVersions}
           onDelete={isAdmin ? handleDelete : undefined}
         />
       ))}
@@ -228,6 +253,56 @@ export default function NodeStatus() {
         panelProtocol={panelProtocol}
         onDeleted={refresh}
       />
+      <Drawer
+        title={activeOperation ? t(`nodeOperation_${activeOperation.action}`) : t('nodeOperations')}
+        open={activeOperation !== null}
+        onClose={() => setActiveOperation(null)}
+        width={isMobile ? '100%' : 640}
+        extra={activeOperation ? (
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+            {activeOperation.action === 'logs' ? (
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                onClick={() => startOperation({ group_id: activeOperation.group_id, node_id: activeOperation.node_id }, 'logs')}
+              >
+                {t('refresh')}
+              </Button>
+            ) : null}
+            <Tag color={activeOperation.status === 'SUCCESS' ? 'green' : activeOperation.status === 'FAILED' || activeOperation.status === 'TIMEOUT' ? 'red' : 'blue'}>{t(`nodeOperationStatus_${activeOperation.status}`)}</Tag>
+          </span>
+        ) : null}
+      >
+        {activeOperation ? (
+          <>
+            <Typography.Paragraph>{activeOperation.message}</Typography.Paragraph>
+            <Typography.Text type="secondary">
+              {activeOperation.architecture || '-'} · {activeOperation.current_version ? `v${activeOperation.current_version}` : '-'}
+              {activeOperation.target_version ? ` → v${activeOperation.target_version}` : ''}
+            </Typography.Text>
+            {activeOperation.logs !== undefined ? (
+              <pre style={{ marginTop: 16, maxHeight: '70vh', overflow: 'auto', whiteSpace: 'pre-wrap', fontSize: 12 }}>{activeOperation.logs || t('nodeLogsEmpty')}</pre>
+            ) : null}
+          </>
+        ) : null}
+      </Drawer>
+      <Modal
+        title={t('nodeUninstallConfirmTitle')}
+        open={uninstallRow !== null}
+        okText={t('nodeUninstall')}
+        okButtonProps={{ danger: true, disabled: uninstallConfirmation !== 'UNINSTALL' }}
+        cancelText={t('cancel')}
+        onCancel={() => setUninstallRow(null)}
+        onOk={async () => {
+          if (!uninstallRow) return;
+          const row = uninstallRow;
+          setUninstallRow(null);
+          await startOperation(row, 'uninstall', uninstallConfirmation);
+        }}
+      >
+        <Typography.Paragraph>{t('nodeUninstallConfirm')}</Typography.Paragraph>
+        <Input value={uninstallConfirmation} onChange={(event) => setUninstallConfirmation(event.target.value)} placeholder="UNINSTALL" />
+      </Modal>
     </>
   );
 }

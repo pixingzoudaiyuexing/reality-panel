@@ -1,7 +1,7 @@
 
 import { Typography, Button, Space, Tag, Tooltip } from 'antd';
-import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined } from '@ant-design/icons';
-import type { Tfn } from './types';
+import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined, FileTextOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons';
+import type { NodeLifecycleHandler, Tfn } from './types';
 import type { NodeDisplayRow } from '../../api/types';
 import { NodeResourceBar } from './NodeResourceBar';
 import { NetworkCell, statusTag } from './shared';
@@ -25,12 +25,14 @@ interface Props {
    *  shows the node version + an upgrade affordance mirroring the desktop
    *  ladder (PR4), compared against the latest NODE release (PR5). */
   onUpgrade?: (row: NodeDisplayRow) => void;
+  onLifecycle?: NodeLifecycleHandler;
+  artifactVersions?: Record<string, string>;
 }
 
 /** Mobile-friendly compact list — one card per node. No wide table, no
  *  horizontal scroll. Shows: status + version + upgrade + network + speed +
  *  resource bars + uptime + a details button. */
-export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, onUpgrade }: Props) {
+export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {} }: Props) {
   const labels = { d: t('uptimeDay'), h: t('uptimeHour'), m: t('uptimeMinute'), s: t('uptimeSecond') };
 
   return (
@@ -58,11 +60,12 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
                 {/* node version tag (only when the admin upgrade view is on).
                     When the node-version check failed, render the bare version
                     with no behind-arrow (we can't vouch for any colouring). */}
-                {onUpgrade && r.node_version ? (
+                {(onUpgrade || onLifecycle) && r.node_version ? (
                   <Tag color={nodeVersionCheckFailed ? undefined : versionTagColor(versionRelation(r.node_version, latestNodeVersion))} className="rp-mono">
                     {`v${r.node_version}`}
                   </Tag>
                 ) : null}
+                {onLifecycle && r.architecture ? <Tag className="rp-mono">{r.architecture}</Tag> : null}
                 {/* upgrade affordance — same ladder as desktop */}
                 {onUpgrade ? (
                   <MobileUpgradeAffordance
@@ -72,6 +75,19 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
                     onUpgrade={() => onUpgrade(r)}
                   />
                 ) : null}
+                {onLifecycle ? (() => {
+                  const arch = r.architecture === 'x86_64' ? 'amd64' : r.architecture === 'aarch64' ? 'arm64' : (r.architecture || '');
+                  const target = artifactVersions[arch];
+                  const ready = !!r.node_id && !!r.online && r.install_method === 'systemd';
+                  return (
+                    <Space size={2}>
+                      <Button size="small" type="text" icon={<FileTextOutlined />} disabled={!r.node_id || !r.online} aria-label={t('nodeLogs')} onClick={() => onLifecycle(r, 'logs')} />
+                      <Button size="small" type="text" icon={<ReloadOutlined />} disabled={!ready} aria-label={t('nodeRestart')} onClick={() => onLifecycle(r, 'restart')} />
+                      <Button size="small" type="text" icon={<CloudDownloadOutlined />} disabled={!ready || !target || target === r.node_version} aria-label={t('nodeUpgrade')} onClick={() => onLifecycle(r, 'upgrade')} />
+                      <Button size="small" type="text" danger icon={<StopOutlined />} disabled={!ready} aria-label={t('nodeUninstall')} onClick={() => onLifecycle(r, 'uninstall')} />
+                    </Space>
+                  );
+                })() : null}
                 <Button
                   size="small"
                   type="link"

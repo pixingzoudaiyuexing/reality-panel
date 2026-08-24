@@ -242,12 +242,36 @@ pub async fn node_ws_handler(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let node_version = headers
+        .get("X-Node-Version")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let node_architecture = headers
+        .get("X-Node-Architecture")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     // Clone the Arc<dyn Repository> so the WS task can keep using it after the
     // upgrade handler returns. The pool snapshot is shared read-only.
     let db = state.db.clone();
 
+    let node_connections = state.node_connections.clone();
+    let node_operations = state.node_operations.clone();
     ws.on_upgrade(move |socket| {
-        handle_node_ws(socket, group_id, node_id, db, state.node_connections)
+        handle_node_ws(
+            socket,
+            group_id,
+            node_id,
+            node_version,
+            node_architecture,
+            state,
+            db,
+            node_connections,
+            node_operations,
+        )
     })
 }
 
@@ -255,8 +279,12 @@ async fn handle_node_ws(
     socket: WebSocket,
     group_id: i64,
     node_id: Option<String>,
+    node_version: Option<String>,
+    node_architecture: Option<String>,
+    state: AppState,
     db: std::sync::Arc<dyn crate::db::Repository>,
     node_connections: NodeConnections,
+    node_operations: crate::api::node_ops::NodeOperationRegistry,
 ) {
     tracing::info!(
         "websocket connected: group_id={} node_id={:?}",
@@ -267,7 +295,18 @@ async fn handle_node_ws(
     // Split so we can concurrently read ping/close from the socket AND write
     // broadcast pushes from the channel. Both halves borrow independent state.
     let (mut sender, mut receiver) = socket.split();
+    let lifecycle_node_id = node_id.clone();
     let (conn_id, mut push_rx) = node_connections.register(group_id, node_id).await;
+    if let Some(node_id) = lifecycle_node_id.as_deref() {
+        for operation in node_operations.connected(
+            group_id,
+            node_id,
+            node_version.as_deref(),
+            node_architecture.as_deref(),
+        ) {
+            crate::api::node_ops::audit_terminal_operation(&state, &operation).await;
+        }
+    }
 
     // Send initial config snapshot so a freshly-connected node has its config
     // immediately, without waiting for the first HTTP poll. None (DB error) →
@@ -311,6 +350,22 @@ async fn handle_node_ws(
                     tracing::info!("websocket disconnected: group_id={}", group_id);
                     break;
                 }
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if let Ok(event) = serde_json::from_str::<
+                        relay_shared::protocol::NodeLifecycleEvent,
+                    >(&text)
+                    {
+                        if event.msg_type == "node_lifecycle_event" {
+                            if let Some(operation) = node_operations.event(group_id, event) {
+                                crate::api::node_ops::audit_terminal_operation(
+                                    &state,
+                                    &operation,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
                 Ok(Some(Ok(_))) => {
                     // ignore other message types
                 }
@@ -331,6 +386,11 @@ async fn handle_node_ws(
     }
 
     node_connections.unregister(group_id, conn_id).await;
+    if let Some(node_id) = lifecycle_node_id.as_deref() {
+        for operation in node_operations.disconnected(group_id, node_id) {
+            crate::api::node_ops::audit_terminal_operation(&state, &operation).await;
+        }
+    }
 }
 
 async fn build_config_snapshot(

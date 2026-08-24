@@ -14,6 +14,7 @@ pub mod groups;
 pub mod middleware;
 pub mod node;
 pub mod node_deploy;
+pub mod node_ops;
 pub mod notify;
 pub mod redeem;
 pub mod restart;
@@ -33,6 +34,7 @@ pub struct AppState {
     pub config: Config,
     pub release_cache: ReleaseCache,
     pub node_connections: ws::NodeConnections,
+    pub node_operations: node_ops::NodeOperationRegistry,
     pub deployments: node_deploy::DeploymentRegistry,
     /// v0.4.8: in-memory rule-diagnosis task registry (request_id → run).
     pub diagnose: diagnose::DiagnoseRegistry,
@@ -313,10 +315,17 @@ pub fn routes() -> Router<AppState> {
             "/nodes/{group_id}",
             axum::routing::delete(stats::delete_node_status),
         )
-        // v1.0.10: admin triggers a directed self-upgrade on one node.
         .route(
-            "/nodes/{group_id}/upgrade/{node_id}",
-            axum::routing::post(stats::upgrade_node),
+            "/admin/nodes/{group_id}/{node_id}/operations/{action}",
+            axum::routing::post(node_ops::start_operation).get(node_ops::get_operation),
+        )
+        .route(
+            "/admin/nodes/{group_id}/{node_id}/logs",
+            axum::routing::get(node_ops::request_logs),
+        )
+        .route(
+            "/admin/node-artifacts",
+            axum::routing::get(node_ops::list_artifacts),
         )
         // System
         .route("/system/version", axum::routing::get(system::get_version))
@@ -327,6 +336,10 @@ pub fn routes() -> Router<AppState> {
         .route("/node/ws", axum::routing::get(ws::node_ws_handler))
         // Node (polled by relay-node binary)
         .route("/node/config", axum::routing::get(node::get_config))
+        .route(
+            "/node/lifecycle-artifacts/{operation_id}",
+            axum::routing::get(node_ops::download_artifact),
+        )
         .route(
             "/node/report_traffic",
             axum::routing::post(node::report_traffic),

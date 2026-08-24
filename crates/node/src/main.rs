@@ -1,6 +1,7 @@
 mod config;
 mod diagnose;
 mod forwarder;
+mod lifecycle;
 mod poller;
 mod reporter;
 mod updater;
@@ -15,8 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 /// Built-in version string. Single source of truth: the Cargo package version
-/// (`env!("CARGO_PKG_VERSION")`), which is kept in sync with
-/// `scripts/relay-node-install.sh` and the GitHub release tag.
+/// (`env!("CARGO_PKG_VERSION")`), also used for Panel artifact validation.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {
@@ -25,6 +25,15 @@ fn main() -> ExitCode {
     // touching the network or spawning the service loop. This matches the
     // conventional CLI contract: version/help must not start the service.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(result) = lifecycle::run_helper_from_args(&args) {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("lifecycle helper failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     for arg in &args {
         match arg.as_str() {
             "-V" | "--version" => {

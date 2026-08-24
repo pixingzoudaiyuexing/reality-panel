@@ -560,6 +560,11 @@ pub struct StatusReport {
     /// send this; the panel treats a missing value as "unknown" (no self-upgrade).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_method: Option<String>,
+    /// Runtime architecture used for selecting a Panel-managed lifecycle
+    /// artifact. Older nodes omit it; the Panel rejects upgrades rather than
+    /// guessing an architecture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
 }
 
 /// One listener bind failure reported by a node. Carries enough context for the
@@ -631,26 +636,90 @@ pub struct DiagnoseRuleMessage {
     pub challenge: String,
 }
 
-/// v1.0.10: Panel → node, over the WS control channel (delivered via
-/// `send_node`, so only the targeted node receives it). Asks the node to
-/// self-upgrade to a SPECIFIC version. The node downloads that exact release
-/// tag's binary for its arch, verifies its sha256, swaps its own binary, and
-/// restarts. The message carries the version string but NO URL/binary — the
-/// node only ever pulls from the hardcoded official GitHub release for that
-/// version (and validates the version is a plain semver), so a compromised
-/// panel can at most force an upgrade to an official build, never run arbitrary
-/// code. Pinning the version (rather than "latest") keeps the node at the same
-/// version as the panel, avoiding a node jumping ahead of an older panel.
+/// A deliberately restricted Panel -> node lifecycle command. It cannot carry
+/// an arbitrary URL or shell command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpgradeNodeMessage {
+pub struct NodeLifecycleCommand {
     #[serde(rename = "type")]
-    pub msg_type: String, // "upgrade_node"
-    /// The intended target's node_id (informational — send_node already routed
-    /// this only to the matching connection; the node may re-check as defence).
+    pub msg_type: String,
+    pub operation_id: String,
     pub node_id: String,
-    /// Target version WITHOUT a leading "v" (e.g. "1.0.10"). The node validates
-    /// this is a plain semver before building the download URL.
-    pub version: String,
+    pub action: NodeLifecycleAction,
+    #[serde(default)]
+    pub target_version: Option<String>,
+    #[serde(default)]
+    pub target_architecture: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// Opaque Panel-issued artifact identifier, not a URL or filesystem path.
+    #[serde(default)]
+    pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub log_lines: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeLifecycleAction {
+    Logs,
+    Restart,
+    Upgrade,
+    Uninstall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeLifecycleEvent {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub operation_id: String,
+    pub node_id: String,
+    pub action: NodeLifecycleAction,
+    pub status: NodeLifecycleEventStatus,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub node_version: Option<String>,
+    #[serde(default)]
+    pub architecture: Option<String>,
+    #[serde(default)]
+    pub logs: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeLifecycleEventStatus {
+    Accepted,
+    Downloading,
+    Validating,
+    Installing,
+    Restarting,
+    Completed,
+    Failed,
+}
+
+pub fn node_supports_lifecycle(version: Option<&str>) -> bool {
+    let Some(version) = version else {
+        return false;
+    };
+    let mut parts = version.trim_start_matches('v').split('.');
+    let parsed = (
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts
+            .next()
+            .and_then(|part| part.split('-').next())
+            .and_then(|part| part.parse::<u64>().ok()),
+    );
+    matches!(parsed, (Some(major), Some(minor), Some(patch)) if (major, minor, patch) >= (1, 2, 3))
+}
+
+/// Normalize Linux/Rust architecture spellings to Panel artifact names.
+pub fn lifecycle_artifact_architecture(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "amd64" | "x86_64" => Some("amd64"),
+        "arm64" | "aarch64" => Some("arm64"),
+        _ => None,
+    }
 }
 
 impl DiagnoseRuleMessage {
@@ -683,8 +752,7 @@ pub struct RestartRuleMessage {
     #[serde(rename = "type")]
     pub msg_type: String, // "restart_rule"
     /// The intended target's node_id. `send_node` already routed this to the
-    /// matching connection; the node re-checks as defence in depth (same
-    /// pattern as `UpgradeNodeMessage`).
+    /// matching connection; the node re-checks as defence in depth.
     pub node_id: String,
     /// The rule whose listeners to restart.
     pub rule_id: i64,
@@ -1499,5 +1567,20 @@ mod tests {
         assert!(node_supports_directed_diagnose(Some("0.4.14-rc1")));
         assert!(node_supports_directed_diagnose(Some("0.5.0")));
         assert!(node_supports_directed_diagnose(Some("1.0.0")));
+    }
+
+    #[test]
+    fn lifecycle_version_and_architecture_gates_are_conservative() {
+        for version in [None, Some(""), Some("garbage"), Some("1.2.2")] {
+            assert!(!node_supports_lifecycle(version));
+        }
+        assert!(node_supports_lifecycle(Some("1.2.3")));
+        assert!(node_supports_lifecycle(Some("1.2.3-rc1")));
+        assert!(node_supports_lifecycle(Some("2.0.0")));
+        assert_eq!(lifecycle_artifact_architecture("x86_64"), Some("amd64"));
+        assert_eq!(lifecycle_artifact_architecture("amd64"), Some("amd64"));
+        assert_eq!(lifecycle_artifact_architecture("aarch64"), Some("arm64"));
+        assert_eq!(lifecycle_artifact_architecture("arm64"), Some("arm64"));
+        assert_eq!(lifecycle_artifact_architecture("riscv64"), None);
     }
 }

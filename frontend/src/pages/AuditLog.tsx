@@ -27,6 +27,13 @@ const ACTIONS = [
   'delete_group',
   'rotate_group_token',
   'upgrade_node',
+  'node_logs',
+  'node_restart_start',
+  'node_restart_result',
+  'node_upgrade_start',
+  'node_upgrade_result',
+  'node_uninstall_start',
+  'node_uninstall_result',
   'create_redeem_codes',
   'void_redeem_code',
   'delete_redeem_codes',
@@ -50,6 +57,8 @@ const DESTRUCTIVE = new Set<string>([
   'reset_traffic',
   'void_redeem_code',
   'delete_announcement',
+  'node_uninstall_start',
+  'node_uninstall_result',
 ]);
 
 const PAGE_SIZE = 20;

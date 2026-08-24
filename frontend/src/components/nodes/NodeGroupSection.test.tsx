@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import type { Tfn } from './types';
 import type { NodeDisplayRow } from '../../api/types';
 import { statusTag } from './shared';
@@ -83,6 +83,50 @@ describe('Node desktop table throughput layout', () => {
     );
 
     expect(container.querySelectorAll('.rp-node-throughput')).toHaveLength(2);
+  });
+});
+
+describe('Stage 2 lifecycle controls', () => {
+  it('renders the four admin actions and routes each explicit action', () => {
+    const onLifecycle = vi.fn();
+    render(
+      <NodeGroupSection
+        rows={[row({ online: true, node_version: '1.2.2', architecture: 'x86_64', install_method: 'systemd' })]}
+        panelProtocol={0}
+        latestNodeVersion=""
+        nodeVersionCheckFailed={false}
+        isMobile={false}
+        t={t}
+        openDetail={vi.fn()}
+        onLifecycle={onLifecycle}
+        artifactVersions={{ amd64: '1.2.3' }}
+      />,
+    );
+    for (const action of ['nodeLogs', 'nodeRestart', 'nodeUpgrade', 'nodeUninstall']) {
+      fireEvent.click(screen.getByRole('button', { name: action }));
+    }
+    expect(onLifecycle.mock.calls.map((call) => call[1])).toEqual([
+      'logs', 'restart', 'upgrade', 'uninstall',
+    ]);
+  });
+
+  it('disables destructive actions for an offline node', () => {
+    render(
+      <NodeGroupSection
+        rows={[row({ online: false, architecture: 'x86_64', install_method: 'systemd' })]}
+        panelProtocol={0}
+        latestNodeVersion=""
+        nodeVersionCheckFailed={false}
+        isMobile={false}
+        t={t}
+        openDetail={vi.fn()}
+        onLifecycle={vi.fn()}
+        artifactVersions={{ amd64: '1.2.3' }}
+      />,
+    );
+    for (const action of ['nodeLogs', 'nodeRestart', 'nodeUpgrade', 'nodeUninstall']) {
+      expect(screen.getByRole('button', { name: action })).toBeDisabled();
+    }
   });
 });
 

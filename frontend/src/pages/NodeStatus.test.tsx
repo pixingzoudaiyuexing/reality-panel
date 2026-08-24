@@ -1,12 +1,13 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, act } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 
 // Mock the api client + auth hook before importing the page under test.
 const { mockGet } = vi.hoisted(() => ({ mockGet: vi.fn() }));
 const { mockUseAuth } = vi.hoisted(() => ({ mockUseAuth: vi.fn() }));
 
 vi.mock('../api/client', () => ({
-  default: { get: mockGet, delete: vi.fn() },
+  default: { get: mockGet, post: vi.fn(), delete: vi.fn() },
 }));
 vi.mock('../auth/useAuth', () => ({ useAuth: mockUseAuth }));
 
@@ -29,16 +30,15 @@ const adminNode = {
 const sharedNode = {
   group_id: 2, group_name: 'shared-grp', node_id: 's1', online: true, connections: 0,
 };
-// v1.2: /system/version now also returns latest_node_version +
-// node_version_check_failed. Existing tests ignore them (they assert on data
-// source / polling, not the upgrade column), but the shape must match the
-// real response so the fetch + state setters don't degrade.
-const version = {
-  current_version: '1.1.0',
+const artifactCatalog = ok({
   config_protocol_version: 2,
-  latest_node_version: '1.1.0',
-  node_version_check_failed: false,
-};
+  artifacts: [
+    { architecture: 'amd64', available: true, version: '1.2.3', sha256: '0'.repeat(64) },
+    { architecture: 'arm64', available: false, error: 'missing' },
+  ],
+});
+
+const renderPage = () => render(<MemoryRouter><NodeStatus /></MemoryRouter>);
 
 beforeEach(() => {
   mockGet.mockReset();
@@ -51,42 +51,42 @@ afterEach(() => {
 });
 
 describe('NodeStatus page data source', () => {
-  it('admin reads /nodes + /system/version (version fetched once, not polled)', async () => {
+  it('admin reads /nodes + Panel artifact catalog (catalog fetched once, not polled)', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     mockGet.mockImplementation((url: string) => {
       if (url === '/nodes') return Promise.resolve(ok([adminNode]));
-      if (url === '/system/version') return Promise.resolve(version);
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       return Promise.reject(new Error(`unexpected ${url}`));
     });
 
-    render(<NodeStatus />);
+    renderPage();
     await flush();
 
     expect(screen.getByText('admin-grp')).toBeInTheDocument();
     expect(mockGet).toHaveBeenCalledWith('/nodes');
-    expect(mockGet).toHaveBeenCalledWith('/system/version');
+    expect(mockGet).toHaveBeenCalledWith('/admin/node-artifacts');
     expect(mockGet).not.toHaveBeenCalledWith('/nodes/shared');
 
     // version must NOT be polled: advance several intervals, still exactly one
     await flush(15000);
-    const versionCalls = mockGet.mock.calls.filter((c) => c[0] === '/system/version').length;
-    expect(versionCalls).toBe(1);
+    const artifactCalls = mockGet.mock.calls.filter((c) => c[0] === '/admin/node-artifacts').length;
+    expect(artifactCalls).toBe(1);
   });
 
-  it('regular user reads /nodes/shared, never /nodes or /system/version', async () => {
+  it('regular user reads /nodes/shared, never admin nodes or artifacts', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: false });
     mockGet.mockImplementation((url: string) => {
       if (url === '/nodes/shared') return Promise.resolve(ok([sharedNode]));
       return Promise.reject(new Error(`unexpected ${url}`));
     });
 
-    render(<NodeStatus />);
+    renderPage();
     await flush();
 
     expect(screen.getByText('shared-grp')).toBeInTheDocument();
     expect(mockGet).toHaveBeenCalledWith('/nodes/shared');
     expect(mockGet).not.toHaveBeenCalledWith('/nodes');
-    expect(mockGet).not.toHaveBeenCalledWith('/system/version');
+    expect(mockGet).not.toHaveBeenCalledWith('/admin/node-artifacts');
   });
 });
 
@@ -95,11 +95,11 @@ describe('NodeStatus load-failure behavior', () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     mockGet.mockImplementation((url: string) => {
       if (url === '/nodes') return Promise.reject(new Error('boom'));
-      if (url === '/system/version') return Promise.resolve(version);
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       return Promise.reject(new Error(`unexpected ${url}`));
     });
 
-    render(<NodeStatus />);
+    renderPage();
     await flush();
 
     expect(screen.getByText('loadFailed')).toBeInTheDocument();
@@ -109,7 +109,7 @@ describe('NodeStatus load-failure behavior', () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     let nodeCall = 0;
     mockGet.mockImplementation((url: string) => {
-      if (url === '/system/version') return Promise.resolve(version);
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       if (url === '/nodes') {
         nodeCall += 1;
         return nodeCall === 1
@@ -119,7 +119,7 @@ describe('NodeStatus load-failure behavior', () => {
       return Promise.reject(new Error(`unexpected ${url}`));
     });
 
-    render(<NodeStatus />);
+    renderPage();
     await flush();
     expect(screen.getByText('admin-grp')).toBeInTheDocument();
 
@@ -253,11 +253,11 @@ describe('NodeStatus rendered group order is stable across refreshes', () => {
             mk(3, 'grp-three'),
           ]),
         );
-      if (url === '/system/version') return Promise.resolve(version);
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       return Promise.reject(new Error(`unexpected ${url}`));
     });
 
-    render(<NodeStatus />);
+    renderPage();
     await flush();
 
     // The four group headers must appear in ascending group_id order in the DOM.
@@ -272,7 +272,7 @@ describe('NodeStatus rendered group order is stable across refreshes', () => {
     let call = 0;
     const set = [mk(3, 'grp-three'), mk(1, 'grp-one'), mk(2, 'grp-two')];
     mockGet.mockImplementation((url: string) => {
-      if (url === '/system/version') return Promise.resolve(version);
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       if (url === '/nodes') {
         call += 1;
         // Second call returns the SAME set in a different order.
@@ -281,7 +281,7 @@ describe('NodeStatus rendered group order is stable across refreshes', () => {
       return Promise.reject(new Error(`unexpected ${url}`));
     });
 
-    render(<NodeStatus />);
+    renderPage();
     await flush();
     const order = ['grp-one', 'grp-two', 'grp-three'];
     const isAscending = () => {
@@ -309,11 +309,11 @@ describe('NodeStatus rendered group order is stable across refreshes', () => {
             mk(1, 'g', { node_id: 'n2', public_ipv4: '5.5.5.5' }),
           ]),
         );
-      if (url === '/system/version') return Promise.resolve(version);
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       return Promise.reject(new Error(`unexpected ${url}`));
     });
 
-    render(<NodeStatus />);
+    renderPage();
     await flush();
 
     // The three IPs render in distinct table cells; the lowest-numbered IP
@@ -335,7 +335,7 @@ describe('NodeStatus rendered group order is stable across refreshes', () => {
       return Promise.reject(new Error(`unexpected ${url}`));
     });
 
-    render(<NodeStatus />);
+    renderPage();
     await flush();
 
     expect(isBefore(docOrderIdx('shared-one'), docOrderIdx('shared-two'))).toBe(true);

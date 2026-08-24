@@ -1,10 +1,11 @@
 use crate::config::NodeConfig;
 use crate::forwarder::ForwarderManager;
 use crate::poller;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{interval, Instant};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -16,6 +17,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 /// connection is dead and force a reconnect (rather than waiting for the
 /// panel's 120s timeout to notice).
 const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn spawn_lifecycle_work<F>(work: F) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(work)
+}
 
 /// Derive the WebSocket URL from PANEL_URL.
 /// http://ip:port -> ws://ip:port/api/v1/node/ws
@@ -201,6 +209,12 @@ async fn connect_and_run(
             request.headers_mut().insert("X-Node-ID", v);
         }
     }
+    if let Ok(value) = env!("CARGO_PKG_VERSION").parse() {
+        request.headers_mut().insert("X-Node-Version", value);
+    }
+    if let Ok(value) = std::env::consts::ARCH.parse() {
+        request.headers_mut().insert("X-Node-Architecture", value);
+    }
 
     let ws_result = connect_async(request).await;
 
@@ -217,6 +231,28 @@ async fn connect_and_run(
         }
     };
 
+    if let Some((event, marker)) = crate::lifecycle::pending_boot_event() {
+        if event.node_id == node_id {
+            let payload = match serde_json::to_string(&event) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::error!("serialize lifecycle boot event: {error}");
+                    return WsExit::Disconnected;
+                }
+            };
+            if ws_stream.send(Message::Text(payload.into())).await.is_err() {
+                return WsExit::Disconnected;
+            }
+            crate::lifecycle::clear_pending_boot_event(&marker);
+        } else {
+            tracing::error!(
+                "lifecycle marker belongs to node {}, current node is {}; preserving marker",
+                event.node_id,
+                node_id
+            );
+        }
+    }
+
     // ── Heartbeat state ──
     // All timestamps are millis relative to `session_start` (a monotonic
     // Instant captured once per connection). We avoid SystemTime (can jump
@@ -229,6 +265,9 @@ async fn connect_and_run(
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     // Don't fire immediately on the first tick (we just connected).
     heartbeat.reset();
+    let (lifecycle_tx, mut lifecycle_rx) =
+        mpsc::unbounded_channel::<relay_shared::protocol::NodeLifecycleEvent>();
+    let lifecycle_lock = Arc::new(Mutex::new(()));
 
     loop {
         tokio::select! {
@@ -315,6 +354,59 @@ async fn connect_and_run(
                                     restarted
                                 );
                             }
+                        } else if let Some(command) = serde_json::from_str::<
+                            relay_shared::protocol::NodeLifecycleCommand,
+                        >(&text)
+                        .ok()
+                        .filter(|command| command.msg_type == "node_lifecycle")
+                        {
+                            if command.node_id != node_id {
+                                tracing::warn!(
+                                    operation_id = %command.operation_id,
+                                    "websocket: lifecycle command targeted another node"
+                                );
+                                continue;
+                            }
+                            let guard = if command.action
+                                == relay_shared::protocol::NodeLifecycleAction::Logs
+                            {
+                                None
+                            } else {
+                                match lifecycle_lock.clone().try_lock_owned() {
+                                    Ok(guard) => Some(guard),
+                                    Err(_) => {
+                                        let _ = lifecycle_tx.send(
+                                            crate::lifecycle::failed_event(
+                                                &command,
+                                                "another destructive lifecycle action is running",
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                }
+                            };
+                            if command.action
+                                != relay_shared::protocol::NodeLifecycleAction::Logs
+                            {
+                                let accepted = crate::lifecycle::accepted_event(&command);
+                                if ws_stream
+                                    .send(Message::Text(
+                                        serde_json::to_string(&accepted)
+                                            .expect("lifecycle event serializes")
+                                            .into(),
+                                    ))
+                                    .await
+                                    .is_err()
+                                {
+                                    return WsExit::Disconnected;
+                                }
+                            }
+                            let tx = lifecycle_tx.clone();
+                            let config = config.clone();
+                            spawn_lifecycle_work(async move {
+                                crate::lifecycle::execute(config, command, tx).await;
+                                drop(guard);
+                            });
                         } else if let Ok(dm) =
                             serde_json::from_str::<relay_shared::protocol::DiagnoseRuleMessage>(&text)
                         {
@@ -342,43 +434,6 @@ async fn connect_and_run(
                                 )
                                 .await;
                             });
-                        } else if let Ok(um) = serde_json::from_str::<
-                            relay_shared::protocol::UpgradeNodeMessage,
-                        >(&text)
-                        {
-                            // v1.0.10: directed self-upgrade command. send_node
-                            // already routed this to only this node; re-check the
-                            // node_id as defence in depth, then run the upgrade on
-                            // a detached task so the WS loop keeps draining. On
-                            // success the task exits the process → systemd restarts
-                            // into the new binary; on failure the node keeps running.
-                            if um.msg_type == "upgrade_node" && um.node_id != node_id {
-                                tracing::warn!(
-                                    "websocket: ignoring upgrade for {} (I am {})",
-                                    um.node_id,
-                                    node_id
-                                );
-                            } else if um.msg_type == "upgrade_node" {
-                                let version = um.version.clone();
-                                tracing::warn!(
-                                    "websocket: self-upgrade to v{} requested; starting",
-                                    version
-                                );
-                                tokio::spawn(async move {
-                                    match crate::updater::self_upgrade(&version).await {
-                                        Ok(()) => {
-                                            tracing::warn!(
-                                                "self-upgrade done; exiting to restart into new binary"
-                                            );
-                                            std::process::exit(0);
-                                        }
-                                        Err(e) => tracing::error!(
-                                            "self-upgrade failed: {} (keeping current binary)",
-                                            e
-                                        ),
-                                    }
-                                });
-                            }
                         } else {
                             tracing::debug!("websocket: received text: {}", &text[..text.len().min(100)]);
                         }
@@ -399,6 +454,22 @@ async fn connect_and_run(
                     Err(e) => {
                         return WsExit::Error(format!("stream: {}", e));
                     }
+                }
+            }
+
+            lifecycle_event = lifecycle_rx.recv() => {
+                let Some(event) = lifecycle_event else {
+                    return WsExit::Disconnected;
+                };
+                let payload = match serde_json::to_string(&event) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        tracing::error!("serialize lifecycle event: {error}");
+                        continue;
+                    }
+                };
+                if ws_stream.send(Message::Text(payload.into())).await.is_err() {
+                    return WsExit::Disconnected;
                 }
             }
 
@@ -455,7 +526,7 @@ async fn apply_snapshot_at(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_snapshot_at, derive_ws_url};
+    use super::{apply_snapshot_at, derive_ws_url, spawn_lifecycle_work};
     use crate::forwarder::ForwarderManager;
     use crate::poller::{self, CachePaths};
     use crate::reporter::{ConnectionTracker, TrafficCounter};
@@ -463,6 +534,7 @@ mod tests {
         ListenerConfig, LoadBalanceStrategy, NodeConfigResponse, NodeTransport, Protocol,
     };
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Mutex;
 
     /// v0.4.16: the WSS control-channel URL is derived from PANEL_URL. The
@@ -488,6 +560,22 @@ mod tests {
             derive_ws_url("127.0.0.1:18888"),
             "ws://127.0.0.1:18888/api/v1/node/ws"
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_work_is_detached_from_the_websocket_reader() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = spawn_lifecycle_work(async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+        });
+        tokio::time::timeout(Duration::from_millis(100), started_rx)
+            .await
+            .expect("lifecycle task must start without blocking the reader")
+            .expect("lifecycle task reports readiness");
+        let _ = release_tx.send(());
+        task.await.unwrap();
     }
 
     fn cache_paths(label: &str) -> CachePaths {

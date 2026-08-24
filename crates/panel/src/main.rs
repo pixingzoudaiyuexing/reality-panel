@@ -104,6 +104,7 @@ async fn main() {
         config: config.clone(),
         release_cache: api::system::ReleaseCache::new(),
         node_connections: api::ws::NodeConnections::new(),
+        node_operations: api::node_ops::NodeOperationRegistry::new(),
         deployments: api::node_deploy::DeploymentRegistry::default(),
         diagnose: api::diagnose::DiagnoseRegistry::new(),
         geoip_in_flight: std::sync::Arc::new(tokio::sync::Mutex::new(

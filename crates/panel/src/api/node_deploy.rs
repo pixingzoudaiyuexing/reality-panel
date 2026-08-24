@@ -1236,6 +1236,7 @@ mod tests {
             },
             release_cache: ReleaseCache::new(),
             node_connections: NodeConnections::new(),
+            node_operations: crate::api::node_ops::NodeOperationRegistry::new(),
             deployments: registry,
             diagnose: DiagnoseRegistry::new(),
             geoip_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),

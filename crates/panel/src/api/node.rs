@@ -281,6 +281,7 @@ pub async fn report_status(
             // frontend saw `undefined` and wrongly showed every node as "manual",
             // hiding the upgrade button on legitimately systemd-managed nodes.
             "install_method": req.install_method,
+            "architecture": req.architecture,
         });
         // Status persistence is best-effort: the original used .ok() to swallow
         // any DB error so a transient failure never broke the report cycle.
@@ -409,6 +410,7 @@ mod tests {
             },
             release_cache: ReleaseCache::new(),
             node_connections: NodeConnections::new(),
+            node_operations: crate::api::node_ops::NodeOperationRegistry::new(),
             deployments: crate::api::node_deploy::DeploymentRegistry::default(),
             diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
             geoip_in_flight: std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -723,6 +725,7 @@ mod tests {
             config_protocol_version: None,
             listener_errors: None,
             install_method: None,
+            architecture: None,
         };
         let Json(resp) = report_status(State(state.clone()), h, Json(req)).await;
         assert_eq!(resp.code, 401, "missing token → business 401, not HTTP 401");
@@ -864,6 +867,7 @@ mod tests {
             config_protocol_version: None,
             listener_errors: None,
             install_method: Some("systemd".into()),
+            architecture: Some("x86_64".into()),
         };
         let Json(resp) =
             report_status(State(state.clone()), auth_headers("tok-A"), Json(req)).await;

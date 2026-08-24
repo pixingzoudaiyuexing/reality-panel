@@ -446,6 +446,8 @@ export interface NodeStatus {
   /** v1.0.10: how the node is run — "systemd" | "docker" | "manual". Gates the
    *  one-click upgrade affordance. Missing on older nodes. */
   install_method?: string | null;
+  /** Runtime architecture as reported by relay-node. */
+  architecture?: string | null;
   /** v0.4.0: config-protocol version the node speaks. Missing/old →
    *  "配置协议不兼容，请升级节点". Compared against the panel's current version. */
   config_protocol_version?: number | null;
@@ -675,6 +677,7 @@ export interface NodeDisplayRow {
   node_version?: string | null;
   /** v1.0.10: "systemd" | "docker" | "manual" — gates one-click upgrade. */
   install_method?: string | null;
+  architecture?: string | null;
   config_protocol_version?: number | null;
   connections?: number | null;
   cpu?: number | null;
@@ -702,4 +705,39 @@ export interface NodeDisplayRow {
   /** Shared-group-only metadata (user view). */
   region?: string | null;
   line_type?: string | null;
+}
+
+export type NodeLifecycleAction = 'logs' | 'restart' | 'upgrade' | 'uninstall';
+
+export type NodeOperationStatus =
+  | 'PENDING' | 'SENT' | 'ACCEPTED' | 'DOWNLOADING' | 'VALIDATING'
+  | 'INSTALLING' | 'RESTARTING' | 'VERIFYING' | 'SUCCESS' | 'FAILED' | 'TIMEOUT';
+
+export interface NodeOperation {
+  id: string;
+  group_id: number;
+  node_id: string;
+  action: NodeLifecycleAction;
+  status: NodeOperationStatus;
+  message: string;
+  created_at: string;
+  updated_at: string;
+  current_version?: string;
+  target_version?: string;
+  architecture?: string;
+  sha256?: string;
+  logs?: string;
+}
+
+export interface NodeArtifactInfo {
+  architecture: 'amd64' | 'arm64';
+  available: boolean;
+  version?: string;
+  sha256?: string;
+  error?: string;
+}
+
+export interface NodeArtifactCatalog {
+  config_protocol_version: number;
+  artifacts: NodeArtifactInfo[];
 }
