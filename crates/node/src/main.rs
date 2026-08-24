@@ -225,6 +225,17 @@ async fn run() {
 
     tracing::info!("RelayNode {} starting, panel={}", VERSION, config.panel_url);
 
+    // Corrected Stage 3.1: restore the Relay-local camouflage endpoint before
+    // activating listener LKG routes that may send browser fallback traffic
+    // back to this node. This has no dependency on the Panel control channel.
+    let mut camouflage_sites =
+        forwarder::camouflage_site::CamouflageSiteManager::new(config.camouflage_site_config());
+    if config.camouflage_sites_enabled && !camouflage_sites.restore_and_apply() {
+        tracing::error!(
+            "camouflage site LKG was not restored; continuing without local TLS fallback"
+        );
+    }
+
     // --- Offline resilience: load cached config on startup ---
     // If the panel is down when the node starts, load the last known config
     // from disk and start forwarding immediately. The poller will sync
@@ -240,14 +251,6 @@ async fn run() {
         }
     } else {
         tracing::info!("No cached config found - will start forwarding after first panel sync");
-    }
-
-    // Stage 3.1: site recovery is intentionally independent of the Panel
-    // control channel. It restores a healthy Node-local LKG before any fetch.
-    let mut reality_sites =
-        forwarder::reality_site::RealitySiteManager::new(config.reality_site_config());
-    if config.reality_sites_enabled && !reality_sites.restore_and_apply(&manager).await {
-        tracing::error!("Reality site LKG was not restored; listener LKG remains active");
     }
 
     // v0.3.0: stable per-node identity. Generated once and persisted to a

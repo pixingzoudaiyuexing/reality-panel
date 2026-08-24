@@ -1,6 +1,6 @@
 use super::gate::RuleRuntime;
 use super::limiter::RateLimit;
-use super::nginx_sni::{self, LocalSniRoute, NginxSniConfig, NginxSniPlan};
+use super::nginx_sni::{self, NginxSniConfig, NginxSniPlan};
 use super::selector::TargetSelector;
 use super::tcp;
 use super::tls;
@@ -141,8 +141,6 @@ pub struct ForwarderManager {
     /// Reality/SNI fork: node delegates TLS SNI routing to Nginx Stream.
     nginx_sni: NginxSniConfig,
     nginx_sni_plan: Option<NginxSniPlan>,
-    nginx_sni_listeners: Vec<ListenerConfig>,
-    reality_sni_routes: Vec<LocalSniRoute>,
     /// Guards the one best-effort rollback after a raw listener startup
     /// failure. A broken previous config must not recurse forever.
     restoring_previous_config: bool,
@@ -163,8 +161,6 @@ impl ForwarderManager {
             source_ipv4: None,
             nginx_sni: NginxSniConfig::default(),
             nginx_sni_plan: None,
-            nginx_sni_listeners: Vec::new(),
-            reality_sni_routes: Vec::new(),
             restoring_previous_config: false,
         }
     }
@@ -277,9 +273,7 @@ impl ForwarderManager {
             &sni_listeners,
             &self.nginx_sni.default_backend,
             &self.nginx_sni.access_log_path,
-        )
-        .with_local_routes(self.reality_sni_routes.clone())
-        {
+        ) {
             Ok(plan) => plan,
             Err(error) => {
                 tracing::error!("nginx_sni plan rejected: {}", error);
@@ -300,7 +294,6 @@ impl ForwarderManager {
                     return false;
                 } else {
                     self.nginx_sni_plan = Some(sni_plan);
-                    self.nginx_sni_listeners = sni_listeners.clone();
                 }
             }
         } else if !sni_listeners.is_empty() {
@@ -843,38 +836,6 @@ impl ForwarderManager {
         // v1.2.0: remember the applied config so restart_rule can rebuild a
         // rule's listeners from it without a round-trip to the panel.
         self.last_config = Some(config.clone());
-        true
-    }
-
-    /// Apply Node-local Reality routes through the same transactional stream
-    /// owner as Panel nginx_sni rules. The state update is deliberately last:
-    /// a failed Nginx apply leaves future Panel snapshots at the old layout.
-    pub async fn apply_reality_sni_routes(&mut self, routes: Vec<LocalSniRoute>) -> bool {
-        if !self.nginx_sni.enabled {
-            tracing::error!("cannot apply Reality sites while NGINX_SNI_ENABLED is false");
-            return false;
-        }
-        let plan = match NginxSniPlan::from_listeners(
-            &self.nginx_sni_listeners,
-            &self.nginx_sni.default_backend,
-            &self.nginx_sni.access_log_path,
-        )
-        .with_local_routes(routes.clone())
-        {
-            Ok(plan) => plan,
-            Err(error) => {
-                tracing::error!("Reality SNI route rejected: {}", error);
-                return false;
-            }
-        };
-        if self.nginx_sni_plan.as_ref() != Some(&plan)
-            && nginx_sni::apply_plan(&plan, &self.nginx_sni).is_err()
-        {
-            tracing::error!("Reality Nginx route apply failed");
-            return false;
-        }
-        self.reality_sni_routes = routes;
-        self.nginx_sni_plan = Some(plan);
         true
     }
 
