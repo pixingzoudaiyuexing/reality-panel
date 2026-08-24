@@ -28,6 +28,14 @@ pub struct NodeConfig {
     pub nginx_sni_default_backend: String,
     pub nginx_sni_access_log_path: String,
     pub nginx_sni_traffic_state_path: String,
+    /// Stage 3.1: Node-local REALITY site manifest and fixed Xray runtime.
+    /// No Panel protocol field carries site secrets.
+    pub reality_sites_enabled: bool,
+    pub reality_sites_manifest_path: String,
+    pub reality_sites_state_dir: String,
+    pub xray_binary_path: String,
+    pub xray_expected_version: String,
+    pub reality_wrapper_conf_path: String,
 }
 
 impl NodeConfig {
@@ -95,6 +103,24 @@ impl NodeConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "/opt/relay-node/nginx-sni-log.offset".to_string()),
+            reality_sites_enabled: parse_bool_env("REALITY_SITES_ENABLED", false),
+            reality_sites_manifest_path: std::env::var("REALITY_SITES_MANIFEST_PATH")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "/etc/relay-panel/reality-sites.json".to_string()),
+            reality_sites_state_dir: std::env::var("REALITY_SITES_STATE_DIR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "/opt/relay-node/reality-sites".to_string()),
+            xray_binary_path: std::env::var("XRAY_BINARY_PATH")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "/opt/relay-node/xray".to_string()),
+            xray_expected_version: crate::forwarder::reality_site::FIXED_XRAY_VERSION.to_string(),
+            reality_wrapper_conf_path: std::env::var("REALITY_WRAPPER_CONF_PATH")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "/etc/nginx/conf.d/relay-panel-reality-sites.conf".to_string()),
         };
         cfg.validate();
         cfg
@@ -108,6 +134,25 @@ impl NodeConfig {
             reload_cmd: self.nginx_sni_reload_cmd.clone(),
             default_backend: self.nginx_sni_default_backend.clone(),
             access_log_path: self.nginx_sni_access_log_path.clone(),
+        }
+    }
+
+    pub fn reality_site_config(&self) -> crate::forwarder::reality_site::RealitySiteConfig {
+        crate::forwarder::reality_site::RealitySiteConfig {
+            enabled: self.reality_sites_enabled,
+            manifest_path: PathBuf::from(&self.reality_sites_manifest_path),
+            state_dir: PathBuf::from(&self.reality_sites_state_dir),
+            xray_binary: PathBuf::from(&self.xray_binary_path),
+            expected_xray_version: self.xray_expected_version.clone(),
+            nginx: crate::forwarder::nginx_sni::NginxSniConfig {
+                enabled: self.nginx_sni_enabled,
+                conf_path: PathBuf::from(&self.reality_wrapper_conf_path),
+                test_cmd: self.nginx_sni_test_cmd.clone(),
+                reload_cmd: self.nginx_sni_reload_cmd.clone(),
+                default_backend: self.nginx_sni_default_backend.clone(),
+                access_log_path: self.nginx_sni_access_log_path.clone(),
+            },
+            openlist_upstream: "127.0.0.1:5244".to_string(),
         }
     }
 

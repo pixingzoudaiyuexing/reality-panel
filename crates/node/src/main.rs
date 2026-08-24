@@ -242,6 +242,14 @@ async fn run() {
         tracing::info!("No cached config found - will start forwarding after first panel sync");
     }
 
+    // Stage 3.1: site recovery is intentionally independent of the Panel
+    // control channel. It restores a healthy Node-local LKG before any fetch.
+    let mut reality_sites =
+        forwarder::reality_site::RealitySiteManager::new(config.reality_site_config());
+    if config.reality_sites_enabled && !reality_sites.restore_and_apply(&manager).await {
+        tracing::error!("Reality site LKG was not restored; listener LKG remains active");
+    }
+
     // v0.3.0: stable per-node identity. Generated once and persisted to a
     // node-id file, so the panel can tell multiple nodes sharing one group
     // token apart (otherwise their status entries overwrite each other).

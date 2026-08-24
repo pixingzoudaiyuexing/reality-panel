@@ -37,9 +37,20 @@ pub struct NginxSniRule {
     pub load_balance_strategy: LoadBalanceStrategy,
 }
 
+/// A Node-local SNI route. Unlike panel rules this is not reported for traffic
+/// accounting and is never part of the Panel protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalSniRoute {
+    pub site_id: String,
+    pub listen_port: u16,
+    pub sni: String,
+    pub backend: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NginxSniPlan {
     rules: Vec<NginxSniRule>,
+    local_routes: Vec<LocalSniRoute>,
     default_backend: String,
     access_log_path: String,
 }
@@ -102,9 +113,45 @@ impl NginxSniPlan {
         rules.dedup_by(|a, b| a.listen_port == b.listen_port && a.sni == b.sni);
         Self {
             rules,
+            local_routes: Vec::new(),
             default_backend: default_backend.to_string(),
             access_log_path: access_log_path.to_string(),
         }
+    }
+
+    /// Merge Node-local routes into the one RelayPanel-owned stream layout.
+    /// A duplicate (port, SNI) would make routing order-dependent, so reject it
+    /// before Nginx ever sees a candidate configuration.
+    pub fn with_local_routes(mut self, mut routes: Vec<LocalSniRoute>) -> Result<Self, String> {
+        for route in &mut routes {
+            route.sni = route.sni.trim().to_ascii_lowercase();
+            route.backend = route.backend.trim().to_string();
+            if route.site_id.is_empty() || route.sni.is_empty() || route.backend.is_empty() {
+                return Err("local SNI route is incomplete".to_string());
+            }
+            if self
+                .rules
+                .iter()
+                .any(|rule| rule.listen_port == route.listen_port && rule.sni == route.sni)
+                || self.local_routes.iter().any(|existing| {
+                    existing.listen_port == route.listen_port && existing.sni == route.sni
+                })
+            {
+                return Err(format!(
+                    "duplicate Nginx SNI route on port {}",
+                    route.listen_port
+                ));
+            }
+            self.local_routes.push(route.clone());
+        }
+        self.local_routes.sort_by(|a, b| {
+            (a.listen_port, a.sni.as_str(), a.site_id.as_str()).cmp(&(
+                b.listen_port,
+                b.sni.as_str(),
+                b.site_id.as_str(),
+            ))
+        });
+        Ok(self)
     }
 
     pub fn rule_id_for(&self, port: u16, sni: &str) -> Option<i64> {
@@ -151,12 +198,27 @@ impl NginxSniPlan {
             out.push_str("}\n\n");
         }
 
+        for route in &self.local_routes {
+            out.push_str(&format!("upstream {} {{\n", local_upstream_name(route)));
+            out.push_str(&format!(
+                "    server {} max_fails=1 fail_timeout=10s;\n",
+                escape_nginx_upstream_server(&route.backend)
+            ));
+            out.push_str("}\n\n");
+        }
         out.push_str("map \"$server_port:$ssl_preread_server_name\" $relay_panel_sni_backend {\n");
         for rule in &self.rules {
             out.push_str(&format!(
                 "    {} {};\n",
                 map_key_for(rule),
                 upstream_name(rule)
+            ));
+        }
+        for route in &self.local_routes {
+            out.push_str(&format!(
+                "    {} {};\n",
+                local_map_key_for(route),
+                local_upstream_name(route)
             ));
         }
         out.push_str(&format!("    default {};\n", default_upstream));
@@ -166,9 +228,15 @@ impl NginxSniPlan {
         for rule in &self.rules {
             out.push_str(&format!("    {} {};\n", map_key_for(rule), rule.rule_id));
         }
+        for route in &self.local_routes {
+            out.push_str(&format!("    {} 0;\n", local_map_key_for(route)));
+        }
         out.push_str("    default 0;\n");
         out.push_str("}\n\n");
 
+        for route in &self.local_routes {
+            by_port.entry(route.listen_port).or_default();
+        }
         for (port, _rules) in by_port {
             out.push_str("server {\n");
             out.push_str(&format!("    listen {};\n", port));
@@ -178,6 +246,23 @@ impl NginxSniPlan {
         }
         out
     }
+}
+
+fn local_upstream_name(route: &LocalSniRoute) -> String {
+    format!(
+        "relay_panel_reality_site_{}_{}_{}",
+        sanitize_nginx_name(&route.site_id),
+        route.listen_port,
+        sanitize_nginx_name(&route.sni)
+    )
+}
+
+fn local_map_key_for(route: &LocalSniRoute) -> String {
+    format!(
+        "~*^{}:{}$",
+        route.listen_port,
+        escape_nginx_regex(&route.sni)
+    )
 }
 
 fn effective_targets(rule: &NginxSniRule) -> Vec<&String> {
@@ -257,6 +342,12 @@ impl From<std::io::Error> for ApplyError {
 }
 
 pub fn apply_plan(plan: &NginxSniPlan, cfg: &NginxSniConfig) -> Result<(), ApplyError> {
+    apply_rendered(plan.render().as_bytes(), cfg)
+}
+
+/// Apply a second Node-owned Nginx fragment with the same test/reload rollback
+/// contract as the stream router. Used by the local Reality TLS wrappers.
+pub fn apply_rendered(contents: &[u8], cfg: &NginxSniConfig) -> Result<(), ApplyError> {
     if !cfg.enabled {
         return Ok(());
     }
@@ -270,7 +361,7 @@ pub fn apply_plan(plan: &NginxSniPlan, cfg: &NginxSniConfig) -> Result<(), Apply
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
-    replace_durably(&cfg.conf_path, plan.render().as_bytes())?;
+    replace_durably(&cfg.conf_path, contents)?;
 
     if let Err(e) = run_shell(&cfg.test_cmd) {
         restore_previous(&cfg.conf_path, previous.as_deref())?;
@@ -291,10 +382,21 @@ pub fn apply_plan(plan: &NginxSniPlan, cfg: &NginxSniConfig) -> Result<(), Apply
     }
     tracing::info!(
         "applied nginx_sni config: {} rule(s), path={}",
-        plan.rules.len(),
+        "managed",
         cfg.conf_path.display()
     );
     Ok(())
+}
+
+/// Restore a managed fragment after a later cross-component transaction step
+/// fails. This intentionally tests and reloads the old runtime too.
+pub fn restore_rendered(previous: Option<&[u8]>, cfg: &NginxSniConfig) -> Result<(), ApplyError> {
+    if !cfg.enabled {
+        return Ok(());
+    }
+    restore_previous(&cfg.conf_path, previous)?;
+    run_shell(&cfg.test_cmd)?;
+    run_shell(&cfg.reload_cmd)
 }
 
 fn temp_path(path: &std::path::Path) -> PathBuf {
@@ -497,6 +599,54 @@ mod tests {
         );
         assert_eq!(plan.rule_id_for(443, "op1.example.com"), Some(7));
         assert_eq!(plan.rule_id_for(8443, "op1.example.com"), None);
+    }
+
+    #[test]
+    fn local_reality_route_shares_the_single_stream_server() {
+        let plan = NginxSniPlan::from_listeners(
+            &[listener(
+                7,
+                443,
+                "panel.example.com",
+                &["127.0.0.1:8443"],
+                LoadBalanceStrategy::First,
+            )],
+            "127.0.0.1:9",
+            "/tmp/relay-panel-test.log",
+        )
+        .with_local_routes(vec![LocalSniRoute {
+            site_id: "reality-1".into(),
+            listen_port: 443,
+            sni: "reality.example.com".into(),
+            backend: "127.0.0.1:24443".into(),
+        }])
+        .unwrap();
+        let rendered = plan.render();
+        assert_eq!(rendered.matches("listen 443;").count(), 1);
+        assert!(rendered.contains("127.0.0.1:24443"));
+        assert!(rendered.contains("~*^443:reality\\.example\\.com$ relay_panel_reality_site_"));
+    }
+
+    #[test]
+    fn local_reality_route_cannot_shadow_a_panel_route() {
+        let result = NginxSniPlan::from_listeners(
+            &[listener(
+                7,
+                443,
+                "same.example.com",
+                &["127.0.0.1:8443"],
+                LoadBalanceStrategy::First,
+            )],
+            "127.0.0.1:9",
+            "/tmp/relay-panel-test.log",
+        )
+        .with_local_routes(vec![LocalSniRoute {
+            site_id: "reality-1".into(),
+            listen_port: 443,
+            sni: "same.example.com".into(),
+            backend: "127.0.0.1:24443".into(),
+        }]);
+        assert!(result.is_err());
     }
 
     fn unique_path(label: &str) -> PathBuf {

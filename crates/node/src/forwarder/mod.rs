@@ -5,6 +5,7 @@ pub mod manager;
 pub mod nginx_sni;
 pub mod nginx_sni_traffic;
 pub mod outbound;
+pub mod reality_site;
 pub mod selector;
 // v1.0.8: Linux-only splice(2) zero-copy forwarding (used by tcp.rs for
 // unlimited rules). Other targets fall back to the userspace copy.
