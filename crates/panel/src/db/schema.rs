@@ -362,6 +362,38 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action, ts);
 
+-- Short-lived, durable Manual Bootstrap enrollment state. Only keyed
+-- verifiers are stored; plaintext enrollment/session credentials never enter
+-- the database. LOCAL_COMMITTED is intentionally distinct from SUCCESS so a
+-- later Panel finalization failure can be retried without rolling back a
+-- healthy Relay.
+CREATE TABLE IF NOT EXISTS manual_bootstrap_enrollments (
+    id TEXT PRIMARY KEY,
+    secret_verifier TEXT NOT NULL,
+    group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    profile TEXT NOT NULL CHECK (profile IN ('reality_camouflage')),
+    state TEXT NOT NULL CHECK (state IN ('PENDING','CLAIMED','VERIFYING','LOCAL_COMMITTED','SUCCESS','FAILED','EXPIRED')),
+    architecture TEXT CHECK (architecture IS NULL OR architecture IN ('amd64','arm64')),
+    client_nonce_verifier TEXT,
+    session_verifier TEXT,
+    session_expires_at TEXT,
+    node_id TEXT,
+    observed_at TEXT,
+    last_error_category TEXT,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    claimed_at TEXT,
+    verified_at TEXT,
+    local_committed_at TEXT,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_manual_bootstrap_enrollments_group_state
+    ON manual_bootstrap_enrollments(group_id, state);
+CREATE INDEX IF NOT EXISTS idx_manual_bootstrap_enrollments_expiry
+    ON manual_bootstrap_enrollments(state, expires_at, session_expires_at);
+
 -- v1.2.4: site announcements.
 --
 -- Replaces the single `announcement` string that lived in the site:config kvs
@@ -1834,6 +1866,47 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .await?;
     tracing::info!("Migration 45: forward_rules.camouflage_enabled present");
 
+    // ── Migration 46: durable Manual Bootstrap enrollment state ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS manual_bootstrap_enrollments (\
+             id TEXT PRIMARY KEY,\
+             secret_verifier TEXT NOT NULL,\
+             group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,\
+             profile TEXT NOT NULL CHECK (profile IN ('reality_camouflage')),\
+             state TEXT NOT NULL CHECK (state IN ('PENDING','CLAIMED','VERIFYING','LOCAL_COMMITTED','SUCCESS','FAILED','EXPIRED')),\
+             architecture TEXT CHECK (architecture IS NULL OR architecture IN ('amd64','arm64')),\
+             client_nonce_verifier TEXT,\
+             session_verifier TEXT,\
+             session_expires_at TEXT,\
+             node_id TEXT,\
+             observed_at TEXT,\
+             last_error_category TEXT,\
+             created_by INTEGER NOT NULL,\
+             created_at TEXT NOT NULL,\
+             updated_at TEXT NOT NULL,\
+             expires_at TEXT NOT NULL,\
+             claimed_at TEXT,\
+             verified_at TEXT,\
+             local_committed_at TEXT,\
+             completed_at TEXT\
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_manual_bootstrap_enrollments_group_state \
+         ON manual_bootstrap_enrollments(group_id, state)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_manual_bootstrap_enrollments_expiry \
+         ON manual_bootstrap_enrollments(state, expires_at, session_expires_at)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 46: manual_bootstrap_enrollments table present");
+
     Ok(())
 }
 
@@ -2073,6 +2146,50 @@ mod tests {
             before, after,
             "second migration run must not duplicate seed rows"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_46_creates_durable_manual_bootstrap_enrollments() {
+        let pool = fresh_pool().await;
+        let columns: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT cid, name FROM pragma_table_info('manual_bootstrap_enrollments') ORDER BY cid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let names: Vec<&str> = columns.iter().map(|(_, name)| name.as_str()).collect();
+        for required in [
+            "id",
+            "secret_verifier",
+            "group_id",
+            "profile",
+            "state",
+            "client_nonce_verifier",
+            "session_verifier",
+            "session_expires_at",
+            "node_id",
+            "local_committed_at",
+            "completed_at",
+        ] {
+            assert!(
+                names.contains(&required),
+                "missing enrollment column {required}"
+            );
+        }
+        assert!(!names.contains(&"secret"));
+        assert!(!names.contains(&"session_token"));
+
+        run_migrations(&pool)
+            .await
+            .expect("migration 46 is idempotent");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'manual_bootstrap_enrollments'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
     }
 
     /// An "old" database that predates v0.3.0 (has forward_rules + device_groups

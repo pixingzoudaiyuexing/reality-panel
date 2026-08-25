@@ -27,6 +27,7 @@
 use sqlx::PgPool;
 
 mod announcements;
+mod enrollments;
 mod groups;
 mod kvs;
 mod orders;

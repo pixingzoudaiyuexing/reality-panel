@@ -250,6 +250,35 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
 CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action, ts);
 
+-- Durable Manual Bootstrap enrollment state. The secret/session columns hold
+-- keyed verifiers only, never plaintext credentials.
+CREATE TABLE IF NOT EXISTS manual_bootstrap_enrollments (
+    id TEXT PRIMARY KEY,
+    secret_verifier TEXT NOT NULL,
+    group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    profile TEXT NOT NULL CHECK (profile IN ('reality_camouflage')),
+    state TEXT NOT NULL CHECK (state IN ('PENDING','CLAIMED','VERIFYING','LOCAL_COMMITTED','SUCCESS','FAILED','EXPIRED')),
+    architecture TEXT CHECK (architecture IS NULL OR architecture IN ('amd64','arm64')),
+    client_nonce_verifier TEXT,
+    session_verifier TEXT,
+    session_expires_at TEXT,
+    node_id TEXT,
+    observed_at TEXT,
+    last_error_category TEXT,
+    created_by BIGINT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    claimed_at TEXT,
+    verified_at TEXT,
+    local_committed_at TEXT,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_manual_bootstrap_enrollments_group_state
+    ON manual_bootstrap_enrollments(group_id, state);
+CREATE INDEX IF NOT EXISTS idx_manual_bootstrap_enrollments_expiry
+    ON manual_bootstrap_enrollments(state, expires_at, session_expires_at);
+
 -- v1.2.4: site announcements (mirrors the SQLite baseline — see there for why
 -- this replaced the single announcement string in the site:config kvs blob and
 -- why author_name is a snapshot).
@@ -383,7 +412,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 29;
+pub const PG_SCHEMA_VERSION: i32 = 30;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1493,6 +1522,53 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 29: forward_rules.camouflage_enabled present");
     }
 
+    if current < 30 {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS manual_bootstrap_enrollments (\
+                 id TEXT PRIMARY KEY,\
+                 secret_verifier TEXT NOT NULL,\
+                 group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,\
+                 profile TEXT NOT NULL CHECK (profile IN ('reality_camouflage')),\
+                 state TEXT NOT NULL CHECK (state IN ('PENDING','CLAIMED','VERIFYING','LOCAL_COMMITTED','SUCCESS','FAILED','EXPIRED')),\
+                 architecture TEXT CHECK (architecture IS NULL OR architecture IN ('amd64','arm64')),\
+                 client_nonce_verifier TEXT,\
+                 session_verifier TEXT,\
+                 session_expires_at TEXT,\
+                 node_id TEXT,\
+                 observed_at TEXT,\
+                 last_error_category TEXT,\
+                 created_by BIGINT NOT NULL,\
+                 created_at TEXT NOT NULL,\
+                 updated_at TEXT NOT NULL,\
+                 expires_at TEXT NOT NULL,\
+                 claimed_at TEXT,\
+                 verified_at TEXT,\
+                 local_committed_at TEXT,\
+                 completed_at TEXT\
+             )",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_manual_bootstrap_enrollments_group_state \
+             ON manual_bootstrap_enrollments(group_id, state)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_manual_bootstrap_enrollments_expiry \
+             ON manual_bootstrap_enrollments(state, expires_at, session_expires_at)",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (30) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+        tracing::info!("PG migration 30: manual_bootstrap_enrollments table present");
+    }
+
     Ok(())
 }
 
@@ -1553,7 +1629,16 @@ mod tests {
 
     #[test]
     fn pg_schema_version_matches_latest_migration() {
-        assert_eq!(PG_SCHEMA_VERSION, 29);
+        assert_eq!(PG_SCHEMA_VERSION, 30);
+    }
+
+    #[test]
+    fn pg_schema_contains_manual_bootstrap_enrollment_revision() {
+        assert!(PG_SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS manual_bootstrap_enrollments"));
+        assert!(PG_SCHEMA_SQL.contains("secret_verifier TEXT NOT NULL"));
+        assert!(PG_SCHEMA_SQL.contains("LOCAL_COMMITTED"));
+        assert!(!PG_SCHEMA_SQL.contains("enrollment_secret TEXT"));
+        assert!(!PG_SCHEMA_SQL.contains("bootstrap_session TEXT"));
     }
 
     // The real baseline schema must split into runnable statements, and no

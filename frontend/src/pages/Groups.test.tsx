@@ -17,7 +17,7 @@ const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
 
 function group(over: Record<string, unknown> = {}) {
   return {
-    id: 1, name: 'g1', group_type: 'in', token: 'tok-'.padEnd(36, 'x'), uid: 1,
+    id: 1, name: 'g1', group_type: 'in', uid: 1,
     connect_host: '1.2.3.4', port_range: '10000-65535', rate: 1.0, hidden: false,
     ...over,
   };
@@ -32,6 +32,26 @@ beforeEach(() => {
   mockGet.mockImplementation((url: string) => {
     if (url === '/groups') return Promise.resolve(ok([group()]));
     return Promise.resolve(ok([]));
+  });
+});
+
+describe('group list credential boundary', () => {
+  it('renders without a group token and sends Add Node to Bootstrap with its group selected', async () => {
+    render(<Groups />);
+
+    await waitFor(() => expect(screen.getByText('g1')).toBeInTheDocument());
+    expect(screen.queryByText('nodeToken')).toBeNull();
+    const addNode = screen.getByRole('link', { name: 'addNode' });
+    expect(addNode).toHaveAttribute('href', '/node-bootstrap?group_id=1');
+  });
+
+  it('keeps token rotation behind an explicit destructive re-enrollment warning', async () => {
+    const user = userEvent.setup();
+    render(<Groups />);
+    await screen.findByText('g1');
+    await user.click(screen.getByRole('button', { name: /rotateToken/ }));
+    expect(screen.getByText('rotateTokenWarnDesc')).toBeInTheDocument();
+    expect(screen.getByText('rotateTokenTypeName')).toBeInTheDocument();
   });
 });
 

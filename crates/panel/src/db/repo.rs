@@ -522,6 +522,125 @@ pub trait GroupRepository: Send + Sync {
     async fn list_group_names_by_ids(&self, ids: &[i64]) -> Result<Vec<String>, DbError>;
 }
 
+// ── Manual bootstrap enrollments ──
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ManualBootstrapEnrollment {
+    pub id: String,
+    pub secret_verifier: String,
+    pub group_id: i64,
+    pub profile: String,
+    pub state: String,
+    pub architecture: Option<String>,
+    pub client_nonce_verifier: Option<String>,
+    pub session_verifier: Option<String>,
+    pub session_expires_at: Option<String>,
+    pub node_id: Option<String>,
+    pub observed_at: Option<String>,
+    pub last_error_category: Option<String>,
+    pub created_by: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub expires_at: String,
+    pub claimed_at: Option<String>,
+    pub verified_at: Option<String>,
+    pub local_committed_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewManualBootstrapEnrollment {
+    pub id: String,
+    pub secret_verifier: String,
+    pub group_id: i64,
+    pub profile: String,
+    pub created_by: i64,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ManualBootstrapClaim {
+    pub id: String,
+    pub secret_verifier: String,
+    pub profile: String,
+    pub architecture: String,
+    pub client_nonce_verifier: String,
+    pub session_verifier: String,
+    pub session_expires_at: String,
+    pub now: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ManualBootstrapClaimResult {
+    Claimed(ManualBootstrapEnrollment),
+    Existing(ManualBootstrapEnrollment),
+    Expired,
+    Invalid,
+    Replay,
+}
+
+#[async_trait]
+pub trait ManualBootstrapEnrollmentRepository: Send + Sync {
+    async fn create_manual_bootstrap_enrollment(
+        &self,
+        enrollment: &NewManualBootstrapEnrollment,
+    ) -> Result<(), DbError>;
+
+    async fn find_manual_bootstrap_enrollment(
+        &self,
+        id: &str,
+    ) -> Result<Option<ManualBootstrapEnrollment>, DbError>;
+
+    async fn claim_manual_bootstrap_enrollment(
+        &self,
+        claim: &ManualBootstrapClaim,
+    ) -> Result<ManualBootstrapClaimResult, DbError>;
+
+    async fn expire_manual_bootstrap_enrollment(&self, id: &str, now: &str)
+        -> Result<u64, DbError>;
+
+    async fn record_manual_bootstrap_verification_error(
+        &self,
+        id: &str,
+        session_verifier: &str,
+        category: &str,
+        now: &str,
+    ) -> Result<u64, DbError>;
+
+    async fn mark_manual_bootstrap_verifying(
+        &self,
+        id: &str,
+        session_verifier: &str,
+        node_id: &str,
+        observed_at: &str,
+        now: &str,
+    ) -> Result<u64, DbError>;
+
+    async fn mark_manual_bootstrap_local_committed(
+        &self,
+        id: &str,
+        session_verifier: &str,
+        node_id: &str,
+        now: &str,
+    ) -> Result<u64, DbError>;
+
+    async fn complete_manual_bootstrap_enrollment(
+        &self,
+        id: &str,
+        session_verifier: &str,
+        now: &str,
+    ) -> Result<u64, DbError>;
+
+    async fn fail_manual_bootstrap_enrollment(
+        &self,
+        id: &str,
+        session_verifier: &str,
+        category: &str,
+        now: &str,
+    ) -> Result<u64, DbError>;
+}
+
 // ── v1.0.7: per-user device-group authorization ──
 // Replaces the v1.0.4 user-permission-group layer (user → named group →
 // device-group allowlist) with a direct user ↔ device_group link plus a
@@ -1267,6 +1386,7 @@ pub trait Repository:
     + OrderRepository
     + RedeemRepository
     + AnnouncementRepository
+    + ManualBootstrapEnrollmentRepository
     + Send
     + Sync
 {

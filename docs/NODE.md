@@ -1,5 +1,12 @@
 # Relay Node (relay-node)
 
+> **Current deployment path:** use the Panel **Node Bootstrap** page. Choose
+> **SSH one-click deployment** when Panel can reach the Relay over SSH, or
+> **Manual Bootstrap** when the Relay can reach Panel outbound over HTTP(S)/WebSocket.
+> Both paths use the same transactional `scripts/relay-node-bootstrap.sh` engine.
+> The installer sections below are retained only as deprecated compatibility
+> reference for existing nodes; the current UI never generates those commands.
+
 `relay-node` is the forwarding daemon that runs on each relay server. It
 listens on the ports you configured in the panel and forwards TCP/UDP traffic
 to the target address. It also reports CPU / memory / disk / network / active
@@ -39,9 +46,9 @@ manually if you install by hand (see below).
 
 ## Install
 
-### Option A: One-line installer (recommended)
+### Legacy Option A: One-line installer (deprecated)
 
-This is the supported path. It detects the architecture, downloads the right
+This is a compatibility path only. It detects the architecture, downloads the right
 binary from GitHub Releases, writes a systemd service, and starts it.
 
 ```bash

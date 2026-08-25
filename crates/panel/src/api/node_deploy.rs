@@ -5,6 +5,10 @@
 //! spawned worker's stack and are never serialised or persisted.
 
 use crate::api::middleware::AdminOnly;
+use crate::api::provisioning::{
+    capabilities_satisfy, load_artifact, normalize_architecture, reported_capabilities,
+    ProvisioningArtifact, ProvisioningBundle, ProvisioningProfile,
+};
 use crate::api::AppState;
 use crate::db::repo::{GroupRepository, ResourceScope};
 use async_trait::async_trait;
@@ -18,7 +22,6 @@ use ssh2::Session;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
     Arc,
@@ -30,8 +33,6 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_LOGS: usize = 100;
-const INSTALL_SCRIPT: &str = include_str!("../../../../scripts/relay-node-bootstrap.sh");
-
 #[derive(Deserialize)]
 pub struct TestSshRequest {
     pub host: String,
@@ -54,21 +55,6 @@ pub struct StartDeploymentRequest {
     pub confirmed_fingerprint: String,
     #[serde(default)]
     pub profile: ProvisioningProfile,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProvisioningProfile {
-    #[default]
-    RealityCamouflage,
-}
-
-impl ProvisioningProfile {
-    fn required_capabilities(self) -> ProvisioningCapabilities {
-        match self {
-            Self::RealityCamouflage => ProvisioningCapabilities::reality_camouflage(),
-        }
-    }
 }
 
 #[derive(Clone, Serialize)]
@@ -239,12 +225,6 @@ struct Secrets {
     node_token: String,
 }
 
-struct NodeArtifact {
-    architecture: String,
-    bytes: Vec<u8>,
-    sha256: String,
-}
-
 struct VerifiedNode {
     node_id: String,
     capabilities: ProvisioningCapabilities,
@@ -263,13 +243,13 @@ struct Preflight {
 trait DeploymentRunner: Send + Sync {
     async fn probe(&self, ssh: &SshInput) -> Result<SshProbe, DeployError>;
     async fn preflight(&self, ssh: &SshInput, fingerprint: &str) -> Result<Preflight, DeployError>;
-    async fn artifact(&self, architecture: &str) -> Result<NodeArtifact, DeployError>;
+    async fn artifact(&self, architecture: &str) -> Result<ProvisioningArtifact, DeployError>;
     async fn install(
         &self,
         task_id: &str,
         ssh: &SshInput,
         fingerprint: &str,
-        artifact: &NodeArtifact,
+        artifact: &ProvisioningArtifact,
         panel_url: &str,
         token: &str,
     ) -> Result<(), DeployError>;
@@ -330,11 +310,14 @@ impl DeploymentRunner for SystemSshRunner {
         }).await.map_err(|_| DeployError::new("PREFLIGHT_FAILED", "preflight worker terminated"))?
     }
 
-    async fn artifact(&self, architecture: &str) -> Result<NodeArtifact, DeployError> {
+    async fn artifact(&self, architecture: &str) -> Result<ProvisioningArtifact, DeployError> {
         let architecture = architecture.to_string();
-        tokio::task::spawn_blocking(move || load_artifact(&architecture))
-            .await
-            .map_err(|_| DeployError::new("ARTIFACT_FAILED", "artifact worker terminated"))?
+        tokio::task::spawn_blocking(move || {
+            load_artifact(&architecture)
+                .map_err(|error| DeployError::new(error.category, error.message))
+        })
+        .await
+        .map_err(|_| DeployError::new("ARTIFACT_FAILED", "artifact worker terminated"))?
     }
 
     async fn install(
@@ -342,20 +325,14 @@ impl DeploymentRunner for SystemSshRunner {
         task_id: &str,
         ssh: &SshInput,
         fingerprint: &str,
-        artifact: &NodeArtifact,
+        artifact: &ProvisioningArtifact,
         panel_url: &str,
         token: &str,
     ) -> Result<(), DeployError> {
         let input = ssh.clone_without_secret_debug();
         let fingerprint = fingerprint.to_string();
         let task_id = task_id.to_string();
-        let artifact = NodeArtifact {
-            architecture: artifact.architecture.clone(),
-            bytes: artifact.bytes.clone(),
-            sha256: artifact.sha256.clone(),
-        };
-        let panel_url = panel_url.to_string();
-        let token = token.to_string();
+        let bundle = ProvisioningBundle::new(panel_url, token, artifact.clone());
         tokio::task::spawn_blocking(move || {
             let mut session = connect(&input, Some(&fingerprint))?;
             authenticate(&mut session, &input)?;
@@ -369,14 +346,21 @@ impl DeploymentRunner for SystemSshRunner {
                 ),
             )?;
             let script_path = format!("{remote_dir}/bootstrap.sh");
-            let artifact_path = format!("{remote_dir}/relay-node-linux-{}", artifact.architecture);
+            let artifact_path = format!(
+                "{remote_dir}/relay-node-linux-{}",
+                bundle.artifact.architecture
+            );
             let config_path = format!("{remote_dir}/config.env");
             let transaction_path = format!("{remote_dir}/transaction");
-            let config = bootstrap_config(&panel_url, &token, &artifact);
             let result = (|| {
-                upload(&mut session, &script_path, INSTALL_SCRIPT.as_bytes(), 0o700)?;
-                upload(&mut session, &artifact_path, &artifact.bytes, 0o700)?;
-                upload(&mut session, &config_path, config.as_bytes(), 0o600)?;
+                upload(
+                    &mut session,
+                    &script_path,
+                    bundle.install_script.as_bytes(),
+                    0o700,
+                )?;
+                upload(&mut session, &artifact_path, &bundle.artifact.bytes, 0o700)?;
+                upload(&mut session, &config_path, bundle.config.as_bytes(), 0o600)?;
                 exec(
                     &mut session,
                     &format!(
@@ -743,7 +727,7 @@ async fn run_task(
             .map(|task| task.profile)
             .unwrap_or_default();
         let required = profile.required_capabilities();
-        if !verified.capabilities.satisfies(required) {
+        if !capabilities_satisfy(verified.capabilities, required) {
             return Err(DeployError::new(
                 "CAPABILITY_FAILED",
                 "remote verification did not confirm requested provisioning capabilities",
@@ -875,15 +859,9 @@ async fn wait_for_node_capabilities(
             saw_online = true;
             let key = format!("node_status:{group_id}:{node_id}");
             if let Ok(Some(raw)) = state.db.get(&key).await {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
-                    if let Some(capabilities) =
-                        value.get("provisioning_capabilities").and_then(|item| {
-                            serde_json::from_value::<ProvisioningCapabilities>(item.clone()).ok()
-                        })
-                    {
-                        if capabilities.satisfies(required) {
-                            return Ok(capabilities);
-                        }
+                if let Some(capabilities) = reported_capabilities(&raw) {
+                    if capabilities_satisfy(capabilities, required) {
+                        return Ok(capabilities);
                     }
                 }
             }
@@ -957,7 +935,7 @@ fn parse_preflight(output: &str) -> Result<Preflight, DeployError> {
         .lines()
         .filter_map(|line| line.split_once('='))
         .collect();
-    let architecture = map_arch(values.get("arch").copied().unwrap_or_default())
+    let architecture = normalize_architecture(values.get("arch").copied().unwrap_or_default())
         .ok_or_else(|| DeployError::new("PREFLIGHT_FAILED", "unsupported CPU architecture"))?;
     let free_kib = values
         .get("free_kib")
@@ -999,34 +977,6 @@ fn validate_preflight(facts: &Preflight) -> Result<(), DeployError> {
         ));
     }
     Ok(())
-}
-
-fn map_arch(raw: &str) -> Option<&'static str> {
-    match raw {
-        "amd64" | "x86_64" => Some("amd64"),
-        "arm64" | "aarch64" => Some("arm64"),
-        _ => None,
-    }
-}
-
-fn load_artifact(architecture: &str) -> Result<NodeArtifact, DeployError> {
-    let dir = std::env::var("NODE_BOOTSTRAP_BINARY_DIR")
-        .unwrap_or_else(|_| "/opt/relay-panel/node-assets".into());
-    let path = PathBuf::from(dir).join(format!("relay-node-linux-{architecture}"));
-    let bytes = std::fs::read(&path)
-        .map_err(|_| DeployError::new("ARTIFACT_FAILED", "Panel relay-node artifact is missing"))?;
-    if bytes.is_empty() {
-        return Err(DeployError::new(
-            "ARTIFACT_FAILED",
-            "Panel relay-node artifact is empty",
-        ));
-    }
-    let sha256 = hex::encode(Sha256::digest(&bytes));
-    Ok(NodeArtifact {
-        architecture: architecture.into(),
-        bytes,
-        sha256,
-    })
 }
 
 fn connect(ssh: &SshInput, expected_fingerprint: Option<&str>) -> Result<Session, DeployError> {
@@ -1142,15 +1092,6 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn bootstrap_config(panel_url: &str, token: &str, artifact: &NodeArtifact) -> String {
-    format!(
-        "PANEL_URL={}\nNODE_TOKEN={}\nRELAY_NODE_ARCH={}\nRELAY_NODE_SHA256={}\n",
-        shell_quote(panel_url),
-        shell_quote(token),
-        artifact.architecture,
-        artifact.sha256
-    )
-}
 fn truncate_tail(value: &str) -> String {
     let length = value.chars().count();
     if length <= 512 {
@@ -1233,6 +1174,7 @@ mod tests {
     use super::*;
     use crate::api::diagnose::DiagnoseRegistry;
     use crate::api::middleware::Claims;
+    use crate::api::provisioning::INSTALL_SCRIPT;
     use crate::api::system::ReleaseCache;
     use crate::api::ws::NodeConnections;
     use crate::config::Config;
@@ -1319,8 +1261,8 @@ mod tests {
             }
         }
 
-        async fn artifact(&self, architecture: &str) -> Result<NodeArtifact, DeployError> {
-            Ok(NodeArtifact {
+        async fn artifact(&self, architecture: &str) -> Result<ProvisioningArtifact, DeployError> {
+            Ok(ProvisioningArtifact {
                 architecture: architecture.into(),
                 bytes: vec![1, 2, 3],
                 sha256: "fake-sha256".into(),
@@ -1332,7 +1274,7 @@ mod tests {
             _task_id: &str,
             _ssh: &SshInput,
             _fingerprint: &str,
-            _artifact: &NodeArtifact,
+            _artifact: &ProvisioningArtifact,
             _panel_url: &str,
             _token: &str,
         ) -> Result<(), DeployError> {
@@ -1942,15 +1884,6 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
     }
 
     #[test]
-    fn architecture_aliases_are_supported() {
-        assert_eq!(map_arch("amd64"), Some("amd64"));
-        assert_eq!(map_arch("x86_64"), Some("amd64"));
-        assert_eq!(map_arch("arm64"), Some("arm64"));
-        assert_eq!(map_arch("aarch64"), Some("arm64"));
-        assert_eq!(map_arch("riscv64"), None);
-    }
-
-    #[test]
     fn password_token_and_bearer_are_redacted() {
         let value = redact("password=wrong-password token=node-token-secret Authorization: Bearer abc.def https://panel.test/api?access_token=other-secret", &secrets());
         assert!(!value.contains("wrong-password"));
@@ -1960,15 +1893,16 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
     }
 
     #[test]
-    fn bootstrap_config_has_separate_shell_quoted_lines() {
-        let artifact = NodeArtifact {
+    fn ssh_bootstrap_uses_the_shared_bundle_config_unchanged() {
+        let artifact = ProvisioningArtifact {
             architecture: "amd64".into(),
             bytes: vec![],
             sha256: "abc123".into(),
         };
-        let config = bootstrap_config("https://panel.test/api", "token with ' quote", &artifact);
+        let bundle =
+            ProvisioningBundle::new("https://panel.test/api", "token with ' quote", artifact);
         assert_eq!(
-            config.lines().collect::<Vec<_>>(),
+            bundle.config.lines().collect::<Vec<_>>(),
             vec![
                 "PANEL_URL='https://panel.test/api'",
                 "NODE_TOKEN='token with '\\'' quote'",
@@ -2632,6 +2566,88 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             status.capabilities,
             Some(ProvisioningCapabilities::reality_camouflage())
         );
+        assert_eq!(runner.commit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_ssh_task_preserves_stage_and_log_contract() {
+        let runner = Arc::new(FakeRunner::new(FakeBehavior::Success));
+        let state = test_state(test_registry(
+            runner.clone(),
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        ))
+        .await;
+        let task = state
+            .deployments
+            .insert(
+                7,
+                "node.example".into(),
+                ProvisioningProfile::RealityCamouflage,
+            )
+            .await;
+        let (_connection_id, _receiver) = state
+            .node_connections
+            .register(7, Some("node-test-1".into()))
+            .await;
+        seed_node_capabilities(&state, ProvisioningCapabilities::reality_camouflage()).await;
+
+        run_task(
+            state.clone(),
+            task.id.clone(),
+            ssh_input(),
+            "SHA256:confirmed".into(),
+            "node-token-secret".into(),
+            "https://panel.test".into(),
+            1,
+        )
+        .await;
+
+        let status = state.deployments.status(&task.id).await.unwrap();
+        assert_eq!(status.stage, DeploymentStage::Success);
+        assert_eq!(status.status, "SUCCESS");
+        assert_eq!(
+            status.message,
+            "node bootstrap completed and requested capabilities are online"
+        );
+        assert_eq!(status.node_id.as_deref(), Some("node-test-1"));
+        assert_eq!(
+            status.capabilities,
+            Some(ProvisioningCapabilities::reality_camouflage())
+        );
+
+        let logs = state.deployments.logs(&task.id).await.unwrap();
+        assert_eq!(
+            logs.iter()
+                .map(|entry| (entry.stage, entry.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (DeploymentStage::Pending, "deployment task queued"),
+                (
+                    DeploymentStage::Connecting,
+                    "validating confirmed SSH host key",
+                ),
+                (DeploymentStage::Preflight, "preflight checks passed"),
+                (
+                    DeploymentStage::Installing,
+                    "uploading verified relay-node artifact",
+                ),
+                (
+                    DeploymentStage::Configuring,
+                    "relay-node, Docker, Nginx Stream, OpenList, fallback, and Certbot base configured",
+                ),
+                (
+                    DeploymentStage::Verifying,
+                    "checking remote services and Panel enrollment",
+                ),
+                (
+                    DeploymentStage::Success,
+                    "node bootstrap completed and requested capabilities are online",
+                ),
+            ]
+        );
+        assert_eq!(runner.install_calls.load(Ordering::SeqCst), 1);
         assert_eq!(runner.commit_calls.load(Ordering::SeqCst), 1);
         assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 0);
     }

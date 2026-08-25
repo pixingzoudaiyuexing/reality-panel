@@ -1,15 +1,12 @@
 import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Typography, Tag, Tooltip, Alert, Switch } from 'antd';
-import { PlusOutlined, ReloadOutlined, CopyOutlined, EditOutlined, CloudServerOutlined, CodeOutlined, ApiOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { PlusOutlined, ReloadOutlined, EditOutlined, CloudServerOutlined, ApiOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
+import { useCallback, useEffect, useState } from 'react';
 import api from '../api/client';
 import type { ApiEnvelope, DeviceGroup, User, NodeStatus } from '../api/types';
 import { useI18n } from '../i18n/context';
-import { copyText } from '../utils/clipboard';
 import { useAuth } from '../auth/useAuth';
 
 const { Text } = Typography;
-
-const INSTALL_SCRIPT_URL = 'https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh';
 
 /** v1.2.5: the forwarding/visibility columns and fields that a monitor-only
  *  group has no use for. It carries no rules and never reaches a regular user,
@@ -20,57 +17,6 @@ function isMonitorOnly(g: { group_type: string }): boolean {
 
 const dash = <span style={{ color: 'var(--rp-text-tertiary)' }}>-</span>;
 
-interface InstallCommandOptions {
-  nginxSni?: boolean;
-  nginxDocker?: boolean;
-  nginxDockerImage?: string;
-  openlistPort?: number | null;
-  fallbackPort?: number | null;
-  fallbackName?: string;
-  certbotDomain?: string;
-  certbotEmail?: string;
-  certbotStaging?: boolean;
-}
-
-interface InstallCommandContext {
-  token: string;
-  panelUrl: string;
-}
-
-const shellArg = (value: string): string => {
-  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-};
-
-function buildInstallCommand(token: string, panelUrl: string, options: InstallCommandOptions = {}): string {
-  const args = [
-    `bash <(curl -fsSL ${INSTALL_SCRIPT_URL})`,
-    `-t ${shellArg(token)}`,
-    `-u ${shellArg(panelUrl)}`,
-  ];
-  if (options.nginxSni) {
-    args.push('--nginx-sni');
-    if (options.nginxDocker) {
-      args.push('--nginx-docker');
-      if (options.nginxDockerImage?.trim() && options.nginxDockerImage.trim() !== 'nginx:1.27-alpine') {
-        args.push(`--nginx-docker-image ${shellArg(options.nginxDockerImage.trim())}`);
-      }
-    }
-    if (options.openlistPort) args.push(`--openlist-port ${options.openlistPort}`);
-    if (options.fallbackPort) args.push(`--fallback-port ${options.fallbackPort}`);
-    if (options.fallbackName?.trim()) args.push(`--fallback-name ${shellArg(options.fallbackName.trim())}`);
-    if (options.certbotDomain?.trim()) args.push(`--fallback-certbot-domain ${shellArg(options.certbotDomain.trim())}`);
-    if (options.certbotEmail?.trim()) args.push(`--fallback-certbot-email ${shellArg(options.certbotEmail.trim())}`);
-    if (options.certbotStaging) args.push('--fallback-certbot-staging');
-  }
-  return args.map((arg, idx) => idx === 0 ? arg : `  ${arg}`).join(' \\\n');
-}
-
-function isLocalhost(): boolean {
-  const h = window.location.hostname;
-  return h === 'localhost' || h === '127.0.0.1' || h === '::1';
-}
-
 export default function Groups() {
   const { t } = useI18n();
   const { isAdmin } = useAuth();
@@ -80,17 +26,6 @@ export default function Groups() {
   const [loading, setLoading] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
-  const [cmdModalOpen, setCmdModalOpen] = useState(false);
-  const [cmdModalContent, setCmdModalContent] = useState<{ title: ReactNode; body: ReactNode }>({ title: null, body: null });
-  const [installContext, setInstallContext] = useState<InstallCommandContext | null>(null);
-  const [installOptions, setInstallOptions] = useState<InstallCommandOptions>({
-    nginxSni: true,
-    nginxDocker: true,
-    nginxDockerImage: 'nginx:1.27-alpine',
-    openlistPort: 5244,
-    fallbackPort: 8443,
-    certbotStaging: false,
-  });
   const [editing, setEditing] = useState<DeviceGroup | null>(null);
   // v1.2.3: node-token rotation. `rotating` is the target group; `confirmName`
   // is the typed group name that unlocks the button — rotation kicks every node
@@ -228,85 +163,27 @@ export default function Groups() {
     }
   };
 
-  const doCopy = async (text: string, successMsg: string) => {
-    if (!text || text.length < 20) { message.error(t('copyFailed')); return; }
-    const ok = await copyText(text);
-    if (ok) {
-      message.success(successMsg);
-    } else {
-      message.error(t('copyFailed'));
-    }
-  };
-
-  const panelUrlRef = async (): Promise<string> => {
-    try {
-      const resp = await api.get<unknown, { public_panel_url?: string }>("/system/version");
-      if (resp.public_panel_url) return resp.public_panel_url;
-    } catch { /* ignore */ }
-    return window.location.origin;
-  };
-
-  const showInstallCommand = async (g: DeviceGroup) => {
-    const panelUrl = await panelUrlRef();
-    setInstallContext({ token: g.token, panelUrl });
-    setInstallOptions({
-      nginxSni: true,
-      nginxDocker: true,
-      nginxDockerImage: 'nginx:1.27-alpine',
-      openlistPort: 5244,
-      fallbackPort: 8443,
-      certbotStaging: false,
-    });
-    setCmdModalContent({
-      title: <span>{t('installCommandTitle')}</span>,
-      body: null,
-    });
-    setCmdModalOpen(true);
-  };
-
   /**
    * Rotate the group's node token. The backend invalidates the old token and
    * force-closes this group's live WS connections (a node that reconnected with
    * the revoked token used to fetch an empty config and tear down all its
    * listeners), so every node here is offline until re-enrolled.
    *
-   * The new token is shown once, together with the ready-to-paste enrollment
-   * command — this is the moment the operator needs it, and hunting for it
-   * afterwards while nodes are down is the wrong time to go looking.
+   * Manual and SSH Bootstrap obtain the new group token only inside their
+   * protected provisioning bundle; the Groups page never renders it.
    */
   const handleRotateToken = async () => {
     if (!rotating) return;
     setRotateBusy(true);
     try {
-      const res = await api.post<unknown, ApiEnvelope<{ token: string }>>(
+      const res = await api.post<unknown, ApiEnvelope<unknown>>(
         `/groups/${rotating.id}/rotate-token`,
       );
-      if (res.code !== 0 || !res.data) { message.error(res.message || t('tokenRotateFailed')); return; }
-      const newToken = res.data.token;
-      const panelUrl = await panelUrlRef();
-      const cmd = buildInstallCommand(newToken, panelUrl);
+      if (res.code !== 0) { message.error(res.message || t('tokenRotateFailed')); return; }
       setRotating(null);
       setConfirmName('');
-      setInstallContext(null);
       load();
-      setCmdModalContent({
-        title: <span>{t('tokenRotated')}</span>,
-        body: (
-          <>
-            <Alert type="warning" showIcon style={{ marginBottom: 12 }} title={t('tokenRotatedHint')} />
-            <div style={{ marginBottom: 6 }}><Text strong>{t('nodeToken')}</Text></div>
-            <Input value={newToken} readOnly style={{ fontFamily: 'var(--rp-font-mono)', fontSize: 12, marginBottom: 12 }} />
-            <div style={{ marginBottom: 6 }}><Text strong>{t('installCommandTitle')}</Text></div>
-            <Input.TextArea value={cmd} readOnly autoSize={{ minRows: 3, maxRows: 5 }} style={{ fontFamily: 'var(--rp-font-mono)', fontSize: 12 }} />
-            <div style={{ textAlign: 'right', marginTop: 8 }}>
-              <Button type="primary" icon={<CopyOutlined />} onClick={() => doCopy(cmd, t('installCommandCopied'))}>
-                {t('copyInstallCommand')}
-              </Button>
-            </div>
-          </>
-        ),
-      });
-      setCmdModalOpen(true);
+      message.success(t('tokenRotated'));
     } catch {
       message.error(t('tokenRotateFailed'));
     } finally {
@@ -366,17 +243,6 @@ export default function Groups() {
         return <span>{total > 0 ? `${online}/${total}` : '-'}</span>;
       },
     },
-    {
-      title: t('nodeToken'), dataIndex: 'token', key: 'token',
-      render: (tk: string, g: DeviceGroup) => (
-        <Space>
-          <Text code style={{ maxWidth: 180 }} ellipsis>{tk}</Text>
-          <Tooltip title={t('copyInstallCommand')}>
-            <Button size="small" type="text" icon={<CodeOutlined />} aria-label={t('copyInstallCommand')} onClick={() => showInstallCommand(g)} />
-          </Tooltip>
-        </Space>
-      ),
-    },
     // v1.2.5: these four say nothing about a monitor-only group — it forwards
     // nothing and is never shown to a user — so it reads "-" rather than a
     // stored value that looks like configuration but is inert. The value itself
@@ -404,9 +270,14 @@ export default function Groups() {
         hidden && !isMonitorOnly(g) ? <Tag>{t('yes')}</Tag> : dash,
     },
     {
-      title: t('action'), key: 'action', width: 190,
+      title: t('action'), key: 'action', width: 230,
       render: (_: unknown, g: DeviceGroup) => (
         <Space size={0}>
+          {isAdmin && (
+            <Tooltip title={t('addNode')}>
+              <Button size="small" type="text" icon={<ApiOutlined />} href={`/node-bootstrap?group_id=${g.id}`} aria-label={t('addNode')} />
+            </Tooltip>
+          )}
           <Button size="small" type="text" icon={<EditOutlined />} onClick={() => handleEdit(g)}>{t('edit')}</Button>
           <Tooltip title={t('rotateTokenHint')}>
             <Button
@@ -432,9 +303,7 @@ export default function Groups() {
       return (
         <div style={{ padding: '8px 0', color: 'var(--rp-text-tertiary)', fontSize: 13 }}>
           {t('noNodesInGroup')}
-          <Button size="small" type="link" icon={<ApiOutlined />} style={{ marginLeft: 12 }} onClick={() => showInstallCommand(g)}>
-            {t('addNode')}
-          </Button>
+          {isAdmin && <Button size="small" type="link" icon={<ApiOutlined />} style={{ marginLeft: 12 }} href={`/node-bootstrap?group_id=${g.id}`}>{t('addNode')}</Button>}
         </div>
       );
     }
@@ -442,7 +311,7 @@ export default function Groups() {
       <div style={{ padding: 4 }}>
         <div style={{ marginBottom: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <Text type="secondary" style={{ fontSize: 12 }}>{t('nodesInGroup')} ({groupNodes.length})</Text>
-          <Button size="small" icon={<ApiOutlined />} onClick={() => showInstallCommand(g)}>{t('addNode')}</Button>
+          {isAdmin && <Button size="small" icon={<ApiOutlined />} href={`/node-bootstrap?group_id=${g.id}`}>{t('addNode')}</Button>}
         </div>
         <Table
           dataSource={groupNodes}
@@ -543,103 +412,6 @@ export default function Groups() {
             </>
           )}
         </Form>
-      </Modal>
-
-      <Modal title={cmdModalContent.title} open={cmdModalOpen} onCancel={() => { setCmdModalOpen(false); setInstallContext(null); }} footer={null} width={640}>
-        {installContext ? (
-          <>
-            {(isLocalhost() || installContext.panelUrl.includes("127.0.0.1") || installContext.panelUrl.includes("localhost") || installContext.panelUrl.includes("0.0.0.0")) && (
-              <Alert type="warning" showIcon style={{ marginBottom: 12 }} title={t('localhostWarning')} />
-            )}
-            <Form layout="vertical" size="small">
-              <Form.Item label={t('installRealitySniMode')}>
-                <Switch
-                  checked={!!installOptions.nginxSni}
-                  onChange={(checked) => setInstallOptions(o => ({ ...o, nginxSni: checked }))}
-                />
-              </Form.Item>
-              {installOptions.nginxSni && (
-                <>
-                  <Form.Item label={t('installNginxDockerMode')}>
-                    <Switch
-                      checked={!!installOptions.nginxDocker}
-                      onChange={(checked) => setInstallOptions(o => ({ ...o, nginxDocker: checked }))}
-                    />
-                  </Form.Item>
-                  {installOptions.nginxDocker && (
-                    <Form.Item label={t('installNginxDockerImage')}>
-                      <Input
-                        value={installOptions.nginxDockerImage}
-                        placeholder="nginx:1.27-alpine"
-                        onChange={(e) => setInstallOptions(o => ({ ...o, nginxDockerImage: e.target.value }))}
-                      />
-                    </Form.Item>
-                  )}
-                  <Form.Item label={t('installOpenlistPort')}>
-                    <InputNumber
-                      min={1}
-                      max={65535}
-                      value={installOptions.openlistPort}
-                      onChange={(value) => setInstallOptions(o => ({ ...o, openlistPort: typeof value === 'number' ? value : null }))}
-                      style={{ width: '100%' }}
-                    />
-                  </Form.Item>
-                  <Form.Item label={t('installFallbackPort')}>
-                    <InputNumber
-                      min={1}
-                      max={65535}
-                      value={installOptions.fallbackPort}
-                      onChange={(value) => setInstallOptions(o => ({ ...o, fallbackPort: typeof value === 'number' ? value : null }))}
-                      style={{ width: '100%' }}
-                    />
-                  </Form.Item>
-                  <Form.Item label={t('installFallbackName')}>
-                    <Input
-                      value={installOptions.fallbackName}
-                      placeholder="op1.example.com"
-                      onChange={(e) => setInstallOptions(o => ({ ...o, fallbackName: e.target.value }))}
-                    />
-                  </Form.Item>
-                  <Form.Item label={t('installCertbotDomain')} extra={t('installCertbotDomainHint')}>
-                    <Input
-                      value={installOptions.certbotDomain}
-                      placeholder="op1.example.com"
-                      onChange={(e) => setInstallOptions(o => ({ ...o, certbotDomain: e.target.value }))}
-                    />
-                  </Form.Item>
-                  <Form.Item label={t('installCertbotEmail')}>
-                    <Input
-                      value={installOptions.certbotEmail}
-                      placeholder="admin@example.com"
-                      onChange={(e) => setInstallOptions(o => ({ ...o, certbotEmail: e.target.value }))}
-                    />
-                  </Form.Item>
-                  <Form.Item label={t('installCertbotStaging')}>
-                    <Switch
-                      checked={!!installOptions.certbotStaging}
-                      onChange={(checked) => setInstallOptions(o => ({ ...o, certbotStaging: checked }))}
-                    />
-                  </Form.Item>
-                </>
-              )}
-            </Form>
-            <Input.TextArea
-              value={buildInstallCommand(installContext.token, installContext.panelUrl, installOptions)}
-              readOnly
-              autoSize={{ minRows: 5, maxRows: 9 }}
-              style={{ fontFamily: 'var(--rp-font-mono)', fontSize: 12 }}
-            />
-            <div style={{ textAlign: 'right', marginTop: 8 }}>
-              <Button
-                type="primary"
-                icon={<CopyOutlined />}
-                onClick={() => doCopy(buildInstallCommand(installContext.token, installContext.panelUrl, installOptions), t('installCommandCopied'))}
-              >
-                {t('copyInstallCommand')}
-              </Button>
-            </div>
-          </>
-        ) : cmdModalContent.body}
       </Modal>
 
       {/* v1.2.3: rotate confirmation. Deliberately heavier than a Popconfirm —

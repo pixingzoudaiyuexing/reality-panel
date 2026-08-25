@@ -77,8 +77,11 @@ impl Config {
             .unwrap_or_else(|_| "sqlite:data.db?mode=rwc".into());
         let listen = std::env::var("LISTEN").unwrap_or_else(|_| "0.0.0.0:18888".into());
         let key = std::env::var("PANEL_KEY").unwrap_or_else(|_| "default-key".into());
-        let jwt_secret =
-            std::env::var("JWT_SECRET").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+        // JWTs and Manual Bootstrap enrollment verifiers must survive Panel
+        // restarts. An implicit random key would silently invalidate both, so
+        // an unset value follows the same fail-closed path as the documented
+        // insecure placeholder in `validate_security`.
+        let jwt_secret = configured_jwt_secret(std::env::var("JWT_SECRET").ok());
         let public_dir = std::env::var("PUBLIC_DIR").unwrap_or_else(|_| "public".into());
         let public_panel_url = std::env::var("PUBLIC_PANEL_URL").unwrap_or_else(|_| String::new());
         let registration_enabled = std::env::var("REGISTRATION_ENABLED")
@@ -139,6 +142,10 @@ impl Config {
     }
 }
 
+fn configured_jwt_secret(raw: Option<String>) -> String {
+    raw.unwrap_or_else(|| INSECURE_JWT_SECRET.into())
+}
+
 /// v0.4.16: parse `GEOIP_ENABLED` into a boolean. Extracted as a pure function
 /// so the truth table is unit-testable.
 ///
@@ -160,7 +167,16 @@ fn parse_geoip_enabled(raw: Option<String>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_geoip_enabled;
+    use super::{configured_jwt_secret, parse_geoip_enabled, INSECURE_JWT_SECRET};
+
+    #[test]
+    fn jwt_secret_is_explicit_and_restart_stable() {
+        assert_eq!(
+            configured_jwt_secret(Some("persisted-panel-secret".into())),
+            "persisted-panel-secret"
+        );
+        assert_eq!(configured_jwt_secret(None), INSECURE_JWT_SECRET);
+    }
 
     /// v0.4.16: pin the GEOIP_ENABLED truth table. The default flipped from
     /// false (v0.4.15, opt-in) to true (opt-out). This test guards against a

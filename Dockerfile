@@ -18,6 +18,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY crates/ ./crates/
 COPY scripts/relay-node-bootstrap.sh ./scripts/relay-node-bootstrap.sh
+COPY scripts/relay-node-manual-bootstrap.sh ./scripts/relay-node-manual-bootstrap.sh
 RUN cargo build --release -p relay-panel
 
 # ---- Build stage for the Rust workspace (node only) ----

@@ -111,111 +111,45 @@ ghcr.io/pixingzoudaiyuexing/relay-panel-node:1.2.2
 
 ## 节点部署
 
-先在面板里创建一个“入口/监听”设备分组，复制分组 token，然后在中转节点服务器执行：
+当前支持两种 Relay 部署方式，二者最终都会进入同一套 Stage 3.4
+provisioning 状态，并共用唯一的 `scripts/relay-node-bootstrap.sh` mutation
+engine：
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
-  -t <NODE_TOKEN> \
-  -u http://<PANEL_IP>:18888 \
-  --nginx-sni \
-  --nginx-docker
-```
+### SSH 一键部署（推荐）
 
-安装完成后，节点会运行 systemd 服务：
+当 Panel 可以 SSH 访问 Relay 时，在 Panel 的 **Node Bootstrap** 页面选择
+SSH 一键部署，选择入口设备分组并完成 host-key 确认。Panel 会选择架构、校验
+artifact、执行事务 provisioning，并等待 Node WS online 与五项能力确认：
+`nginx_stream`、`openlist`、`http01`、`certificate_lifecycle`、
+`reality_camouflage`。
 
-```bash
-systemctl status relay-node
-journalctl -u relay-node -f
-```
+### 手动 Bootstrap
 
-节点文档见 [docs/NODE.zh-CN.md](docs/NODE.zh-CN.md)。
+适用于 Panel 无法 SSH 到 Relay、但 Relay 可以通过 HTTP(S)/WebSocket 主动访问
+Panel 的场景：
 
-## 使用 OpenList 做 fallback 站点
+1. Panel 创建短期 enrollment。
+2. 管理员复制不含 secret 的 launcher command。
+3. Relay 通过 `/dev/tty` 隐藏读取一次性 enrollment secret。
+4. Relay claim enrollment，下载并校验签名/哈希绑定的 bundle。
+5. wrapper 调用同一 `scripts/relay-node-bootstrap.sh`。
+6. Node WS authenticated，五项能力确认。
+7. 本地 provisioning commit，之后由 Panel 完成可重试的 finalization。
 
-如果你希望未命中 SNI 规则时显示一个真实 HTTPS 站点，可以先在中转节点上用 Docker 启动 OpenList。
-OpenList 官方 Docker 文档推荐使用轻量镜像 `openlistteam/openlist:latest-lite`，服务端口为 `5244`。
+`PUBLIC_PANEL_URL` 支持 `http://IP:PORT` 和 `https://hostname`。HTTPS 可提供加密传输；enrollment secret 只显示一次，
+不能粘贴进 launcher command，也不是永久 group token 或 SSH credential。
+Bootstrap 本身不会申请真实 SNI 证书；Reality/camouflage 配置仍由 Panel 的
+Rules desired state 驱动，证书生命周期在 Node reconcile 阶段处理。
 
-建议只监听本机，避免绕过 Nginx 直接暴露：
+### 兼容性说明
 
-```bash
-docker run -d \
-  --name openlist \
-  --restart unless-stopped \
-  -p 127.0.0.1:5244:5244 \
-  -v /etc/openlist:/opt/openlist/data \
-  -e UMASK=022 \
-  -e TZ=Asia/Shanghai \
-  openlistteam/openlist:latest-lite
-```
+`scripts/relay-node-install.sh` 仍保留给旧节点升级/迁移使用，但已 deprecated，
+不再由当前 UI 或推荐文档生成新命令。新部署请使用 Node Bootstrap。该旧脚本的
+legacy token、Docker Nginx、OpenList port、fallback、certbot 和 GitHub version
+选项不属于当前产品 bootstrap contract。
 
-然后安装或重装 relay-node：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
-  -t <NODE_TOKEN> \
-  -u http://<PANEL_IP>:18888 \
-  --nginx-sni \
-  --nginx-docker \
-  --openlist-port 5244 \
-  --fallback-name op1.example.com
-```
-
-`--nginx-docker` 会用 Docker 运行 SNI 分流 Nginx，默认镜像为 `nginx:1.27-alpine`，容器名为 `relay-node-nginx`。容器使用 host network，这样面板后续下发新的监听端口时，不需要重新做 Docker 端口映射。
-
-Docker Nginx 的文件会放在：
-
-```text
-/opt/relay-node/nginx/
-```
-
-卸载 Nginx 容器可以执行：
-
-```bash
-/opt/relay-node/uninstall-nginx-docker.sh
-```
-
-这个模式会在节点本机创建一个 HTTPS wrapper：
-
-```text
-127.0.0.1:8443 -> http://127.0.0.1:5244
-```
-
-然后把 Nginx SNI 默认后端设为 `127.0.0.1:8443`。
-
-如果你已经有自己的 HTTPS fallback，可以直接指定：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
-  -t <NODE_TOKEN> \
-  -u http://<PANEL_IP>:18888 \
-  --nginx-sni \
-  --nginx-docker \
-  --fallback-backend 127.0.0.1:8443
-```
-
-要让浏览器显示“安全”，fallback 站点需要有效证书。脚本可以用 certbot 自动申请并配置续签后 reload nginx：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
-  -t <NODE_TOKEN> \
-  -u http://<PANEL_IP>:18888 \
-  --nginx-sni \
-  --nginx-docker \
-  --openlist-port 5244 \
-  --fallback-certbot-domain op1.example.com \
-  --fallback-certbot-email admin@example.com
-```
-
-前提是 `op1.example.com` 已解析到中转节点公网 IP，并且节点的 `80` 端口可被 Let's Encrypt 访问。
-
-也可以传入已有证书：
-
-```bash
---fallback-cert /etc/letsencrypt/live/op1.example.com/fullchain.pem \
---fallback-key /etc/letsencrypt/live/op1.example.com/privkey.pem
-```
-
-不配置 fallback 时，节点默认 fail-closed 到 `127.0.0.1:9`。
+节点状态与故障排查见 [docs/NODE.zh-CN.md](docs/NODE.zh-CN.md)；Panel 反向代理
+与 WebSocket 要求见 [docs/REVERSE-PROXY.md](docs/REVERSE-PROXY.md)。
 
 ## 添加 Reality SNI 规则
 
@@ -262,14 +196,10 @@ git pull --ff-only
 
 节点：
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
-  -t <NODE_TOKEN> \
-  -u http://<PANEL_IP>:18888 \
-  --nginx-sni
-```
-
-systemd 节点也可以在面板“节点状态”里一键升级。
+使用 Panel 的 **Node Bootstrap** 页面重新执行 SSH 一键部署，或在 Relay
+无法被 Panel SSH 访问时使用手动 Bootstrap。两种方式都会复用同一个事务
+provisioning engine，并保留 Node ID、LKG、证书和 OpenList 数据。旧的一行
+installer 仅供兼容旧节点，不再作为新部署或更新的推荐路径。
 
 ## 开发
 

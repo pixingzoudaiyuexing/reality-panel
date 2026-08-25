@@ -1,5 +1,11 @@
 # 转发节点（relay-node）
 
+> **当前部署路径：**请使用 Panel 的“节点 Bootstrap”页面。Panel 可以 SSH
+> 访问 Relay 时选择“SSH 一键部署”；Panel 无法 SSH 但 Relay 可以主动通过
+> HTTP(S)/WebSocket 访问 Panel 时选择“手动 Bootstrap”。两者共用同一套事务
+> `scripts/relay-node-bootstrap.sh`。下方 installer 内容仅作为旧节点兼容参考，
+> 当前 UI 不再生成这些命令。
+
 `relay-node` 是运行在每台中转服务器上的转发守护进程。它监听你在面板里
 配置的端口，把 TCP/UDP 流量转发到目标地址，同时通过 HTTP 把 CPU / 内存 /
 硬盘 / 网络 / 活跃连接数回报给面板，让面板能显示实时节点状态。
@@ -37,9 +43,9 @@ uname -m
 
 ## 安装
 
-### 方式 A：一行脚本（推荐）
+### 旧方式 A：一行脚本（已废弃）
 
-这是推荐方式。脚本会自动检测架构、从 GitHub Releases 下载对应二进制、
+这是兼容旧节点的方式。脚本会自动检测架构、从 GitHub Releases 下载对应二进制、
 写好 systemd 服务并启动：
 
 ```bash

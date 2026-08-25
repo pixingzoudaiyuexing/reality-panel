@@ -14,8 +14,10 @@ pub mod groups;
 pub mod middleware;
 pub mod node;
 pub mod node_deploy;
+pub mod node_enrollment;
 pub mod node_ops;
 pub mod notify;
+mod provisioning;
 pub mod redeem;
 pub mod restart;
 pub mod security_headers;
@@ -111,6 +113,42 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/admin/node-deployments/{id}/logs",
             axum::routing::get(node_deploy::deployment_logs),
+        )
+        .route(
+            "/admin/node-enrollments",
+            axum::routing::post(node_enrollment::create_enrollment),
+        )
+        .route(
+            "/admin/node-enrollments/{id}",
+            axum::routing::get(node_enrollment::enrollment_status),
+        )
+        .route(
+            "/node-enrollments/{id}/claim",
+            axum::routing::post(node_enrollment::claim_enrollment),
+        )
+        .route(
+            "/node-enrollments/manual-bootstrap-launcher.sh",
+            axum::routing::get(node_enrollment::manual_bootstrap_launcher),
+        )
+        .route(
+            "/node-enrollments/{id}/bundle/{architecture}",
+            axum::routing::get(node_enrollment::enrollment_bundle),
+        )
+        .route(
+            "/node-enrollments/{id}/verify",
+            axum::routing::post(node_enrollment::verify_enrollment),
+        )
+        .route(
+            "/node-enrollments/{id}/local-commit",
+            axum::routing::post(node_enrollment::mark_local_committed),
+        )
+        .route(
+            "/node-enrollments/{id}/complete",
+            axum::routing::post(node_enrollment::complete_enrollment),
+        )
+        .route(
+            "/node-enrollments/{id}/fail",
+            axum::routing::post(node_enrollment::fail_enrollment),
         )
         // v1.2.0: self-service balance top-up. Scoped to the caller's own id
         // from the token — there is no user_id in the body, so it can never

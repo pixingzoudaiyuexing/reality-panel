@@ -11,6 +11,7 @@
 use sqlx::SqlitePool;
 
 mod announcements;
+mod enrollments;
 mod groups;
 mod kvs;
 mod orders;

@@ -9,23 +9,66 @@ use axum::{
 use relay_shared::models::*;
 use relay_shared::protocol::*;
 // === Device Groups ===
+#[derive(serde::Serialize)]
+pub struct DeviceGroupView {
+    pub id: i64,
+    pub name: String,
+    pub group_type: String,
+    pub uid: i64,
+    pub connect_host: String,
+    pub port_range: String,
+    pub fallback_group: Option<i64>,
+    pub config: String,
+    pub capabilities: String,
+    pub region: Option<String>,
+    pub line_type: Option<String>,
+    pub remark: Option<String>,
+    pub rate: f64,
+    pub hidden: bool,
+    pub created_at: String,
+}
+
+impl From<DeviceGroup> for DeviceGroupView {
+    fn from(group: DeviceGroup) -> Self {
+        Self {
+            id: group.id,
+            name: group.name,
+            group_type: group.group_type,
+            uid: group.uid,
+            connect_host: group.connect_host,
+            port_range: group.port_range,
+            fallback_group: group.fallback_group,
+            config: group.config,
+            capabilities: group.capabilities,
+            region: group.region,
+            line_type: group.line_type,
+            remark: group.remark,
+            rate: group.rate,
+            hidden: group.hidden,
+            created_at: group.created_at,
+        }
+    }
+}
+
 pub async fn list_groups(
     user: AuthUser,
     State(state): State<AppState>,
-) -> Json<ApiResponse<Vec<DeviceGroup>>> {
+) -> Json<ApiResponse<Vec<DeviceGroupView>>> {
     let scope = user.resource_scope();
     let groups: Vec<DeviceGroup> = state.db.list_groups(&scope).await.unwrap_or_else(|e| {
         tracing::error!("list_groups: db error: {}", e);
         Vec::new()
     });
-    Json(ApiResponse::success(groups))
+    Json(ApiResponse::success(
+        groups.into_iter().map(DeviceGroupView::from).collect(),
+    ))
 }
 
 pub async fn create_group(
     admin: AdminOnly,
     State(state): State<AppState>,
     Json(req): Json<CreateGroupRequest>,
-) -> Json<ApiResponse<DeviceGroup>> {
+) -> Json<ApiResponse<DeviceGroupView>> {
     // v0.4.12 PR1: device groups are admin-managed shared infrastructure, and
     // only ADMIN-owned groups are ever shared to regular users. Creating a
     // group owned by a regular user would produce a "dead" group the user
@@ -51,7 +94,7 @@ pub async fn create_group(
     )
     .await
     {
-        Ok(g) => Json(ApiResponse::success(g)),
+        Ok(g) => Json(ApiResponse::success(DeviceGroupView::from(g))),
         Err(CreateGroupError::FetchFailed) => Json(err(500, "Failed to fetch created group")),
         Err(CreateGroupError::Database(e)) => {
             tracing::error!("create_group: db error: {}", e);
@@ -63,11 +106,13 @@ pub async fn create_group(
 /// Rotate a device group's node token. Generates a fresh UUID, persists it,
 /// and broadcasts `config_changed` so connected nodes drop the old token and
 /// re-authenticate with the new one. This is the only way to revoke a leaked
-/// node token without deleting the whole group (and its rules). Returns the
-/// new token so the admin can hand it to the node operator.
+/// node token without deleting the whole group (and its rules). The new token
+/// is intentionally not returned; Node Bootstrap injects it into a protected
+/// provisioning bundle instead.
 #[derive(serde::Serialize)]
 pub struct RotatedToken {
-    token: String,
+    invalidates_existing_nodes: bool,
+    reprovision_required: bool,
 }
 
 pub async fn rotate_group_token(
@@ -77,7 +122,7 @@ pub async fn rotate_group_token(
 ) -> Json<ApiResponse<RotatedToken>> {
     match crate::service::groups::rotate_group_token(state.db.as_ref(), id).await {
         Ok(None) => Json(err(404, "分组不存在")),
-        Ok(Some(new_token)) => {
+        Ok(Some(_new_token)) => {
             // v0.3.9: tear down every live WS connection for this group BEFORE
             // broadcasting. The old token just became invalid, but sockets that
             // authenticated at upgrade time stay open with the revoked credential
@@ -111,7 +156,10 @@ pub async fn rotate_group_token(
                 &format!("断开 {closed} 个节点连接"),
             )
             .await;
-            Json(ApiResponse::success(RotatedToken { token: new_token }))
+            Json(ApiResponse::success(RotatedToken {
+                invalidates_existing_nodes: true,
+                reprovision_required: true,
+            }))
         }
         Err(e) => {
             tracing::error!(

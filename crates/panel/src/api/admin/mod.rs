@@ -880,6 +880,10 @@ mod tests {
             super::rotate_group_token(AdminOnly { user_id: 1 }, State(state.clone()), Path(30))
                 .await;
         assert_eq!(resp.code, 0, "rotation must succeed: {}", resp.message);
+        let response_json = serde_json::to_value(&resp).unwrap();
+        assert!(response_json["data"].get("token").is_none());
+        assert_eq!(response_json["data"]["invalidates_existing_nodes"], true);
+        assert_eq!(response_json["data"]["reprovision_required"], true);
         // Read the landed token from the DB rather than the response struct:
         // it is the same value, and the stored credential is the thing that
         // must not be discoverable through the audit log.
@@ -1887,6 +1891,8 @@ mod tests {
         )
         .await;
         assert_eq!(resp.code, 0, "{}", resp.message);
+        let serialized = serde_json::to_string(&resp).unwrap();
+        assert!(!serialized.contains("\"token\""));
         let owner: (i64,) = sqlx::query_as("SELECT uid FROM device_groups WHERE name = 'g'")
             .fetch_one(&pool)
             .await

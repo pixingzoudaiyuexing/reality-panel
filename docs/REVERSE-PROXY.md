@@ -18,15 +18,15 @@ proxy for TLS termination, custom domains, and production hardening.
 
 ## `PUBLIC_PANEL_URL`
 
-This is the URL that **forwarding nodes** use to reach the panel. The "Copy
-Install Command" button in **Device Groups** reads it from
-`/api/v1/system/version` and embeds it into the one-line install command.
+This is the URL that **forwarding nodes** use to reach the panel. SSH Bootstrap
+and Manual Bootstrap both use it for Node control traffic. Manual Bootstrap
+accepts either `http://IP:PORT` or `https://hostname`.
 
 | `PUBLIC_PANEL_URL` | Effect |
 |-------------------|--------|
-| Empty / unset | Frontend falls back to `window.location.origin`. Nodes use whatever URL the admin's browser is on. |
-| `https://panel.example.com` | Nodes connect via `wss://panel.example.com/api/v1/node/ws`. Install command includes this URL. |
-| `http://203.0.113.10:18888` | Explicit IP:port. Nodes use `ws://...` (no TLS). |
+| Empty / unset | Frontend falls back to `window.location.origin`; set it explicitly for Manual Bootstrap. |
+| `https://panel.example.com` | Nodes connect via `wss://panel.example.com/api/v1/node/ws`. Both bootstrap modes can use this URL. |
+| `http://203.0.113.10:18888` | Explicit HTTP IP:port. Manual Bootstrap supports it; HTTPS remains preferable when available. |
 
 **Rule of thumb:** set `PUBLIC_PANEL_URL` whenever the panel is behind a
 reverse proxy or domain. Otherwise nodes may get the wrong URL (e.g. the

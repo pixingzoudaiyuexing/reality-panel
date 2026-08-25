@@ -369,7 +369,6 @@ export interface DeviceGroup {
   id: number;
   name: string;
   group_type: string;
-  token: string;
   uid: number;
   connect_host: string;
   port_range: string;

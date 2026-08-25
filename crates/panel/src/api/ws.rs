@@ -152,6 +152,23 @@ impl NodeConnections {
             .unwrap_or_default()
     }
 
+    /// Return the groups where a node identity currently has a live WS.
+    /// Used by enrollment verification to distinguish a transiently offline
+    /// node from one authenticated with a different device-group token.
+    pub async fn online_group_ids(&self, node_id: &str) -> std::collections::HashSet<i64> {
+        self.inner
+            .read()
+            .await
+            .iter()
+            .filter_map(|(group_id, conns)| {
+                conns
+                    .values()
+                    .any(|entry| entry.node_id.as_deref() == Some(node_id))
+                    .then_some(*group_id)
+            })
+            .collect()
+    }
+
     /// Number of live connections currently registered for a group. Used by
     /// diagnosis to decide "WS online" vs "control channel offline".
     #[allow(dead_code)]
