@@ -116,8 +116,13 @@ describe('port validator', () => {
 
 describe('camouflage observed status', () => {
   const rule = { id: 42, camouflage_enabled: true, sni: 'op1.example.com', device_group_in: 10 };
-  const node = (site: Record<string, unknown>): NodeStatus => ({
+  const node = (
+    site: Record<string, unknown>,
+    overrides: Partial<NodeStatus> = {},
+  ): NodeStatus => ({
     group_id: 10,
+    node_id: 'node-a',
+    public_ipv4: '192.0.2.10',
     online: true,
     cpu: 0,
     mem: 0,
@@ -132,39 +137,108 @@ describe('camouflage observed status', () => {
       certificate_status: 'active',
       ...site,
     }],
+    ...overrides,
   });
 
-  it('keeps the route waiting until the site and certificate are active', () => {
-    expect(deriveCamouflageStatus(rule, [])).toEqual({ state: 'preparing', certificate: undefined });
+  it('returns unknown when no Relay has useful observed state', () => {
+    const result = deriveCamouflageStatus(rule, []);
+    expect(result.state).toBe('unknown');
+    expect(result.activeCount).toBe(0);
+    expect(result.totalCount).toBe(0);
   });
 
-  it('marks an active certificate-backed site as route active', () => {
-    expect(deriveCamouflageStatus(rule, [node({})]).state).toBe('active');
-  });
-
-  it('does not claim active until the matching listener rule is applied', () => {
-    const waiting = node({});
-    waiting.active_listener_rule_ids = [];
-    expect(deriveCamouflageStatus(rule, [waiting]).state).toBe('preparing');
-  });
-
-  it('does not combine certificate and listener state from different nodes', () => {
-    const certificateOnly = node({});
-    certificateOnly.node_id = 'certificate-only';
-    certificateOnly.active_listener_rule_ids = [];
-    const listenerOnly = node({ site_status: 'preparing', certificate_status: 'pending' });
-    listenerOnly.node_id = 'listener-only';
-    expect(deriveCamouflageStatus(rule, [certificateOnly, listenerOnly]).state).toBe('preparing');
-  });
-
-  it('surfaces DNS/certificate failure instead of claiming the route is active', () => {
-    const result = deriveCamouflageStatus(rule, [node({
+  it('keeps ACTIVE plus FAILED available as partial', () => {
+    const active = node({}, { node_id: 'active', public_ipv4: '192.0.2.10' });
+    const failed = node({
       site_status: 'failed',
       certificate_status: 'failed',
-      last_error: 'DNS does not resolve the certificate domain to this node',
-    })]);
+      last_error: 'DNS does not target this Relay',
+    }, {
+      node_id: 'failed',
+      public_ipv4: '192.0.2.20',
+      active_listener_rule_ids: [],
+    });
+    const result = deriveCamouflageStatus(rule, [active, failed]);
+    expect(result.state).toBe('partial');
+    expect(result.activeCount).toBe(1);
+    expect(result.totalCount).toBe(2);
+    expect(result.certificate?.certificate_status).toBe('active');
+  });
+
+  it('keeps ACTIVE plus WITHHELD available as partial', () => {
+    const active = node({}, { node_id: 'active', public_ipv4: '192.0.2.10' });
+    const withheld = node({}, {
+      node_id: 'withheld',
+      public_ipv4: '192.0.2.20',
+      active_listener_rule_ids: [],
+    });
+    const result = deriveCamouflageStatus(rule, [active, withheld]);
+    expect(result.state).toBe('partial');
+    expect(result.nodes.find(entry => entry.nodeId === 'withheld')?.listenerState).toBe('withheld');
+  });
+
+  it('reports active when all relevant Relays are fully active', () => {
+    const result = deriveCamouflageStatus(rule, [
+      node({}, { node_id: 'node-a', public_ipv4: '192.0.2.10' }),
+      node({}, { node_id: 'node-b', public_ipv4: '192.0.2.20' }),
+    ]);
+    expect(result.state).toBe('active');
+    expect(result.activeCount).toBe(2);
+    expect(result.totalCount).toBe(2);
+  });
+
+  it('reports preparing when zero Relays are active and one is preparing', () => {
+    const result = deriveCamouflageStatus(rule, [node({
+      site_status: 'preparing',
+      certificate_status: 'pending',
+    }, { active_listener_rule_ids: [] })]);
+    expect(result.state).toBe('preparing');
+    expect(result.activeCount).toBe(0);
+  });
+
+  it('reports failed when zero Relays are active and all observed states failed', () => {
+    const first = node({
+      site_status: 'failed',
+      certificate_status: 'failed',
+      last_error: 'terminal failure A',
+    }, { node_id: 'node-a', public_ipv4: '192.0.2.10', active_listener_rule_ids: [] });
+    const second = node({
+      site_status: 'failed',
+      certificate_status: 'failed',
+      last_error: 'terminal failure B',
+    }, { node_id: 'node-b', public_ipv4: '192.0.2.20', active_listener_rule_ids: [] });
+    const result = deriveCamouflageStatus(rule, [first, second]);
     expect(result.state).toBe('failed');
-    expect(result.certificate?.last_error).toContain('DNS');
+    expect(result.activeCount).toBe(0);
+  });
+
+  it('is deterministic when API node order changes', () => {
+    const active = node({}, { node_id: 'active', public_ipv4: '192.0.2.10' });
+    const failed = node({
+      site_status: 'failed',
+      certificate_status: 'failed',
+      last_error: 'DNS does not target this Relay',
+    }, {
+      node_id: 'failed',
+      public_ipv4: '192.0.2.20',
+      active_listener_rule_ids: [],
+    });
+    expect(deriveCamouflageStatus(rule, [active, failed]))
+      .toEqual(deriveCamouflageStatus(rule, [failed, active]));
+  });
+
+  it('preserves Relay IP and Node ID in every per-node result', () => {
+    const result = deriveCamouflageStatus(rule, [node({}, {
+      node_id: 'persistent-node-id',
+      public_ipv4: '198.51.100.25',
+    })]);
+    expect(result.nodes[0]).toMatchObject({
+      nodeId: 'persistent-node-id',
+      relayIp: '198.51.100.25',
+      listenerState: 'active',
+      siteState: 'active',
+      certificateState: 'active',
+    });
   });
 });
 

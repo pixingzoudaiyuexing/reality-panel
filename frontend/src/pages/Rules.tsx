@@ -1,6 +1,6 @@
-import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Tag, Alert, Typography, Dropdown, Switch, Tabs, Spin, Tooltip } from 'antd';
+import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Popover, Tag, Alert, Typography, Dropdown, Switch, Tabs, Spin, Tooltip } from 'antd';
 import type { MenuProps } from 'antd';
-import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, SearchOutlined } from '@ant-design/icons';
+import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, SearchOutlined, InfoCircleOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
@@ -49,25 +49,96 @@ function normalizeSni(value?: string | null): string | undefined {
 export function deriveCamouflageStatus(
   rule: Pick<ForwardRule, 'id' | 'camouflage_enabled' | 'sni' | 'device_group_in'>,
   nodes: NodeStatus[],
-): { state: 'disabled' | 'preparing' | 'active' | 'failed'; certificate?: CamouflageSiteStatus } {
-  if (!rule.camouflage_enabled) return { state: 'disabled' };
-  const relevantNodes = nodes.filter(node =>
-    node.group_id === rule.device_group_in && node.online !== false);
-  const observed = relevantNodes
-    .flatMap(node => node.camouflage_sites ?? [])
-    .filter(site => site.sni === normalizeSni(rule.sni));
-  const failed = observed.find(site => site.site_status === 'failed' || site.certificate_status === 'failed');
-  if (failed) return { state: 'failed', certificate: failed };
-  for (const node of relevantNodes) {
-    const active = (node.camouflage_sites ?? []).find(site =>
-      site.sni === normalizeSni(rule.sni)
-        && site.site_status === 'active'
-        && site.certificate_status === 'active');
-    if (active && (node.active_listener_rule_ids ?? []).includes(rule.id)) {
-      return { state: 'active', certificate: active };
-    }
+): CamouflageAggregateStatus {
+  if (!rule.camouflage_enabled) {
+    return { state: 'disabled', nodes: [], activeCount: 0, totalCount: 0 };
   }
-  return { state: 'preparing', certificate: observed[0] };
+  const sni = normalizeSni(rule.sni);
+  const nodeViews: CamouflageNodeStatusView[] = nodes
+    .filter(node => node.group_id === rule.device_group_in)
+    .map(node => {
+      const certificate = (node.camouflage_sites ?? []).find(site => site.sni === sni);
+      const listenerState: CamouflageNodeStatusView['listenerState'] = node.active_listener_rule_ids == null
+        ? 'unknown'
+        : node.active_listener_rule_ids.includes(rule.id) ? 'active' : 'withheld';
+      const fullyActive = node.online !== false
+        && listenerState === 'active'
+        && certificate?.site_status === 'active'
+        && certificate.certificate_status === 'active';
+      let state: CamouflageNodeStatusView['state'];
+      if (node.online === false) state = 'offline';
+      else if (fullyActive) state = 'active';
+      else if (certificate?.site_status === 'failed' || certificate?.certificate_status === 'failed') state = 'failed';
+      else if (certificate || listenerState === 'withheld') state = 'preparing';
+      else state = 'unknown';
+      return {
+        nodeId: node.node_id ?? undefined,
+        relayIp: node.public_ipv4 ?? node.public_ip ?? node.public_ipv6 ?? undefined,
+        listenerState,
+        siteState: certificate?.site_status ?? 'unknown',
+        certificateState: certificate?.certificate_status ?? 'unknown',
+        lastError: certificate?.last_error ?? undefined,
+        certificate,
+        state,
+      };
+    })
+    .sort((a, b) => {
+      const aKey = `${a.relayIp ?? ''}\u0000${a.nodeId ?? ''}`;
+      const bKey = `${b.relayIp ?? ''}\u0000${b.nodeId ?? ''}`;
+      return aKey.localeCompare(bKey);
+    });
+  const activeNodes = nodeViews.filter(node => node.state === 'active');
+  const preparingNodes = nodeViews.filter(node => node.state === 'preparing');
+  const failedNodes = nodeViews.filter(node => node.state === 'failed');
+  const totalCount = nodeViews.length;
+  const activeCount = activeNodes.length;
+  if (activeCount > 0) {
+    return {
+      state: activeCount === totalCount ? 'active' : 'partial',
+      certificate: activeNodes[0].certificate,
+      nodes: nodeViews,
+      activeCount,
+      totalCount,
+    };
+  }
+  if (preparingNodes.length > 0) {
+    return {
+      state: 'preparing',
+      certificate: preparingNodes[0].certificate,
+      nodes: nodeViews,
+      activeCount,
+      totalCount,
+    };
+  }
+  if (failedNodes.length > 0) {
+    return {
+      state: 'failed',
+      certificate: failedNodes[0].certificate,
+      nodes: nodeViews,
+      activeCount,
+      totalCount,
+    };
+  }
+  return { state: 'unknown', nodes: nodeViews, activeCount, totalCount };
+}
+
+export interface CamouflageNodeStatusView {
+  nodeId?: string;
+  relayIp?: string;
+  listenerState: 'active' | 'withheld' | 'unknown';
+  siteState: string;
+  certificateState: string;
+  lastError?: string;
+  certificate?: CamouflageSiteStatus;
+  state: 'active' | 'preparing' | 'failed' | 'unknown' | 'offline';
+}
+
+export interface CamouflageAggregateStatus {
+  state: 'disabled' | 'unknown' | 'preparing' | 'active' | 'partial' | 'failed';
+  certificate?: CamouflageSiteStatus;
+  nodes: CamouflageNodeStatusView[];
+  activeCount: number;
+  totalCount: number;
 }
 
 export function CamouflageFormFields({
@@ -764,23 +835,62 @@ const IMPORT_DEFAULTS = {
       },
     },
     {
-      title: t('camouflage'), key: 'camouflage', width: 220,
+      title: t('camouflage'), key: 'camouflage', width: 280,
       render: (_: unknown, r: ForwardRule) => {
         const view = deriveCamouflageStatus(r, nodeStatuses);
         if (view.state === 'disabled') return <Text type="secondary">-</Text>;
         const status = view.certificate;
+        const routeAvailable = view.state === 'active' || view.state === 'partial';
         const days = status?.valid_until
           ? Math.max(0, Math.floor((new Date(status.valid_until).getTime() - Date.now()) / 86_400_000))
           : null;
+        const details = (
+          <Space orientation="vertical" size={8} style={{ minWidth: 320, maxWidth: 440 }}>
+            {view.nodes.map(node => {
+              const standby = view.state === 'partial' && node.state !== 'active' && node.state !== 'offline';
+              const stateLabel = node.state === 'active' ? t('relayActive')
+                : standby ? t('relayStandby')
+                  : node.state === 'preparing' ? t('preparing')
+                    : node.state === 'failed' ? t('routeFailed')
+                      : node.state === 'offline' ? t('offline') : t('routeUnknown');
+              const stateColor = node.state === 'active' ? 'green'
+                : standby || node.state === 'preparing' ? 'gold'
+                  : node.state === 'failed' ? 'red' : 'default';
+              return (
+                <div key={`${node.relayIp ?? ''}:${node.nodeId ?? ''}`} style={{ borderBottom: '1px solid #f0f0f0', paddingBottom: 8 }}>
+                  <Space size={6} wrap>
+                    <Text strong className="rp-mono">{node.relayIp ?? node.nodeId ?? t('routeUnknown')}</Text>
+                    <Tag color={stateColor}>{stateLabel}</Tag>
+                  </Space>
+                  {node.nodeId && node.relayIp && <div><Text type="secondary" className="rp-mono">{node.nodeId}</Text></div>}
+                  <Space size={[4, 4]} wrap style={{ marginTop: 4 }}>
+                    <Tag>{t('listeners')}: {node.listenerState}</Tag>
+                    <Tag>{t('camouflage')}: {node.siteState}</Tag>
+                    <Tag>{t('certificate')}: {node.certificateState}</Tag>
+                  </Space>
+                  {node.lastError && <div><Text type={view.state === 'failed' ? 'danger' : 'secondary'}>{node.lastError}</Text></div>}
+                </div>
+              );
+            })}
+          </Space>
+        );
         return (
           <Space orientation="vertical" size={2}>
             <Space size={4}>
-              <Tag color={view.state === 'active' ? 'green' : view.state === 'failed' ? 'red' : 'gold'}>
-                {view.state === 'active' ? t('routeActive') : view.state === 'failed' ? t('routeFailed') : t('routeWaiting')}
+              <Tag color={routeAvailable ? 'green' : view.state === 'failed' ? 'red' : view.state === 'unknown' ? 'default' : 'gold'}>
+                {routeAvailable ? t('routeActive') : view.state === 'failed' ? t('routeFailed') : view.state === 'unknown' ? t('routeUnknown') : t('routeWaiting')}
               </Tag>
               <Tag color={status?.certificate_status === 'active' ? 'green' : status?.certificate_status === 'failed' ? 'red' : 'gold'}>
                 {t('certificate')}: {status?.certificate_status ?? t('preparing')}
               </Tag>
+            </Space>
+            <Space size={4}>
+              <Text type="secondary">{t('activeRelays')}: {view.activeCount}/{view.totalCount}</Text>
+              {view.nodes.length > 0 && (
+                <Popover title={t('relayStatusDetails')} content={details} trigger="click">
+                  <Button type="text" size="small" icon={<InfoCircleOutlined />} aria-label={t('relayStatusDetails')}>{t('details')}</Button>
+                </Popover>
+              )}
             </Space>
             {status?.issuer && <Text type="secondary">{status.issuer}</Text>}
             {status?.valid_until && <Text type="secondary">{t('expires')}: {new Date(status.valid_until).toLocaleDateString()} ({days}d)</Text>}
