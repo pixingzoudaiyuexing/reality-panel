@@ -284,6 +284,7 @@ pub async fn report_status(
             "architecture": req.architecture,
             "camouflage_sites": req.camouflage_sites,
             "active_listener_rule_ids": req.active_listener_rule_ids,
+            "provisioning_capabilities": req.provisioning_capabilities,
         });
         // Status persistence is best-effort: the original used .ok() to swallow
         // any DB error so a transient failure never broke the report cycle.
@@ -730,6 +731,7 @@ mod tests {
             architecture: None,
             camouflage_sites: None,
             active_listener_rule_ids: None,
+            provisioning_capabilities: None,
         };
         let Json(resp) = report_status(State(state.clone()), h, Json(req)).await;
         assert_eq!(resp.code, 401, "missing token → business 401, not HTTP 401");
@@ -924,6 +926,9 @@ mod tests {
                 active_generation: Some("generation-1".into()),
             }]),
             active_listener_rule_ids: Some(vec![42]),
+            provisioning_capabilities: Some(
+                relay_shared::protocol::ProvisioningCapabilities::reality_camouflage(),
+            ),
         };
         let Json(resp) =
             report_status(State(state.clone()), auth_headers("tok-A"), Json(req)).await;
@@ -942,6 +947,10 @@ mod tests {
             Some("op1.example.com")
         );
         assert_eq!(v["active_listener_rule_ids"][0].as_i64(), Some(42));
+        assert_eq!(
+            v["provisioning_capabilities"]["reality_camouflage"].as_bool(),
+            Some(true)
+        );
         for forbidden in ["PRIVATE KEY", "privkey.pem", "NODE_TOKEN", "Bearer"] {
             assert!(!raw.contains(forbidden));
         }

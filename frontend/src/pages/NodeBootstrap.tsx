@@ -2,13 +2,23 @@ import { Alert, Button, Checkbox, Descriptions, Form, Input, InputNumber, List, 
 import { CloudUploadOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
 import { useEffect, useState } from 'react';
 import api, { type ApiEnvelope } from '../api/client';
-import type { DeviceGroup } from '../api/types';
+import type { DeviceGroup, ProvisioningCapabilities } from '../api/types';
 import { useI18n } from '../i18n/context';
 
 type Values = { group_id: number; host: string; port: number; username: string; password: string };
 type SshProbe = { fingerprint: string; os: string; architecture: string };
 type DeployLog = { stage: string; message: string; at: string };
-type Deployment = { id: string; group_id: number; host: string; stage: string; status: string; message: string; node_id?: string | null };
+type Deployment = {
+  id: string;
+  group_id: number;
+  host: string;
+  stage: string;
+  status: string;
+  message: string;
+  node_id?: string | null;
+  profile: 'reality_camouflage';
+  capabilities?: ProvisioningCapabilities | null;
+};
 
 export default function NodeBootstrap() {
   const { t } = useI18n();
@@ -59,7 +69,11 @@ export default function NodeBootstrap() {
     if (!probe || !confirmed) { message.error(t('nodeBootstrapConfirmFingerprint')); return; }
     setDeploying(true);
     try {
-      const response = await api.post<unknown, ApiEnvelope<Deployment>>('/admin/node-deployments', { ...values, confirmed_fingerprint: probe.fingerprint });
+      const response = await api.post<unknown, ApiEnvelope<Deployment>>('/admin/node-deployments', {
+        ...values,
+        confirmed_fingerprint: probe.fingerprint,
+        profile: 'reality_camouflage',
+      });
       if (!response.data) throw new Error(response.message);
       setDeployment(response.data); setLogs([]); form.setFieldValue('password', ''); setProbe(null); setConfirmed(false);
       message.success(t('nodeBootstrapStarted'));
@@ -91,6 +105,13 @@ export default function NodeBootstrap() {
       {deployment && <section>
         <Space style={{ marginBottom: 8 }}><Tag color={deployment.status === 'SUCCESS' ? 'green' : deployment.status === 'FAILED' ? 'red' : 'blue'}>{deployment.stage}</Tag><span>{t('nodeBootstrapTask')}</span></Space>
         <Alert type={deployment.status === 'FAILED' ? 'error' : deployment.status === 'SUCCESS' ? 'success' : 'info'} showIcon message={deployment.message} />
+        {deployment.capabilities && <Descriptions size="small" column={{ xs: 1, sm: 2 }} style={{ marginTop: 12 }} items={[
+          { key: 'nginx_stream', label: t('nodeCapabilityNginxStream'), children: <Tag color={deployment.capabilities.nginx_stream ? 'green' : 'red'}>{deployment.capabilities.nginx_stream ? 'PASS' : 'FAIL'}</Tag> },
+          { key: 'openlist', label: t('nodeCapabilityOpenList'), children: <Tag color={deployment.capabilities.openlist ? 'green' : 'red'}>{deployment.capabilities.openlist ? 'PASS' : 'FAIL'}</Tag> },
+          { key: 'http01', label: t('nodeCapabilityHttp01'), children: <Tag color={deployment.capabilities.http01 ? 'green' : 'red'}>{deployment.capabilities.http01 ? 'PASS' : 'FAIL'}</Tag> },
+          { key: 'certificate_lifecycle', label: t('nodeCapabilityCertificateLifecycle'), children: <Tag color={deployment.capabilities.certificate_lifecycle ? 'green' : 'red'}>{deployment.capabilities.certificate_lifecycle ? 'PASS' : 'FAIL'}</Tag> },
+          { key: 'reality_camouflage', label: t('nodeCapabilityRealityCamouflage'), children: <Tag color={deployment.capabilities.reality_camouflage ? 'green' : 'red'}>{deployment.capabilities.reality_camouflage ? 'PASS' : 'FAIL'}</Tag> },
+        ]} />}
         <List size="small" style={{ marginTop: 12 }} dataSource={logs} renderItem={(log) => <List.Item><Tag>{log.stage}</Tag>{log.message}</List.Item>} />
       </section>}
     </Space>

@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY crates/ ./crates/
+COPY scripts/relay-node-bootstrap.sh ./scripts/relay-node-bootstrap.sh
 RUN cargo build --release -p relay-panel
 
 # ---- Build stage for the Rust workspace (node only) ----

@@ -41,6 +41,7 @@ pub struct NodeConfig {
     pub certificate_http01_webroot: String,
     pub certificate_http01_conf_path: String,
     pub certificate_state_dir: String,
+    pub provisioning_capabilities_path: String,
 }
 
 impl NodeConfig {
@@ -149,6 +150,10 @@ impl NodeConfig {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "/opt/relay-node/certificates".to_string()),
+            provisioning_capabilities_path: std::env::var("PROVISIONING_CAPABILITIES_PATH")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "/opt/relay-node/provisioning-capabilities.json".to_string()),
         };
         cfg.validate();
         cfg
@@ -197,6 +202,24 @@ impl NodeConfig {
                     },
                 },
         }
+    }
+
+    pub fn provisioning_capabilities(&self) -> relay_shared::protocol::ProvisioningCapabilities {
+        let Ok(contents) = std::fs::read(&self.provisioning_capabilities_path) else {
+            return relay_shared::protocol::ProvisioningCapabilities::default();
+        };
+        let Ok(mut capabilities) =
+            serde_json::from_slice::<relay_shared::protocol::ProvisioningCapabilities>(&contents)
+        else {
+            return relay_shared::protocol::ProvisioningCapabilities::default();
+        };
+
+        capabilities.nginx_stream &= self.nginx_sni_enabled;
+        capabilities.http01 &= self.certificate_lifecycle_enabled;
+        capabilities.certificate_lifecycle &= self.certificate_lifecycle_enabled;
+        capabilities.reality_camouflage &=
+            self.camouflage_sites_enabled && self.certificate_lifecycle_enabled;
+        capabilities
     }
 
     fn validate(&self) {

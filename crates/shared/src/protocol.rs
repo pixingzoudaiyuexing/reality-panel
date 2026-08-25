@@ -621,6 +621,39 @@ pub struct StatusReport {
     /// listener config. This lets the Panel distinguish configured from active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_listener_rule_ids: Option<Vec<i64>>,
+    /// Stage 3.4: bootstrap-confirmed local provisioning capabilities. This is
+    /// intentionally a fixed typed set and contains no paths or secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioning_capabilities: Option<ProvisioningCapabilities>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvisioningCapabilities {
+    pub nginx_stream: bool,
+    pub openlist: bool,
+    pub http01: bool,
+    pub certificate_lifecycle: bool,
+    pub reality_camouflage: bool,
+}
+
+impl ProvisioningCapabilities {
+    pub fn reality_camouflage() -> Self {
+        Self {
+            nginx_stream: true,
+            openlist: true,
+            http01: true,
+            certificate_lifecycle: true,
+            reality_camouflage: true,
+        }
+    }
+
+    pub fn satisfies(self, required: Self) -> bool {
+        (!required.nginx_stream || self.nginx_stream)
+            && (!required.openlist || self.openlist)
+            && (!required.http01 || self.http01)
+            && (!required.certificate_lifecycle || self.certificate_lifecycle)
+            && (!required.reality_camouflage || self.reality_camouflage)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1670,5 +1703,17 @@ mod tests {
         assert_eq!(lifecycle_artifact_architecture("aarch64"), Some("arm64"));
         assert_eq!(lifecycle_artifact_architecture("arm64"), Some("arm64"));
         assert_eq!(lifecycle_artifact_architecture("riscv64"), None);
+    }
+
+    #[test]
+    fn provisioning_capabilities_require_every_requested_feature() {
+        let required = ProvisioningCapabilities::reality_camouflage();
+        assert!(required.satisfies(required));
+
+        let mut missing_http01 = required;
+        missing_http01.http01 = false;
+        assert!(!missing_http01.satisfies(required));
+
+        assert!(ProvisioningCapabilities::default().satisfies(ProvisioningCapabilities::default()));
     }
 }

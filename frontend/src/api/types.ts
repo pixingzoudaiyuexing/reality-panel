@@ -508,6 +508,15 @@ export interface NodeStatus {
   listener_errors?: ListenerError[] | null;
   camouflage_sites?: CamouflageSiteStatus[] | null;
   active_listener_rule_ids?: number[] | null;
+  provisioning_capabilities?: ProvisioningCapabilities | null;
+}
+
+export interface ProvisioningCapabilities {
+  nginx_stream: boolean;
+  openlist: boolean;
+  http01: boolean;
+  certificate_lifecycle: boolean;
+  reality_camouflage: boolean;
 }
 
 export interface LoginResponse {

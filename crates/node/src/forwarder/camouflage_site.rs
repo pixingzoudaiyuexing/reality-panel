@@ -61,6 +61,7 @@ pub struct CamouflageSiteManager {
     desired: Vec<CamouflageSiteDesired>,
     last_errors: HashMap<String, String>,
     panel_authority_established: bool,
+    http01_runtime: Option<String>,
 }
 
 impl CamouflageSiteManager {
@@ -72,6 +73,7 @@ impl CamouflageSiteManager {
             desired: Vec::new(),
             last_errors: HashMap::new(),
             panel_authority_established: false,
+            http01_runtime: None,
         }
     }
 
@@ -358,7 +360,8 @@ impl CamouflageSiteManager {
         }
 
         let lifecycle = CertificateLifecycle::new(self.config.certificate_lifecycle.clone());
-        let (candidate, actions) = lifecycle.reconcile(&manifest)?;
+        lifecycle.prepare_http01_once(&manifest, &mut self.http01_runtime)?;
+        let (candidate, actions) = lifecycle.reconcile_prepared(&manifest)?;
         if actions
             .iter()
             .any(|action| *action != LifecycleAction::Unchanged)

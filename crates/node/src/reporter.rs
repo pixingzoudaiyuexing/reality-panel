@@ -850,6 +850,7 @@ pub async fn report_status(
         architecture: Some(std::env::consts::ARCH.to_string()),
         camouflage_sites: Some(camouflage_sites),
         active_listener_rule_ids: Some(active_listener_rule_ids),
+        provisioning_capabilities: Some(config.provisioning_capabilities()),
     };
 
     // debug, not info: this runs every poll cycle (default 10s). Keeping it

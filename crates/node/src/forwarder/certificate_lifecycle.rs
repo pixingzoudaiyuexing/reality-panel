@@ -183,10 +183,32 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
         &self,
         source: &CamouflageSitesManifest,
     ) -> Result<(CamouflageSitesManifest, Vec<LifecycleAction>), String> {
-        self.reconcile_with_dns(source, validate_dns)
+        let mut prepared = None;
+        self.prepare_http01_once(source, &mut prepared)?;
+        self.reconcile_prepared(source)
     }
 
     fn reconcile_with_dns<F>(
+        &self,
+        source: &CamouflageSitesManifest,
+        dns_validator: F,
+    ) -> Result<(CamouflageSitesManifest, Vec<LifecycleAction>), String>
+    where
+        F: Fn(&str, &str) -> Result<(), String>,
+    {
+        let mut prepared = None;
+        self.prepare_http01_once(source, &mut prepared)?;
+        self.reconcile_prepared_with_dns(source, dns_validator)
+    }
+
+    pub(crate) fn reconcile_prepared(
+        &self,
+        source: &CamouflageSitesManifest,
+    ) -> Result<(CamouflageSitesManifest, Vec<LifecycleAction>), String> {
+        self.reconcile_prepared_with_dns(source, validate_dns)
+    }
+
+    fn reconcile_prepared_with_dns<F>(
         &self,
         source: &CamouflageSitesManifest,
         dns_validator: F,
@@ -205,7 +227,6 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
         }
         ensure_private_dir(&self.config.state_dir)?;
         ensure_directory(&self.config.webroot, 0o755)?;
-        self.prepare_http01(source)?;
 
         let mut manifest = source.clone();
         let mut actions = Vec::with_capacity(manifest.sites.len());
@@ -264,7 +285,19 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
         Ok((manifest, actions))
     }
 
-    fn prepare_http01(&self, manifest: &CamouflageSitesManifest) -> Result<(), String> {
+    pub(crate) fn prepare_http01_once(
+        &self,
+        manifest: &CamouflageSitesManifest,
+        prepared: &mut Option<String>,
+    ) -> Result<(), String> {
+        if !self.config.enabled {
+            return Ok(());
+        }
+        if !self.config.http01_nginx.enabled {
+            return Err("certificate lifecycle requires managed Nginx for HTTP-01".into());
+        }
+        ensure_private_dir(&self.config.state_dir)?;
+        ensure_directory(&self.config.webroot, 0o755)?;
         let domains: Vec<&str> = manifest
             .sites
             .iter()
@@ -279,8 +312,14 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
             return Ok(());
         }
         let rendered = render_http01_vhost(&domains, &self.config.webroot)?;
-        nginx_sni::apply_rendered(rendered.as_bytes(), &self.config.http01_nginx)
-            .map_err(|_| "HTTP-01 Nginx preflight failed (port 80 may be unavailable)".to_string())
+        if prepared.as_deref() == Some(rendered.as_str()) {
+            return Ok(());
+        }
+        nginx_sni::apply_rendered(rendered.as_bytes(), &self.config.http01_nginx).map_err(
+            |_| "HTTP-01 Nginx preflight failed (port 80 may be unavailable)".to_string(),
+        )?;
+        *prepared = Some(rendered);
+        Ok(())
     }
 
     fn invoke_certbot(
@@ -854,6 +893,48 @@ mod tests {
         let lifecycle =
             CertificateLifecycle::with_runner(config, FakeRunner(Mutex::new(VecDeque::new())));
         assert!(lifecycle.reconcile(&manifest).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn identical_http01_plan_reuses_successful_runtime_without_reload() {
+        let dir = unique_dir("http01-noop");
+        let marker = dir.join("reload-count");
+        let manifest = CamouflageSitesManifest {
+            sites: vec![site(
+                &dir,
+                CertificateReference {
+                    cert_path: dir.join("missing.crt"),
+                    key_path: dir.join("missing.key"),
+                    lifecycle: Some(policy("site.example.com")),
+                },
+            )],
+        };
+        let config = CertificateLifecycleConfig {
+            enabled: true,
+            certbot_binary: "/bin/true".into(),
+            certbot_live_dir: dir.join("letsencrypt/live"),
+            webroot: dir.join("webroot"),
+            state_dir: dir.join("state"),
+            http01_nginx: NginxSniConfig {
+                enabled: true,
+                conf_path: dir.join("acme.conf"),
+                test_cmd: "true".into(),
+                reload_cmd: format!("printf x >> {}", marker.display()),
+                default_backend: "127.0.0.1:9".into(),
+                access_log_path: dir.join("stream.log").display().to_string(),
+            },
+        };
+        let lifecycle =
+            CertificateLifecycle::with_runner(config, FakeRunner(Mutex::new(VecDeque::new())));
+        let mut prepared = None;
+        lifecycle
+            .prepare_http01_once(&manifest, &mut prepared)
+            .unwrap();
+        lifecycle
+            .prepare_http01_once(&manifest, &mut prepared)
+            .unwrap();
+        assert_eq!(fs::read_to_string(marker).unwrap(), "x");
         let _ = fs::remove_dir_all(dir);
     }
 

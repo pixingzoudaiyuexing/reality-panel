@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use axum::extract::{Path, State};
 use axum::Json;
 use base64::Engine;
-use relay_shared::protocol::ApiResponse;
+use relay_shared::protocol::{ApiResponse, ProvisioningCapabilities};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssh2::Session;
@@ -19,7 +19,10 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -49,6 +52,23 @@ pub struct StartDeploymentRequest {
     pub username: String,
     pub password: String,
     pub confirmed_fingerprint: String,
+    #[serde(default)]
+    pub profile: ProvisioningProfile,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvisioningProfile {
+    #[default]
+    RealityCamouflage,
+}
+
+impl ProvisioningProfile {
+    fn required_capabilities(self) -> ProvisioningCapabilities {
+        match self {
+            Self::RealityCamouflage => ProvisioningCapabilities::reality_camouflage(),
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -87,6 +107,8 @@ pub struct DeploymentStatus {
     pub status: String,
     pub message: String,
     pub node_id: Option<String>,
+    pub profile: ProvisioningProfile,
+    pub capabilities: Option<ProvisioningCapabilities>,
     pub updated_at: String,
 }
 
@@ -115,7 +137,12 @@ impl Default for DeploymentRegistry {
 }
 
 impl DeploymentRegistry {
-    async fn insert(&self, group_id: i64, host: String) -> DeploymentStatus {
+    async fn insert(
+        &self,
+        group_id: i64,
+        host: String,
+        profile: ProvisioningProfile,
+    ) -> DeploymentStatus {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now();
         let status = DeploymentStatus {
@@ -126,6 +153,8 @@ impl DeploymentRegistry {
             status: "PENDING".into(),
             message: "deployment task queued".into(),
             node_id: None,
+            profile,
+            capabilities: None,
             updated_at: now.clone(),
         };
         let log = DeploymentLog {
@@ -185,9 +214,15 @@ impl DeploymentRegistry {
         }
     }
 
-    async fn set_node_id(&self, id: &str, node_id: String) {
+    async fn set_verified(
+        &self,
+        id: &str,
+        node_id: String,
+        capabilities: ProvisioningCapabilities,
+    ) {
         if let Some(task) = self.tasks.lock().await.get_mut(id) {
             task.status.node_id = Some(node_id);
+            task.status.capabilities = Some(capabilities);
         }
     }
 }
@@ -208,6 +243,11 @@ struct NodeArtifact {
     architecture: String,
     bytes: Vec<u8>,
     sha256: String,
+}
+
+struct VerifiedNode {
+    node_id: String,
+    capabilities: ProvisioningCapabilities,
 }
 
 struct Preflight {
@@ -233,7 +273,19 @@ trait DeploymentRunner: Send + Sync {
         panel_url: &str,
         token: &str,
     ) -> Result<(), DeployError>;
-    async fn verify(&self, ssh: &SshInput, fingerprint: &str) -> Result<String, DeployError>;
+    async fn verify(&self, ssh: &SshInput, fingerprint: &str) -> Result<VerifiedNode, DeployError>;
+    async fn commit(
+        &self,
+        task_id: &str,
+        ssh: &SshInput,
+        fingerprint: &str,
+    ) -> Result<(), DeployError>;
+    async fn rollback(
+        &self,
+        task_id: &str,
+        ssh: &SshInput,
+        fingerprint: &str,
+    ) -> Result<(), DeployError>;
 }
 
 #[derive(Debug)]
@@ -319,6 +371,7 @@ impl DeploymentRunner for SystemSshRunner {
             let script_path = format!("{remote_dir}/bootstrap.sh");
             let artifact_path = format!("{remote_dir}/relay-node-linux-{}", artifact.architecture);
             let config_path = format!("{remote_dir}/config.env");
+            let transaction_path = format!("{remote_dir}/transaction");
             let config = bootstrap_config(&panel_url, &token, &artifact);
             let result = (|| {
                 upload(&mut session, &script_path, INSTALL_SCRIPT.as_bytes(), 0o700)?;
@@ -327,25 +380,22 @@ impl DeploymentRunner for SystemSshRunner {
                 exec(
                     &mut session,
                     &format!(
-                        "bash {} {} {}",
+                        "bash {} {} {} {}",
                         shell_quote(&script_path),
                         shell_quote(&config_path),
-                        shell_quote(&artifact_path)
+                        shell_quote(&artifact_path),
+                        shell_quote(&transaction_path)
                     ),
                 )
                 .map(|_| ())
             })();
-            let _ = exec(
-                &mut session,
-                &format!("rm -rf -- {}", shell_quote(&remote_dir)),
-            );
             result
         })
         .await
         .map_err(|_| DeployError::new("INSTALL_FAILED", "installer worker terminated"))?
     }
 
-    async fn verify(&self, ssh: &SshInput, fingerprint: &str) -> Result<String, DeployError> {
+    async fn verify(&self, ssh: &SshInput, fingerprint: &str) -> Result<VerifiedNode, DeployError> {
         let input = ssh.clone_without_secret_debug();
         let fingerprint = fingerprint.to_string();
         tokio::task::spawn_blocking(move || {
@@ -366,14 +416,107 @@ impl DeploymentRunner for SystemSshRunner {
             verify_command(
                 &mut session,
                 "FALLBACK_FAILED",
-                "ss -H -ltn | grep -F '127.0.0.1:8443' >/dev/null; curl -kfsS --max-time 10 https://127.0.0.1:8443/ >/dev/null",
+                "ss -H -ltn | awk '$4 ~ /:8443$/ { found=1 } END { exit !found }'; curl -kfsS --max-time 10 https://127.0.0.1:8443/ >/dev/null",
+            )?;
+            verify_command(
+                &mut session,
+                "CAPABILITY_FAILED",
+                "test -f /etc/nginx/relay-panel-stream.conf; test -x /usr/bin/certbot; grep -Fx 'CAMOUFLAGE_SITES_ENABLED=1' /etc/relay-node/relay-node.env >/dev/null; grep -Fx 'CERTIFICATE_LIFECYCLE_ENABLED=1' /etc/relay-node/relay-node.env >/dev/null; test -s /opt/relay-node/provisioning-capabilities.json",
             )?;
             let output = exec(&mut session, "cat /opt/relay-node/node-id")
                 .map_err(|_| DeployError::new("RELAY_NODE_FAILED", "could not read node-id"))?;
             let node_id = output.trim();
-            if node_id.is_empty() { Err(DeployError::new("VERIFY_FAILED", "node-id is empty")) } else { Ok(node_id.to_string()) }
+            if node_id.is_empty() {
+                Err(DeployError::new("VERIFY_FAILED", "node-id is empty"))
+            } else {
+                Ok(VerifiedNode {
+                    node_id: node_id.to_string(),
+                    capabilities: ProvisioningCapabilities::reality_camouflage(),
+                })
+            }
         }).await.map_err(|_| DeployError::new("VERIFY_FAILED", "verification worker terminated"))?
     }
+
+    async fn commit(
+        &self,
+        task_id: &str,
+        ssh: &SshInput,
+        fingerprint: &str,
+    ) -> Result<(), DeployError> {
+        finish_remote_transaction(task_id, ssh, fingerprint, "--commit", "COMMIT_FAILED").await
+    }
+
+    async fn rollback(
+        &self,
+        task_id: &str,
+        ssh: &SshInput,
+        fingerprint: &str,
+    ) -> Result<(), DeployError> {
+        finish_remote_transaction(task_id, ssh, fingerprint, "--rollback", "ROLLBACK_FAILED").await
+    }
+}
+
+async fn finish_remote_transaction(
+    task_id: &str,
+    ssh: &SshInput,
+    fingerprint: &str,
+    mode: &'static str,
+    category: &'static str,
+) -> Result<(), DeployError> {
+    let input = ssh.clone_without_secret_debug();
+    let fingerprint = fingerprint.to_string();
+    let task_id = task_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let remote_dir = format!("/tmp/relay-panel-bootstrap-{task_id}");
+        let script_path = format!("{remote_dir}/bootstrap.sh");
+        let transaction_path = format!("{remote_dir}/transaction");
+        let finalize_command = if mode == "--rollback" {
+            format!(
+                "set -eu; if [ -x {script} ]; then bash {script} --rollback {transaction}; fi",
+                script = shell_quote(&script_path),
+                transaction = shell_quote(&transaction_path),
+            )
+        } else {
+            format!(
+                "set -eu; test -x {script}; test -f {transaction}/state; bash {script} --commit {transaction}",
+                script = shell_quote(&script_path),
+                transaction = shell_quote(&transaction_path),
+            )
+        };
+        let finalize_once = || -> Result<(), DeployError> {
+            let mut session = connect(&input, Some(&fingerprint))?;
+            authenticate(&mut session, &input)?;
+            exec(&mut session, &finalize_command)
+                .map(|_| ())
+                .map_err(|error| DeployError::new(category, error.message))
+        };
+        if finalize_once().is_err() {
+            finalize_once()?;
+        }
+
+        let cleanup = || -> Result<(), DeployError> {
+            let mut session = connect(&input, Some(&fingerprint))?;
+            authenticate(&mut session, &input)?;
+            exec(
+                &mut session,
+                &format!(
+                    "rm -rf -- {}; test ! -e {}",
+                    shell_quote(&remote_dir),
+                    shell_quote(&remote_dir)
+                ),
+            )
+            .map(|_| ())
+            .map_err(|error| DeployError::new(category, error.message))
+        };
+        if mode == "--rollback" {
+            cleanup()?;
+        } else {
+            let _ = cleanup();
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| DeployError::new(category, "transaction worker terminated"))?
 }
 
 impl SshInput {
@@ -443,7 +586,10 @@ pub async fn start_deployment(
             "PUBLIC_PANEL_URL must be configured before node bootstrap",
         );
     }
-    let status = state.deployments.insert(group.id, ssh.host.clone()).await;
+    let status = state
+        .deployments
+        .insert(group.id, ssh.host.clone(), req.profile)
+        .await;
     crate::service::audit::record(
         &state,
         Some(admin.user_id),
@@ -501,6 +647,8 @@ async fn run_task(
     panel_url: String,
     actor_id: i64,
 ) {
+    const ROLLBACK_TIMEOUT: Duration = Duration::from_secs(120);
+
     let secrets = Secrets {
         password: ssh.password.clone(),
         node_token: token.clone(),
@@ -512,6 +660,10 @@ async fn run_task(
         .await
         .map(|task| task.group_id)
         .unwrap_or_default();
+    let mutation_started = Arc::new(AtomicBool::new(false));
+    let transaction_committed = Arc::new(AtomicBool::new(false));
+    let work_mutation_started = mutation_started.clone();
+    let work_transaction_committed = transaction_committed.clone();
     let work = async {
         state
             .deployments
@@ -555,6 +707,9 @@ async fn run_task(
                 &secrets,
             )
             .await;
+        // From this point onward, the deterministic remote transaction path may
+        // exist even if SSH reports a timeout before install returns.
+        work_mutation_started.store(true, AtomicOrdering::SeqCst);
         state
             .deployments
             .runner
@@ -580,19 +735,42 @@ async fn run_task(
                 &secrets,
             )
             .await;
-        let node_id = state.deployments.runner.verify(&ssh, &fingerprint).await?;
-        state.deployments.set_node_id(&id, node_id.clone()).await;
-        wait_for_node(
-            &state.node_connections,
+        let verified = state.deployments.runner.verify(&ssh, &fingerprint).await?;
+        let profile = state
+            .deployments
+            .status(&id)
+            .await
+            .map(|task| task.profile)
+            .unwrap_or_default();
+        let required = profile.required_capabilities();
+        if !verified.capabilities.satisfies(required) {
+            return Err(DeployError::new(
+                "CAPABILITY_FAILED",
+                "remote verification did not confirm requested provisioning capabilities",
+            ));
+        }
+        let confirmed = wait_for_node_capabilities(
+            &state,
             group_id,
-            &node_id,
+            &verified.node_id,
+            required,
             state.deployments.online_timeout,
         )
         .await?;
+        state
+            .deployments
+            .runner
+            .commit(&id, &ssh, &fingerprint)
+            .await?;
+        work_transaction_committed.store(true, AtomicOrdering::SeqCst);
+        state
+            .deployments
+            .set_verified(&id, verified.node_id, confirmed)
+            .await;
         Ok::<(), DeployError>(())
     };
     let result = tokio::time::timeout(state.deployments.total_timeout, work).await;
-    match result {
+    let failure = match result {
         Ok(Ok(())) => {
             state
                 .deployments
@@ -600,7 +778,7 @@ async fn run_task(
                     &id,
                     DeploymentStage::Success,
                     "SUCCESS",
-                    "node bootstrap completed and node is online",
+                    "node bootstrap completed and requested capabilities are online",
                     &secrets,
                 )
                 .await;
@@ -613,69 +791,116 @@ async fn run_task(
                 &format!("host={host} group_id={group_id}"),
             )
             .await;
+            None
         }
-        Ok(Err(err)) => {
+        Ok(Err(err)) => Some(err),
+        Err(_) => Some(DeployError::new(
+            "TOTAL_TIMEOUT",
+            "deployment exceeded the total timeout",
+        )),
+    };
+
+    if let Some(err) = failure {
+        let mut message = public_error(&err, &secrets);
+        if mutation_started.load(AtomicOrdering::SeqCst)
+            && !transaction_committed.load(AtomicOrdering::SeqCst)
+        {
             state
                 .deployments
                 .update(
                     &id,
-                    DeploymentStage::Failed,
-                    "FAILED",
-                    public_error(&err, &secrets),
+                    DeploymentStage::Configuring,
+                    "RUNNING",
+                    "deployment failed; restoring previous managed runtime",
                     &secrets,
                 )
                 .await;
-            crate::service::audit::record(
-                &state,
-                Some(actor_id),
-                "node_deploy_failed",
-                "node",
-                &id,
-                &format!("host={host} group_id={group_id} category={}", err.category),
+            match tokio::time::timeout(
+                ROLLBACK_TIMEOUT,
+                state.deployments.runner.rollback(&id, &ssh, &fingerprint),
             )
-            .await;
+            .await
+            {
+                Ok(Ok(())) => {
+                    state
+                        .deployments
+                        .update(
+                            &id,
+                            DeploymentStage::Configuring,
+                            "RUNNING",
+                            "previous managed runtime restored and verified",
+                            &secrets,
+                        )
+                        .await;
+                }
+                Ok(Err(rollback_error)) => {
+                    message.push_str("; ROLLBACK_FAILED: ");
+                    message.push_str(&redact(&rollback_error.message, &secrets));
+                }
+                Err(_) => message.push_str("; ROLLBACK_FAILED: rollback timed out"),
+            }
         }
-        Err(_) => {
-            state
-                .deployments
-                .update(
-                    &id,
-                    DeploymentStage::Failed,
-                    "FAILED",
-                    "TOTAL_TIMEOUT: deployment exceeded the total timeout",
-                    &secrets,
-                )
-                .await;
-            crate::service::audit::record(
-                &state,
-                Some(actor_id),
-                "node_deploy_failed",
-                "node",
-                &id,
-                &format!("host={host} group_id={group_id} category=TOTAL_TIMEOUT"),
-            )
+        state
+            .deployments
+            .update(&id, DeploymentStage::Failed, "FAILED", &message, &secrets)
             .await;
-        }
+        crate::service::audit::record(
+            &state,
+            Some(actor_id),
+            "node_deploy_failed",
+            "node",
+            &id,
+            &format!("host={host} group_id={group_id} category={}", err.category),
+        )
+        .await;
     }
 }
 
-async fn wait_for_node(
-    conns: &crate::api::ws::NodeConnections,
+async fn wait_for_node_capabilities(
+    state: &AppState,
     group_id: i64,
     node_id: &str,
+    required: ProvisioningCapabilities,
     timeout: Duration,
-) -> Result<(), DeployError> {
+) -> Result<ProvisioningCapabilities, DeployError> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut saw_online = false;
     loop {
-        if conns.online_node_ids(group_id).await.contains(node_id) {
-            return Ok(());
+        if state
+            .node_connections
+            .online_node_ids(group_id)
+            .await
+            .contains(node_id)
+        {
+            saw_online = true;
+            let key = format!("node_status:{group_id}:{node_id}");
+            if let Ok(Some(raw)) = state.db.get(&key).await {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(capabilities) =
+                        value.get("provisioning_capabilities").and_then(|item| {
+                            serde_json::from_value::<ProvisioningCapabilities>(item.clone()).ok()
+                        })
+                    {
+                        if capabilities.satisfies(required) {
+                            return Ok(capabilities);
+                        }
+                    }
+                }
+            }
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(DeployError::new(
-                "NODE_ONLINE_TIMEOUT",
-                "node did not appear online before the deployment timeout",
-            ));
+            return if saw_online {
+                Err(DeployError::new(
+                    "CAPABILITY_CONFIRMATION_TIMEOUT",
+                    "node connected but did not confirm requested provisioning capabilities",
+                ))
+            } else {
+                Err(DeployError::new(
+                    "NODE_ONLINE_TIMEOUT",
+                    "node did not appear online before the deployment timeout",
+                ))
+            };
         }
         tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
     }
@@ -880,7 +1105,10 @@ fn exec(session: &mut Session, command: &str) -> Result<String, DeployError> {
     if channel.exit_status().unwrap_or(1) == 0 {
         Ok(stdout)
     } else {
-        Err(DeployError::new("REMOTE_COMMAND_FAILED", truncate(&stderr)))
+        Err(DeployError::new(
+            "REMOTE_COMMAND_FAILED",
+            truncate_tail(&stderr),
+        ))
     }
 }
 
@@ -923,8 +1151,12 @@ fn bootstrap_config(panel_url: &str, token: &str, artifact: &NodeArtifact) -> St
         artifact.sha256
     )
 }
-fn truncate(value: &str) -> String {
-    value.chars().take(512).collect()
+fn truncate_tail(value: &str) -> String {
+    let length = value.chars().count();
+    if length <= 512 {
+        return value.to_string();
+    }
+    value.chars().skip(length - 512).collect()
 }
 fn default_port() -> u16 {
     22
@@ -1011,6 +1243,7 @@ mod tests {
     use jsonwebtoken::{encode, EncodingKey, Header};
     use sqlx::sqlite::SqlitePoolOptions;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1029,14 +1262,19 @@ mod tests {
         RejectPassword,
         HostKeyMismatch,
         InstallTimeout,
+        SlowInstall,
         InstallFailure(&'static str),
         SlowPreflight,
         VerifyFailure(&'static str),
+        CommitFailure,
+        RollbackFailure,
     }
 
     struct FakeRunner {
         behavior: FakeBehavior,
         install_calls: Arc<AtomicUsize>,
+        commit_calls: Arc<AtomicUsize>,
+        rollback_calls: Arc<AtomicUsize>,
     }
 
     impl FakeRunner {
@@ -1044,6 +1282,8 @@ mod tests {
             Self {
                 behavior,
                 install_calls: Arc::new(AtomicUsize::new(0)),
+                commit_calls: Arc::new(AtomicUsize::new(0)),
+                rollback_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -1098,6 +1338,10 @@ mod tests {
         ) -> Result<(), DeployError> {
             self.install_calls.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
+                FakeBehavior::SlowInstall => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(())
+                }
                 FakeBehavior::InstallTimeout => Err(DeployError::new(
                     "SSH_COMMAND_TIMEOUT",
                     "SSH command timed out",
@@ -1109,12 +1353,51 @@ mod tests {
             }
         }
 
-        async fn verify(&self, _ssh: &SshInput, _fingerprint: &str) -> Result<String, DeployError> {
+        async fn verify(
+            &self,
+            _ssh: &SshInput,
+            _fingerprint: &str,
+        ) -> Result<VerifiedNode, DeployError> {
             match self.behavior {
                 FakeBehavior::VerifyFailure(category) => {
                     Err(DeployError::new(category, "verification fixture failed"))
                 }
-                _ => Ok("node-test-1".into()),
+                _ => Ok(VerifiedNode {
+                    node_id: "node-test-1".into(),
+                    capabilities: ProvisioningCapabilities::reality_camouflage(),
+                }),
+            }
+        }
+
+        async fn commit(
+            &self,
+            _task_id: &str,
+            _ssh: &SshInput,
+            _fingerprint: &str,
+        ) -> Result<(), DeployError> {
+            self.commit_calls.fetch_add(1, Ordering::SeqCst);
+            match self.behavior {
+                FakeBehavior::CommitFailure => Err(DeployError::new(
+                    "COMMIT_FAILED",
+                    "transaction commit failed",
+                )),
+                _ => Ok(()),
+            }
+        }
+
+        async fn rollback(
+            &self,
+            _task_id: &str,
+            _ssh: &SshInput,
+            _fingerprint: &str,
+        ) -> Result<(), DeployError> {
+            self.rollback_calls.fetch_add(1, Ordering::SeqCst);
+            match self.behavior {
+                FakeBehavior::RollbackFailure => Err(DeployError::new(
+                    "ROLLBACK_FAILED",
+                    "rollback failed token=node-token-secret password=wrong-password",
+                )),
+                _ => Ok(()),
             }
         }
     }
@@ -1163,6 +1446,376 @@ mod tests {
             .arg(root)
             .output()
             .expect("run bootstrap certbot base fixture")
+    }
+
+    fn run_public_fallback_fixture(root: &Path) -> std::process::Output {
+        Command::new("bash")
+            .arg(bootstrap_script())
+            .arg("--test-public-fallback")
+            .arg(root)
+            .output()
+            .expect("run bootstrap public fallback fixture")
+    }
+
+    fn run_port_preflight_fixture(root: &Path, listeners: &Path) -> std::process::Output {
+        Command::new("bash")
+            .arg(bootstrap_script())
+            .arg("--test-port-preflight")
+            .arg(root)
+            .arg(listeners)
+            .output()
+            .expect("run bootstrap port preflight fixture")
+    }
+
+    fn run_env_filter_fixture(input: &Path, output: &Path) -> std::process::Output {
+        Command::new("bash")
+            .arg(bootstrap_script())
+            .arg("--test-env-filter")
+            .arg(input)
+            .arg(output)
+            .output()
+            .expect("run bootstrap env filter fixture")
+    }
+
+    const MANAGED_TRANSACTION_FILES: &[(&str, &str)] = &[
+        ("opt/relay-node/relay-node", "old relay-node binary\n"),
+        (
+            "etc/relay-node/relay-node.env",
+            "PANEL_URL='https://old.panel'\nNODE_TOKEN='old-node-token'\n",
+        ),
+        (
+            "etc/systemd/system/relay-node.service",
+            "old relay-node unit\n",
+        ),
+        ("etc/nginx/nginx.conf", "events {}\nhttp {}\n"),
+        (
+            "etc/nginx/relay-panel-stream.conf",
+            "old managed stream root\n",
+        ),
+        (
+            "etc/nginx/relay-panel-stream.d/relay-panel-sni.conf",
+            "old listener config\n",
+        ),
+        (
+            "etc/nginx/conf.d/relay-panel-fallback.conf",
+            "old camouflage wrapper\n",
+        ),
+        (
+            "etc/nginx/conf.d/relay-panel-acme.conf",
+            "old HTTP-01 config\n",
+        ),
+        (
+            "etc/nginx/relay-panel-certs/fallback.crt",
+            "old fallback certificate\n",
+        ),
+        (
+            "etc/nginx/relay-panel-certs/fallback.key",
+            "old fallback private key\n",
+        ),
+        (
+            "opt/relay-node/provisioning-capabilities.json",
+            "{\"old\":true}\n",
+        ),
+    ];
+
+    const PERSISTENT_TRANSACTION_FILES: &[(&str, &str)] = &[
+        ("opt/relay-node/node-id", "persistent-node-id\n"),
+        (
+            "opt/relay-node/config-cache.json",
+            "{\"listener\":\"primary\"}\n",
+        ),
+        (
+            "opt/relay-node/config-cache.json.backup",
+            "{\"listener\":\"backup\"}\n",
+        ),
+        (
+            "opt/relay-node/camouflage-sites/site-manifest.json",
+            "{\"camouflage\":\"primary\"}\n",
+        ),
+        (
+            "opt/relay-node/camouflage-sites/site-manifest.json.backup",
+            "{\"camouflage\":\"backup\"}\n",
+        ),
+        (
+            "opt/relay-node/certificates/op1/generations/g1/fullchain.pem",
+            "active certificate generation\n",
+        ),
+        (
+            "opt/relay-node/certificates/op1/generations/g1/privkey.pem",
+            "active certificate private key\n",
+        ),
+        (
+            "opt/relay-node/certificates/op1/active.json",
+            "{\"generation\":\"g1\"}\n",
+        ),
+        (
+            "var/lib/relay-panel/openlist/data.db",
+            "persistent OpenList data\n",
+        ),
+    ];
+
+    fn write_fixture_file(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    fn read_fixture_files(root: &Path, files: &[(&str, &str)]) -> Vec<(String, Vec<u8>)> {
+        files
+            .iter()
+            .map(|(relative, _)| {
+                (
+                    (*relative).to_string(),
+                    fs::read(root.join(relative)).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        fs::write(path, contents).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    struct TransactionFixture {
+        root: PathBuf,
+        transaction: PathBuf,
+        systemctl: PathBuf,
+        nginx: PathBuf,
+        state_dir: PathBuf,
+        command_log: PathBuf,
+        managed_before: Vec<(String, Vec<u8>)>,
+        managed_modes_before: Vec<(String, u32)>,
+        persistent_before: Vec<(String, Vec<u8>)>,
+    }
+
+    impl TransactionFixture {
+        fn new(label: &str) -> Self {
+            let root = unique_fixture_dir(label);
+            for (relative, contents) in MANAGED_TRANSACTION_FILES
+                .iter()
+                .chain(PERSISTENT_TRANSACTION_FILES.iter())
+            {
+                write_fixture_file(&root, relative, contents);
+            }
+            for (relative, mode) in [
+                ("opt/relay-node/relay-node", 0o755),
+                ("etc/relay-node/relay-node.env", 0o600),
+                ("etc/nginx/relay-panel-certs/fallback.key", 0o600),
+            ] {
+                let mut permissions = fs::metadata(root.join(relative)).unwrap().permissions();
+                permissions.set_mode(mode);
+                fs::set_permissions(root.join(relative), permissions).unwrap();
+            }
+            let state_dir = root.join("fake-service-state");
+            let bin_dir = root.join("fake-bin");
+            fs::create_dir_all(&state_dir).unwrap();
+            fs::create_dir_all(&bin_dir).unwrap();
+            for unit in ["relay-node", "nginx"] {
+                fs::write(state_dir.join(format!("{unit}.active")), "yes\n").unwrap();
+                fs::write(state_dir.join(format!("{unit}.enabled")), "yes\n").unwrap();
+            }
+            let proc_exe = root.join("proc/4242/exe");
+            fs::create_dir_all(proc_exe.parent().unwrap()).unwrap();
+            fs::copy(root.join("opt/relay-node/relay-node"), &proc_exe).unwrap();
+
+            let command_log = root.join("commands.log");
+            let systemctl = bin_dir.join("systemctl");
+            write_executable(
+                &systemctl,
+                r#"#!/usr/bin/env bash
+set -eu
+state="${FAKE_SERVICE_STATE_DIR:?}"
+root="${TRANSACTION_ROOT:?}"
+log="${FAKE_COMMAND_LOG:?}"
+action="${1:?}"
+shift
+unit="${*: -1}"
+printf 'systemctl %s %s\n' "$action" "$unit" >> "$log"
+fail_key="${FAKE_FAIL_ONCE_ACTION:-}"
+marker="$state/failed-once"
+if [ "$fail_key" = "$action:$unit" ] && [ ! -e "$marker" ]; then
+  : > "$marker"
+  exit 1
+fi
+case "$action" in
+  is-active) grep -Fx yes "$state/$unit.active" >/dev/null ;;
+  is-enabled) grep -Fx yes "$state/$unit.enabled" >/dev/null ;;
+  enable)
+    printf 'yes\n' > "$state/$unit.enabled"
+    ;;
+  disable)
+    printf 'no\n' > "$state/$unit.enabled"
+    ;;
+  start|restart)
+    printf 'yes\n' > "$state/$unit.active"
+    if [ "$unit" = relay-node ]; then
+      mkdir -p "$root/proc/4242"
+      cp "$root/opt/relay-node/relay-node" "$root/proc/4242/exe"
+    fi
+    ;;
+  reload|daemon-reload) ;;
+  stop) printf 'no\n' > "$state/$unit.active" ;;
+  show) printf '4242\n' ;;
+  *) exit 1 ;;
+esac
+"#,
+            );
+            let nginx = bin_dir.join("nginx");
+            write_executable(
+                &nginx,
+                r#"#!/usr/bin/env bash
+set -eu
+printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
+! grep -q BROKEN "${TRANSACTION_ROOT:?}/etc/nginx/nginx.conf"
+"#,
+            );
+            let managed_before = read_fixture_files(&root, MANAGED_TRANSACTION_FILES);
+            let managed_modes_before = MANAGED_TRANSACTION_FILES
+                .iter()
+                .map(|(relative, _)| {
+                    (
+                        (*relative).to_string(),
+                        fs::metadata(root.join(relative))
+                            .unwrap()
+                            .permissions()
+                            .mode()
+                            & 0o777,
+                    )
+                })
+                .collect();
+            let persistent_before = read_fixture_files(&root, PERSISTENT_TRANSACTION_FILES);
+            Self {
+                transaction: root.join("transaction"),
+                root,
+                systemctl,
+                nginx,
+                state_dir,
+                command_log,
+                managed_before,
+                managed_modes_before,
+                persistent_before,
+            }
+        }
+
+        fn run_failure(
+            &self,
+            failure_point: &str,
+            fail_once: Option<&str>,
+        ) -> std::process::Output {
+            let mut command = Command::new("bash");
+            command
+                .arg(bootstrap_script())
+                .arg("--test-transaction-failure")
+                .arg(&self.root)
+                .arg(&self.transaction)
+                .arg(failure_point)
+                .env("TRANSACTION_ROOT", &self.root)
+                .env("SYSTEMCTL_BIN", &self.systemctl)
+                .env("NGINX_BIN", &self.nginx)
+                .env("FAKE_SERVICE_STATE_DIR", &self.state_dir)
+                .env("FAKE_COMMAND_LOG", &self.command_log);
+            if let Some(value) = fail_once {
+                command.env("FAKE_FAIL_ONCE_ACTION", value);
+            }
+            command.output().expect("run bootstrap rollback fixture")
+        }
+
+        fn run_noop(&self) -> std::process::Output {
+            Command::new("bash")
+                .arg(bootstrap_script())
+                .arg("--test-transaction-noop")
+                .arg(&self.root)
+                .arg(&self.transaction)
+                .env("TRANSACTION_ROOT", &self.root)
+                .env("SYSTEMCTL_BIN", &self.systemctl)
+                .env("NGINX_BIN", &self.nginx)
+                .env("FAKE_SERVICE_STATE_DIR", &self.state_dir)
+                .env("FAKE_COMMAND_LOG", &self.command_log)
+                .output()
+                .expect("run bootstrap no-op transaction fixture")
+        }
+
+        fn assert_restored(&self, relay_restarted: bool, nginx_reloaded: bool) {
+            for (relative, expected) in &self.managed_before {
+                assert_eq!(
+                    fs::read(self.root.join(relative)).unwrap(),
+                    *expected,
+                    "{relative}"
+                );
+            }
+            for (relative, expected) in &self.persistent_before {
+                assert_eq!(
+                    fs::read(self.root.join(relative)).unwrap(),
+                    *expected,
+                    "{relative}"
+                );
+            }
+            for (relative, expected) in &self.managed_modes_before {
+                assert_eq!(
+                    fs::metadata(self.root.join(relative))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    *expected,
+                    "mode for {relative}"
+                );
+            }
+            assert_eq!(
+                fs::read(self.root.join("proc/4242/exe")).unwrap(),
+                fs::read(self.root.join("opt/relay-node/relay-node")).unwrap(),
+                "running process must use the restored binary"
+            );
+            assert_eq!(
+                fs::read_to_string(self.transaction.join("state")).unwrap(),
+                "rolled_back\n"
+            );
+            assert!(!self.transaction.join("lock").exists());
+            assert!(!self.transaction.join("candidate").exists());
+            for relative in MANAGED_TRANSACTION_FILES
+                .iter()
+                .map(|(relative, _)| *relative)
+            {
+                for suffix in [".new", ".rollback", ".tmp"] {
+                    assert!(!self.root.join(format!("{relative}{suffix}")).exists());
+                }
+            }
+            let commands = fs::read_to_string(&self.command_log).unwrap();
+            assert!(commands.contains("nginx -t"));
+            assert_eq!(
+                commands.contains("systemctl restart relay-node"),
+                relay_restarted,
+                "{commands}"
+            );
+            assert_eq!(
+                commands.contains("systemctl reload nginx"),
+                nginx_reloaded,
+                "{commands}"
+            );
+            assert_eq!(
+                fs::read_to_string(self.state_dir.join("relay-node.active")).unwrap(),
+                "yes\n"
+            );
+            assert!(
+                Command::new(&self.nginx)
+                    .arg("-t")
+                    .env("TRANSACTION_ROOT", &self.root)
+                    .env("FAKE_COMMAND_LOG", &self.command_log)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "restored Nginx configuration must validate"
+            );
+        }
+    }
+
+    impl Drop for TransactionFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 
     fn write_fixture_nginx_conf(root: &Path) {
@@ -1253,7 +1906,14 @@ mod tests {
     }
 
     async fn run_fake_task(state: AppState) -> DeploymentStatus {
-        let task = state.deployments.insert(7, "node.example".into()).await;
+        let task = state
+            .deployments
+            .insert(
+                7,
+                "node.example".into(),
+                ProvisioningProfile::RealityCamouflage,
+            )
+            .await;
         run_task(
             state.clone(),
             task.id.clone(),
@@ -1265,6 +1925,20 @@ mod tests {
         )
         .await;
         state.deployments.status(&task.id).await.unwrap()
+    }
+
+    async fn seed_node_capabilities(state: &AppState, capabilities: ProvisioningCapabilities) {
+        state
+            .db
+            .set(
+                "node_status:7:node-test-1",
+                &serde_json::json!({
+                    "provisioning_capabilities": capabilities,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -1333,20 +2007,32 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_script_preserves_p0_lkg_and_uses_loopback_only() {
+    fn bootstrap_preserves_lkg_and_uses_public_camouflage_with_loopback_openlist() {
         assert!(INSTALL_SCRIPT.contains("/opt/relay-node/node-id"));
         assert!(!INSTALL_SCRIPT.contains("touch /opt/relay-node/node-id"));
         assert!(!INSTALL_SCRIPT.contains("config-cache.json"));
         assert!(INSTALL_SCRIPT.contains("127.0.0.1:5244:5244"));
-        assert!(INSTALL_SCRIPT.contains("listen 127.0.0.1:8443 ssl"));
+        assert!(INSTALL_SCRIPT.contains("listen 8443 ssl default_server"));
+        assert!(INSTALL_SCRIPT.contains("listen [::]:8443 ssl default_server"));
         assert!(INSTALL_SCRIPT.contains("/var/lib/relay-panel/openlist"));
         assert!(INSTALL_SCRIPT.contains("/var/www/relay-panel-certbot/.well-known/acme-challenge"));
+        assert!(INSTALL_SCRIPT.contains("existing_env_value CAMOUFLAGE_SITES_STATE_DIR"));
+        assert!(INSTALL_SCRIPT.contains("existing_env_value CERTIFICATE_STATE_DIR"));
+        assert!(
+            INSTALL_SCRIPT.contains("cmp -s /opt/relay-node/provisioning-capabilities.json.tmp")
+        );
     }
 
     #[tokio::test]
     async fn task_state_transitions_are_visible_without_credentials() {
         let registry = DeploymentRegistry::default();
-        let task = registry.insert(9, "node.example".into()).await;
+        let task = registry
+            .insert(
+                9,
+                "node.example".into(),
+                ProvisioningProfile::RealityCamouflage,
+            )
+            .await;
         registry
             .update(
                 &task.id,
@@ -1386,8 +2072,20 @@ mod tests {
     #[tokio::test]
     async fn concurrent_tasks_keep_logs_and_secrets_isolated() {
         let registry = DeploymentRegistry::default();
-        let first = registry.insert(1, "one.example".into()).await;
-        let second = registry.insert(2, "two.example".into()).await;
+        let first = registry
+            .insert(
+                1,
+                "one.example".into(),
+                ProvisioningProfile::RealityCamouflage,
+            )
+            .await;
+        let second = registry
+            .insert(
+                2,
+                "two.example".into(),
+                ProvisioningProfile::RealityCamouflage,
+            )
+            .await;
         registry
             .update(
                 &first.id,
@@ -1440,6 +2138,18 @@ mod tests {
     }
 
     #[test]
+    fn remote_error_truncation_preserves_failure_step_at_stderr_tail() {
+        let stderr = format!(
+            "{}\nBOOTSTRAP_FAILED_STEP=verify-fallback exit=7\nBOOTSTRAP_ROLLBACK=SUCCESS\n",
+            "normal provisioning output\n".repeat(64)
+        );
+        let truncated = truncate_tail(&stderr);
+        assert!(truncated.chars().count() <= 512);
+        assert!(truncated.contains("BOOTSTRAP_FAILED_STEP=verify-fallback exit=7"));
+        assert!(truncated.contains("BOOTSTRAP_ROLLBACK=SUCCESS"));
+    }
+
+    #[test]
     fn bootstrap_script_is_idempotent_and_scoped_to_relaypanel_resources() {
         assert!(INSTALL_SCRIPT.contains("docker inspect relay-panel-openlist"));
         assert!(INSTALL_SCRIPT.contains("docker start relay-panel-openlist"));
@@ -1447,12 +2157,124 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("ensure_relay_panel_stream_layout"));
         assert!(INSTALL_SCRIPT.contains("/etc/nginx/relay-panel-stream.d/relay-panel-sni.conf"));
         assert!(INSTALL_SCRIPT.contains("NGINX_STREAM_CONFLICT"));
-        assert!(INSTALL_SCRIPT.contains("chown -R 1001:1001 /var/lib/relay-panel/openlist"));
+        assert!(INSTALL_SCRIPT.contains("! -uid 1001 -o ! -gid 1001"));
         assert!(INSTALL_SCRIPT.contains("BOOTSTRAP_FAILED_STEP="));
         assert!(INSTALL_SCRIPT.contains("step verify-openlist"));
+        assert!(INSTALL_SCRIPT.contains("current_sha"));
+        assert!(INSTALL_SCRIPT.contains("RELAY_NODE_RESTART_REQUIRED"));
+        assert!(INSTALL_SCRIPT.contains("is_managed_listener_config"));
         assert!(!INSTALL_SCRIPT.contains("rm -rf /var/lib/relay-panel/openlist"));
         assert!(!INSTALL_SCRIPT.contains("rm -rf /etc/nginx"));
         assert!(!INSTALL_SCRIPT.contains("rm -f /opt/relay-node/config-cache"));
+        assert!(!INSTALL_SCRIPT.contains("find \"$(managed_path /opt/relay-node)\""));
+    }
+
+    #[test]
+    fn bootstrap_env_filter_is_awk_compatible_and_preserves_unmanaged_values() {
+        let root = unique_fixture_dir("env-filter");
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("relay-node.env");
+        let output = root.join("relay-node.env.filtered");
+        fs::write(
+            &input,
+            concat!(
+                "PANEL_URL='https://old.panel'\n",
+                "NODE_TOKEN='secret'\n",
+                "NGINX_SNI_CONF_PATH=/old/path\n",
+                "CUSTOM_SETTING=preserve-me\n",
+            ),
+        )
+        .unwrap();
+
+        let result = run_env_filter_fixture(&input, &output);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&output).unwrap(),
+            "CUSTOM_SETTING=preserve-me\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bootstrap_transaction_restores_binary_env_unit_nginx_and_persistent_state() {
+        for failure_point in [
+            "binary-activation",
+            "env-mutation",
+            "unit-mutation",
+            "nginx-validation",
+            "service-health",
+        ] {
+            let fixture = TransactionFixture::new(failure_point);
+            let output = fixture.run_failure(failure_point, None);
+            assert!(!output.status.success(), "{failure_point} must fail");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("BOOTSTRAP_ROLLBACK=SUCCESS"), "{stderr}");
+            assert!(!stderr.contains("old-node-token"));
+            assert!(!stderr.contains("injected-secret"));
+            assert!(!stderr.contains("old fallback private key"));
+            fixture.assert_restored(
+                failure_point != "nginx-validation",
+                failure_point == "nginx-validation",
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_transaction_retries_a_recoverable_rollback_error() {
+        let fixture = TransactionFixture::new("rollback-retry");
+        let output = fixture.run_failure("rollback-retry", Some("restart:relay-node"));
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("failed once; retrying rollback recovery"));
+        assert!(stderr.contains("BOOTSTRAP_ROLLBACK=SUCCESS"));
+        fixture.assert_restored(true, true);
+        let commands = fs::read_to_string(&fixture.command_log).unwrap();
+        assert_eq!(commands.matches("systemctl restart relay-node").count(), 2);
+    }
+
+    #[test]
+    fn rollback_without_managed_mutation_preserves_running_services() {
+        let fixture = TransactionFixture::new("rollback-no-mutation");
+        let output = fixture.run_failure("no-mutation", None);
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("BOOTSTRAP_ROLLBACK=SUCCESS"), "{stderr}");
+        fixture.assert_restored(false, false);
+        let commands = fs::read_to_string(&fixture.command_log).unwrap();
+        assert!(!commands.contains("daemon-reload"), "{commands}");
+        assert!(!commands.contains("systemctl enable"), "{commands}");
+        assert!(!commands.contains("systemctl disable"), "{commands}");
+    }
+
+    #[test]
+    fn identical_transaction_commit_is_a_runtime_noop() {
+        let fixture = TransactionFixture::new("transaction-noop");
+        let output = fixture.run_noop();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.transaction.join("state")).unwrap(),
+            "committed\n"
+        );
+        for (relative, expected) in &fixture.managed_before {
+            assert_eq!(fs::read(fixture.root.join(relative)).unwrap(), *expected);
+        }
+        for (relative, expected) in &fixture.persistent_before {
+            assert_eq!(fs::read(fixture.root.join(relative)).unwrap(), *expected);
+        }
+        let commands = fs::read_to_string(&fixture.command_log).unwrap();
+        assert!(!commands.contains(" restart "));
+        assert!(!commands.contains(" reload "));
+        assert!(!commands.contains(" enable "));
+        assert!(!commands.contains(" disable "));
+        assert!(!commands.contains("daemon-reload"));
     }
 
     #[test]
@@ -1489,6 +2311,88 @@ mod tests {
         assert!(!INSTALL_SCRIPT.contains("certbot renew"));
         assert!(!INSTALL_SCRIPT.contains("/etc/letsencrypt/renewal/"));
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bootstrap_public_fallback_is_reachable_and_preserves_active_generated_config() {
+        let root = unique_fixture_dir("public-fallback");
+        let first = run_public_fallback_fixture(&root);
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let conf = root.join("etc/nginx/conf.d/relay-panel-fallback.conf");
+        let rendered = fs::read_to_string(&conf).unwrap();
+        assert!(rendered.contains("listen 8443 ssl default_server;"));
+        assert!(rendered.contains("listen [::]:8443 ssl default_server;"));
+        assert!(!rendered.contains("listen 127.0.0.1:8443"));
+        assert!(rendered.contains("proxy_pass http://127.0.0.1:5244;"));
+
+        let active =
+            "# generated by relay-node; TLS camouflage sites\n# preserve active generation\n";
+        fs::write(&conf, active).unwrap();
+        let repeated = run_public_fallback_fixture(&root);
+        assert!(repeated.status.success());
+        assert_eq!(fs::read_to_string(&conf).unwrap(), active);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bootstrap_port_preflight_allows_managed_and_rejects_unknown_owners() {
+        let root = unique_fixture_dir("port-preflight");
+        fs::create_dir_all(root.join("etc/nginx/relay-panel-stream.d")).unwrap();
+        let listeners = root.join("listeners.txt");
+        fs::write(
+            root.join("etc/nginx/relay-panel-stream.d/relay-panel-sni.conf"),
+            "# generated by relay-node; do not edit\n",
+        )
+        .unwrap();
+        fs::write(
+            &listeners,
+            concat!(
+                "LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:((\"nginx\",pid=1,fd=1))\n",
+                "LISTEN 0 511 [::]:443 [::]:* users:((\"nginx\",pid=1,fd=2))\n",
+            ),
+        )
+        .unwrap();
+        let managed = run_port_preflight_fixture(&root, &listeners);
+        assert!(
+            managed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&managed.stderr)
+        );
+
+        fs::write(
+            &listeners,
+            "LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:((\"nginx\",pid=1,fd=1))\n",
+        )
+        .unwrap();
+        let shared_http = run_port_preflight_fixture(&root, &listeners);
+        assert!(
+            shared_http.status.success(),
+            "{}",
+            String::from_utf8_lossy(&shared_http.stderr)
+        );
+
+        fs::write(
+            &listeners,
+            "LISTEN 0 128 0.0.0.0:8443 0.0.0.0:* users:((\"otherd\",pid=2,fd=3))\n",
+        )
+        .unwrap();
+        let unknown_process = run_port_preflight_fixture(&root, &listeners);
+        assert!(!unknown_process.status.success());
+        assert!(String::from_utf8_lossy(&unknown_process.stderr).contains("PORT_CONFLICT"));
+
+        fs::write(
+            &listeners,
+            "LISTEN 0 511 0.0.0.0:8443 0.0.0.0:* users:((\"nginx\",pid=1,fd=1))\n",
+        )
+        .unwrap();
+        let unknown_nginx = run_port_preflight_fixture(&root, &listeners);
+        assert!(!unknown_nginx.status.success());
+        assert!(String::from_utf8_lossy(&unknown_nginx.stderr).contains("PORT_CONFLICT"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1609,7 +2513,7 @@ mod tests {
     async fn command_timeout_marks_task_failed() {
         let runner = Arc::new(FakeRunner::new(FakeBehavior::InstallTimeout));
         let state = test_state(test_registry(
-            runner,
+            runner.clone(),
             Duration::from_secs(1),
             Duration::from_millis(5),
         ))
@@ -1617,6 +2521,8 @@ mod tests {
         let status = run_fake_task(state).await;
         assert_eq!(status.stage, DeploymentStage::Failed);
         assert!(status.message.starts_with("SSH_COMMAND_TIMEOUT:"));
+        assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.commit_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1625,7 +2531,7 @@ mod tests {
             "NGINX_CONFIG_INVALID",
         )));
         let state = test_state(test_registry(
-            runner,
+            runner.clone(),
             Duration::from_secs(1),
             Duration::from_millis(5),
         ))
@@ -1633,6 +2539,7 @@ mod tests {
         let status = run_fake_task(state).await;
         assert_eq!(status.stage, DeploymentStage::Failed);
         assert!(status.message.starts_with("NGINX_CONFIG_INVALID:"));
+        assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1653,11 +2560,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn total_timeout_after_mutation_attempts_rollback() {
+        let runner = Arc::new(FakeRunner::new(FakeBehavior::SlowInstall));
+        let state = test_state(test_registry(
+            runner.clone(),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        ))
+        .await;
+        let status = run_fake_task(state).await;
+        assert_eq!(status.stage, DeploymentStage::Failed);
+        assert_eq!(
+            status.message,
+            "TOTAL_TIMEOUT: deployment exceeded the total timeout"
+        );
+        assert_eq!(runner.install_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn remote_service_verification_failures_never_report_success() {
         for category in ["RELAY_NODE_FAILED", "OPENLIST_FAILED", "NGINX_FAILED"] {
             let runner = Arc::new(FakeRunner::new(FakeBehavior::VerifyFailure(category)));
             let state = test_state(test_registry(
-                runner,
+                runner.clone(),
                 Duration::from_secs(1),
                 Duration::from_millis(5),
             ))
@@ -1665,6 +2591,7 @@ mod tests {
             let status = run_fake_task(state).await;
             assert_eq!(status.stage, DeploymentStage::Failed, "{category}");
             assert!(status.message.starts_with(category), "{}", status.message);
+            assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -1672,7 +2599,7 @@ mod tests {
     async fn node_online_timeout_marks_task_failed() {
         let runner = Arc::new(FakeRunner::new(FakeBehavior::Success));
         let state = test_state(test_registry(
-            runner,
+            runner.clone(),
             Duration::from_secs(1),
             Duration::from_millis(5),
         ))
@@ -1680,13 +2607,15 @@ mod tests {
         let status = run_fake_task(state).await;
         assert_eq!(status.stage, DeploymentStage::Failed);
         assert!(status.message.starts_with("NODE_ONLINE_TIMEOUT:"));
+        assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.commit_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
     async fn successful_task_reaches_success_after_node_enrollment() {
         let runner = Arc::new(FakeRunner::new(FakeBehavior::Success));
         let state = test_state(test_registry(
-            runner,
+            runner.clone(),
             Duration::from_secs(1),
             Duration::from_millis(50),
         ))
@@ -1695,9 +2624,87 @@ mod tests {
             .node_connections
             .register(7, Some("node-test-1".into()))
             .await;
+        seed_node_capabilities(&state, ProvisioningCapabilities::reality_camouflage()).await;
         let status = run_fake_task(state).await;
         assert_eq!(status.stage, DeploymentStage::Success);
         assert_eq!(status.node_id.as_deref(), Some("node-test-1"));
+        assert_eq!(
+            status.capabilities,
+            Some(ProvisioningCapabilities::reality_camouflage())
+        );
+        assert_eq!(runner.commit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn online_node_without_requested_capabilities_never_reports_success() {
+        let runner = Arc::new(FakeRunner::new(FakeBehavior::Success));
+        let state = test_state(test_registry(
+            runner.clone(),
+            Duration::from_secs(1),
+            Duration::from_millis(15),
+        ))
+        .await;
+        let (_connection_id, _receiver) = state
+            .node_connections
+            .register(7, Some("node-test-1".into()))
+            .await;
+        seed_node_capabilities(&state, ProvisioningCapabilities::default()).await;
+
+        let status = run_fake_task(state).await;
+
+        assert_eq!(status.stage, DeploymentStage::Failed);
+        assert!(status
+            .message
+            .starts_with("CAPABILITY_CONFIRMATION_TIMEOUT:"));
+        assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.commit_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn commit_failure_rolls_back_and_never_reports_success() {
+        let runner = Arc::new(FakeRunner::new(FakeBehavior::CommitFailure));
+        let state = test_state(test_registry(
+            runner.clone(),
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        ))
+        .await;
+        let (_connection_id, _receiver) = state
+            .node_connections
+            .register(7, Some("node-test-1".into()))
+            .await;
+        seed_node_capabilities(&state, ProvisioningCapabilities::reality_camouflage()).await;
+
+        let status = run_fake_task(state).await;
+
+        assert_eq!(status.stage, DeploymentStage::Failed);
+        assert!(status.message.starts_with("COMMIT_FAILED:"));
+        assert_eq!(runner.commit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rollback_failure_is_redacted_and_never_reports_success() {
+        let runner = Arc::new(FakeRunner::new(FakeBehavior::RollbackFailure));
+        let state = test_state(test_registry(
+            runner.clone(),
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        ))
+        .await;
+
+        let status = run_fake_task(state.clone()).await;
+
+        assert_eq!(status.stage, DeploymentStage::Failed);
+        assert!(status.message.contains("ROLLBACK_FAILED:"));
+        assert!(!status.message.contains("wrong-password"));
+        assert!(!status.message.contains("node-token-secret"));
+        assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 1);
+        let logs =
+            serde_json::to_string(&state.deployments.logs(&status.id).await.unwrap()).unwrap();
+        assert!(!logs.contains("wrong-password"));
+        assert!(!logs.contains("node-token-secret"));
     }
 
     #[tokio::test]
