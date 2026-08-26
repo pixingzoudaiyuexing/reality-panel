@@ -1,8 +1,8 @@
-import { describe, expect, it } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { Form } from 'antd';
-import { CamouflageFormFields, deriveCamouflageStatus } from './Rules';
-import type { NodeStatus } from '../api/types';
+import { CamouflageFormFields, deriveCamouflageStatus, DnsStatusCell } from './Rules';
+import type { NodeStatus, RuleDnsStatus } from '../api/types';
 
 // ============================================================
 // Pure-function tests for Rules.tsx helpers
@@ -266,6 +266,70 @@ describe('camouflage rule form fields', () => {
 
     expect(screen.getByRole('switch', { name: 'camouflage' })).toBeDisabled();
     expect(screen.getByText('camouflageAdminOnly')).toBeInTheDocument();
+  });
+});
+
+describe('rule DNS status', () => {
+  const t = (key: string) => key;
+  const status = (sync_state: string, overrides: Partial<RuleDnsStatus> = {}): RuleDnsStatus => ({
+    rule_id: 42,
+    eligible: true,
+    automation_enabled: true,
+    fqdn: 'op1.example.com',
+    record_type: 'A',
+    expected_value: '192.0.2.10',
+    ownership: 'PANEL_MANAGED',
+    sync_state,
+    last_observed_at: null,
+    mutation_verified_at: null,
+    propagated_at: null,
+    last_error_category: null,
+    warning_category: null,
+    ...overrides,
+  });
+
+  it.each([
+    'PENDING',
+    'SYNCING',
+    'MUTATION_VERIFIED',
+    'PROPAGATING',
+    'PROPAGATED',
+    'CONFLICT',
+    'FAILED',
+    'DISABLED',
+    'INVALID_CONFIG',
+  ])('renders %s independently from certificate and Relay state', (state) => {
+    const { unmount } = render(<DnsStatusCell status={status(state)} t={t} />);
+    expect(screen.getByText(state)).toBeInTheDocument();
+    expect(screen.getByText('A op1.example.com → 192.0.2.10')).toBeInTheDocument();
+    unmount();
+  });
+
+  it('shows external ownership and a multiple-answer propagation warning', () => {
+    render(<DnsStatusCell status={status('PROPAGATED', {
+      ownership: 'EXTERNAL',
+      warning_category: 'PUBLIC_DNS_MULTIPLE_ANSWERS',
+    })} t={t} />);
+    expect(screen.getByText('dnsOwnership: EXTERNAL')).toBeInTheDocument();
+    expect(screen.getByText('PUBLIC_DNS_MULTIPLE_ANSWERS')).toBeInTheDocument();
+  });
+
+  it('offers retry for safe terminal states but not unknown mutation outcomes', () => {
+    const retry = vi.fn();
+    const { rerender } = render(<DnsStatusCell status={status('CONFLICT')} onRetry={retry} t={t} />);
+    fireEvent.click(screen.getByRole('button', { name: /retryDnsSync/ }));
+    expect(retry).toHaveBeenCalledOnce();
+
+    rerender(<DnsStatusCell status={status('MUTATION_OUTCOME_UNKNOWN', {
+      last_error_category: 'POST_WRITE_NOT_VERIFIED',
+    })} onRetry={retry} t={t} />);
+    expect(screen.queryByRole('button', { name: /retryDnsSync/ })).not.toBeInTheDocument();
+  });
+
+  it('shows disabled automation without claiming the certificate or route failed', () => {
+    render(<DnsStatusCell status={status('DISABLED', { automation_enabled: false })} t={t} />);
+    expect(screen.getByText('dnsAutomationDisabled')).toBeInTheDocument();
+    expect(screen.queryByText('routeFailed')).not.toBeInTheDocument();
   });
 });
 

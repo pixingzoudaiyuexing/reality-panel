@@ -394,6 +394,62 @@ CREATE INDEX IF NOT EXISTS idx_manual_bootstrap_enrollments_group_state
 CREATE INDEX IF NOT EXISTS idx_manual_bootstrap_enrollments_expiry
     ON manual_bootstrap_enrollments(state, expires_at, session_expires_at);
 
+-- Durable ownership evidence for DNS records created by RelayPanel. Discovery
+-- alone never inserts a row. Rule deletion clears only the optional relation;
+-- the provider identity is retained for explicit cleanup/audit in later stages.
+CREATE TABLE IF NOT EXISTS dns_record_bindings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER REFERENCES forward_rules(id) ON DELETE SET NULL,
+    fqdn TEXT NOT NULL,
+    zone_id INTEGER NOT NULL CHECK (zone_id > 0),
+    zone_name TEXT NOT NULL,
+    host TEXT NOT NULL,
+    record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),
+    line TEXT NOT NULL,
+    line_key TEXT NOT NULL,
+    record_id TEXT NOT NULL CHECK (record_id <> ''),
+    desired_value TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('BOUND','MISSING','CONFLICT','ERROR')),
+    last_observed_at TEXT,
+    last_error_category TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_dns_record_bindings_provider_record
+    ON dns_record_bindings(zone_id, record_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_dns_record_bindings_rule_record
+    ON dns_record_bindings(rule_id, fqdn, record_type, line_key)
+    WHERE rule_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_dns_record_bindings_rule_id
+    ON dns_record_bindings(rule_id);
+
+-- Persisted DNS desired/reconciliation state. This is deliberately separate
+-- from dns_record_bindings: pending and externally-owned records are not
+-- Panel ownership evidence.
+CREATE TABLE IF NOT EXISTS dns_record_syncs (
+    rule_id INTEGER PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
+    fqdn TEXT NOT NULL,
+    record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),
+    expected_value TEXT NOT NULL,
+    line TEXT NOT NULL,
+    line_key TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'PENDING','SYNCING','MUTATION_VERIFIED','PROPAGATING','PROPAGATED',
+        'CONFLICT','FAILED','MUTATION_OUTCOME_UNKNOWN','DISABLED','NOT_ELIGIBLE'
+    )),
+    ownership TEXT NOT NULL CHECK (ownership IN ('UNKNOWN','PANEL','EXTERNAL')),
+    mutation_verified_at TEXT,
+    last_observed_at TEXT,
+    propagated_at TEXT,
+    last_error_category TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    next_attempt_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dns_record_syncs_due
+    ON dns_record_syncs(state, next_attempt_at);
+
 -- v1.2.4: site announcements.
 --
 -- Replaces the single `announcement` string that lived in the site:config kvs
@@ -1907,6 +1963,84 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .await?;
     tracing::info!("Migration 46: manual_bootstrap_enrollments table present");
 
+    // ── Migration 47: durable DNS record ownership bindings ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS dns_record_bindings (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT,\
+             rule_id INTEGER REFERENCES forward_rules(id) ON DELETE SET NULL,\
+             fqdn TEXT NOT NULL,\
+             zone_id INTEGER NOT NULL CHECK (zone_id > 0),\
+             zone_name TEXT NOT NULL,\
+             host TEXT NOT NULL,\
+             record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),\
+             line TEXT NOT NULL,\
+             line_key TEXT NOT NULL,\
+             record_id TEXT NOT NULL CHECK (record_id <> ''),\
+             desired_value TEXT NOT NULL,\
+             state TEXT NOT NULL CHECK (state IN ('BOUND','MISSING','CONFLICT','ERROR')),\
+             last_observed_at TEXT,\
+             last_error_category TEXT,\
+             created_at TEXT NOT NULL,\
+             updated_at TEXT NOT NULL\
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_dns_record_bindings_provider_record \
+         ON dns_record_bindings(zone_id, record_id)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_dns_record_bindings_rule_record \
+         ON dns_record_bindings(rule_id, fqdn, record_type, line_key) \
+         WHERE rule_id IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_dns_record_bindings_rule_id \
+         ON dns_record_bindings(rule_id)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 47: dns_record_bindings table present");
+
+    // ── Migration 48: durable DNS reconciliation desired state ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS dns_record_syncs (\
+             rule_id INTEGER PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,\
+             fqdn TEXT NOT NULL,\
+             record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),\
+             expected_value TEXT NOT NULL,\
+             line TEXT NOT NULL,\
+             line_key TEXT NOT NULL,\
+             state TEXT NOT NULL CHECK (state IN (\
+                 'PENDING','SYNCING','MUTATION_VERIFIED','PROPAGATING','PROPAGATED',\
+                 'CONFLICT','FAILED','MUTATION_OUTCOME_UNKNOWN','DISABLED','NOT_ELIGIBLE'\
+             )),\
+             ownership TEXT NOT NULL CHECK (ownership IN ('UNKNOWN','PANEL','EXTERNAL')),\
+             mutation_verified_at TEXT,\
+             last_observed_at TEXT,\
+             propagated_at TEXT,\
+             last_error_category TEXT,\
+             attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),\
+             next_attempt_at TEXT,\
+             created_at TEXT NOT NULL,\
+             updated_at TEXT NOT NULL\
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_dns_record_syncs_due \
+         ON dns_record_syncs(state, next_attempt_at)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 48: dns_record_syncs table present");
+
     Ok(())
 }
 
@@ -2190,6 +2324,99 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_47_creates_dns_record_binding_ownership_schema() {
+        let pool = fresh_pool().await;
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('dns_record_bindings') ORDER BY cid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        for required in [
+            "rule_id",
+            "fqdn",
+            "zone_id",
+            "zone_name",
+            "host",
+            "record_type",
+            "line",
+            "line_key",
+            "record_id",
+            "desired_value",
+            "state",
+            "last_observed_at",
+            "last_error_category",
+        ] {
+            assert!(columns.iter().any(|column| column == required));
+        }
+
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' \
+             AND tbl_name = 'dns_record_bindings' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(indexes
+            .iter()
+            .any(|name| name == "uq_dns_record_bindings_provider_record"));
+        assert!(indexes
+            .iter()
+            .any(|name| name == "uq_dns_record_bindings_rule_record"));
+
+        run_migrations(&pool)
+            .await
+            .expect("migration 47 is idempotent");
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'dns_record_bindings'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_48_creates_dns_record_sync_state_schema() {
+        let pool = fresh_pool().await;
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('dns_record_syncs') ORDER BY cid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        for required in [
+            "rule_id",
+            "fqdn",
+            "record_type",
+            "expected_value",
+            "state",
+            "ownership",
+            "mutation_verified_at",
+            "last_observed_at",
+            "propagated_at",
+            "attempt_count",
+            "next_attempt_at",
+        ] {
+            assert!(columns.iter().any(|column| column == required));
+        }
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' \
+             AND tbl_name = 'dns_record_syncs' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(indexes
+            .iter()
+            .any(|name| name == "idx_dns_record_syncs_due"));
+        run_migrations(&pool)
+            .await
+            .expect("migration 48 is idempotent");
     }
 
     /// An "old" database that predates v0.3.0 (has forward_rules + device_groups

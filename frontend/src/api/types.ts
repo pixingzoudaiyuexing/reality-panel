@@ -605,6 +605,48 @@ export interface RegistrationSettings {
   allowed_plan_ids: number[];
 }
 
+export interface DnsMgrSettings {
+  enabled: boolean;
+  base_url: string;
+  uid: number | null;
+  configured: boolean;
+  has_api_key: boolean;
+}
+
+export type DnsMgrConnectionCategory =
+  | 'OK'
+  | 'TRANSPORT_ERROR'
+  | 'TIMEOUT'
+  | 'AUTH_OR_PERMISSION_DENIED'
+  | 'UPSTREAM_REJECTED'
+  | 'MALFORMED_RESPONSE'
+  | 'CONTRACT_ERROR';
+
+export interface DnsMgrConnectionTestResult {
+  category: DnsMgrConnectionCategory;
+  domain_count: number | null;
+  empty_domain_list: boolean;
+  zone_ownership_verified: boolean;
+}
+
+export type RuleDnsOwnership = 'PANEL_MANAGED' | 'EXTERNAL' | 'NONE';
+
+export interface RuleDnsStatus {
+  rule_id: number;
+  eligible: boolean;
+  automation_enabled: boolean;
+  fqdn: string | null;
+  record_type: string | null;
+  expected_value: string | null;
+  ownership: RuleDnsOwnership;
+  sync_state: string;
+  last_observed_at: string | null;
+  mutation_verified_at: string | null;
+  propagated_at: string | null;
+  last_error_category: string | null;
+  warning_category: string | null;
+}
+
 // === v0.4.8: rule diagnosis ===  === v0.4.9: TCP-only + panel→ingress probe ===
 
 /** Outcome of probing ONE target from the node (TCP-only since v0.4.9).

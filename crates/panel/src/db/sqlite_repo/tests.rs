@@ -5449,3 +5449,328 @@ async fn admin_order_list_pages_without_overlap() {
         "the two pages must cover all three rows exactly once"
     );
 }
+
+#[tokio::test]
+async fn dns_record_bindings_preserve_exact_ownership_and_enforce_uniqueness() {
+    let db = repo().await;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    seed_group(&db, 10).await;
+    for (id, port) in [(100, 21000), (101, 21001)] {
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+             VALUES (?, ?, 1, ?, 10, '127.0.0.1', 80)",
+        )
+        .bind(id)
+        .bind(format!("rule-{id}"))
+        .bind(port)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    let original = new_dns_binding(100, "record-1");
+    let id = db.insert_dns_record_binding(&original).await.unwrap();
+    let by_record = db
+        .find_dns_record_binding_by_record(7, "record-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_record.id, id);
+    assert_eq!(by_record.line, "Default");
+    assert_eq!(by_record.line_key, "default");
+    assert!(db
+        .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "default")
+        .await
+        .unwrap()
+        .is_some());
+
+    let same_provider_record = new_dns_binding(101, "record-1");
+    assert!(matches!(
+        db.insert_dns_record_binding(&same_provider_record).await,
+        Err(DbError::UniqueViolation)
+    ));
+    let same_logical_record = new_dns_binding(100, "record-2");
+    assert!(matches!(
+        db.insert_dns_record_binding(&same_logical_record).await,
+        Err(DbError::UniqueViolation)
+    ));
+
+    assert_eq!(
+        db.update_dns_record_binding_observation(
+            id,
+            "MISSING",
+            Some("2026-08-26 00:01:00"),
+            Some("NOT_FOUND"),
+            "2026-08-26 00:01:00",
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let updated = db
+        .find_dns_record_binding_by_record(7, "record-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.state, "MISSING");
+    assert_eq!(updated.last_error_category.as_deref(), Some("NOT_FOUND"));
+
+    assert_eq!(
+        db.rebind_verified_dns_record(
+            id,
+            "record-verified",
+            "0",
+            "192.0.2.11",
+            "2026-08-26 00:02:00",
+            "2026-08-26 00:02:00",
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let rebound = db
+        .find_dns_record_binding_by_record(7, "record-verified")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rebound.state, "BOUND");
+    assert_eq!(rebound.line, "0");
+    assert_eq!(rebound.desired_value, "192.0.2.11");
+    assert_eq!(rebound.last_error_category, None);
+
+    db.insert_dns_record_sync(&NewDnsRecordSync {
+        rule_id: 100,
+        fqdn: "op1.example.com".into(),
+        record_type: "A".into(),
+        expected_value: "192.0.2.11".into(),
+        line: "0".into(),
+        line_key: "default".into(),
+        state: "PROPAGATED".into(),
+        ownership: "PANEL".into(),
+        last_error_category: None,
+        next_attempt_at: None,
+        created_at: "2026-08-26 00:02:00".into(),
+        updated_at: "2026-08-26 00:02:00".into(),
+    })
+    .await
+    .unwrap();
+
+    sqlx::query("DELETE FROM forward_rules WHERE id = 100")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let preserved = db
+        .find_dns_record_binding_by_record(7, "record-verified")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        preserved.rule_id, None,
+        "rule deletion preserves ownership history"
+    );
+    assert!(
+        db.find_dns_record_sync(100).await.unwrap().is_none(),
+        "rule deletion removes only the rule-scoped reconciliation row"
+    );
+}
+
+#[tokio::test]
+async fn dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
+    let db = repo().await;
+    seed_group(&db, 10).await;
+    sqlx::query(
+        "INSERT INTO forward_rules \
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+         VALUES (100, 'rule-100', 1, 21000, 10, '127.0.0.1', 80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    db.insert_dns_record_sync(&NewDnsRecordSync {
+        rule_id: 100,
+        fqdn: "op1.example.com".into(),
+        record_type: "A".into(),
+        expected_value: "192.0.2.10".into(),
+        line: "default".into(),
+        line_key: "default".into(),
+        state: "PENDING".into(),
+        ownership: "UNKNOWN".into(),
+        last_error_category: None,
+        next_attempt_at: Some("2026-08-26 00:00:00".into()),
+        created_at: "2026-08-26 00:00:00".into(),
+        updated_at: "2026-08-26 00:00:00".into(),
+    })
+    .await
+    .unwrap();
+
+    let due = db
+        .list_due_dns_record_syncs("2026-08-26 00:01:00", 1)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].rule_id, 100);
+
+    assert_eq!(
+        db.update_dns_record_sync_observation(
+            &due[0],
+            "PENDING",
+            "PROPAGATING",
+            "PANEL",
+            Some("2026-08-26 00:01:00"),
+            Some("2026-08-26 00:01:00"),
+            None,
+            Some("PUBLIC_DNS_NOT_YET_PROPAGATED"),
+            1,
+            Some("2026-08-26 00:02:00"),
+            "2026-08-26 00:01:00",
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let saved = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    assert_eq!(saved.state, "PROPAGATING");
+    assert_eq!(saved.ownership, "PANEL");
+    assert_eq!(saved.attempt_count, 1);
+
+    db.mark_all_dns_record_syncs_disabled("2026-08-26 00:03:00", "DNSMGR_DISABLED")
+        .await
+        .unwrap();
+    let disabled = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    assert_eq!(disabled.state, "DISABLED");
+    assert_eq!(disabled.next_attempt_at, None);
+
+    db.schedule_dns_record_sync(100, "SYNCING", "UNKNOWN", None, None, "2026-08-26 00:04:00")
+        .await
+        .unwrap();
+    db.resume_dns_record_syncs_on_startup("2026-08-26 00:05:00")
+        .await
+        .unwrap();
+    let resumed = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    assert_eq!(resumed.state, "PENDING");
+    assert_eq!(
+        resumed.next_attempt_at.as_deref(),
+        Some("2026-08-26 00:05:00")
+    );
+
+    db.schedule_dns_record_sync(
+        100,
+        "MUTATION_OUTCOME_UNKNOWN",
+        "UNKNOWN",
+        Some("MUTATION_UNKNOWN"),
+        None,
+        "2026-08-26 00:06:00",
+    )
+    .await
+    .unwrap();
+    db.resume_dns_record_syncs_on_startup("2026-08-26 00:07:00")
+        .await
+        .unwrap();
+    let unknown = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    assert_eq!(unknown.state, "MUTATION_OUTCOME_UNKNOWN");
+    assert_eq!(unknown.next_attempt_at, None);
+
+    db.schedule_dns_record_sync(
+        100,
+        "CONFLICT",
+        "UNKNOWN",
+        Some("DNS_CONFLICT"),
+        None,
+        "2026-08-26 00:08:00",
+    )
+    .await
+    .unwrap();
+    db.resume_dns_record_syncs_on_startup("2026-08-26 00:09:00")
+        .await
+        .unwrap();
+    let conflict = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    assert_eq!(conflict.state, "CONFLICT");
+    assert_eq!(conflict.next_attempt_at, None);
+
+    db.schedule_dns_record_sync(
+        100,
+        "FAILED",
+        "UNKNOWN",
+        Some("DNSMGR_TIMEOUT"),
+        None,
+        "2026-08-26 00:10:00",
+    )
+    .await
+    .unwrap();
+    db.resume_dns_record_syncs_on_startup("2026-08-26 00:11:00")
+        .await
+        .unwrap();
+    let transient = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    assert_eq!(transient.state, "PENDING");
+    assert_eq!(
+        transient.next_attempt_at.as_deref(),
+        Some("2026-08-26 00:11:00")
+    );
+
+    db.schedule_dns_record_sync(
+        100,
+        "FAILED",
+        "UNKNOWN",
+        Some("NO_MATCHING_ZONE"),
+        None,
+        "2026-08-26 00:12:00",
+    )
+    .await
+    .unwrap();
+    db.resume_dns_record_syncs_on_startup("2026-08-26 00:13:00")
+        .await
+        .unwrap();
+    let terminal = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    assert_eq!(terminal.state, "FAILED");
+    assert_eq!(terminal.next_attempt_at, None);
+
+    db.schedule_dns_record_sync(
+        100,
+        "FAILED",
+        "UNKNOWN",
+        Some("POST_WRITE_NOT_VERIFIED"),
+        None,
+        "2026-08-26 00:14:00",
+    )
+    .await
+    .unwrap();
+    db.resume_dns_record_syncs_on_startup("2026-08-26 00:15:00")
+        .await
+        .unwrap();
+    let unverified_write = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    assert_eq!(unverified_write.state, "FAILED");
+    assert_eq!(unverified_write.next_attempt_at, None);
+
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM forward_rules WHERE id = 100")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(db.find_dns_record_sync(100).await.unwrap().is_none());
+}
+
+fn new_dns_binding(rule_id: i64, record_id: &str) -> NewDnsRecordBinding {
+    NewDnsRecordBinding {
+        rule_id: Some(rule_id),
+        fqdn: "op1.example.com".into(),
+        zone_id: 7,
+        zone_name: "example.com".into(),
+        host: "op1".into(),
+        record_type: "A".into(),
+        line: "Default".into(),
+        line_key: "default".into(),
+        record_id: record_id.into(),
+        desired_value: "192.0.2.10".into(),
+        state: "BOUND".into(),
+        last_observed_at: Some("2026-08-26 00:00:00".into()),
+        created_at: "2026-08-26 00:00:00".into(),
+    }
+}

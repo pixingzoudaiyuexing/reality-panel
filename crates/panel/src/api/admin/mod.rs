@@ -2,6 +2,7 @@ use relay_shared::protocol::ApiResponse;
 use serde::Serialize;
 
 mod auth;
+mod dnsmgr;
 mod groups;
 mod nodes;
 mod password;
@@ -12,6 +13,7 @@ mod settings;
 mod shop;
 mod users;
 
+pub use dnsmgr::*;
 pub use groups::*;
 pub use password::*;
 pub use plans::*;

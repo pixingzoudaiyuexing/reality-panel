@@ -27,6 +27,8 @@
 use sqlx::PgPool;
 
 mod announcements;
+mod dns_record_bindings;
+mod dns_record_syncs;
 mod enrollments;
 mod groups;
 mod kvs;

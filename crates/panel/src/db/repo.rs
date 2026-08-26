@@ -641,6 +641,197 @@ pub trait ManualBootstrapEnrollmentRepository: Send + Sync {
     ) -> Result<u64, DbError>;
 }
 
+// ── DNS record ownership bindings ──
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DnsRecordBinding {
+    pub id: i64,
+    pub rule_id: Option<i64>,
+    pub fqdn: String,
+    pub zone_id: i64,
+    pub zone_name: String,
+    pub host: String,
+    pub record_type: String,
+    /// Exact provider line identity as observed when the binding was created.
+    pub line: String,
+    /// Normalized comparison key (`default` or `provider:<raw id>`).
+    pub line_key: String,
+    pub record_id: String,
+    pub desired_value: String,
+    pub state: String,
+    pub last_observed_at: Option<String>,
+    pub last_error_category: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewDnsRecordBinding {
+    pub rule_id: Option<i64>,
+    pub fqdn: String,
+    pub zone_id: i64,
+    pub zone_name: String,
+    pub host: String,
+    pub record_type: String,
+    pub line: String,
+    pub line_key: String,
+    pub record_id: String,
+    pub desired_value: String,
+    pub state: String,
+    pub last_observed_at: Option<String>,
+    pub created_at: String,
+}
+
+#[async_trait]
+pub trait DnsRecordBindingRepository: Send + Sync {
+    async fn insert_dns_record_binding(
+        &self,
+        binding: &NewDnsRecordBinding,
+    ) -> Result<i64, DbError>;
+
+    async fn find_dns_record_binding_by_record(
+        &self,
+        zone_id: i64,
+        record_id: &str,
+    ) -> Result<Option<DnsRecordBinding>, DbError>;
+
+    async fn find_dns_record_binding_for_rule(
+        &self,
+        rule_id: i64,
+        fqdn: &str,
+        record_type: &str,
+        line_key: &str,
+    ) -> Result<Option<DnsRecordBinding>, DbError>;
+
+    async fn update_dns_record_binding_observation(
+        &self,
+        id: i64,
+        state: &str,
+        last_observed_at: Option<&str>,
+        last_error_category: Option<&str>,
+        updated_at: &str,
+    ) -> Result<u64, DbError>;
+
+    /// Replace the provider identity/value only after a mutation has been
+    /// confirmed by post-write discovery. This is the controlled stale-record
+    /// recreation path; discovery alone must never call it.
+    async fn rebind_verified_dns_record(
+        &self,
+        id: i64,
+        record_id: &str,
+        line: &str,
+        desired_value: &str,
+        observed_at: &str,
+        updated_at: &str,
+    ) -> Result<u64, DbError>;
+}
+
+// ── DNS reconciliation desired state ──
+
+/// Persisted desired/reconciliation state is deliberately separate from
+/// `DnsRecordBinding`: a pending or externally-owned record is not Panel
+/// ownership evidence.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct DnsRecordSync {
+    pub rule_id: i64,
+    pub fqdn: String,
+    pub record_type: String,
+    pub expected_value: String,
+    pub line: String,
+    pub line_key: String,
+    pub state: String,
+    pub ownership: String,
+    pub mutation_verified_at: Option<String>,
+    pub last_observed_at: Option<String>,
+    pub propagated_at: Option<String>,
+    pub last_error_category: Option<String>,
+    pub attempt_count: i32,
+    pub next_attempt_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewDnsRecordSync {
+    pub rule_id: i64,
+    pub fqdn: String,
+    pub record_type: String,
+    pub expected_value: String,
+    pub line: String,
+    pub line_key: String,
+    pub state: String,
+    pub ownership: String,
+    pub last_error_category: Option<String>,
+    pub next_attempt_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[async_trait]
+pub trait DnsRecordSyncRepository: Send + Sync {
+    async fn insert_dns_record_sync(&self, sync: &NewDnsRecordSync) -> Result<(), DbError>;
+
+    async fn find_dns_record_sync(&self, rule_id: i64) -> Result<Option<DnsRecordSync>, DbError>;
+
+    /// Update desired state only when the desired record changed. The caller
+    /// supplies a fresh pending state for an explicit rule/settings trigger.
+    async fn update_dns_record_sync_desired(
+        &self,
+        rule_id: i64,
+        fqdn: &str,
+        record_type: &str,
+        expected_value: &str,
+        line: &str,
+        line_key: &str,
+        state: &str,
+        ownership: &str,
+        last_error_category: Option<&str>,
+        next_attempt_at: Option<&str>,
+        updated_at: &str,
+    ) -> Result<u64, DbError>;
+
+    async fn schedule_dns_record_sync(
+        &self,
+        rule_id: i64,
+        state: &str,
+        ownership: &str,
+        last_error_category: Option<&str>,
+        next_attempt_at: Option<&str>,
+        updated_at: &str,
+    ) -> Result<u64, DbError>;
+
+    async fn list_due_dns_record_syncs(
+        &self,
+        now: &str,
+        limit: i64,
+    ) -> Result<Vec<DnsRecordSync>, DbError>;
+
+    async fn update_dns_record_sync_observation(
+        &self,
+        expected: &DnsRecordSync,
+        expected_state: &str,
+        state: &str,
+        ownership: &str,
+        mutation_verified_at: Option<&str>,
+        last_observed_at: Option<&str>,
+        propagated_at: Option<&str>,
+        last_error_category: Option<&str>,
+        attempt_count: i32,
+        next_attempt_at: Option<&str>,
+        updated_at: &str,
+    ) -> Result<u64, DbError>;
+
+    async fn mark_all_dns_record_syncs_disabled(
+        &self,
+        now: &str,
+        error_category: &str,
+    ) -> Result<u64, DbError>;
+
+    /// Recover only safely retryable in-flight/transient states after a Panel
+    /// restart. Conflict and mutation-unknown rows remain terminal.
+    async fn resume_dns_record_syncs_on_startup(&self, now: &str) -> Result<u64, DbError>;
+}
+
 // ── v1.0.7: per-user device-group authorization ──
 // Replaces the v1.0.4 user-permission-group layer (user → named group →
 // device-group allowlist) with a direct user ↔ device_group link plus a
@@ -1387,6 +1578,8 @@ pub trait Repository:
     + RedeemRepository
     + AnnouncementRepository
     + ManualBootstrapEnrollmentRepository
+    + DnsRecordBindingRepository
+    + DnsRecordSyncRepository
     + Send
     + Sync
 {

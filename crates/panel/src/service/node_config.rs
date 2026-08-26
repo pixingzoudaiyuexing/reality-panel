@@ -314,6 +314,33 @@ mod tests {
         assert_eq!(cfg.listeners[0].port, 20000);
     }
 
+    #[tokio::test]
+    async fn dns_reconciliation_state_never_changes_node_config_authority() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        add_group(&pool, 10, "in", 2).await;
+        add_rule(&pool, 100, 2, 10, 20000).await;
+        let before = build_node_config(&repo(&pool), 10).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO dns_record_syncs \
+             (rule_id, fqdn, record_type, expected_value, line, line_key, state, ownership, \
+              last_error_category, next_attempt_at, created_at, updated_at) \
+             VALUES (100, 'op1.example.com', 'A', '192.0.2.10', 'default', 'default', \
+                     'FAILED', 'UNKNOWN', 'DNSMGR_TIMEOUT', NULL, \
+                     '2026-08-26 00:00:00', '2026-08-26 00:00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let after = build_node_config(&repo(&pool), 10).await.unwrap();
+
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+    }
+
     /// A banned user's rule must NOT appear — this is the regression the WS path
     /// was missing (v0.3.5 drift). Both paths now share this query, so the test
     /// pins the filter itself.

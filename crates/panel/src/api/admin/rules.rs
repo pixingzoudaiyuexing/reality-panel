@@ -75,6 +75,18 @@ pub async fn create_rule(
         .await
     {
         Ok(rule_id) => {
+            if let Err(error) =
+                crate::service::dnsmgr::schedule_rule(state.db.as_ref(), rule_id).await
+            {
+                tracing::error!(
+                    "create_rule {}: DNS reconciliation scheduling failed: {}",
+                    rule_id,
+                    error
+                );
+            } else {
+                crate::service::dnsmgr::audit_sync_scheduled(&state, Some(user.user_id), rule_id)
+                    .await;
+            }
             if req.camouflage_enabled {
                 let detail = format!(
                     "sni={} public_port={} remote={}:{} camouflage=enabled result=success",
@@ -203,6 +215,15 @@ pub async fn update_rule(
     }
     match crate::service::rules::update_rule(state.db.as_ref(), id, &scope, &req).await {
         Ok(()) => {
+            if let Err(error) = crate::service::dnsmgr::schedule_rule(state.db.as_ref(), id).await {
+                tracing::error!(
+                    "update_rule {}: DNS reconciliation scheduling failed: {}",
+                    id,
+                    error
+                );
+            } else {
+                crate::service::dnsmgr::audit_sync_scheduled(&state, Some(user.user_id), id).await;
+            }
             if user.admin
                 && (existing_snapshot
                     .as_ref()

@@ -199,6 +199,17 @@ pub async fn update_group(
     .await
     {
         Ok(()) => {
+            if req.connect_host.is_some() {
+                if let Err(error) =
+                    crate::service::dnsmgr::schedule_all_eligible(state.db.as_ref()).await
+                {
+                    tracing::error!(
+                        "update_group {}: DNS reconciliation scheduling failed: {}",
+                        id,
+                        error
+                    );
+                }
+            }
             state
                 .node_connections
                 .broadcast_all(r#"{"type":"config_changed"}"#)

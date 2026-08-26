@@ -1,7 +1,7 @@
-import { Card, Form, Switch, Select, Button, message, Spin, Result, Typography } from 'antd';
+import { Alert, Button, Card, Form, Input, InputNumber, message, Result, Select, Space, Spin, Switch, Tag, Typography } from 'antd';
 import { useEffect, useState } from 'react';
 import api from '../api/client';
-import type { ApiEnvelope, Plan, RegistrationSettings } from '../api/types';
+import type { ApiEnvelope, DnsMgrConnectionTestResult, DnsMgrSettings, Plan, RegistrationSettings } from '../api/types';
 import { useI18n } from '../i18n/context';
 
 const { Text } = Typography;
@@ -12,18 +12,24 @@ const { Text } = Typography;
 export default function SystemSettings() {
   const { t } = useI18n();
   const [form] = Form.useForm();
+  const [dnsForm] = Form.useForm();
   const [plans, setPlans] = useState<Plan[]>([]);
+  const [dnsSettings, setDnsSettings] = useState<DnsMgrSettings | null>(null);
+  const [dnsTestResult, setDnsTestResult] = useState<DnsMgrConnectionTestResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadFailed, setLoadFailed] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [dnsSaving, setDnsSaving] = useState(false);
+  const [dnsTesting, setDnsTesting] = useState(false);
 
   const load = async () => {
     setLoading(true);
     setLoadFailed(false);
     try {
-      const [settingsRes, plansRes] = await Promise.all([
+      const [settingsRes, plansRes, dnsRes] = await Promise.all([
         api.get<unknown, ApiEnvelope<RegistrationSettings>>('/admin/settings/registration'),
         api.get<unknown, ApiEnvelope<Plan[]>>('/admin/plans'),
+        api.get<unknown, ApiEnvelope<DnsMgrSettings>>('/admin/settings/dnsmgr'),
       ]);
       if (settingsRes.data) {
         form.setFieldsValue({
@@ -33,6 +39,15 @@ export default function SystemSettings() {
         });
       }
       setPlans(plansRes.data || []);
+      if (dnsRes.data) {
+        setDnsSettings(dnsRes.data);
+        dnsForm.setFieldsValue({
+          enabled: dnsRes.data.enabled,
+          base_url: dnsRes.data.base_url,
+          uid: dnsRes.data.uid,
+          api_key: '',
+        });
+      }
     } catch {
       setLoadFailed(true);
     } finally {
@@ -84,6 +99,58 @@ export default function SystemSettings() {
     }
   };
 
+  const dnsPayload = async () => {
+    const values = await dnsForm.validateFields();
+    const replacement = String(values.api_key ?? '').trim();
+    return {
+      enabled: values.enabled === true,
+      base_url: String(values.base_url ?? '').trim(),
+      uid: Number(values.uid),
+      ...(replacement ? { api_key: replacement } : {}),
+    };
+  };
+
+  const onSaveDns = async () => {
+    const payload = await dnsPayload();
+    setDnsSaving(true);
+    try {
+      const res = await api.put<unknown, ApiEnvelope<DnsMgrSettings>>('/admin/settings/dnsmgr', payload);
+      if (res.code !== 0 || !res.data) {
+        message.error(res.message || t('settingsSaveFailed'));
+        return;
+      }
+      setDnsSettings(res.data);
+      dnsForm.setFieldValue('api_key', '');
+      setDnsTestResult(null);
+      message.success(t('settingsSaved'));
+    } catch {
+      message.error(t('settingsSaveFailed'));
+    } finally {
+      setDnsSaving(false);
+    }
+  };
+
+  const onTestDns = async () => {
+    const payload = await dnsPayload();
+    setDnsTesting(true);
+    setDnsTestResult(null);
+    try {
+      const res = await api.post<unknown, ApiEnvelope<DnsMgrConnectionTestResult>>(
+        '/admin/settings/dnsmgr/test',
+        { base_url: payload.base_url, uid: payload.uid, ...('api_key' in payload ? { api_key: payload.api_key } : {}) },
+      );
+      if (res.code !== 0 || !res.data) {
+        message.error(res.message || t('dnsMgrConnectionTestFailed'));
+        return;
+      }
+      setDnsTestResult(res.data);
+    } catch {
+      message.error(t('dnsMgrConnectionTestFailed'));
+    } finally {
+      setDnsTesting(false);
+    }
+  };
+
   // When allowed_plan_ids changes, clear default if it's no longer valid.
   const handleAllowedChange = (newAllowed: number[]) => {
     const currentDefault: number = form.getFieldValue('default_registration_plan_id');
@@ -108,11 +175,12 @@ export default function SystemSettings() {
   const planOptions = plans.map((p) => ({ value: p.id, label: `${p.name} (${p.max_rules} ${t('rules')})` }));
 
   return (
-    <Card
-      title={t('basicSettings')}
-      extra={<Button type="primary" loading={saving} onClick={onSave}>{t('save')}</Button>}
-    >
-      <Form form={form} layout="vertical">
+    <Space orientation="vertical" size={16} style={{ width: '100%' }}>
+      <Card
+        title={t('basicSettings')}
+        extra={<Button type="primary" loading={saving} onClick={onSave}>{t('save')}</Button>}
+      >
+        <Form form={form} layout="vertical">
         <Form.Item
           name="registration_enabled"
           label={t('registrationEnabled')}
@@ -159,7 +227,49 @@ export default function SystemSettings() {
         <Text type="secondary" style={{ fontSize: 12 }}>
           {t('registrationSettingsHint')}
         </Text>
-      </Form>
-    </Card>
+        </Form>
+      </Card>
+
+      <Card
+        title={t('dnsMgrSettings')}
+        extra={<Button type="primary" loading={dnsSaving} onClick={onSaveDns}>{t('save')}</Button>}
+      >
+        <Form form={dnsForm} layout="vertical" style={{ maxWidth: 720 }}>
+          <Space size={8} wrap style={{ marginBottom: 16 }}>
+            <Text type="secondary">{t('configuredStatus')}</Text>
+            <Tag color={dnsSettings?.configured ? 'green' : 'default'}>
+              {dnsSettings?.configured ? t('configured') : t('notConfigured')}
+            </Tag>
+            <Tag color={dnsSettings?.has_api_key ? 'green' : 'default'}>
+              {t('apiKey')}: {dnsSettings?.has_api_key ? t('configured') : t('notConfigured')}
+            </Tag>
+          </Space>
+          <Form.Item name="enabled" label={t('enabled')} valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="base_url" label={t('baseUrl')} rules={[{ required: true }]}>
+            <Input placeholder="http://127.0.0.1:8080" autoComplete="off" />
+          </Form.Item>
+          <Form.Item name="uid" label="UID" rules={[{ required: true }]}>
+            <InputNumber min={1} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item name="api_key" label={t('apiKeyReplacement')} extra={t('apiKeyBlankPreserves')}>
+            <Input.Password autoComplete="new-password" />
+          </Form.Item>
+          <Button loading={dnsTesting} onClick={onTestDns}>{t('testConnection')}</Button>
+          {dnsTestResult && (
+            <Alert
+              showIcon
+              type={dnsTestResult.category === 'OK' ? 'success' : 'warning'}
+              style={{ marginTop: 16 }}
+              title={`${t('connectionTestResult')}: ${dnsTestResult.category}`}
+              description={dnsTestResult.domain_count == null
+                ? undefined
+                : `${t('domainCount')}: ${dnsTestResult.domain_count}`}
+            />
+          )}
+        </Form>
+      </Card>
+    </Space>
   );
 }

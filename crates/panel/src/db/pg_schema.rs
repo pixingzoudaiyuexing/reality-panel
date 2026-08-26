@@ -279,6 +279,61 @@ CREATE INDEX IF NOT EXISTS idx_manual_bootstrap_enrollments_group_state
 CREATE INDEX IF NOT EXISTS idx_manual_bootstrap_enrollments_expiry
     ON manual_bootstrap_enrollments(state, expires_at, session_expires_at);
 
+-- Durable ownership evidence for DNS records created by RelayPanel. Rule
+-- deletion preserves the provider identity by clearing only rule_id.
+CREATE TABLE IF NOT EXISTS dns_record_bindings (
+    id BIGSERIAL PRIMARY KEY,
+    rule_id BIGINT REFERENCES forward_rules(id) ON DELETE SET NULL,
+    fqdn TEXT NOT NULL,
+    zone_id BIGINT NOT NULL CHECK (zone_id > 0),
+    zone_name TEXT NOT NULL,
+    host TEXT NOT NULL,
+    record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),
+    line TEXT NOT NULL,
+    line_key TEXT NOT NULL,
+    record_id TEXT NOT NULL CHECK (record_id <> ''),
+    desired_value TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('BOUND','MISSING','CONFLICT','ERROR')),
+    last_observed_at TEXT,
+    last_error_category TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_dns_record_bindings_provider_record
+    ON dns_record_bindings(zone_id, record_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_dns_record_bindings_rule_record
+    ON dns_record_bindings(rule_id, fqdn, record_type, line_key)
+    WHERE rule_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_dns_record_bindings_rule_id
+    ON dns_record_bindings(rule_id);
+
+-- Persisted DNS desired/reconciliation state. This is deliberately separate
+-- from dns_record_bindings: pending and externally-owned records are not
+-- Panel ownership evidence.
+CREATE TABLE IF NOT EXISTS dns_record_syncs (
+    rule_id BIGINT PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
+    fqdn TEXT NOT NULL,
+    record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),
+    expected_value TEXT NOT NULL,
+    line TEXT NOT NULL,
+    line_key TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'PENDING','SYNCING','MUTATION_VERIFIED','PROPAGATING','PROPAGATED',
+        'CONFLICT','FAILED','MUTATION_OUTCOME_UNKNOWN','DISABLED','NOT_ELIGIBLE'
+    )),
+    ownership TEXT NOT NULL CHECK (ownership IN ('UNKNOWN','PANEL','EXTERNAL')),
+    mutation_verified_at TEXT,
+    last_observed_at TEXT,
+    propagated_at TEXT,
+    last_error_category TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    next_attempt_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dns_record_syncs_due
+    ON dns_record_syncs(state, next_attempt_at);
+
 -- v1.2.4: site announcements (mirrors the SQLite baseline — see there for why
 -- this replaced the single announcement string in the site:config kvs blob and
 -- why author_name is a snapshot).
@@ -412,7 +467,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 30;
+pub const PG_SCHEMA_VERSION: i32 = 32;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1569,6 +1624,100 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 30: manual_bootstrap_enrollments table present");
     }
 
+    if current < 31 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS dns_record_bindings (\
+                 id BIGSERIAL PRIMARY KEY,\
+                 rule_id BIGINT REFERENCES forward_rules(id) ON DELETE SET NULL,\
+                 fqdn TEXT NOT NULL,\
+                 zone_id BIGINT NOT NULL CHECK (zone_id > 0),\
+                 zone_name TEXT NOT NULL,\
+                 host TEXT NOT NULL,\
+                 record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),\
+                 line TEXT NOT NULL,\
+                 line_key TEXT NOT NULL,\
+                 record_id TEXT NOT NULL CHECK (record_id <> ''),\
+                 desired_value TEXT NOT NULL,\
+                 state TEXT NOT NULL CHECK (state IN ('BOUND','MISSING','CONFLICT','ERROR')),\
+                 last_observed_at TEXT,\
+                 last_error_category TEXT,\
+                 created_at TEXT NOT NULL,\
+                 updated_at TEXT NOT NULL\
+             )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_dns_record_bindings_provider_record \
+             ON dns_record_bindings(zone_id, record_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_dns_record_bindings_rule_record \
+             ON dns_record_bindings(rule_id, fqdn, record_type, line_key) \
+             WHERE rule_id IS NOT NULL",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_dns_record_bindings_rule_id \
+             ON dns_record_bindings(rule_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (31) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 31: dns_record_bindings table present");
+    }
+
+    if current < 32 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS dns_record_syncs (\
+                 rule_id BIGINT PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,\
+                 fqdn TEXT NOT NULL,\
+                 record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),\
+                 expected_value TEXT NOT NULL,\
+                 line TEXT NOT NULL,\
+                 line_key TEXT NOT NULL,\
+                 state TEXT NOT NULL CHECK (state IN (\
+                     'PENDING','SYNCING','MUTATION_VERIFIED','PROPAGATING','PROPAGATED',\
+                     'CONFLICT','FAILED','MUTATION_OUTCOME_UNKNOWN','DISABLED','NOT_ELIGIBLE'\
+                 )),\
+                 ownership TEXT NOT NULL CHECK (ownership IN ('UNKNOWN','PANEL','EXTERNAL')),\
+                 mutation_verified_at TEXT,\
+                 last_observed_at TEXT,\
+                 propagated_at TEXT,\
+                 last_error_category TEXT,\
+                 attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),\
+                 next_attempt_at TEXT,\
+                 created_at TEXT NOT NULL,\
+                 updated_at TEXT NOT NULL\
+             )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_dns_record_syncs_due \
+             ON dns_record_syncs(state, next_attempt_at)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (32) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 32: dns_record_syncs table present");
+    }
+
     Ok(())
 }
 
@@ -1629,7 +1778,7 @@ mod tests {
 
     #[test]
     fn pg_schema_version_matches_latest_migration() {
-        assert_eq!(PG_SCHEMA_VERSION, 30);
+        assert_eq!(PG_SCHEMA_VERSION, 32);
     }
 
     #[test]
@@ -1639,6 +1788,22 @@ mod tests {
         assert!(PG_SCHEMA_SQL.contains("LOCAL_COMMITTED"));
         assert!(!PG_SCHEMA_SQL.contains("enrollment_secret TEXT"));
         assert!(!PG_SCHEMA_SQL.contains("bootstrap_session TEXT"));
+    }
+
+    #[test]
+    fn pg_schema_contains_dns_record_binding_revision() {
+        assert!(PG_SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS dns_record_bindings"));
+        assert!(PG_SCHEMA_SQL.contains("ON DELETE SET NULL"));
+        assert!(PG_SCHEMA_SQL.contains("uq_dns_record_bindings_provider_record"));
+        assert!(PG_SCHEMA_SQL.contains("uq_dns_record_bindings_rule_record"));
+        assert!(PG_SCHEMA_SQL.contains("WHERE rule_id IS NOT NULL"));
+    }
+
+    #[test]
+    fn pg_schema_contains_dns_record_sync_revision() {
+        assert!(PG_SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS dns_record_syncs"));
+        assert!(PG_SCHEMA_SQL.contains("idx_dns_record_syncs_due"));
+        assert!(PG_SCHEMA_SQL.contains("ON DELETE CASCADE"));
     }
 
     // The real baseline schema must split into runnable statements, and no

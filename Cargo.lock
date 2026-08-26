@@ -1829,6 +1829,7 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "lettre",
+ "md-5",
  "once_cell",
  "relay-shared",
  "reqwest",

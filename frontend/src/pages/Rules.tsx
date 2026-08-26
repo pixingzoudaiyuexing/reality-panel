@@ -4,7 +4,7 @@ import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, NodeStatus, CamouflageSiteStatus } from '../api/types';
+import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, NodeStatus, CamouflageSiteStatus, RuleDnsStatus } from '../api/types';
 import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
@@ -141,6 +141,50 @@ export interface CamouflageAggregateStatus {
   totalCount: number;
 }
 
+export function DnsStatusCell({
+  status,
+  retrying = false,
+  onRetry,
+  t,
+}: {
+  status?: RuleDnsStatus;
+  retrying?: boolean;
+  onRetry?: () => void;
+  t: (key: string) => string;
+}) {
+  if (!status || !status.eligible || status.sync_state === 'NOT_ELIGIBLE') {
+    return <Text type="secondary">-</Text>;
+  }
+  const color = status.sync_state === 'PROPAGATED' ? 'green'
+    : status.sync_state === 'CONFLICT' ? 'orange'
+      : ['FAILED', 'INVALID_CONFIG', 'MUTATION_OUTCOME_UNKNOWN'].includes(status.sync_state) ? 'red'
+        : ['PENDING', 'SYNCING', 'MUTATION_VERIFIED', 'PROPAGATING'].includes(status.sync_state) ? 'gold'
+          : 'default';
+  const retryable = status.automation_enabled
+    && ['FAILED', 'CONFLICT', 'DISABLED'].includes(status.sync_state)
+    && status.sync_state !== 'MUTATION_OUTCOME_UNKNOWN'
+    && !['MUTATION_UNKNOWN', 'POST_WRITE_NOT_VERIFIED'].includes(status.last_error_category ?? '');
+  return (
+    <Space orientation="vertical" size={2}>
+      <Space size={4} wrap>
+        <Tag color={color}>{status.sync_state}</Tag>
+        {!status.automation_enabled && <Tag>{t('dnsAutomationDisabled')}</Tag>}
+      </Space>
+      {status.fqdn && status.record_type && status.expected_value && (
+        <Text className="rp-mono">{status.record_type} {status.fqdn} → {status.expected_value}</Text>
+      )}
+      <Text type="secondary">{t('dnsOwnership')}: {status.ownership}</Text>
+      {status.warning_category && <Text type="warning">{status.warning_category}</Text>}
+      {status.last_error_category && <Text type="danger">{status.last_error_category}</Text>}
+      {retryable && onRetry && (
+        <Button size="small" type="text" icon={<ReloadOutlined />} loading={retrying} onClick={onRetry}>
+          {t('retryDnsSync')}
+        </Button>
+      )}
+    </Space>
+  );
+}
+
 export function CamouflageFormFields({
   enabled,
   initialValue,
@@ -205,6 +249,8 @@ export default function Rules() {
   const [sharedLoadFailed, setSharedLoadFailed] = useState(false);
   const [users, setUsers] = useState<User[]>([]);
   const [nodeStatuses, setNodeStatuses] = useState<NodeStatus[]>([]);
+  const [dnsStatuses, setDnsStatuses] = useState<RuleDnsStatus[]>([]);
+  const [dnsRetrying, setDnsRetrying] = useState<number | null>(null);
   // v1.0.7: a regular user's own traffic quota (admins read each owner's quota
   // from `users` instead). Used to flag rules whose owner is out of traffic —
   // those rules stop forwarding even though their `paused` flag stays false.
@@ -268,10 +314,17 @@ export default function Rules() {
         } catch {
           setNodeStatuses([]);
         }
+        try {
+          const dns = await api.get<unknown, ApiEnvelope<RuleDnsStatus[]>>('/admin/rules/dns-status');
+          setDnsStatuses(dns.data || []);
+        } catch {
+          setDnsStatuses([]);
+        }
         setSelfQuota(null);
       } else {
         setUsers([]);
         setNodeStatuses([]);
+        setDnsStatuses([]);
         // v1.0.7: a regular user only ever sees their own rules, so one /user/me
         // read gives the quota needed to flag all of them. Non-fatal on failure.
         try {
@@ -338,6 +391,10 @@ export default function Rules() {
     }
     return m;
   }, [groups, sharedGroups]);
+  const dnsStatusByRule = useMemo(
+    () => new Map(dnsStatuses.map(status => [status.rule_id, status])),
+    [dnsStatuses],
+  );
   // The rules actually shown: the group filter and the search box compose, so
   // "this group, port 443" works. Computed once so the table + count stay in
   // sync.
@@ -722,6 +779,29 @@ const IMPORT_DEFAULTS = {
     setSelectedRowKeys([]);
   };
 
+  const handleDnsRetry = async (ruleId: number) => {
+    setDnsRetrying(ruleId);
+    try {
+      const res = await api.post<unknown, ApiEnvelope<RuleDnsStatus>>(
+        `/admin/rules/${ruleId}/dns/retry`,
+        {},
+      );
+      if (res.code !== 0 || !res.data) {
+        message.error(res.message || t('dnsRetryFailed'));
+        return;
+      }
+      setDnsStatuses(current => [
+        ...current.filter(status => status.rule_id !== ruleId),
+        res.data as RuleDnsStatus,
+      ]);
+      message.success(t('dnsRetryScheduled'));
+    } catch {
+      message.error(t('dnsRetryFailed'));
+    } finally {
+      setDnsRetrying(null);
+    }
+  };
+
   /** v0.4.8: run a diagnosis for a rule. The panel fans the probe out to the
    *  rule's inbound-group nodes over WS and waits up to 8s for results. */
   const handleDiagnose = async (r: ForwardRule) => {
@@ -833,6 +913,17 @@ const IMPORT_DEFAULTS = {
           </Space>
         );
       },
+    },
+    {
+      title: 'DNS', key: 'dns', width: 300,
+      render: (_: unknown, r: ForwardRule) => (
+        <DnsStatusCell
+          status={dnsStatusByRule.get(r.id)}
+          retrying={dnsRetrying === r.id}
+          onRetry={() => handleDnsRetry(r.id)}
+          t={t}
+        />
+      ),
     },
     {
       title: t('camouflage'), key: 'camouflage', width: 280,
@@ -960,7 +1051,7 @@ const IMPORT_DEFAULTS = {
   // v0.4.10: hide the owner column for regular users — they only ever own
   // their own rules, and /admin/users is never fetched for them (so userMap
   // is empty and the column would show "-" everywhere).
-  const columns = isAdmin ? allColumns : allColumns.filter(c => c.key !== 'owner');
+  const columns = isAdmin ? allColumns : allColumns.filter(c => !['owner', 'dns'].includes(String(c.key)));
 
   const inGroups = groups.filter(g => g.group_type === 'in');
   // v0.4.12 PR1: inbound group selection. Admins pick from their OWN 'in'

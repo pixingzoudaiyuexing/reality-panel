@@ -302,6 +302,22 @@ pub fn routes() -> Router<AppState> {
             axum::routing::get(admin::get_registration_settings)
                 .put(admin::update_registration_settings),
         )
+        .route(
+            "/admin/settings/dnsmgr",
+            axum::routing::get(admin::get_dnsmgr_settings).put(admin::update_dnsmgr_settings),
+        )
+        .route(
+            "/admin/settings/dnsmgr/test",
+            axum::routing::post(admin::test_dnsmgr_connection),
+        )
+        .route(
+            "/admin/rules/dns-status",
+            axum::routing::get(admin::list_rule_dns_statuses),
+        )
+        .route(
+            "/admin/rules/{id}/dns/retry",
+            axum::routing::post(admin::retry_rule_dns_sync),
+        )
         // v1.2.4: site identity (name / subtitle / announcement / contact).
         .route(
             "/admin/settings/site",

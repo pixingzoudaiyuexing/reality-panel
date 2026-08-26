@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod db;
 mod dto;
+mod integrations;
 mod service;
 
 use axum::Router;
@@ -125,6 +126,10 @@ async fn main() {
     // v1.2.0: traffic-history retention. The history table has no FK, so this
     // sweeper is the only thing that ever deletes its rows.
     service::history_prune::spawn(state.clone());
+
+    // v1.2.x: Panel-only DNS desired-state reconciliation. DNS failures remain
+    // control-plane state and never alter Relay runtime configuration.
+    service::dnsmgr::spawn(state.clone());
 
     let app = app.with_state(state);
 
