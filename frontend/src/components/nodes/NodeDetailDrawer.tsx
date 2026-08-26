@@ -4,7 +4,7 @@ import { DeleteOutlined } from '@ant-design/icons';
 import { formatPercent, formatBytes, formatBps, formatUptime } from '../../utils/format';
 import { useI18n } from '../../i18n/context';
 import { CountryFlag } from './CountryFlag';
-import type { NodeDisplayRow } from '../../api/types';
+import type { NodeDisplayRow, ReconciliationState } from '../../api/types';
 import api from '../../api/client';
 
 interface Props {
@@ -15,6 +15,30 @@ interface Props {
   panelProtocol: number;
   onDeleted?: () => void;
 }
+
+const reconciliationColor = (state: ReconciliationState): string => {
+  switch (state) {
+    case 'CONVERGED': return 'green';
+    case 'RECONCILING':
+    case 'REPAIRING': return 'blue';
+    case 'DEPENDENCY_WITHHELD': return 'gold';
+    case 'DEGRADED_LOCAL_RECOVERY': return 'orange';
+    case 'APPLY_FAILED': return 'red';
+    case 'WAITING_FOR_AUTHORITY': return 'default';
+  }
+};
+
+const shortFingerprint = (value?: string | null) => {
+  if (!value) return '-';
+  const shortened = value.length > 12 ? `${value.slice(0, 12)}...` : value;
+  return <span className="rp-mono" title={value}>{shortened}</span>;
+};
+
+const displayTimestamp = (value?: string | null) => {
+  if (!value) return '-';
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+};
 
 /** Full-metric detail drawer for one node. Admin sees extra fields (node_id,
  *  config protocol, interface, disk mount, process uptime, listener errors, a
@@ -113,6 +137,35 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
                   return <Tag color="red">{errs.length} {t('failed')}</Tag>;
                 })()}
               </Descriptions.Item>
+              {row.reconciliation && (
+                <>
+                  <Descriptions.Item label={t('reconciliation')}>
+                    <Tag color={reconciliationColor(row.reconciliation.state)}>
+                      {t(`reconciliationState_${row.reconciliation.state}`)}
+                    </Tag>
+                  </Descriptions.Item>
+                  <Descriptions.Item label={t('reconciliationDesired')}>
+                    {shortFingerprint(row.reconciliation.desired_fingerprint)}
+                  </Descriptions.Item>
+                  <Descriptions.Item label={t('reconciliationApplied')}>
+                    {shortFingerprint(row.reconciliation.applied_fingerprint)}
+                  </Descriptions.Item>
+                  <Descriptions.Item label={t('reconciliationObserved')}>
+                    {shortFingerprint(row.reconciliation.observed_fingerprint)}
+                  </Descriptions.Item>
+                  <Descriptions.Item label={t('reconciliationRecoverySource')}>
+                    {t(`reconciliationSource_${row.reconciliation.recovery_source}`)}
+                  </Descriptions.Item>
+                  <Descriptions.Item label={t('reconciliationLastSuccess')}>
+                    {displayTimestamp(row.reconciliation.last_success_at)}
+                  </Descriptions.Item>
+                  {row.reconciliation.last_error && (
+                    <Descriptions.Item label={t('reconciliationLastError')}>
+                      {row.reconciliation.last_error}
+                    </Descriptions.Item>
+                  )}
+                </>
+              )}
             </>
           )}
         </Descriptions>

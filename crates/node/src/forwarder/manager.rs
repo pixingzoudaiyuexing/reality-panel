@@ -10,6 +10,7 @@ use crate::reporter::{ConnectionTracker, TrafficCounter};
 use relay_shared::protocol::{
     ListenerConfig, ListenerError, LoadBalanceStrategy, NodeConfigResponse, NodeTransport, Protocol,
 };
+use relay_shared::reconciliation::{fingerprint_bytes, ConfigFingerprint};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -106,6 +107,14 @@ pub struct ListenerInfo {
     pub transport: String,
     pub targets: Vec<String>,
     pub running: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ForwarderRuntimeObservation {
+    pub fingerprint: ConfigFingerprint,
+    pub healthy: bool,
+    pub drifted_listener_keys: Vec<(u16, Protocol, NodeTransport)>,
+    pub nginx_drift: bool,
 }
 
 pub struct ForwarderManager {
@@ -252,6 +261,20 @@ impl ForwarderManager {
     /// data-plane prerequisite succeeded and it is safe for the caller to make
     /// this snapshot the last-known-good config.
     pub async fn apply_config(&mut self, config: &NodeConfigResponse) -> bool {
+        self.apply_config_scoped(config, &HashSet::new(), false, true)
+            .await
+    }
+
+    /// Repair only the supplied managed listener keys, optionally forcing the
+    /// managed Nginx fragment to be regenerated. `allow_cleanup` is false for
+    /// local LKG recovery so an untrusted snapshot cannot remove extra state.
+    pub(crate) async fn apply_config_scoped(
+        &mut self,
+        config: &NodeConfigResponse,
+        force_listener_keys: &HashSet<(u16, Protocol, NodeTransport)>,
+        force_nginx: bool,
+        allow_cleanup: bool,
+    ) -> bool {
         let previous_config = self.last_config.clone();
         let sni_listeners: Vec<ListenerConfig> = config
             .listeners
@@ -282,7 +305,12 @@ impl ForwarderManager {
             }
         };
         if self.nginx_sni.enabled {
-            if self.nginx_sni_plan.as_ref() != Some(&sni_plan) {
+            let nginx_observation =
+                nginx_sni::inspect_rendered(sni_plan.render().as_bytes(), &self.nginx_sni);
+            if force_nginx
+                || self.nginx_sni_plan.as_ref() != Some(&sni_plan)
+                || !nginx_observation.healthy
+            {
                 if let Err(e) = nginx_sni::apply_plan(&sni_plan, &self.nginx_sni) {
                     tracing::error!("nginx_sni apply failed: {}", e);
                     self.listener_errors.lock().await.push(ListenerError {
@@ -374,21 +402,26 @@ impl ForwarderManager {
         // whose fingerprint changed (target / ws_path / rule_id). Both are
         // "tear down the current task" — the restart case just immediately
         // re-adds it in step 4.
-        let mut to_stop: Vec<ListenerKey> = self
-            .listeners
-            .keys()
-            .filter(|k| !active_keys.contains(k))
-            .copied()
-            .collect();
+        let mut to_stop: Vec<ListenerKey> = if allow_cleanup {
+            self.listeners
+                .keys()
+                .filter(|k| !active_keys.contains(k))
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Fingerprint-changed listeners that ARE still desired: stop them now so
         // step 4 starts them fresh with the new config.
         for listener in &effective_config.listeners {
             let key = (listener.port, listener.protocol, listener.node_transport);
             if let Some(m) = self.listeners.get(&key) {
                 let new_fp = ListenerFingerprint::from_listener(listener);
-                if m.fingerprint != new_fp {
+                if m.fingerprint != new_fp || force_listener_keys.contains(&key) {
                     to_stop.push(key);
                 }
+            } else if force_listener_keys.contains(&key) {
+                to_stop.push(key);
             }
         }
         for key in to_stop {
@@ -831,13 +864,101 @@ impl ForwarderManager {
         // rule removed from the config can no longer have its traffic attributed
         // or billed (step 2/3 already pruned its counters), so letting its
         // connections outlive it would forward bytes nobody accounts for.
-        self.rule_runtime
-            .retain(|rule_id, _| desired_rule_ids.contains(rule_id));
+        if allow_cleanup {
+            self.rule_runtime
+                .retain(|rule_id, _| desired_rule_ids.contains(rule_id));
+        }
 
         // v1.2.0: remember the applied config so restart_rule can rebuild a
         // rule's listeners from it without a round-trip to the panel.
         self.last_config = Some(config.clone());
         true
+    }
+
+    pub fn inspect_runtime(&self, effective: &NodeConfigResponse) -> ForwarderRuntimeObservation {
+        let sni_listeners: Vec<ListenerConfig> = effective
+            .listeners
+            .iter()
+            .filter(|listener| listener.node_transport == NodeTransport::NginxSni)
+            .cloned()
+            .collect();
+        let sni_plan = NginxSniPlan::from_listeners(
+            &sni_listeners,
+            &self.nginx_sni.default_backend,
+            &self.nginx_sni.access_log_path,
+        );
+        let (nginx_drift, nginx_healthy, nginx_fingerprint) = match sni_plan {
+            Ok(plan) => {
+                let observation =
+                    nginx_sni::inspect_rendered(plan.render().as_bytes(), &self.nginx_sni);
+                (
+                    !observation.healthy,
+                    observation.healthy,
+                    observation.fingerprint,
+                )
+            }
+            Err(_) => (true, false, fingerprint_bytes(b"nginx-invalid-plan")),
+        };
+
+        let mut drifted_listener_keys = Vec::new();
+        let mut evidence = b"forwarder-runtime-v1\0".to_vec();
+        evidence.extend_from_slice(nginx_fingerprint.as_str().as_bytes());
+        let mut raw_listeners: Vec<_> = effective
+            .listeners
+            .iter()
+            .filter(|listener| listener.node_transport != NodeTransport::NginxSni)
+            .filter(|listener| listener.protocol != Protocol::TcpUdp)
+            .collect();
+        raw_listeners.sort_by_key(|listener| {
+            (
+                listener.port,
+                format!("{:?}", listener.protocol),
+                format!("{:?}", listener.node_transport),
+            )
+        });
+        for listener in raw_listeners {
+            let key = (listener.port, listener.protocol, listener.node_transport);
+            let task_alive = self
+                .listeners
+                .get(&key)
+                .map(|managed| !managed.handle.is_finished())
+                .unwrap_or(false);
+            let socket_bound = if task_alive {
+                socket_bound(listener.port, listener.protocol).unwrap_or(true)
+            } else {
+                false
+            };
+            if !task_alive || !socket_bound {
+                drifted_listener_keys.push(key);
+            }
+            evidence.extend_from_slice(&listener.port.to_be_bytes());
+            evidence.extend_from_slice(protocol_tag(listener.protocol).as_bytes());
+            evidence.push(0);
+            evidence.extend_from_slice(transport_tag(listener.node_transport).as_bytes());
+            evidence.push(0);
+            evidence.push(task_alive as u8);
+            evidence.push(socket_bound as u8);
+        }
+        drifted_listener_keys.sort_by_key(|(port, protocol, transport)| {
+            (*port, format!("{:?}", protocol), format!("{:?}", transport))
+        });
+        for (port, protocol, transport) in &drifted_listener_keys {
+            evidence.extend_from_slice(&port.to_be_bytes());
+            evidence.extend_from_slice(protocol_tag(*protocol).as_bytes());
+            evidence.push(b'/');
+            evidence.extend_from_slice(transport_tag(*transport).as_bytes());
+        }
+        let healthy = nginx_healthy && drifted_listener_keys.is_empty();
+        ForwarderRuntimeObservation {
+            fingerprint: fingerprint_bytes(&evidence),
+            healthy,
+            drifted_listener_keys,
+            nginx_drift,
+        }
+    }
+
+    pub fn current_config(&self) -> Option<NodeConfigResponse> {
+        self.last_config.clone()
     }
 
     pub fn active_rule_ids(&self) -> Vec<i64> {
@@ -977,11 +1098,65 @@ impl ForwarderManager {
     }
 }
 
+fn protocol_tag(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
+        Protocol::TcpUdp => "tcp_udp",
+    }
+}
+
+fn transport_tag(transport: NodeTransport) -> &'static str {
+    match transport {
+        NodeTransport::Raw => "raw",
+        NodeTransport::Ws => "ws",
+        NodeTransport::TlsSimple => "tls_simple",
+        NodeTransport::NginxSni => "nginx_sni",
+    }
+}
+
+fn socket_bound(port: u16, protocol: Protocol) -> Option<bool> {
+    let (v4, v6) = match protocol {
+        Protocol::Tcp => ("/proc/net/tcp", "/proc/net/tcp6"),
+        Protocol::Udp => ("/proc/net/udp", "/proc/net/udp6"),
+        Protocol::TcpUdp => return None,
+    };
+    let mut inspected = false;
+    let mut found = false;
+    for path in [v4, v6] {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                inspected = true;
+                found |= proc_socket_table_contains(&contents, port, protocol == Protocol::Tcp);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => inspected = true,
+        }
+    }
+    inspected.then_some(found)
+}
+
+fn proc_socket_table_contains(contents: &str, port: u16, tcp: bool) -> bool {
+    let wanted = format!("{:04X}", port);
+    contents.lines().skip(1).any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let Some(local) = fields.get(1) else {
+            return false;
+        };
+        let Some(local_port) = local.rsplit(':').next() else {
+            return false;
+        };
+        local_port.eq_ignore_ascii_case(&wanted) && (!tcp || fields.get(3).copied() == Some("0A"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::reporter::{ConnectionTracker, TrafficCounter};
-    use relay_shared::protocol::{ListenerConfig, NodeConfigResponse, NodeTransport, Protocol};
+    use relay_shared::protocol::{
+        ListenerConfig, LoadBalanceStrategy, NodeConfigResponse, NodeTransport, Protocol,
+    };
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1054,6 +1229,98 @@ mod tests {
 
     fn raw_config(port: u16, protocol: Protocol) -> NodeConfigResponse {
         one_rule(port, protocol, NodeTransport::Raw)
+    }
+
+    #[tokio::test]
+    async fn runtime_inspection_reports_healthy_raw_tcp_without_churn() {
+        let mut mgr = fresh_mgr();
+        mgr.set_listen_addresses_for_test("127.0.0.1", "");
+        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+        let config = raw_config(port, Protocol::Tcp);
+
+        assert!(mgr.apply_config(&config).await);
+        let first = mgr.inspect_runtime(&config);
+        let second = mgr.inspect_runtime(&config);
+        assert!(first.healthy);
+        assert!(first.drifted_listener_keys.is_empty());
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(mgr.listener_keys().len(), 1);
+        assert!(mgr.apply_config(&config).await);
+        assert_eq!(mgr.listener_keys().len(), 1);
+        mgr.apply_config(&NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners: vec![],
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn runtime_inspection_targets_dead_raw_tcp_only() {
+        let mut mgr = fresh_mgr();
+        mgr.set_listen_addresses_for_test("127.0.0.1", "");
+        let reserve_a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let reserve_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port_a = reserve_a.local_addr().unwrap().port();
+        let port_b = reserve_b.local_addr().unwrap().port();
+        drop(reserve_a);
+        drop(reserve_b);
+        let mut config = raw_config(port_a, Protocol::Tcp);
+        config.listeners.push(ListenerConfig {
+            rule_id: 2,
+            port: port_b,
+            protocol: Protocol::Tcp,
+            node_transport: NodeTransport::Raw,
+            ws_path: None,
+            sni: None,
+            camouflage_required: false,
+            targets: vec!["127.0.0.1:2".into()],
+            load_balance_strategy: LoadBalanceStrategy::First,
+            upload_limit_bps: None,
+            download_limit_bps: None,
+            max_connections: None,
+        });
+        assert!(mgr.apply_config(&config).await);
+        let dead_key = (port_b, Protocol::Tcp, NodeTransport::Raw);
+        mgr.listeners.get(&dead_key).unwrap().handle.abort();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let observation = mgr.inspect_runtime(&config);
+        assert!(!observation.healthy);
+        assert!(observation.drifted_listener_keys.contains(&dead_key));
+        assert!(!observation.drifted_listener_keys.contains(&(
+            port_a,
+            Protocol::Tcp,
+            NodeTransport::Raw
+        )));
+        mgr.apply_config(&NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners: vec![],
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn runtime_inspection_reports_healthy_raw_udp_and_detects_dead_task() {
+        let mut mgr = fresh_mgr();
+        mgr.set_listen_addresses_for_test("127.0.0.1", "");
+        let reserve = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+        let config = raw_config(port, Protocol::Udp);
+
+        assert!(mgr.apply_config(&config).await);
+        assert!(mgr.inspect_runtime(&config).healthy);
+        let key = (port, Protocol::Udp, NodeTransport::Raw);
+        mgr.listeners.get(&key).unwrap().handle.abort();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let observation = mgr.inspect_runtime(&config);
+        assert!(observation.drifted_listener_keys.contains(&key));
+        mgr.apply_config(&NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners: vec![],
+        })
+        .await;
     }
 
     /// v1.0.9: a rate-limit change (set OR cleared) must change the listener

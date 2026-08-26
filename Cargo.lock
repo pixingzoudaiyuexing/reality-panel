@@ -1791,6 +1791,7 @@ dependencies = [
 name = "relay-node"
 version = "1.2.3"
 dependencies = [
+ "chrono",
  "dashmap",
  "futures-util",
  "libc",
@@ -1854,6 +1855,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
 ]
 

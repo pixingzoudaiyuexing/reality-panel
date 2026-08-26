@@ -285,6 +285,7 @@ pub async fn report_status(
             "camouflage_sites": req.camouflage_sites,
             "active_listener_rule_ids": req.active_listener_rule_ids,
             "provisioning_capabilities": req.provisioning_capabilities,
+            "reconciliation": req.reconciliation,
         });
         // Status persistence is best-effort: the original used .ok() to swallow
         // any DB error so a transient failure never broke the report cycle.
@@ -732,6 +733,7 @@ mod tests {
             camouflage_sites: None,
             active_listener_rule_ids: None,
             provisioning_capabilities: None,
+            reconciliation: None,
         };
         let Json(resp) = report_status(State(state.clone()), h, Json(req)).await;
         assert_eq!(resp.code, 401, "missing token → business 401, not HTTP 401");
@@ -847,6 +849,11 @@ mod tests {
             serde_json::to_value(&http_config).unwrap(),
             serde_json::to_value(&ws_config).unwrap()
         );
+        assert_eq!(
+            relay_shared::reconciliation::config_fingerprint(&http_config),
+            relay_shared::reconciliation::config_fingerprint(&ws_config),
+            "HTTP and WS snapshots must have one canonical desired fingerprint"
+        );
         assert_eq!(http_config.camouflage_sites.len(), 1);
         assert!(http_config.listeners[0].camouflage_required);
         let serialized = serde_json::to_string(&http_config).unwrap();
@@ -929,6 +936,15 @@ mod tests {
             provisioning_capabilities: Some(
                 relay_shared::protocol::ProvisioningCapabilities::reality_camouflage(),
             ),
+            reconciliation: Some(relay_shared::protocol::ReconciliationStatus {
+                state: relay_shared::protocol::ReconciliationStatusState::Converged,
+                desired_fingerprint: Some("a".repeat(64)),
+                applied_fingerprint: Some("b".repeat(64)),
+                observed_fingerprint: Some("c".repeat(64)),
+                last_success_at: Some("2026-08-26T00:00:00Z".into()),
+                last_error: None,
+                recovery_source: relay_shared::protocol::ReconciliationRecoverySource::Panel,
+            }),
         };
         let Json(resp) =
             report_status(State(state.clone()), auth_headers("tok-A"), Json(req)).await;
@@ -951,6 +967,7 @@ mod tests {
             v["provisioning_capabilities"]["reality_camouflage"].as_bool(),
             Some(true)
         );
+        assert_eq!(v["reconciliation"]["state"].as_str(), Some("CONVERGED"));
         for forbidden in ["PRIVATE KEY", "privkey.pem", "NODE_TOKEN", "Bearer"] {
             assert!(!raw.contains(forbidden));
         }

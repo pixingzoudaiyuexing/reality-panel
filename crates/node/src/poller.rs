@@ -2,6 +2,7 @@ use crate::config::NodeConfig;
 use crate::forwarder::camouflage_site::CamouflageSiteManager;
 use crate::forwarder::ForwarderManager;
 use relay_shared::protocol::{NodeConfigResponse, NodeTransport, CONFIG_PROTOCOL_VERSION};
+use relay_shared::reconciliation::{fingerprint_bytes, ConfigFingerprint};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -99,14 +100,86 @@ pub(crate) struct CachePaths {
     pub tmp: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CacheRecoverySource {
+    PrimaryLkg,
+    RepairedFromBackup,
+    BackupFallback,
+    DegradedNoTrustedLkg,
+}
+
+#[derive(Debug)]
+pub(crate) struct CacheLoad {
+    pub config: NodeConfigResponse,
+    pub source: CacheRecoverySource,
+}
+
+#[derive(Debug)]
+pub(crate) struct CoordinatedApplyOutcome {
+    pub success: bool,
+    pub effective: Option<NodeConfigResponse>,
+    pub dependency_withheld: bool,
+    pub pending: Option<PendingFinalization>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeInspection {
+    pub observed_fingerprint: ConfigFingerprint,
+    pub healthy: bool,
+    pub drifted_listener_keys:
+        std::collections::HashSet<(u16, relay_shared::protocol::Protocol, NodeTransport)>,
+    pub nginx_drift: bool,
+    pub camouflage_drift: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingFinalization {
+    pub effective: NodeConfigResponse,
+    pub referenced_snis: std::collections::HashSet<String>,
+    pub lkg_committed: bool,
+}
+
+impl CoordinatedApplyOutcome {
+    fn rejected() -> Self {
+        Self {
+            success: false,
+            effective: None,
+            dependency_withheld: false,
+            pending: None,
+        }
+    }
+
+    fn applied(effective: NodeConfigResponse, dependency_withheld: bool) -> Self {
+        Self {
+            success: true,
+            effective: Some(effective),
+            dependency_withheld,
+            pending: None,
+        }
+    }
+
+    fn failed(
+        effective: NodeConfigResponse,
+        dependency_withheld: bool,
+        pending: Option<PendingFinalization>,
+    ) -> Self {
+        Self {
+            success: false,
+            effective: Some(effective),
+            dependency_withheld,
+            pending,
+        }
+    }
+}
+
 /// Apply first, then commit the snapshot as LKG while holding the same manager
 /// mutex. HTTP polls and WebSocket snapshots both use this path so an older
 /// snapshot cannot finish its cache write after a newer one.
-pub async fn apply_and_commit_coordinated(
+pub(crate) async fn apply_and_commit_coordinated(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
     config: &NodeConfigResponse,
-) -> bool {
+) -> CoordinatedApplyOutcome {
     apply_and_commit_coordinated_at(manager, camouflage, config, &cache_paths()).await
 }
 
@@ -115,17 +188,25 @@ pub(crate) async fn apply_and_commit_coordinated_at(
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
     config: &NodeConfigResponse,
     paths: &CachePaths,
-) -> bool {
+) -> CoordinatedApplyOutcome {
     let previous = load_cache_at(paths);
-    apply_coordinated(manager, camouflage, config, previous.as_ref(), Some(paths)).await
+    apply_coordinated(
+        manager,
+        camouflage,
+        config,
+        previous.as_ref(),
+        Some(paths),
+        true,
+    )
+    .await
 }
 
-pub async fn apply_cached_coordinated(
+pub(crate) async fn apply_cached_coordinated(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
     config: &NodeConfigResponse,
-) -> bool {
-    apply_coordinated(manager, camouflage, config, Some(config), None).await
+) -> CoordinatedApplyOutcome {
+    apply_coordinated(manager, camouflage, config, Some(config), None, false).await
 }
 
 async fn apply_coordinated(
@@ -134,23 +215,32 @@ async fn apply_coordinated(
     desired: &NodeConfigResponse,
     previous: Option<&NodeConfigResponse>,
     commit_paths: Option<&CachePaths>,
-) -> bool {
+    allow_cleanup: bool,
+) -> CoordinatedApplyOutcome {
     if let Err(error) = validate_config(desired) {
         tracing::warn!("refusing invalid node config: {}", error);
-        return false;
+        return CoordinatedApplyOutcome::rejected();
     }
 
     // Keep the camouflage lock through listener apply, listener LKG commit,
     // and stale-site finalization. HTTP polling and WebSocket pushes can race;
     // this makes the two-resource transaction observe one desired snapshot.
     let mut sites = camouflage.lock().await;
-    let active_snis = sites.prepare_desired(&desired.camouflage_sites);
-    let (effective, referenced_snis) = build_effective_config(desired, previous, &active_snis);
+    let active_snis = sites.prepare_desired(&desired.camouflage_sites, allow_cleanup);
+    let (effective, referenced_snis, dependency_withheld) =
+        build_effective_config(desired, previous, &active_snis);
 
     let mut forwarders = manager.lock().await;
-    if !forwarders.apply_config(&effective).await {
+    let applied = if allow_cleanup {
+        forwarders.apply_config(&effective).await
+    } else {
+        forwarders
+            .apply_config_scoped(&effective, &std::collections::HashSet::new(), false, false)
+            .await
+    };
+    if !applied {
         tracing::warn!("coordinated listener apply failed; preserving listener LKG");
-        return false;
+        return CoordinatedApplyOutcome::failed(effective, dependency_withheld, None);
     }
     if let Some(paths) = commit_paths {
         if let Err(error) = commit_cache_at(&effective, paths) {
@@ -158,13 +248,151 @@ async fn apply_coordinated(
                 "coordinated config applied but LKG commit failed: {}",
                 error
             );
-            return false;
+            return CoordinatedApplyOutcome::failed(
+                effective.clone(),
+                dependency_withheld,
+                Some(PendingFinalization {
+                    effective,
+                    referenced_snis,
+                    lkg_committed: false,
+                }),
+            );
         }
     }
     drop(forwarders);
 
+    if !allow_cleanup {
+        return CoordinatedApplyOutcome::applied(effective, dependency_withheld);
+    }
     if !sites.finalize_for_listener_snis(&referenced_snis) {
         tracing::warn!("listener applied, but stale camouflage finalization failed");
+        return CoordinatedApplyOutcome::failed(
+            effective.clone(),
+            dependency_withheld,
+            Some(PendingFinalization {
+                effective,
+                referenced_snis,
+                lkg_committed: true,
+            }),
+        );
+    }
+    CoordinatedApplyOutcome::applied(effective, dependency_withheld)
+}
+
+pub(crate) async fn inspect_runtime(
+    manager: &Arc<Mutex<ForwarderManager>>,
+    camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    effective: &NodeConfigResponse,
+) -> RuntimeInspection {
+    let forwarder = manager.lock().await.inspect_runtime(effective);
+    let expected_camouflage_snis = effective_camouflage_snis(effective);
+    let camouflage = camouflage
+        .lock()
+        .await
+        .inspect_runtime(&expected_camouflage_snis);
+    tracing::debug!(
+        ownership = ?camouflage.ownership,
+        healthy = camouflage.healthy,
+        "inspected camouflage runtime ownership"
+    );
+    let mut evidence = b"runtime-observation-v1\0".to_vec();
+    evidence.extend_from_slice(forwarder.fingerprint.as_str().as_bytes());
+    evidence.extend_from_slice(camouflage.fingerprint.as_str().as_bytes());
+    let drifted_listener_keys = forwarder
+        .drifted_listener_keys
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let nginx_drift = forwarder.nginx_drift;
+    let camouflage_drift = !camouflage.healthy;
+    let mut sorted_drift: Vec<_> = drifted_listener_keys.iter().copied().collect();
+    sorted_drift.sort_by_key(|(port, protocol, transport)| {
+        (
+            *port,
+            runtime_protocol_tag(*protocol),
+            runtime_transport_tag(*transport),
+        )
+    });
+    for (port, protocol, transport) in sorted_drift {
+        evidence.extend_from_slice(&port.to_be_bytes());
+        evidence.extend_from_slice(runtime_protocol_tag(protocol).as_bytes());
+        evidence.push(b'/');
+        evidence.extend_from_slice(runtime_transport_tag(transport).as_bytes());
+    }
+    evidence.push(nginx_drift as u8);
+    evidence.push(camouflage_drift as u8);
+    let healthy = forwarder.healthy && camouflage.healthy;
+    RuntimeInspection {
+        observed_fingerprint: fingerprint_bytes(&evidence),
+        healthy,
+        drifted_listener_keys,
+        nginx_drift,
+        camouflage_drift,
+    }
+}
+
+fn runtime_protocol_tag(protocol: relay_shared::protocol::Protocol) -> &'static str {
+    match protocol {
+        relay_shared::protocol::Protocol::Tcp => "tcp",
+        relay_shared::protocol::Protocol::Udp => "udp",
+        relay_shared::protocol::Protocol::TcpUdp => "tcp_udp",
+    }
+}
+
+fn runtime_transport_tag(transport: NodeTransport) -> &'static str {
+    transport.to_db_str()
+}
+
+pub(crate) async fn repair_runtime(
+    manager: &Arc<Mutex<ForwarderManager>>,
+    camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    effective: &NodeConfigResponse,
+    inspection: &RuntimeInspection,
+    allow_cleanup: bool,
+) -> bool {
+    if inspection.camouflage_drift {
+        let expected_camouflage_snis = effective_camouflage_snis(effective);
+        let mut sites = camouflage.lock().await;
+        if !sites.repair_active_runtime(&expected_camouflage_snis) {
+            tracing::warn!("camouflage runtime repair failed");
+            return false;
+        }
+    }
+    let mut forwarders = manager.lock().await;
+    forwarders
+        .apply_config_scoped(
+            effective,
+            &inspection.drifted_listener_keys,
+            inspection.nginx_drift,
+            allow_cleanup,
+        )
+        .await
+}
+
+fn effective_camouflage_snis(effective: &NodeConfigResponse) -> std::collections::HashSet<String> {
+    effective
+        .listeners
+        .iter()
+        .filter(|listener| listener.camouflage_required)
+        .filter_map(|listener| listener.sni.clone())
+        .collect()
+}
+
+pub(crate) async fn retry_pending_finalization(
+    camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    pending: &mut PendingFinalization,
+    paths: &CachePaths,
+) -> bool {
+    if !pending.lkg_committed {
+        if let Err(error) = commit_cache_at(&pending.effective, paths) {
+            tracing::warn!("pending listener LKG commit still unavailable: {}", error);
+            return false;
+        }
+        pending.lkg_committed = true;
+    }
+
+    let sites = &mut *camouflage.lock().await;
+    if !sites.finalize_for_listener_snis(&pending.referenced_snis) {
+        tracing::warn!("pending camouflage finalization still unavailable");
         return false;
     }
     true
@@ -174,9 +402,10 @@ fn build_effective_config(
     desired: &NodeConfigResponse,
     previous: Option<&NodeConfigResponse>,
     active_snis: &std::collections::HashSet<String>,
-) -> (NodeConfigResponse, std::collections::HashSet<String>) {
+) -> (NodeConfigResponse, std::collections::HashSet<String>, bool) {
     let mut listeners = Vec::new();
     let mut preserved_rules = std::collections::HashSet::new();
+    let mut dependency_withheld = false;
     for listener in &desired.listeners {
         let ready = !listener.camouflage_required
             || listener
@@ -188,6 +417,7 @@ fn build_effective_config(
             listeners.push(listener.clone());
             continue;
         }
+        dependency_withheld = true;
         if !preserved_rules.insert(listener.rule_id) {
             continue;
         }
@@ -238,6 +468,7 @@ fn build_effective_config(
             camouflage_sites,
         },
         referenced_snis,
+        dependency_withheld,
     )
 }
 
@@ -272,27 +503,75 @@ pub(crate) async fn apply_and_commit_at(
 /// Load the primary cache if valid, otherwise fall back to the last healthy
 /// backup. A startup load is deliberately not committed again.
 pub fn load_cache() -> Option<NodeConfigResponse> {
-    load_cache_at(&cache_paths())
+    load_cache_state_at(&cache_paths()).map(|state| state.config)
 }
 
 pub(crate) fn load_cache_at(paths: &CachePaths) -> Option<NodeConfigResponse> {
-    for path in [&paths.primary, &paths.backup] {
-        match read_valid_cache(path) {
-            Ok(config) => {
-                tracing::info!(
-                    "Loaded cached config from {} ({} listeners)",
-                    path.display(),
-                    config.listeners.len()
-                );
-                return Some(config);
-            }
-            Err(e) => {
-                tracing::warn!("cached config {} unavailable: {}", path.display(), e);
-            }
-        }
+    load_cache_state_at(paths).map(|state| state.config)
+}
+
+pub(crate) fn load_cache_state_at(paths: &CachePaths) -> Option<CacheLoad> {
+    if let Ok(config) = read_valid_cache(&paths.primary) {
+        remove_tmp_if_safe(&paths.tmp);
+        tracing::info!(
+            "Loaded cached config from primary {} ({} listeners)",
+            paths.primary.display(),
+            config.listeners.len()
+        );
+        return Some(CacheLoad {
+            config,
+            source: CacheRecoverySource::PrimaryLkg,
+        });
     }
+
+    if let Ok(config) = read_valid_cache(&paths.backup) {
+        let source = match repair_primary_from_backup(paths) {
+            Ok(()) => CacheRecoverySource::RepairedFromBackup,
+            Err(error) => {
+                tracing::warn!(
+                    "valid listener LKG backup loaded but primary repair failed: {}",
+                    error
+                );
+                remove_tmp_if_safe(&paths.tmp);
+                CacheRecoverySource::BackupFallback
+            }
+        };
+        tracing::info!(
+            "Loaded cached config from backup {} ({} listeners)",
+            paths.backup.display(),
+            config.listeners.len()
+        );
+        return Some(CacheLoad { config, source });
+    }
+
+    remove_tmp_if_safe(&paths.tmp);
     tracing::warn!("no usable cached config; waiting for panel configuration");
     None
+}
+
+fn repair_primary_from_backup(paths: &CachePaths) -> Result<(), String> {
+    let bytes = fs::read(&paths.backup).map_err(|error| error.to_string())?;
+    let config = serde_json::from_slice::<NodeConfigResponse>(&bytes).map_err(|e| e.to_string())?;
+    validate_config(&config)?;
+    replace_durably(&paths.primary, &bytes).map_err(|error| error.to_string())?;
+    read_valid_cache(&paths.primary).map(|_| ())
+}
+
+fn remove_tmp_if_safe(path: &Path) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if let Err(error) = fs::remove_file(path) {
+                tracing::warn!(
+                    "could not remove stale LKG tmp {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
+        Ok(_) => tracing::warn!("leaving non-file LKG tmp residue {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!("could not inspect LKG tmp {}: {}", path.display(), error),
+    }
 }
 
 pub(crate) fn commit_cache_at(
@@ -328,7 +607,7 @@ pub(crate) fn commit_cache_at(
     Ok(())
 }
 
-fn validate_config(config: &NodeConfigResponse) -> Result<(), String> {
+pub(crate) fn validate_config(config: &NodeConfigResponse) -> Result<(), String> {
     for listener in &config.listeners {
         if listener.port == 0 {
             return Err(format!("rule {} has port 0", listener.rule_id));
@@ -460,6 +739,10 @@ fn cache_paths() -> CachePaths {
         backup: parent.join("config-cache.backup.json"),
         tmp: parent.join("config-cache.json.tmp"),
     }
+}
+
+pub(crate) fn current_cache_paths() -> CachePaths {
+    cache_paths()
 }
 
 fn cache_path() -> PathBuf {
@@ -806,6 +1089,94 @@ mod tests {
         cleanup_cache(&paths);
     }
 
+    #[test]
+    fn missing_primary_is_repaired_from_backup_without_changing_backup() {
+        let paths = cache_paths_for_test("repair-missing-primary");
+        commit_cache_at(&cache_config(1), &paths).unwrap();
+        commit_cache_at(&cache_config(2), &paths).unwrap();
+        let backup = std::fs::read(&paths.backup).unwrap();
+        std::fs::remove_file(&paths.primary).unwrap();
+
+        let loaded = load_cache_state_at(&paths).unwrap();
+        assert_eq!(loaded.source, CacheRecoverySource::RepairedFromBackup);
+        assert_eq!(std::fs::read(&paths.primary).unwrap(), backup);
+        assert_eq!(std::fs::read(&paths.backup).unwrap(), backup);
+        cleanup_cache(&paths);
+    }
+
+    #[test]
+    fn corrupt_primary_and_stale_tmp_use_backup_and_repair_primary() {
+        let paths = cache_paths_for_test("repair-corrupt-primary");
+        commit_cache_at(&cache_config(1), &paths).unwrap();
+        commit_cache_at(&cache_config(2), &paths).unwrap();
+        let backup = std::fs::read(&paths.backup).unwrap();
+        std::fs::write(&paths.primary, b"corrupt").unwrap();
+        std::fs::write(&paths.tmp, b"valid-looking-but-uncommitted").unwrap();
+
+        let loaded = load_cache_state_at(&paths).unwrap();
+        assert_eq!(loaded.source, CacheRecoverySource::RepairedFromBackup);
+        assert_eq!(std::fs::read(&paths.primary).unwrap(), backup);
+        assert_eq!(std::fs::read(&paths.backup).unwrap(), backup);
+        assert!(!paths.tmp.exists());
+        cleanup_cache(&paths);
+    }
+
+    #[test]
+    fn failed_primary_repair_keeps_backup_available() {
+        let paths = cache_paths_for_test("repair-failure");
+        commit_cache_at(&cache_config(1), &paths).unwrap();
+        commit_cache_at(&cache_config(2), &paths).unwrap();
+        let backup = std::fs::read(&paths.backup).unwrap();
+        std::fs::remove_file(&paths.primary).unwrap();
+        std::fs::create_dir(&paths.primary).unwrap();
+
+        let loaded = load_cache_state_at(&paths).unwrap();
+        assert_eq!(loaded.source, CacheRecoverySource::BackupFallback);
+        assert_eq!(std::fs::read(&paths.backup).unwrap(), backup);
+        std::fs::remove_dir(&paths.primary).unwrap();
+        cleanup_cache(&paths);
+    }
+
+    #[test]
+    fn valid_tmp_is_never_promoted_without_primary_or_backup() {
+        let paths = cache_paths_for_test("tmp-not-authority");
+        std::fs::create_dir_all(paths.primary.parent().unwrap()).unwrap();
+        std::fs::write(&paths.primary, b"corrupt-primary").unwrap();
+        std::fs::write(&paths.backup, b"corrupt-backup").unwrap();
+        std::fs::write(&paths.tmp, serde_json::to_vec(&cache_config(9)).unwrap()).unwrap();
+
+        assert!(load_cache_state_at(&paths).is_none());
+        assert!(!paths.tmp.exists());
+        cleanup_cache(&paths);
+    }
+
+    #[tokio::test]
+    async fn runtime_apply_can_remain_healthy_when_lkg_commit_fails() {
+        let paths = cache_paths_for_test("runtime-lkg-pending");
+        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+        let manager = Arc::new(Mutex::new(ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        )));
+        std::fs::create_dir_all(paths.primary.parent().unwrap()).unwrap();
+        std::fs::create_dir(&paths.tmp).unwrap();
+        let config = cache_config(12);
+        let mut config = config;
+        config.listeners[0].port = port;
+
+        assert!(!apply_and_commit_at(&manager, &config, &paths).await);
+        assert!(manager
+            .lock()
+            .await
+            .listener_info_for_rule_tcp(config.listeners[0].rule_id)
+            .is_some());
+        assert!(paths.tmp.is_dir());
+        std::fs::remove_dir(&paths.tmp).unwrap();
+        cleanup_cache(&paths);
+    }
+
     fn camouflage_site(sni: &str) -> relay_shared::protocol::CamouflageSiteDesired {
         relay_shared::protocol::CamouflageSiteDesired {
             site_id: sni.replace('.', "_"),
@@ -852,14 +1223,16 @@ mod tests {
                 "198.51.100.1:55443",
             )],
         };
-        let (waiting, refs) = build_effective_config(&desired, None, &Default::default());
+        let (waiting, refs, withheld) = build_effective_config(&desired, None, &Default::default());
         assert!(waiting.listeners.is_empty());
         assert!(refs.is_empty());
+        assert!(withheld);
 
         let active = std::collections::HashSet::from(["op1.example.com".to_string()]);
-        let (ready, refs) = build_effective_config(&desired, None, &active);
+        let (ready, refs, withheld) = build_effective_config(&desired, None, &active);
         assert_eq!(ready.listeners.len(), 1);
         assert!(refs.contains("op1.example.com"));
+        assert!(!withheld);
     }
 
     #[test]
@@ -876,7 +1249,7 @@ mod tests {
         };
         let active = std::collections::HashSet::from(["op1.example.com".to_string()]);
 
-        let (effective, refs) = build_effective_config(&desired, None, &active);
+        let (effective, refs, withheld) = build_effective_config(&desired, None, &active);
 
         assert_eq!(effective.listeners.len(), 1);
         assert_eq!(effective.listeners[0].rule_id, 1);
@@ -892,6 +1265,7 @@ mod tests {
             std::collections::HashSet::from(["op1.example.com".to_string()])
         );
         assert!(validate_config(&effective).is_ok());
+        assert!(withheld);
     }
 
     #[test]
@@ -913,7 +1287,8 @@ mod tests {
             )],
         };
         let active = std::collections::HashSet::from(["old.example.com".to_string()]);
-        let (effective, refs) = build_effective_config(&desired, Some(&previous), &active);
+        let (effective, refs, withheld) =
+            build_effective_config(&desired, Some(&previous), &active);
         assert_eq!(effective.listeners.len(), 1);
         assert_eq!(
             effective.listeners[0].sni.as_deref(),
@@ -927,6 +1302,7 @@ mod tests {
             .iter()
             .any(|site| site.sni == "old.example.com"));
         assert!(validate_config(&effective).is_ok());
+        assert!(withheld);
     }
 
     #[test]
@@ -944,11 +1320,13 @@ mod tests {
             listeners: vec![],
         };
         let active = std::collections::HashSet::from(["op1.example.com".to_string()]);
-        let (effective, refs) = build_effective_config(&desired, Some(&previous), &active);
+        let (effective, refs, withheld) =
+            build_effective_config(&desired, Some(&previous), &active);
         assert!(effective.listeners.is_empty());
         assert!(
             refs.is_empty(),
             "site removal is finalized only after this route apply"
         );
+        assert!(!withheld);
     }
 }

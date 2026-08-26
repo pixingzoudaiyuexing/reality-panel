@@ -10,6 +10,7 @@ use super::certificate_lifecycle::{
 };
 use super::nginx_sni::{self, NginxSniConfig};
 use relay_shared::protocol::{CamouflageLocalBackend, CamouflageSiteDesired, CamouflageSiteStatus};
+use relay_shared::reconciliation::{fingerprint_bytes, ConfigFingerprint};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -53,6 +54,21 @@ pub struct CamouflageSiteConfig {
     pub certificate_lifecycle: CertificateLifecycleConfig,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CamouflageRuntimeOwnership {
+    Unowned,
+    BootstrapCompatibility,
+    ModernExpectedMissing,
+    ModernManaged,
+}
+
+#[derive(Clone, Debug)]
+pub struct CamouflageRuntimeObservation {
+    pub fingerprint: ConfigFingerprint,
+    pub healthy: bool,
+    pub(crate) ownership: CamouflageRuntimeOwnership,
+}
+
 #[derive(Debug)]
 pub struct CamouflageSiteManager {
     config: CamouflageSiteConfig,
@@ -94,43 +110,32 @@ impl CamouflageSiteManager {
                 }
                 Err(error) => {
                     tracing::error!(
-                        "camouflage site LKG runtime restore failed; trying source manifest: {}",
+                        "camouflage site LKG runtime restore failed; preserving runtime: {}",
                         error
                     );
                 }
             }
         }
 
-        // A successfully restored LKG is authoritative at startup. The source
-        // manifest may predate Panel ownership and must only be a recovery
-        // fallback when no healthy LKG can be activated.
+        // A source manifest is not a substitute for the modern Panel-owned LKG.
+        // If both LKG copies are unavailable, fail-preserve and wait for a
+        // validated Panel snapshot instead of overwriting runtime from legacy
+        // local state.
         if recovered_applied {
             return true;
         }
-
-        match self.load_manifest() {
-            Ok(manifest) => self.reconcile_and_apply_manifest(manifest),
-            Err(error) => {
-                tracing::warn!("camouflage sites unavailable: {}", error);
-                false
-            }
-        }
+        tracing::warn!("camouflage sites unavailable; preserving runtime until Panel sync");
+        false
     }
 
-    /// Reconcile certificates from the Node-local source manifest. This is
-    /// called by the scheduler and never depends on the Panel control channel.
+    /// Legacy source manifests are not an authority for runtime recovery.
+    /// Certificate reconciliation begins only after a validated Panel snapshot
+    /// has established an active modern LKG.
     pub fn reconcile_from_source(&mut self) -> bool {
-        let manifest = match self.load_manifest() {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                tracing::warn!(
-                    "camouflage certificate source manifest unavailable: {}",
-                    error
-                );
-                return false;
-            }
-        };
-        self.reconcile_and_apply_manifest(manifest)
+        tracing::warn!(
+            "legacy camouflage source manifest is not authoritative; waiting for Panel sync"
+        );
+        false
     }
 
     /// Scheduler path after Panel ownership has been established. The active
@@ -146,14 +151,22 @@ impl CamouflageSiteManager {
     /// Prepare all Panel-desired sites while retaining old active sites. The
     /// caller activates dependent :443 listeners only for the returned SNI set,
     /// then calls `finalize_for_listener_snis` to remove unreferenced wrappers.
-    pub fn prepare_desired(&mut self, desired: &[CamouflageSiteDesired]) -> HashSet<String> {
+    pub fn prepare_desired(
+        &mut self,
+        desired: &[CamouflageSiteDesired],
+        panel_authoritative: bool,
+    ) -> HashSet<String> {
         self.desired = desired
             .iter()
             .filter(|site| site.enabled)
             .cloned()
             .collect();
-        if !self.desired.is_empty() {
-            self.panel_authority_established = true;
+        if !panel_authoritative {
+            return self.active_snis();
+        }
+        self.panel_authority_established = true;
+        if self.desired.is_empty() && self.active.is_none() {
+            return HashSet::new();
         }
         let mut candidate = self
             .active
@@ -262,6 +275,66 @@ impl CamouflageSiteManager {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_nginx_commands_for_test(&mut self, test_cmd: &str, reload_cmd: &str) {
+        self.config.nginx.test_cmd = test_cmd.to_string();
+        self.config.nginx.reload_cmd = reload_cmd.to_string();
+    }
+
+    pub fn inspect_runtime(&self, expected_snis: &HashSet<String>) -> CamouflageRuntimeObservation {
+        let Some(active) = self.active.as_ref() else {
+            let wrapper_exists = self.config.enabled && self.config.nginx.conf_path.exists();
+            let ownership = if !expected_snis.is_empty() {
+                CamouflageRuntimeOwnership::ModernExpectedMissing
+            } else if wrapper_exists {
+                CamouflageRuntimeOwnership::BootstrapCompatibility
+            } else {
+                CamouflageRuntimeOwnership::Unowned
+            };
+            let mut evidence = format!("camouflage-runtime-{ownership:?}\0").into_bytes();
+            let mut expected: Vec<_> = expected_snis.iter().collect();
+            expected.sort();
+            for sni in expected {
+                evidence.extend_from_slice(sni.as_bytes());
+                evidence.push(0);
+            }
+            return CamouflageRuntimeObservation {
+                fingerprint: fingerprint_bytes(&evidence),
+                healthy: expected_snis.is_empty(),
+                ownership,
+            };
+        };
+        let active_snis: HashSet<_> = active.sites.iter().map(|site| site.sni.clone()).collect();
+        let healthy = expected_snis.is_subset(&active_snis) && self.runtime_matches(active);
+        let mut evidence = b"camouflage-runtime-v1\0".to_vec();
+        evidence.extend_from_slice(&serde_json::to_vec(active).unwrap_or_default());
+        if let Ok(contents) = fs::read(&self.config.nginx.conf_path) {
+            evidence.extend_from_slice(&contents);
+        } else {
+            evidence.extend_from_slice(b"<missing>");
+        }
+        evidence.push(healthy as u8);
+        CamouflageRuntimeObservation {
+            fingerprint: fingerprint_bytes(&evidence),
+            healthy,
+            ownership: CamouflageRuntimeOwnership::ModernManaged,
+        }
+    }
+
+    pub fn repair_active_runtime(&mut self, expected_snis: &HashSet<String>) -> bool {
+        let Some(active) = self.active.clone() else {
+            return expected_snis.is_empty();
+        };
+        let active_snis: HashSet<_> = active.sites.iter().map(|site| site.sni.clone()).collect();
+        if expected_snis.is_subset(&active_snis) && self.runtime_matches(&active) {
+            return true;
+        }
+        if !expected_snis.is_subset(&active_snis) {
+            return false;
+        }
+        self.apply_candidate(active)
+    }
+
     pub fn status_snapshot(&self) -> Vec<CamouflageSiteStatus> {
         self.desired
             .iter()
@@ -362,6 +435,9 @@ impl CamouflageSiteManager {
         let lifecycle = CertificateLifecycle::new(self.config.certificate_lifecycle.clone());
         lifecycle.prepare_http01_once(&manifest, &mut self.http01_runtime)?;
         let (candidate, actions) = lifecycle.reconcile_prepared(&manifest)?;
+        if self.active.as_ref() == Some(&candidate) && self.runtime_matches(&candidate) {
+            return Ok(());
+        }
         if actions
             .iter()
             .any(|action| *action != LifecycleAction::Unchanged)
@@ -373,6 +449,22 @@ impl CamouflageSiteManager {
         } else {
             Err("camouflage runtime validation or LKG commit failed".into())
         }
+    }
+
+    fn runtime_matches(&self, manifest: &CamouflageSitesManifest) -> bool {
+        if !self.config.enabled {
+            return true;
+        }
+        if manifest.sites.is_empty() && !self.config.nginx.conf_path.exists() {
+            return true;
+        }
+        if self.prepare_candidate(manifest).is_err() {
+            return false;
+        }
+        let Ok(rendered) = render_camouflage_config(manifest) else {
+            return false;
+        };
+        nginx_sni::inspect_rendered(&rendered, &self.config.nginx).healthy
     }
 
     pub fn apply_candidate(&mut self, candidate: CamouflageSitesManifest) -> bool {
@@ -440,19 +532,37 @@ impl CamouflageSiteManager {
         Ok(())
     }
 
-    pub(crate) fn load_manifest(&self) -> Result<CamouflageSitesManifest, String> {
-        read_manifest(&self.config.manifest_path)
-    }
-
     fn load_lkg(&self) -> Result<CamouflageSitesManifest, String> {
-        for path in [self.lkg_path(), self.lkg_backup_path()] {
-            let Ok(manifest) = read_manifest(&path) else {
-                continue;
-            };
+        if let Ok(manifest) = read_manifest(&self.lkg_path()) {
             if self.prepare_candidate(&manifest).is_ok() {
+                remove_tmp_if_safe(&self.lkg_tmp_path());
                 return Ok(manifest);
             }
         }
+
+        if let Ok(manifest) = read_manifest(&self.lkg_backup_path()) {
+            if self.prepare_candidate(&manifest).is_ok() {
+                let bytes = fs::read(self.lkg_backup_path()).map_err(|e| e.to_string())?;
+                match write_private_file(&self.lkg_path(), &bytes)
+                    .and_then(|_| read_manifest(&self.lkg_path()))
+                    .and_then(|repaired| {
+                        self.prepare_candidate(&repaired)?;
+                        Ok(repaired)
+                    }) {
+                    Ok(repaired) => return Ok(repaired),
+                    Err(error) => {
+                        tracing::warn!(
+                            "valid camouflage LKG backup loaded but primary repair failed: {}",
+                            error
+                        );
+                        remove_tmp_if_safe(&self.lkg_tmp_path());
+                        return Ok(manifest);
+                    }
+                }
+            }
+        }
+
+        remove_tmp_if_safe(&self.lkg_tmp_path());
         Err("no valid camouflage site LKG".to_string())
     }
 
@@ -705,6 +815,19 @@ fn appended_temp_path(path: &Path) -> PathBuf {
     PathBuf::from(value)
 }
 
+fn remove_tmp_if_safe(path: &Path) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if let Err(error) = fs::remove_file(path) {
+                tracing::warn!("could not remove stale camouflage LKG tmp: {}", error);
+            }
+        }
+        Ok(_) => tracing::warn!("leaving non-file camouflage LKG tmp residue"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => tracing::warn!("could not inspect camouflage LKG tmp: {}", error),
+    }
+}
+
 fn sync_parent(path: &Path) -> Result<(), std::io::Error> {
     File::open(path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "file has no parent")
@@ -857,6 +980,114 @@ mod tests {
     }
 
     #[test]
+    fn runtime_inspection_detects_and_repairs_managed_camouflage_wrapper() {
+        let dir = unique_dir("runtime-inspection");
+        let mut manager = manager(&dir, "true", "true");
+        assert!(manager.apply_candidate(manifest(&dir)));
+        let expected = HashSet::from(["op1.example.com".to_string()]);
+        let healthy = manager.inspect_runtime(&expected);
+        assert!(healthy.healthy);
+        assert_eq!(healthy.ownership, CamouflageRuntimeOwnership::ModernManaged);
+        let healthy_fingerprint = healthy.fingerprint.clone();
+
+        fs::remove_file(&manager.config.nginx.conf_path).unwrap();
+        let drifted = manager.inspect_runtime(&expected);
+        assert!(!drifted.healthy);
+        assert_ne!(drifted.fingerprint, healthy_fingerprint);
+        assert!(manager.repair_active_runtime(&expected));
+        assert!(manager.inspect_runtime(&expected).healthy);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bootstrap_fallback_without_modern_intent_is_healthy_neutral() {
+        let dir = unique_dir("bootstrap-compatibility");
+        let mut manager = manager(&dir, "true", "true");
+        fs::create_dir_all(manager.config.nginx.conf_path.parent().unwrap()).unwrap();
+        fs::write(&manager.config.nginx.conf_path, b"bootstrap fallback\n").unwrap();
+        let before = fs::read(&manager.config.nginx.conf_path).unwrap();
+        let expected = HashSet::new();
+
+        let observation = manager.inspect_runtime(&expected);
+        assert!(observation.healthy);
+        assert_eq!(
+            observation.ownership,
+            CamouflageRuntimeOwnership::BootstrapCompatibility
+        );
+        assert!(manager.repair_active_runtime(&expected));
+        assert_eq!(fs::read(&manager.config.nginx.conf_path).unwrap(), before);
+        assert!(!manager.panel_authority_established);
+        assert!(manager.active.is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn authoritative_empty_does_not_claim_bootstrap_fallback_runtime() {
+        let dir = unique_dir("bootstrap-authoritative-empty");
+        let mut manager = manager(&dir, "true", "true");
+        fs::create_dir_all(manager.config.nginx.conf_path.parent().unwrap()).unwrap();
+        fs::write(&manager.config.nginx.conf_path, b"bootstrap fallback\n").unwrap();
+
+        assert!(manager.prepare_desired(&[], true).is_empty());
+        assert!(manager.panel_authority_established);
+        assert!(manager.active.is_none());
+        assert!(manager.finalize_for_listener_snis(&HashSet::new()));
+        assert_eq!(
+            fs::read(&manager.config.nginx.conf_path).unwrap(),
+            b"bootstrap fallback\n"
+        );
+        assert!(!manager.lkg_path().exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn modern_effective_intent_without_active_manifest_is_drift() {
+        let dir = unique_dir("modern-expected-missing");
+        let mut manager = manager(&dir, "true", "true");
+        fs::create_dir_all(manager.config.nginx.conf_path.parent().unwrap()).unwrap();
+        fs::write(&manager.config.nginx.conf_path, b"bootstrap fallback\n").unwrap();
+        let expected = HashSet::from(["op1.example.com".to_string()]);
+
+        let observation = manager.inspect_runtime(&expected);
+        assert!(!observation.healthy);
+        assert_eq!(
+            observation.ownership,
+            CamouflageRuntimeOwnership::ModernExpectedMissing
+        );
+        assert!(!manager.repair_active_runtime(&expected));
+        assert!(manager.active.is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn corrupted_managed_camouflage_wrapper_is_drift_and_repaired() {
+        let dir = unique_dir("runtime-corrupt-wrapper");
+        let mut manager = manager(&dir, "true", "true");
+        assert!(manager.apply_candidate(manifest(&dir)));
+        fs::write(&manager.config.nginx.conf_path, b"corrupt\n").unwrap();
+        let expected = HashSet::from(["op1.example.com".to_string()]);
+
+        assert!(!manager.inspect_runtime(&expected).healthy);
+        assert!(manager.repair_active_runtime(&expected));
+        assert!(manager.inspect_runtime(&expected).healthy);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_managed_certificate_reference_is_drift() {
+        let dir = unique_dir("runtime-invalid-certificate");
+        let mut manager = manager(&dir, "true", "true");
+        let active = manifest(&dir);
+        let cert_path = active.sites[0].certificate.cert_path.clone();
+        assert!(manager.apply_candidate(active));
+        fs::remove_file(cert_path).unwrap();
+        let expected = HashSet::from(["op1.example.com".to_string()]);
+
+        assert!(!manager.inspect_runtime(&expected).healthy);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn model_has_no_reality_or_route_authority() {
         let dir = unique_dir("ownership");
         let json = serde_json::to_string(&manifest(&dir)).unwrap();
@@ -974,8 +1205,18 @@ mod tests {
             sites: vec![site(&dir, "op2", "op2.example.com")],
         };
         assert!(manager.apply_candidate(second));
+        let backup_before = fs::read(manager.lkg_backup_path()).unwrap();
         fs::write(manager.lkg_path(), b"not-json").unwrap();
+        fs::write(manager.lkg_tmp_path(), b"stale-uncommitted-state").unwrap();
         assert_eq!(manager.load_lkg().unwrap(), first);
+        assert_eq!(
+            serde_json::from_slice::<CamouflageSitesManifest>(
+                &fs::read(manager.lkg_path()).unwrap()
+            )
+            .unwrap(),
+            first
+        );
+        assert_eq!(fs::read(manager.lkg_backup_path()).unwrap(), backup_before);
         assert!(!manager.lkg_tmp_path().exists());
         let _ = fs::remove_dir_all(dir);
     }
@@ -1000,6 +1241,62 @@ mod tests {
         .unwrap();
 
         assert_eq!(manager.load_lkg().unwrap(), first);
+        assert_eq!(
+            serde_json::from_slice::<CamouflageSitesManifest>(
+                &fs::read(manager.lkg_path()).unwrap()
+            )
+            .unwrap(),
+            first
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_primary_repair_preserves_camouflage_backup() {
+        let dir = unique_dir("repair-failure");
+        let mut manager = manager(&dir, "true", "true");
+        let first = manifest(&dir);
+        assert!(manager.apply_candidate(first));
+        let second = CamouflageSitesManifest {
+            sites: vec![site(&dir, "op2", "op2.example.com")],
+        };
+        assert!(manager.apply_candidate(second));
+        let backup_before = fs::read(manager.lkg_backup_path()).unwrap();
+        fs::remove_file(manager.lkg_path()).unwrap();
+        fs::create_dir(manager.lkg_path()).unwrap();
+
+        assert_eq!(manager.load_lkg().unwrap().sites[0].id, "op1");
+        assert_eq!(fs::read(manager.lkg_backup_path()).unwrap(), backup_before);
+        assert!(manager.lkg_path().is_dir());
+        assert!(!manager.lkg_path().with_extension("json.tmp").exists());
+        fs::remove_dir(manager.lkg_path()).unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_modern_lkg_does_not_promote_legacy_source_manifest() {
+        let dir = unique_dir("legacy-not-authority");
+        let mut manager = manager(&dir, "true", "true");
+        fs::create_dir_all(&manager.config.state_dir).unwrap();
+        fs::write(manager.lkg_path(), b"not-json").unwrap();
+        fs::write(manager.lkg_backup_path(), b"not-json").unwrap();
+        fs::write(
+            manager.lkg_tmp_path(),
+            serde_json::to_vec_pretty(&manifest(&dir)).unwrap(),
+        )
+        .unwrap();
+        write_private_file(
+            &manager.config.manifest_path,
+            &serde_json::to_vec_pretty(&manifest(&dir)).unwrap(),
+        )
+        .unwrap();
+
+        assert!(!manager.restore_and_apply());
+        assert!(manager.active.is_none());
+        assert!(!manager.config.nginx.conf_path.exists());
+        assert!(!manager.reconcile_active());
+        assert!(!manager.config.nginx.conf_path.exists());
+        assert!(!manager.lkg_tmp_path().exists());
         let _ = fs::remove_dir_all(dir);
     }
 

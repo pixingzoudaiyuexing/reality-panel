@@ -1,4 +1,5 @@
 use relay_shared::protocol::{ListenerConfig, LoadBalanceStrategy, Protocol};
+use relay_shared::reconciliation::{fingerprint_bytes, ConfigFingerprint};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
@@ -13,6 +14,16 @@ pub struct NginxSniConfig {
     pub reload_cmd: String,
     pub default_backend: String,
     pub access_log_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NginxRuntimeObservation {
+    pub fingerprint: ConfigFingerprint,
+    pub healthy: bool,
+    pub managed_file_exists: bool,
+    pub file_matches: bool,
+    pub config_valid: bool,
+    pub service_healthy: bool,
 }
 
 impl Default for NginxSniConfig {
@@ -265,6 +276,44 @@ pub fn apply_plan(plan: &NginxSniPlan, cfg: &NginxSniConfig) -> Result<(), Apply
     apply_rendered(plan.render().as_bytes(), cfg)
 }
 
+/// Inspect only the fragment owned by relay-node. Unmanaged Nginx files are
+/// intentionally outside this observation boundary.
+pub fn inspect_rendered(expected: &[u8], cfg: &NginxSniConfig) -> NginxRuntimeObservation {
+    if !cfg.enabled {
+        return NginxRuntimeObservation {
+            fingerprint: fingerprint_bytes(b"nginx-disabled"),
+            healthy: true,
+            managed_file_exists: false,
+            file_matches: true,
+            config_valid: true,
+            service_healthy: true,
+        };
+    }
+
+    let actual = fs::read(&cfg.conf_path).ok();
+    let managed_file_exists = actual.is_some();
+    let file_matches = actual.as_deref() == Some(expected);
+    let config_valid = run_shell(&cfg.test_cmd).is_ok();
+    let service_healthy = nginx_service_healthy(cfg);
+    let mut evidence = b"nginx-runtime-v1\0".to_vec();
+    evidence.extend_from_slice(actual.as_deref().unwrap_or(b"<missing>"));
+    evidence.extend_from_slice(&[
+        managed_file_exists as u8,
+        file_matches as u8,
+        config_valid as u8,
+        service_healthy as u8,
+    ]);
+
+    NginxRuntimeObservation {
+        fingerprint: fingerprint_bytes(&evidence),
+        healthy: managed_file_exists && file_matches && config_valid && service_healthy,
+        managed_file_exists,
+        file_matches,
+        config_valid,
+        service_healthy,
+    }
+}
+
 /// Apply a second Node-owned Nginx fragment with the same test/reload rollback
 /// contract as the stream router. Used by the local Reality TLS wrappers.
 pub fn apply_rendered(contents: &[u8], cfg: &NginxSniConfig) -> Result<(), ApplyError> {
@@ -380,6 +429,17 @@ fn run_shell(cmd: &str) -> Result<(), ApplyError> {
         cmd: cmd.to_string(),
         detail,
     })
+}
+
+fn nginx_service_healthy(cfg: &NginxSniConfig) -> bool {
+    // Test configurations deliberately provide a synthetic validation/reload
+    // command. Production defaults additionally verify that an Nginx process
+    // is active, while custom test commands remain deterministic in unit tests.
+    let uses_production_commands = cfg.test_cmd.trim() == "nginx -t"
+        || cfg.reload_cmd.contains("systemctl")
+        || cfg.reload_cmd.contains("service nginx");
+    !uses_production_commands
+        || run_shell("systemctl is-active --quiet nginx || pgrep -x nginx").is_ok()
 }
 
 fn quote_nginx_string(s: &str) -> String {
@@ -675,6 +735,56 @@ mod tests {
             "apply and old-runtime restore must both run reload despite matching disk content"
         );
         let _ = std::fs::remove_file(marker);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn runtime_inspection_reports_matching_managed_fragment_healthy() {
+        let path = unique_path("inspect-healthy").join("relay.conf");
+        let plan = plan_for("inspect.example.com");
+        let cfg = test_config(path.clone(), "true", "true");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, plan.render()).unwrap();
+
+        let observation = inspect_rendered(plan.render().as_bytes(), &cfg);
+        assert!(observation.healthy);
+        assert!(observation.managed_file_exists);
+        assert!(observation.file_matches);
+        assert!(observation.config_valid);
+        assert!(observation.service_healthy);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn runtime_inspection_detects_missing_and_corrupt_managed_fragment() {
+        let path = unique_path("inspect-drift").join("relay.conf");
+        let plan = plan_for("inspect.example.com");
+        let cfg = test_config(path.clone(), "true", "true");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let missing = inspect_rendered(plan.render().as_bytes(), &cfg);
+        assert!(!missing.healthy);
+        assert!(!missing.managed_file_exists);
+
+        std::fs::write(&path, "corrupt").unwrap();
+        let corrupt = inspect_rendered(plan.render().as_bytes(), &cfg);
+        assert!(!corrupt.healthy);
+        assert!(corrupt.managed_file_exists);
+        assert!(!corrupt.file_matches);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn runtime_inspection_reports_config_validation_failure() {
+        let path = unique_path("inspect-invalid").join("relay.conf");
+        let plan = plan_for("inspect.example.com");
+        let cfg = test_config(path.clone(), "false", "true");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, plan.render()).unwrap();
+
+        let observation = inspect_rendered(plan.render().as_bytes(), &cfg);
+        assert!(!observation.healthy);
+        assert!(!observation.config_valid);
         cleanup(&path);
     }
 }

@@ -3,6 +3,7 @@ mod diagnose;
 mod forwarder;
 mod lifecycle;
 mod poller;
+mod reconciler;
 mod reporter;
 mod updater;
 mod ws_client;
@@ -18,6 +19,41 @@ use tokio::sync::Mutex;
 /// Built-in version string. Single source of truth: the Cargo package version
 /// (`env!("CARGO_PKG_VERSION")`), also used for Panel artifact validation.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+async fn run_local_recovery_tick(
+    manager: &Arc<Mutex<ForwarderManager>>,
+    camouflage_sites: &Arc<Mutex<forwarder::camouflage_site::CamouflageSiteManager>>,
+    reconciler: &Arc<Mutex<reconciler::Reconciler>>,
+) {
+    let Some(cached) = poller::load_cache_state_at(&poller::current_cache_paths()) else {
+        return;
+    };
+    let recovery_source = match cached.source {
+        poller::CacheRecoverySource::PrimaryLkg => reconciler::LocalRecoverySource::PrimaryLkg,
+        poller::CacheRecoverySource::RepairedFromBackup => {
+            reconciler::LocalRecoverySource::RepairedFromBackup
+        }
+        poller::CacheRecoverySource::BackupFallback => {
+            reconciler::LocalRecoverySource::BackupFallback
+        }
+        poller::CacheRecoverySource::DegradedNoTrustedLkg => {
+            reconciler::LocalRecoverySource::DegradedNoTrustedLkg
+        }
+    };
+    let Ok(input) =
+        reconciler::ReconciliationInput::local_recovery_from(cached.config, recovery_source)
+    else {
+        return;
+    };
+    let result = reconciler
+        .lock()
+        .await
+        .reconcile(manager, camouflage_sites, input)
+        .await;
+    if result.state == reconciler::ReconciliationState::ApplyFailed {
+        tracing::warn!("local runtime inspection or repair did not converge");
+    }
+}
 
 fn main() -> ExitCode {
     // Handle CLI flags BEFORE initialising tokio / tracing so that
@@ -231,6 +267,7 @@ async fn run() {
     let camouflage_sites = Arc::new(Mutex::new(
         forwarder::camouflage_site::CamouflageSiteManager::new(config.camouflage_site_config()),
     ));
+    let reconciler = Arc::new(Mutex::new(reconciler::Reconciler::new()));
     if config.camouflage_sites_enabled && !camouflage_sites.lock().await.restore_and_apply() {
         tracing::error!(
             "camouflage site LKG was not restored; continuing without local TLS fallback"
@@ -258,16 +295,54 @@ async fn run() {
     // If the panel is down when the node starts, load the last known config
     // from disk and start forwarding immediately. The poller will sync
     // when the panel comes back online.
-    if let Some(cached) = poller::load_cache() {
+    if let Some(cached) = poller::load_cache_state_at(&poller::current_cache_paths()) {
         tracing::info!(
             "Loaded cached config ({} listeners) - starting forwarding immediately",
-            cached.listeners.len()
+            cached.config.listeners.len()
         );
-        if !poller::apply_cached_coordinated(&manager, &camouflage_sites, &cached).await {
-            tracing::error!("cached config could not be applied; waiting for panel configuration");
+        let recovery_source = match cached.source {
+            poller::CacheRecoverySource::PrimaryLkg => reconciler::LocalRecoverySource::PrimaryLkg,
+            poller::CacheRecoverySource::RepairedFromBackup => {
+                reconciler::LocalRecoverySource::RepairedFromBackup
+            }
+            poller::CacheRecoverySource::BackupFallback => {
+                reconciler::LocalRecoverySource::BackupFallback
+            }
+            poller::CacheRecoverySource::DegradedNoTrustedLkg => {
+                reconciler::LocalRecoverySource::DegradedNoTrustedLkg
+            }
+        };
+        match reconciler::ReconciliationInput::local_recovery_from(cached.config, recovery_source) {
+            Ok(input) => {
+                let result = reconciler
+                    .lock()
+                    .await
+                    .reconcile(&manager, &camouflage_sites, input)
+                    .await;
+                if result.state == reconciler::ReconciliationState::ApplyFailed {
+                    tracing::error!(
+                        "cached config could not be applied; waiting for panel configuration"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    "cached config lost local-recovery trust: {}; waiting for panel configuration",
+                    error
+                );
+            }
         }
     } else {
         tracing::info!("No cached config found - will start forwarding after first panel sync");
+        let _ = reconciler
+            .lock()
+            .await
+            .reconcile(
+                &manager,
+                &camouflage_sites,
+                reconciler::ReconciliationInput::degraded_local_recovery(),
+            )
+            .await;
     }
 
     // v0.3.0: stable per-node identity. Generated once and persisted to a
@@ -280,9 +355,17 @@ async fn run() {
         let config_ws = config.clone();
         let manager_ws = manager.clone();
         let camouflage_ws = camouflage_sites.clone();
+        let reconciler_ws = reconciler.clone();
         let node_id_ws = node_id.clone();
         tokio::spawn(async move {
-            ws_client::run_ws_loop(&config_ws, &manager_ws, &camouflage_ws, &node_id_ws).await;
+            ws_client::run_ws_loop(
+                &config_ws,
+                &manager_ws,
+                &camouflage_ws,
+                &reconciler_ws,
+                &node_id_ws,
+            )
+            .await;
         });
     }
 
@@ -303,8 +386,23 @@ async fn run() {
 
         match poller::fetch_config(&config).await {
             poller::FetchResult::Ok(resp) => {
-                if !poller::apply_and_commit_coordinated(&manager, &camouflage_sites, &resp).await {
-                    tracing::warn!("HTTP config was not committed as last-known-good");
+                match reconciler::ReconciliationInput::validated_panel(resp) {
+                    Ok(input) => {
+                        let result = reconciler
+                            .lock()
+                            .await
+                            .reconcile(&manager, &camouflage_sites, input)
+                            .await;
+                        if result.state == reconciler::ReconciliationState::ApplyFailed {
+                            tracing::warn!("HTTP config was not committed as last-known-good");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "HTTP config lost validated authority before reconciliation: {}",
+                            error
+                        );
+                    }
                 }
                 // Recovered from a mismatch: restore the normal poll interval.
                 if in_mismatch_backoff {
@@ -324,6 +422,7 @@ async fn run() {
                     interval = tokio::time::interval(Duration::from_secs(MISMATCH_BACKOFF_SECS));
                     in_mismatch_backoff = true;
                 }
+                run_local_recovery_tick(&manager, &camouflage_sites, &reconciler).await;
             }
             poller::FetchResult::Transient => {
                 if in_mismatch_backoff {
@@ -332,6 +431,7 @@ async fn run() {
                     interval = tokio::time::interval(Duration::from_secs(config.poll_interval));
                     in_mismatch_backoff = false;
                 }
+                run_local_recovery_tick(&manager, &camouflage_sites, &reconciler).await;
             }
         }
 
@@ -350,6 +450,7 @@ async fn run() {
             (mgr.take_listener_errors().await, mgr.active_rule_ids())
         };
         let camouflage_status = camouflage_sites.lock().await.status_snapshot();
+        let reconciliation_status = reconciler.lock().await.status_snapshot();
         reporter::report_status(
             &config,
             &metrics,
@@ -359,6 +460,7 @@ async fn run() {
             listener_errors,
             camouflage_status,
             active_listener_rule_ids,
+            reconciliation_status,
         )
         .await;
     }

@@ -2,6 +2,7 @@ use crate::config::NodeConfig;
 use crate::forwarder::camouflage_site::CamouflageSiteManager;
 use crate::forwarder::ForwarderManager;
 use crate::poller;
+use crate::reconciler::{Reconciler, ReconciliationInput, ReconciliationState};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -54,6 +55,7 @@ pub async fn run_ws_loop(
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    reconciler: &Arc<Mutex<Reconciler>>,
     node_id: &str,
 ) {
     let ws_url = derive_ws_url(&config.panel_url);
@@ -66,8 +68,16 @@ pub async fn run_ws_loop(
     loop {
         tracing::info!("websocket connecting to {} ...", ws_url);
 
-        let exit =
-            connect_and_run(&ws_url, &config.token, config, manager, camouflage, node_id).await;
+        let exit = connect_and_run(
+            &ws_url,
+            &config.token,
+            config,
+            manager,
+            camouflage,
+            reconciler,
+            node_id,
+        )
+        .await;
         match exit {
             WsExit::ConfigChanged => {
                 tracing::info!("websocket: config_changed received, reconnecting immediately");
@@ -166,6 +176,7 @@ async fn connect_and_run(
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    reconciler: &Arc<Mutex<Reconciler>>,
     node_id: &str,
 ) -> WsExit {
     use futures_util::{SinkExt, StreamExt};
@@ -290,7 +301,7 @@ async fn connect_and_run(
                                 "websocket: received config ({} listeners), applying",
                                 resp.listeners.len()
                             );
-                            if apply_snapshot(manager, camouflage, &resp).await {
+                            if apply_snapshot(manager, camouflage, reconciler, resp).await {
                                 tracing::info!("websocket: config applied and committed as LKG");
                             } else {
                                 tracing::warn!("websocket: config apply/commit failed; preserving LKG");
@@ -299,7 +310,7 @@ async fn connect_and_run(
                             tracing::info!("websocket: config_changed received, re-fetching");
                             match poller::fetch_config(config).await {
                                 poller::FetchResult::Ok(resp) => {
-                                    if apply_snapshot(manager, camouflage, &resp).await {
+                                    if apply_snapshot(manager, camouflage, reconciler, resp).await {
                                         tracing::info!("websocket: config applied after config_changed");
                                     } else {
                                         tracing::warn!("websocket: config_changed apply/commit failed; preserving LKG");
@@ -515,9 +526,23 @@ async fn connect_and_run(
 async fn apply_snapshot(
     manager: &std::sync::Arc<tokio::sync::Mutex<crate::forwarder::ForwarderManager>>,
     camouflage: &std::sync::Arc<tokio::sync::Mutex<CamouflageSiteManager>>,
-    config: &relay_shared::protocol::NodeConfigResponse,
+    reconciler: &std::sync::Arc<tokio::sync::Mutex<Reconciler>>,
+    config: relay_shared::protocol::NodeConfigResponse,
 ) -> bool {
-    poller::apply_and_commit_coordinated(manager, camouflage, config).await
+    let input = match ReconciliationInput::validated_panel(config) {
+        Ok(input) => input,
+        Err(error) => {
+            tracing::warn!("websocket: refusing untrusted config snapshot: {}", error);
+            return false;
+        }
+    };
+    reconciler
+        .lock()
+        .await
+        .reconcile(manager, camouflage, input)
+        .await
+        .state
+        != ReconciliationState::ApplyFailed
 }
 
 #[cfg(test)]

@@ -521,6 +521,62 @@ pub struct TrafficEntry {
     pub download: u64,
 }
 
+/// Relay-local reconciliation state. This is additive status telemetry and is
+/// intentionally independent of the v6 desired-config compatibility gate.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReconciliationStatusState {
+    Converged,
+    Reconciling,
+    Repairing,
+    DegradedLocalRecovery,
+    ApplyFailed,
+    DependencyWithheld,
+    WaitingForAuthority,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReconciliationRecoverySource {
+    Panel,
+    LkgPrimary,
+    LkgBackupRepaired,
+    LocalRecovery,
+    None,
+}
+
+/// A compact, secret-free reconciliation summary. Fingerprints are opaque
+/// SHA-256 values; no desired config or runtime evidence is embedded here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReconciliationStatus {
+    pub state: ReconciliationStatusState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub recovery_source: ReconciliationRecoverySource,
+}
+
+impl Default for ReconciliationStatus {
+    fn default() -> Self {
+        Self {
+            state: ReconciliationStatusState::WaitingForAuthority,
+            desired_fingerprint: None,
+            applied_fingerprint: None,
+            observed_fingerprint: None,
+            last_success_at: None,
+            last_error: None,
+            recovery_source: ReconciliationRecoverySource::None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusReport {
     pub cpu_usage: f32,
@@ -625,6 +681,10 @@ pub struct StatusReport {
     /// intentionally a fixed typed set and contains no paths or secrets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provisioning_capabilities: Option<ProvisioningCapabilities>,
+    /// Stage 4: optional reconciliation telemetry. Older nodes omit it and
+    /// older Panels safely ignore it; CONFIG_PROTOCOL_VERSION remains v6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<ReconciliationStatus>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1715,5 +1775,31 @@ mod tests {
         assert!(!missing_http01.satisfies(required));
 
         assert!(ProvisioningCapabilities::default().satisfies(ProvisioningCapabilities::default()));
+    }
+
+    #[test]
+    fn reconciliation_status_is_optional_and_protocol_v6_compatible() {
+        let legacy = r#"{
+            "cpu_usage": 1.0,
+            "mem_usage": 2.0,
+            "active_connections": 3,
+            "uptime_secs": 4
+        }"#;
+        let report: StatusReport = serde_json::from_str(legacy).unwrap();
+        assert!(report.reconciliation.is_none());
+        assert_eq!(CONFIG_PROTOCOL_VERSION, 6);
+
+        let status = ReconciliationStatus {
+            state: ReconciliationStatusState::Converged,
+            desired_fingerprint: Some("a".repeat(64)),
+            applied_fingerprint: Some("b".repeat(64)),
+            observed_fingerprint: Some("c".repeat(64)),
+            last_success_at: Some("2026-08-26T00:00:00Z".into()),
+            last_error: None,
+            recovery_source: ReconciliationRecoverySource::Panel,
+        };
+        let encoded = serde_json::to_string(&status).unwrap();
+        assert!(encoded.contains("CONVERGED"));
+        assert!(encoded.contains("PANEL"));
     }
 }

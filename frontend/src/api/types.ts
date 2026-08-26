@@ -449,6 +449,32 @@ export interface CamouflageSiteStatus {
   active_generation?: string | null;
 }
 
+export type ReconciliationState =
+  | 'CONVERGED'
+  | 'RECONCILING'
+  | 'REPAIRING'
+  | 'DEGRADED_LOCAL_RECOVERY'
+  | 'APPLY_FAILED'
+  | 'DEPENDENCY_WITHHELD'
+  | 'WAITING_FOR_AUTHORITY';
+
+export type ReconciliationRecoverySource =
+  | 'PANEL'
+  | 'LKG_PRIMARY'
+  | 'LKG_BACKUP_REPAIRED'
+  | 'LOCAL_RECOVERY'
+  | 'NONE';
+
+export interface ReconciliationStatus {
+  state: ReconciliationState;
+  desired_fingerprint?: string | null;
+  applied_fingerprint?: string | null;
+  observed_fingerprint?: string | null;
+  last_success_at?: string | null;
+  last_error?: string | null;
+  recovery_source: ReconciliationRecoverySource;
+}
+
 export interface NodeStatus {
   group_id: number;
   /** Per-node identity. Null/undefined for legacy single-node status rows. */
@@ -508,6 +534,7 @@ export interface NodeStatus {
   camouflage_sites?: CamouflageSiteStatus[] | null;
   active_listener_rule_ids?: number[] | null;
   provisioning_capabilities?: ProvisioningCapabilities | null;
+  reconciliation?: ReconciliationStatus | null;
 }
 
 export interface ProvisioningCapabilities {
@@ -728,6 +755,7 @@ export interface NodeDisplayRow {
   boot_download_bytes?: number | null;
   network_interface?: string | null;
   listener_errors?: ListenerError[] | null;
+  reconciliation?: ReconciliationStatus | null;
   /** Shared-group-only metadata (user view). */
   region?: string | null;
   line_type?: string | null;

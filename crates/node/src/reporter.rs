@@ -2,7 +2,8 @@ use crate::config::NodeConfig;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use relay_shared::protocol::{
-    ApiResponse, CamouflageSiteStatus, ListenerError, StatusReport, TrafficEntry, TrafficReport,
+    ApiResponse, CamouflageSiteStatus, ListenerError, ReconciliationStatus, StatusReport,
+    TrafficEntry, TrafficReport,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -804,6 +805,7 @@ pub async fn report_status(
     listener_errors: Vec<ListenerError>,
     camouflage_sites: Vec<CamouflageSiteStatus>,
     active_listener_rule_ids: Vec<i64>,
+    reconciliation: ReconciliationStatus,
 ) {
     let snap = metrics.snapshot().await;
     let active_connections = connections.current().await;
@@ -851,6 +853,7 @@ pub async fn report_status(
         camouflage_sites: Some(camouflage_sites),
         active_listener_rule_ids: Some(active_listener_rule_ids),
         provisioning_capabilities: Some(config.provisioning_capabilities()),
+        reconciliation: Some(reconciliation),
     };
 
     // debug, not info: this runs every poll cycle (default 10s). Keeping it
