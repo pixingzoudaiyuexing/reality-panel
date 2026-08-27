@@ -7,7 +7,7 @@
 use crate::api::middleware::AdminOnly;
 use crate::api::provisioning::{
     bootstrap_session_lifetime_secs, capabilities_satisfy, load_artifact, normalize_architecture,
-    ProvisioningBundle, ProvisioningProfile, ENROLLMENT_CLAIM_WINDOW_SECS,
+    valid_public_panel_url, ProvisioningBundle, ProvisioningProfile, ENROLLMENT_CLAIM_WINDOW_SECS,
 };
 use crate::api::stats::{status_last_seen, NODE_ONLINE_WINDOW_SECS};
 use crate::api::AppState;
@@ -217,8 +217,11 @@ pub async fn create_enrollment(
                 return api_error(500, "database error");
             }
         };
-    if !valid_panel_url(&state.config.public_panel_url) {
-        return api_error(409, "PUBLIC_PANEL_URL must use http:// or https://");
+    if !valid_public_panel_url(&state.config.public_panel_url) {
+        return api_error(
+            409,
+            "PUBLIC_PANEL_URL must be a valid public http:// or https:// origin",
+        );
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -910,11 +913,6 @@ fn launcher_command(panel_url: &str, enrollment_id: &str) -> String {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn valid_panel_url(url: &str) -> bool {
-    let url = url.trim();
-    url.starts_with("http://") || url.starts_with("https://")
 }
 
 fn bundle_error(status: u16, message: &'static str) -> Response {

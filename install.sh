@@ -3,7 +3,7 @@
 # RelayPanel one-line installer for Linux (Debian / Ubuntu).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/<release-ref>/install.sh | bash
 #
 
 # Touch: trigger script-check CI on version-only PRs (paths filter otherwise skips it).
@@ -23,6 +23,8 @@ set -euo pipefail
 
 INSTALL_DIR="/opt/relay-panel"
 REPO_URL="https://github.com/pixingzoudaiyuexing/relay-panel.git"
+RELEASE_REF="${RELAYPANEL_RELEASE_REF:-RELEASE_REF_REQUIRED}"
+RELEASE_VERSION="${RELAYPANEL_RELEASE_VERSION:-RELEASE_VERSION_REQUIRED}"
 
 # DEBUG=1 shows full git output during clone/pull (default: quiet, clean status
 # lines only). Most users want a clean install log without a wall of git diff
@@ -141,8 +143,11 @@ if [ -d "$INSTALL_DIR" ]; then
 Back it up or remove it, then re-run this script. Refusing to overwrite."
     fi
 else
+    if [ "$RELEASE_REF" = "RELEASE_REF_REQUIRED" ] || [ "$RELEASE_VERSION" = "RELEASE_VERSION_REQUIRED" ]; then
+        fail "Fresh installs require RELAYPANEL_RELEASE_REF and RELAYPANEL_RELEASE_VERSION for a compatible release. Set both explicitly; no unpinned main install is allowed."
+    fi
     info "Cloning ${REPO_URL} into ${INSTALL_DIR} ..."
-    if ! git clone --depth 1 $GIT_QUIET "$REPO_URL" "$INSTALL_DIR" 2>/tmp/relaypanel-git-err; then
+    if ! git clone --depth 1 --branch "$RELEASE_REF" $GIT_QUIET "$REPO_URL" "$INSTALL_DIR" 2>/tmp/relaypanel-git-err; then
         echo -e "${RED}[FAIL]${NC} Clone failed. git output:" >&2
         cat /tmp/relaypanel-git-err >&2
         rm -f /tmp/relaypanel-git-err
@@ -152,6 +157,20 @@ else
     cd "$INSTALL_DIR"
     info "Cloned at $(git rev-parse --short HEAD 2>/dev/null || echo '?')"
 fi
+
+# Existing installations retain the release identity recorded by deploy.sh;
+# callers may explicitly provide a new pinned ref/version for an upgrade.
+if [ "$RELEASE_REF" = "RELEASE_REF_REQUIRED" ]; then
+    RELEASE_REF=$(grep -E '^RELAYPANEL_RELEASE_REF=' .env 2>/dev/null | tail -n1 | cut -d= -f2- || true)
+    RELEASE_REF="${RELEASE_REF:-RELEASE_REF_REQUIRED}"
+fi
+if [ "$RELEASE_VERSION" = "RELEASE_VERSION_REQUIRED" ]; then
+    RELEASE_VERSION=$(grep -E '^RELAYPANEL_RELEASE_VERSION=' .env 2>/dev/null | tail -n1 | cut -d= -f2- || true)
+    RELEASE_VERSION="${RELEASE_VERSION:-RELEASE_VERSION_REQUIRED}"
+fi
+
+export RELAYPANEL_RELEASE_REF="$RELEASE_REF"
+export RELAYPANEL_RELEASE_VERSION="$RELEASE_VERSION"
 
 # ---------- 4. Hand off to deploy.sh ----------
 if [ ! -f deploy.sh ]; then

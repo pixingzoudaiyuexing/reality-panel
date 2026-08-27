@@ -1,14 +1,27 @@
 # Version sync checklist
 
-RelayPanel ships **two independent version tracks** since v1.2:
+RelayPanel ships a Panel release containing the Panel and matching node
+artifacts. The node container still has its own version field, but the
+production Panel image is the compatibility boundary: it packages both
+supported node architectures from the same source revision.
 
-- **Panel** — the management API + web UI. Tagged `vX.Y.Z`.
-- **Node** — the `relay-node` forwarding binary. Tagged `node-vX.Y.Z`.
+- **Panel** — the management API + web UI plus `node-assets`. Tagged `vX.Y.Z`.
+- **Node** — the `relay-node` forwarding binary/container. Tagged `node-vX.Y.Z`.
 
-The two version numbers **do not have to match**. A panel-only update (new UI,
-API, billing logic) does NOT rebuild or republish the node, and a node-only
-update (forwarding fix, new arch) does NOT touch the panel. Each track has its
-own pre-flight check, its own GitHub Release, and its own changelog.
+The Panel release workflow builds both node architectures from the exact
+checked-out source revision and embeds them at:
+
+```text
+/opt/relay-panel/node-assets/{amd64,arm64}/
+  relay-node
+  metadata.json   # version + sha256
+```
+
+Bootstrap and lifecycle upgrades use this one root and validate ELF
+architecture, version metadata, and SHA-256 before serving an artifact.
+The separate node release workflow remains for the standalone node image and
+legacy compatibility, but a production Panel must use the matching Panel
+release image rather than the old independent defaults.
 
 This file is the single source of truth for where each track's version number
 lives. When cutting a release, update only that track's locations, then run its
@@ -81,11 +94,13 @@ tagging.
    ```
 4. Commit ("release: vX.Y.Z") and push to `main`. Wait for main CI green.
 5. Tag on the current `main` HEAD: `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`.
-6. The `v*` tag triggers **docker-release.yml** (PANEL-ONLY): it builds + pushes
+6. The `v*` tag triggers **docker-release.yml**: it builds + pushes
    `ghcr.io/pixingzoudaiyuexing/relay-panel-panel:X.Y.Z` + `:latest` (multi-arch manifest
-   with `linux/amd64` and `linux/arm64` legs), and creates the panel GitHub
-   Release (body from CHANGELOG.md). **No node artifact is built or pushed.**
-   `relay-panel-node:latest` is untouched.
+   with `linux/amd64` and `linux/arm64` legs), builds matching `relay-node`
+   amd64/arm64 artifacts from the same checkout, embeds and verifies them in
+   every Panel image variant, and creates the panel GitHub Release (body from
+   CHANGELOG.md). It does **not** publish a standalone node image or change
+   `relay-panel-node:latest`.
 
 ## Release flow — NODE (tag `node-vX.Y.Z`)
 
@@ -112,9 +127,9 @@ tagging.
 A node release is only tagged when something node-side actually changed
 (forwarding, the self-updater, the reporter, node CLI, or a node dependency).
 A panel-only change (UI, API, billing, plans) must NOT produce a new `node-v*`
-tag, must NOT republish identical node binaries, and must NOT move
-`relay-panel-node:latest`. The split CI (above) enforces this: only a `node-v*`
-tag builds node artifacts.
+tag, must NOT republish the standalone node image, and must NOT move
+`relay-panel-node:latest`. Its Panel release still embeds matching node assets
+for bootstrap and lifecycle so a deployed Panel is self-contained.
 
 ---
 

@@ -163,19 +163,37 @@ EOF
     - Connection failure is **fatal** — the deploy script never falls back to
       SQLite when PostgreSQL was configured.
 
-    #### `PUBLIC_PANEL_URL` (optional)
+#### `PUBLIC_PANEL_URL`
 
 The URL nodes use to reach the Panel. SSH Bootstrap and Manual Bootstrap use it
 for Node control traffic; Manual Bootstrap supports both HTTP and HTTPS.
 
-- **Leave empty** when admins and nodes reach the panel at the same address
-  you type into the browser (e.g. `http://203.0.113.10:18888`). The frontend
-  falls back to `window.location.origin`.
-- **Set it** when the panel is behind a reverse proxy or domain — e.g.
-  `PUBLIC_PANEL_URL=https://panel.example.com` — so nodes get the
-  TLS-terminated address instead of the raw `http://ip:port` the browser bar
-  shows. Also used to derive the WebSocket URL (`wss://...`).
-- A `localhost` / `127.0.0.1` / `0.0.0.0` value cannot be used by a remote Relay.
+- **Required for remote Relay bootstrap.** Set a directly reachable origin,
+  for example `PUBLIC_PANEL_URL=http://203.0.113.10:18888` or
+  `PUBLIC_PANEL_URL=https://panel.example.com`. The installer and API reject
+  malformed URLs, URL credentials, paths, query strings, and fragments.
+- **Empty is only for Panel-only deployments.** The UI browser-origin fallback
+  remains available there, but SSH Bootstrap and Manual Bootstrap will refuse
+  to start until a valid value is configured.
+- HTTPS works normally; HTTP/IP+port is also supported. No TLS mode is
+  invented by this setting. A `localhost` / `127.0.0.1` / `0.0.0.0` value
+  cannot be used by a remote Relay.
+
+#### Pinned release install
+
+Production fresh installs must select the final released source ref and image
+version explicitly. Do not install from an unpinned repository default branch:
+
+```bash
+RELAYPANEL_RELEASE_REF=vX.Y.Z \
+RELAYPANEL_RELEASE_VERSION=X.Y.Z \
+PUBLIC_PANEL_URL=http://203.0.113.10:18888 \
+bash install.sh
+```
+
+The released Panel image contains matching `relay-node` amd64 and arm64
+artifacts built from that same ref. Existing `.env`, database volumes, and
+secrets are preserved by upgrades.
 
     #### GeoIP — node region resolution
 

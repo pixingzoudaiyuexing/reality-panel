@@ -180,14 +180,13 @@ if [ "$TRACK" = "panel" ]; then
         fail "crates/panel/src/config.rs COMPILED_APP_VERSION = $PANEL_VER (expected $VERSION)"
     fi
 
-    # docker-compose.release.yaml: PANEL image tag (node tag is independent).
-    # v1.2: the tag may be a literal (:1.1.0) OR an env-var override with a
-    # default (${RELAYPANEL_PANEL_TAG:-1.1.0}); match the version anywhere on
-    # the panel image line.
-    if grep -E "image:.*ghcr\.io/pixingzoudaiyuexing/relay-panel-panel.*${VERSION}([^0-9.]|$)" docker-compose.release.yaml >/dev/null 2>&1; then
-        ok "docker-compose.release.yaml panel image tag includes ${VERSION}"
+    # The compose file deliberately has no stale literal fallback. The release
+    # job supplies RELAYPANEL_RELEASE_VERSION, which is checked here by the
+    # placeholder contract and by the workflow's source/tag pre-flight.
+    if grep -q 'RELAYPANEL_RELEASE_VERSION' docker-compose.release.yaml; then
+        ok "docker-compose.release.yaml requires RELAYPANEL_RELEASE_VERSION or an explicit panel tag"
     else
-        fail "docker-compose.release.yaml: panel image tag ${VERSION} not found"
+        fail "docker-compose.release.yaml: no explicit panel release version contract"
     fi
 
     # README dynamic release badge (reflects the latest GitHub panel release)
@@ -229,14 +228,12 @@ else
         fail "scripts/relay-node-install.sh SCRIPT_VERSION = $SCRIPT_VER (expected $VERSION)"
     fi
 
-    # docker-compose.release.yaml: NODE image tag (panel tag is independent).
-    # v1.2: the tag may be a literal (:1.1.0) OR an env-var override with a
-    # default (${RELAYPANEL_NODE_TAG:-1.1.0}); match the version anywhere on
-    # the node image line.
-    if grep -E "image:.*ghcr\.io/pixingzoudaiyuexing/relay-panel-node.*${VERSION}([^0-9.]|$)" docker-compose.release.yaml >/dev/null 2>&1; then
-        ok "docker-compose.release.yaml node image tag includes ${VERSION}"
+    # The optional local node container must be explicitly pinned. Panel-side
+    # bootstrap/lifecycle assets come from the matching panel release image.
+    if grep -q 'RELAYPANEL_NODE_TAG' docker-compose.release.yaml; then
+        ok "docker-compose.release.yaml requires an explicit optional node image tag"
     else
-        fail "docker-compose.release.yaml: node image tag ${VERSION} not found"
+        fail "docker-compose.release.yaml: no explicit optional node image tag contract"
     fi
 
     # CHANGELOG-NODE.md node section (the node release body source)

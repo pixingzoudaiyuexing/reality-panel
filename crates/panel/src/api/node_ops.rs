@@ -1,5 +1,6 @@
 use crate::api::middleware::AdminOnly;
 use crate::api::node::extract_node_token;
+use crate::api::provisioning::{NODE_ARTIFACT_ROOT, NODE_ARTIFACT_ROOT_ENV};
 use crate::api::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -337,6 +338,7 @@ impl NodeOperationRegistry {
 pub struct ArtifactMetadata {
     pub version: String,
     pub sha256: String,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -364,9 +366,9 @@ struct LoadedArtifact {
 }
 
 fn artifact_root() -> PathBuf {
-    std::env::var_os("NODE_LIFECYCLE_ARTIFACT_DIR")
+    std::env::var_os(NODE_ARTIFACT_ROOT_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/opt/relay-panel/artifacts"))
+        .unwrap_or_else(|| PathBuf::from(NODE_ARTIFACT_ROOT))
 }
 
 fn elf_machine(architecture: &str) -> Option<u16> {
@@ -393,6 +395,9 @@ fn load_artifact_from(root: &FsPath, architecture: &str) -> Result<LoadedArtifac
     }
     let bytes = std::fs::read(directory.join("relay-node"))
         .map_err(|error| format!("artifact binary missing: {error}"))?;
+    if metadata.size != bytes.len() as u64 {
+        return Err("artifact size does not match metadata".into());
+    }
     if bytes.len() < MIN_ARTIFACT_BYTES
         || bytes.get(..4) != Some(&[0x7f, b'E', b'L', b'F'])
         || bytes.get(4) != Some(&2)
@@ -795,11 +800,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_dir(prefix: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()))
+        std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
     }
 
     async fn test_state() -> (AppState, SqlitePool) {
@@ -1131,6 +1132,7 @@ mod tests {
             serde_json::to_vec(&ArtifactMetadata {
                 version: "1.2.3".into(),
                 sha256: sha,
+                size: bytes.len() as u64,
             })
             .unwrap(),
         )

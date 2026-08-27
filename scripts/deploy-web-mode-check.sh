@@ -86,8 +86,9 @@ SH
 
 make_case_dir() {
     local dir="$1"
-    mkdir -p "$dir"
+    mkdir -p "$dir/scripts"
     cp "$ROOT/deploy.sh" "$ROOT/docker-compose.release.yaml" "$ROOT/docker-compose.yaml" "$ROOT/Caddyfile" "$dir/"
+    cp "$ROOT/scripts/public-panel-url.sh" "$dir/scripts/"
 }
 
 assert_file_has() {
@@ -121,6 +122,13 @@ dir=${res%|*}; log=${res#*|}
 assert_file_has "$dir/.env" 'RELAYPANEL_WEB_MODE=direct'
 assert_log_has "$log" 'RELAYPANEL_PANEL_PORT_BINDING=0.0.0.0:18888'
 pass 'fresh direct mode persists and binds public port'
+
+# Fresh direct persists a valid HTTP control-plane URL for remote Relay
+# bootstrap; no HTTPS-only policy is introduced.
+res=$(run_case fresh-http-url env PUBLIC_PANEL_URL=http://203.0.113.10:18888)
+dir=${res%|*}; log=${res#*|}
+assert_file_has "$dir/.env" 'PUBLIC_PANEL_URL=http://203.0.113.10:18888'
+pass 'fresh direct mode persists HTTP PUBLIC_PANEL_URL'
 
 # Env-selected Caddy must persist mode/domain/public URL and use localhost panel.
 res=$(run_case env-caddy env RELAYPANEL_WEB_MODE=caddy RELAYPANEL_DOMAIN=panel.example.com ACME_EMAIL=admin@example.com)
@@ -199,5 +207,13 @@ if (cd "$dir" && HARNESS_LOG="$log" PATH="$fake:$PATH" env RELAYPANEL_WEB_MODE=c
     fail 'invalid Caddy domain unexpectedly succeeded'
 fi
 pass 'invalid Caddy domain is rejected'
+
+# Invalid URL credentials must fail before compose starts.
+dir="$TMP/bad-public-url"; fake="$TMP/fakebin-bad-public-url"; log="$TMP/bad-public-url.log"
+make_case_dir "$dir"; make_fakebin "$fake"; : > "$log"
+if (cd "$dir" && HARNESS_LOG="$log" PATH="$fake:$PATH" env PUBLIC_PANEL_URL=https://user:password@panel.example.com bash ./deploy.sh >/tmp/rp-bad-public-url.out 2>/tmp/rp-bad-public-url.err); then
+    fail 'credential-bearing PUBLIC_PANEL_URL unexpectedly succeeded'
+fi
+pass 'credential-bearing PUBLIC_PANEL_URL is rejected'
 
 pass 'deploy web-mode harness completed'

@@ -7,7 +7,7 @@
 use crate::api::middleware::AdminOnly;
 use crate::api::provisioning::{
     capabilities_satisfy, load_artifact, normalize_architecture, reported_capabilities,
-    ProvisioningArtifact, ProvisioningBundle, ProvisioningProfile,
+    valid_public_panel_url, ProvisioningArtifact, ProvisioningBundle, ProvisioningProfile,
 };
 use crate::api::AppState;
 use crate::db::repo::{GroupRepository, ResourceScope};
@@ -564,10 +564,10 @@ pub async fn start_deployment(
             }
         };
     let panel_url = state.config.public_panel_url.trim().to_string();
-    if panel_url.is_empty() {
+    if !valid_public_panel_url(&panel_url) {
         return error(
             409,
-            "PUBLIC_PANEL_URL must be configured before node bootstrap",
+            "PUBLIC_PANEL_URL must be a valid public http:// or https:// origin before node bootstrap",
         );
     }
     let status = state

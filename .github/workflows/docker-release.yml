@@ -1,11 +1,9 @@
 name: Docker Release
 
-# v1.2: panel and node release on INDEPENDENT tracks. This workflow is PANEL-
-# ONLY and fires on `v*` tags. It builds + pushes the panel image and creates
-# the panel GitHub Release (body from CHANGELOG.md). The node image, node
-# binaries, and node Release are published by node-release.yml on `node-v*` tags
-# — a panel-only update no longer rebuilds or republishes any node artifact, and
-# relay-panel-node:latest is untouched by a panel release.
+# A Panel release fires on `v*` tags, builds the Panel and both relay-node
+# artifact architectures from that exact checkout, and embeds the verified
+# artifacts in the Panel image. It does not publish a standalone node image or
+# node GitHub Release; node-release.yml still owns those `node-v*` releases.
 #
 # v1.3: panel image is now a multi-arch manifest (linux/amd64 + linux/arm64).
 # Each architecture compiles natively on its own runner — no QEMU, no cross-toolchain.
@@ -64,10 +62,58 @@ jobs:
           path: frontend/dist
           retention-days: 1
 
+  build-node-assets:
+    name: Build relay-node ${{ matrix.arch }} artifact
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            rust_target: x86_64-unknown-linux-musl
+          - arch: arm64
+            rust_target: aarch64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target and cross toolchain
+        run: |
+          rustup target add ${{ matrix.rust_target }}
+          sudo apt-get update
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            sudo apt-get install -y --no-install-recommends musl-tools
+          else
+            sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu musl-tools
+          fi
+
+      - name: Build and verify matching relay-node artifact
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_musl: aarch64-linux-gnu-g++
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }} -p relay-node
+          mkdir -p release-dist/node-assets/${{ matrix.arch }}
+          cp target/${{ matrix.rust_target }}/release/relay-node release-dist/node-assets/${{ matrix.arch }}/relay-node
+          chmod 0755 release-dist/node-assets/${{ matrix.arch }}/relay-node
+          NODE_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/node/Cargo.toml | head -n1)
+          SHA256=$(sha256sum release-dist/node-assets/${{ matrix.arch }}/relay-node | awk '{print $1}')
+          SIZE=$(wc -c < release-dist/node-assets/${{ matrix.arch }}/relay-node | tr -d ' ')
+          printf '{"version":"%s","sha256":"%s","size":%s}\n' "$NODE_VERSION" "$SHA256" "$SIZE" > release-dist/node-assets/${{ matrix.arch }}/metadata.json
+          file release-dist/node-assets/${{ matrix.arch }}/relay-node | grep -q ELF
+          sha256sum -c <(printf '%s  %s\n' "$SHA256" "release-dist/node-assets/${{ matrix.arch }}/relay-node")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-assets-${{ matrix.arch }}
+          path: release-dist/node-assets/${{ matrix.arch }}
+          retention-days: 1
+
   build-and-push:
     name: Build + push ${{ matrix.arch }} image
     runs-on: ${{ matrix.runner }}
-    needs: build-frontend
+    needs: [build-frontend, build-node-assets]
     strategy:
       fail-fast: false
       matrix:
@@ -92,11 +138,28 @@ jobs:
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Building panel image $VERSION for ${{ matrix.arch }}"
 
+      - name: Verify Panel release source version
+        run: bash scripts/release-check.sh panel "${{ steps.ver.outputs.version }}"
+
       - name: Download frontend dist
         uses: actions/download-artifact@v4
         with:
           name: frontend-dist
           path: release-dist/frontend
+
+      - name: Download matching relay-node artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: node-assets-*
+          path: release-dist/node-assets
+          merge-multiple: false
+
+      - name: Normalize node artifact layout
+        run: |
+          mkdir -p release-dist/node-assets/amd64 release-dist/node-assets/arm64
+          mv release-dist/node-assets/node-assets-amd64/* release-dist/node-assets/amd64/
+          mv release-dist/node-assets/node-assets-arm64/* release-dist/node-assets/arm64/
+          rmdir release-dist/node-assets/node-assets-amd64 release-dist/node-assets/node-assets-arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -124,6 +187,10 @@ jobs:
         run: |
           mkdir -p release-dist/panel
           cp target/release/relay-panel release-dist/panel/relay-panel
+          for arch in amd64 arm64; do
+            test -s "release-dist/node-assets/$arch/relay-node"
+            test -s "release-dist/node-assets/$arch/metadata.json"
+          done
 
       - name: Build and push ${{ matrix.arch }} image
         uses: docker/build-push-action@v6

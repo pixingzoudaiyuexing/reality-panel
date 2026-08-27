@@ -36,6 +36,14 @@ NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 fail()  { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
+# shellcheck source=scripts/public-panel-url.sh
+source "$(cd "$(dirname "$0")" && pwd)/scripts/public-panel-url.sh"
+
+validate_public_panel_url() {
+    if ! valid_public_panel_url "$1"; then
+        fail "PUBLIC_PANEL_URL must be an http:// or https:// URL with a host and optional port; credentials, query strings, fragments, and paths are not allowed"
+    fi
+}
 
 # Read a single KEY's value from .env WITHOUT sourcing it. Sourcing (`. ./.env`)
 # executes the file as shell, so a value containing &, $(...), backticks, spaces
@@ -98,6 +106,15 @@ EOF
 else
     FRESH_INSTALL=0
     warn ".env already exists - skipping secret generation"
+fi
+
+# Persist the explicit release identity on fresh installs. Existing values are
+# left untouched so upgrades do not rewrite deployment selection.
+if [ "${RELAYPANEL_RELEASE_VERSION:-RELEASE_VERSION_REQUIRED}" != "RELEASE_VERSION_REQUIRED" ] && ! grep -q '^RELAYPANEL_RELEASE_VERSION=' .env 2>/dev/null; then
+    printf 'RELAYPANEL_RELEASE_VERSION=%s\n' "$RELAYPANEL_RELEASE_VERSION" >> .env
+fi
+if [ "${RELAYPANEL_RELEASE_REF:-RELEASE_REF_REQUIRED}" != "RELEASE_REF_REQUIRED" ] && ! grep -q '^RELAYPANEL_RELEASE_REF=' .env 2>/dev/null; then
+    printf 'RELAYPANEL_RELEASE_REF=%s\n' "$RELAYPANEL_RELEASE_REF" >> .env
 fi
 
 # ---------- 2b. Database backend resolution ----------
@@ -247,7 +264,6 @@ EOF
     fi
 fi
 
-# Export for compose.
 export DATABASE_URL
 
 # ---------- 2c. Database connectivity pre-flight (v0.4.3) ----------
@@ -527,6 +543,10 @@ fi
 # Resolve PUBLIC_PANEL_URL for all modes so compose does not receive an empty
 # value that would clobber a persisted .env setting during upgrades.
 PUBLIC_PANEL_URL="${PUBLIC_PANEL_URL:-${_saved_public_url:-}}"
+validate_public_panel_url "$PUBLIC_PANEL_URL"
+if [ "$FRESH_INSTALL" = "1" ] && [ -n "$PUBLIC_PANEL_URL" ] && ! grep -q '^PUBLIC_PANEL_URL=' .env 2>/dev/null; then
+    env_set PUBLIC_PANEL_URL "$PUBLIC_PANEL_URL"
+fi
 
 # Resolve optional ACME email so Compose receives the persisted value on Caddy
 # upgrades. Caddyfile uses this value in its global ACME account settings.
@@ -649,7 +669,7 @@ elif [ -f "$RELEASE_COMPOSE" ]; then
     info "Pulling pre-built panel image from GHCR ..."
     COMPOSE_FILE="$RELEASE_COMPOSE"
     COMPOSE_FLAGS=""
-    if ! docker compose -f "$COMPOSE_FILE" "${PROFILE_ARGS[@]}" pull; then
+    if ! docker compose -f "$COMPOSE_FILE" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} pull; then
         fail "Failed to pull images from GHCR. Check your internet connection, or build from source with: RELAYPANEL_BUILD_LOCAL=1 ./deploy.sh"
     fi
 else
@@ -660,8 +680,8 @@ else
 fi
 
 # ---------- 4. Start ----------
-info "Starting services (docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]} up -d $COMPOSE_FLAGS) ..."
-docker compose -f "$COMPOSE_FILE" "${PROFILE_ARGS[@]}" up -d $COMPOSE_FLAGS
+info "Starting services (docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]-} up -d $COMPOSE_FLAGS) ..."
+docker compose -f "$COMPOSE_FILE" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d $COMPOSE_FLAGS
 
 # ---------- 5. Verify ----------
 # Deployment success is decided by the CONTAINER + PORT + a real health
@@ -721,13 +741,13 @@ fi
 
 if [ "$RELAYPANEL_WEB_MODE" = "caddy" ]; then
     info "Verifying Caddy container state ..."
-    caddy_id=$(docker compose -f "$COMPOSE_FILE" "${PROFILE_ARGS[@]}" ps -q caddy 2>/dev/null || true)
+    caddy_id=$(docker compose -f "$COMPOSE_FILE" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} ps -q caddy 2>/dev/null || true)
     if [ -z "$caddy_id" ]; then
-        fail "Caddy container is not running. Check: docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]} logs caddy"
+        fail "Caddy container is not running. Check: docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]-} logs caddy"
     fi
     caddy_state=$(docker inspect --format='{{.State.Status}}' "$caddy_id" 2>/dev/null || echo unknown)
     if [ "$caddy_state" != "running" ]; then
-        fail "Caddy container state is $caddy_state, expected running. Check: docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]} logs caddy"
+        fail "Caddy container state is $caddy_state, expected running. Check: docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]-} logs caddy"
     fi
     info "Caddy container is running"
 
@@ -741,7 +761,7 @@ if [ "$RELAYPANEL_WEB_MODE" = "caddy" ]; then
         sleep 2
     done
     if [ "$caddy_https_ok" != "1" ]; then
-        fail "Caddy HTTPS check failed for https://${RELAYPANEL_DOMAIN}/ after 60s. Ensure DNS points to this server, ports 80/443 are reachable, and check: docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]} logs caddy"
+        fail "Caddy HTTPS check failed for https://${RELAYPANEL_DOMAIN}/ after 60s. Ensure DNS points to this server, ports 80/443 are reachable, and check: docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]-} logs caddy"
     fi
     info "Caddy HTTPS endpoint OK"
 fi
@@ -783,6 +803,6 @@ if [ "${RELAYPANEL_WITH_NODE:-0}" != "1" ]; then
     echo "  To ALSO run node on this host: RELAYPANEL_WITH_NODE=1 ./deploy.sh"
 fi
 echo ""
-echo "  Logs:      docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]} logs -f"
-echo "  Stop:      docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]} down"
+echo "  Logs:      docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]-} logs -f"
+echo "  Stop:      docker compose -f $COMPOSE_FILE ${PROFILE_ARGS[*]-} down"
 echo "  Update:    git pull --quiet && ./deploy.sh"

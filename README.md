@@ -100,11 +100,15 @@ EOF
 docker compose -f docker-compose.release.yaml up -d
 ```
 
-默认镜像：
+正式部署必须显式钉住同一发布的 `RELAYPANEL_RELEASE_REF` 与
+`RELAYPANEL_RELEASE_VERSION`；不要让 fresh install 跟随旧 `main`。Panel 镜像内置
+同一 source ref 构建的 amd64/arm64 relay-node artifact。
+
+镜像标签由最终 release-time version 提供：
 
 ```text
-ghcr.io/pixingzoudaiyuexing/relay-panel-panel:1.2.9
-ghcr.io/pixingzoudaiyuexing/relay-panel-node:1.2.2
+ghcr.io/pixingzoudaiyuexing/relay-panel-panel:<release-version>
+ghcr.io/pixingzoudaiyuexing/relay-panel-node:<explicit-node-tag-if-profile-enabled>
 ```
 
 完整部署细节见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
