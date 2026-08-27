@@ -82,6 +82,18 @@ admin / admin123
 
 首次登录会强制修改密码。
 
+### 卸载本机 Panel
+
+先导出需要保留的 Rules。以下命令只删除本机 `/opt/relay-panel` 的 Panel
+Compose 资源、持久数据和本地配置；不会创建导出文件，也不会操作任何远程 Relay、DNS
+或 Reality 后端。命令会要求输入 `DELETE` 确认：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/<release-ref>/install.sh | bash -s -- uninstall
+```
+
+非交互自动化必须显式附加 `--yes`。
+
 ### Docker Compose
 
 也可以手动部署：

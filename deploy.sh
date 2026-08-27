@@ -25,6 +25,13 @@
 #
 set -euo pipefail
 
+# Keep local removal reachable from the same install/deploy workflow. The
+# installer owns the fixed /opt/relay-panel root and performs the confirmation.
+if [ "${1:-}" = "uninstall" ]; then
+    shift
+    exec "$(cd "$(dirname "$0")" && pwd)/install.sh" uninstall "$@"
+fi
+
 REPO_DIR="${1:-$(cd "$(dirname "$0")" && pwd)}"
 cd "$REPO_DIR"
 

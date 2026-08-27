@@ -24,6 +24,21 @@ Run as root (default on most VPS / cloud servers). If logged in as a non-root
 user, prefix with `sudo`. Debian / Ubuntu only.
 The script refuses to overwrite a non-git directory at `/opt/relay-panel`.
 
+### One-line uninstall
+
+Export any Rules that must be retained before uninstalling. The uninstall command
+removes only the local Panel deployment at `/opt/relay-panel`: its Compose
+containers/networks, project-owned persistent volumes, `.env`, node assets, and
+the cloned source directory. It does not create an export, contact remote Relay
+nodes, change DNS, or remove Reality backends.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/<release-ref>/install.sh | bash -s -- uninstall
+```
+
+Type `DELETE` at the prompt to continue. For non-interactive automation, append
+`--yes` explicitly; it is never the default.
+
 ---
 
 ## Prerequisites

@@ -4,6 +4,7 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/<release-ref>/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/<release-ref>/install.sh | bash -s -- uninstall
 #
 
 # Touch: trigger script-check CI on version-only PRs (paths filter otherwise skips it).
@@ -39,6 +40,103 @@ NC='\033[0m'
 info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 fail()  { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage:
+  install.sh                 Install or upgrade RelayPanel
+  install.sh uninstall       Remove this local RelayPanel deployment
+  install.sh uninstall --yes Remove without the interactive confirmation
+EOF
+}
+
+confirm_uninstall() {
+    local answer=""
+    echo ""
+    warn "RelayPanel uninstall will permanently delete this Panel's local database, configuration, and secrets."
+    warn "Rule exports are NOT created automatically. Export important Rules before continuing."
+    warn "Remote Relay nodes, DNS records, and Reality backends will NOT be touched."
+    echo ""
+    printf "Type DELETE to remove the local RelayPanel deployment: "
+    if [ -t 0 ]; then
+        read -r answer
+    elif { read -r answer < /dev/tty; } 2>/dev/null; then
+        :
+    elif ! read -r answer; then
+        fail "No interactive terminal is available. Re-run with uninstall --yes only after reviewing the warning."
+    fi
+    [ "$answer" = "DELETE" ] || {
+        info "Uninstall cancelled. Nothing was deleted."
+        exit 0
+    }
+}
+
+uninstall_panel() {
+    local yes=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --yes) yes=1 ;;
+            -h|--help) usage; exit 0 ;;
+            *) fail "Unknown uninstall option: $1" ;;
+        esac
+        shift
+    done
+
+    # This script owns one fixed deployment root. Never permit a caller-supplied
+    # path or a glob here: uninstall is intentionally local-panel only.
+    [ "$INSTALL_DIR" = "/opt/relay-panel" ] || fail "Unexpected RelayPanel install root; refusing uninstall."
+
+    if [ ! -e "$INSTALL_DIR" ]; then
+        info "RelayPanel is already absent at ${INSTALL_DIR}. Nothing to uninstall."
+        exit 0
+    fi
+
+    if [ "$yes" -ne 1 ]; then
+        confirm_uninstall
+    fi
+
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        # Both files describe the same fixed project root. Running down for each
+        # makes a partially completed source/release deployment recoverable while
+        # Compose limits deletion to project-scoped containers, networks, and the
+        # named volumes declared by that file.
+        for compose_file in docker-compose.release.yaml docker-compose.yaml; do
+            if [ -f "$INSTALL_DIR/$compose_file" ]; then
+                info "Removing RelayPanel Compose resources from ${compose_file} ..."
+                if ! docker compose --project-directory "$INSTALL_DIR" -f "$INSTALL_DIR/$compose_file" down --volumes --remove-orphans; then
+                    warn "Compose cleanup for ${compose_file} did not complete; continuing with local file cleanup."
+                fi
+            fi
+        done
+    else
+        warn "Docker Compose is unavailable; no containers or volumes can be removed by this run."
+    fi
+
+    # The path is fixed and checked above. This removes only the clone, .env,
+    # runtime files, and local node-assets belonging to this Panel installation.
+    rm -rf -- "$INSTALL_DIR"
+    info "Local RelayPanel deployment removed. Remote Relay nodes were not contacted."
+}
+
+# Uninstall is handled before platform/dependency installation or git cloning.
+# This keeps an already-absent or partial deployment idempotent and avoids any
+# unrelated package changes during removal.
+case "${1:-}" in
+    uninstall)
+        shift
+        uninstall_panel "$@"
+        exit 0
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    "")
+        ;;
+    *)
+        fail "Unknown command: $1 (use uninstall or --help)"
+        ;;
+esac
 
 # Quiet git flags: suppress the file-change stat dump (the `Foo | 123 +++`
 # block) that looks like an error to non-technical users. When DEBUG=1 we drop
