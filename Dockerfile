@@ -42,13 +42,13 @@ COPY --from=frontend-build /frontend/dist /app/public
 # canonical layout used by release images. Production multi-arch images use
 # the panel-release stage below, which supplies both architectures.
 ARG TARGETARCH
-RUN install -d -m 0755 /app/node-assets/${TARGETARCH}
+RUN install -d -m 0755 /opt/relay-panel/node-assets/${TARGETARCH}
 COPY --from=node-build /app/target/release/relay-node /tmp/relay-node
 COPY --from=node-build /app/node-version /tmp/node-version
-RUN install -m 0755 /tmp/relay-node /app/node-assets/${TARGETARCH}/relay-node && \
-    sha256sum /app/node-assets/${TARGETARCH}/relay-node | awk '{print $1}' > /tmp/node-sha && \
-    printf '{"version":"%s","sha256":"%s","size":%s}\n' "$(cat /tmp/node-version)" "$(cat /tmp/node-sha)" "$(wc -c < /app/node-assets/${TARGETARCH}/relay-node)" > /app/node-assets/${TARGETARCH}/metadata.json && \
-    chmod 0644 /app/node-assets/${TARGETARCH}/metadata.json
+RUN install -m 0755 /tmp/relay-node /opt/relay-panel/node-assets/${TARGETARCH}/relay-node && \
+    sha256sum /opt/relay-panel/node-assets/${TARGETARCH}/relay-node | awk '{print $1}' > /tmp/node-sha && \
+    printf '{"version":"%s","sha256":"%s","size":%s}\n' "$(cat /tmp/node-version)" "$(cat /tmp/node-sha)" "$(wc -c < /opt/relay-panel/node-assets/${TARGETARCH}/relay-node)" > /opt/relay-panel/node-assets/${TARGETARCH}/metadata.json && \
+    chmod 0644 /opt/relay-panel/node-assets/${TARGETARCH}/metadata.json
 VOLUME ["/app/data"]
 EXPOSE 18888
 ENV DATABASE_URL="sqlite:/app/data/data.db?mode=rwc" \
@@ -85,18 +85,18 @@ WORKDIR /app
 COPY release-dist/panel/relay-panel /app/relay-panel
 RUN chmod +x /app/relay-panel
 COPY release-dist/frontend /app/public
-COPY release-dist/node-assets /app/node-assets
+COPY release-dist/node-assets /opt/relay-panel/node-assets
 RUN for arch in amd64 arm64; do \
-      test -s "/app/node-assets/$arch/relay-node"; \
-      test -s "/app/node-assets/$arch/metadata.json"; \
-      sha=$(sed -n 's/.*"sha256":"\([0-9A-Fa-f]\{64\}\)".*/\1/p' "/app/node-assets/$arch/metadata.json"); \
-      size=$(sed -n 's/.*"size":\([0-9]\{1,\}\).*/\1/p' "/app/node-assets/$arch/metadata.json"); \
+      test -s "/opt/relay-panel/node-assets/$arch/relay-node"; \
+      test -s "/opt/relay-panel/node-assets/$arch/metadata.json"; \
+      sha=$(sed -n 's/.*"sha256":"\([0-9A-Fa-f]\{64\}\)".*/\1/p' "/opt/relay-panel/node-assets/$arch/metadata.json"); \
+      size=$(sed -n 's/.*"size":\([0-9]\{1,\}\).*/\1/p' "/opt/relay-panel/node-assets/$arch/metadata.json"); \
       test -n "$sha"; \
-      test "$size" = "$(wc -c < /app/node-assets/$arch/relay-node)"; \
-      printf '%s  %s\n' "$sha" "/app/node-assets/$arch/relay-node" | sha256sum -c -; \
+      test "$size" = "$(wc -c < /opt/relay-panel/node-assets/$arch/relay-node)"; \
+      printf '%s  %s\n' "$sha" "/opt/relay-panel/node-assets/$arch/relay-node" | sha256sum -c -; \
     done && \
-    find /app/node-assets -type f -name relay-node -exec chmod 0755 {} + && \
-    find /app/node-assets -type f -name metadata.json -exec chmod 0644 {} +
+    find /opt/relay-panel/node-assets -type f -name relay-node -exec chmod 0755 {} + && \
+    find /opt/relay-panel/node-assets -type f -name metadata.json -exec chmod 0644 {} +
 VOLUME ["/app/data"]
 EXPOSE 18888
 ENV DATABASE_URL="sqlite:/app/data/data.db?mode=rwc" \
