@@ -1234,6 +1234,7 @@ mod tests {
             ws_path: None,
             sni: None,
             camouflage_enabled: false,
+            send_proxy_protocol: false,
             target_addr: "127.0.0.1".into(),
             target_port: 80,
             targets: None,
@@ -1486,6 +1487,112 @@ mod tests {
         ] {
             assert!(audits.iter().any(|entry| entry.action == action));
         }
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_is_admin_only_nginx_only_and_synchronizes_listener_cohort() {
+        let (state, pool) = test_state().await;
+        add_user(&pool, 2, "alice", false).await;
+        add_group(&pool, 11, 1, "relay-in").await;
+        add_group(&pool, 12, 1, "other-relay-in").await;
+
+        let reality = |name: &str, sni: &str, group: i64, port: u16, enabled: bool| {
+            let mut request = rule_req(name, port, group, None);
+            request.public_transport = PublicTransport::NginxSni;
+            request.protocol = Protocol::Tcp;
+            request.sni = Some(sni.into());
+            request.send_proxy_protocol = enabled;
+            request.target_addr = "198.51.100.20".into();
+            request.target_port = 55443;
+            request
+        };
+
+        let Json(first) = create_rule(
+            auth(1, true),
+            State(state.clone()),
+            Json(reality("op1", "op1.example.com", 11, 443, false)),
+        )
+        .await;
+        assert_eq!(first.code, 0, "{}", first.message);
+
+        let Json(second) = create_rule(
+            auth(1, true),
+            State(state.clone()),
+            Json(reality("op2", "op2.example.com", 11, 443, true)),
+        )
+        .await;
+        assert_eq!(second.code, 0, "{}", second.message);
+
+        for (name, group, port) in [("other-port", 11, 444), ("other-group", 12, 443)] {
+            let Json(created) = create_rule(
+                auth(1, true),
+                State(state.clone()),
+                Json(reality(
+                    name,
+                    &format!("{name}.example.com"),
+                    group,
+                    port,
+                    false,
+                )),
+            )
+            .await;
+            assert_eq!(created.code, 0, "{}", created.message);
+        }
+
+        let cohort: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT name, send_proxy_protocol FROM forward_rules \
+             WHERE device_group_in=11 AND listen_port=443 ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cohort, vec![("op1".into(), true), ("op2".into(), true)]);
+
+        let first_id: i64 = sqlx::query_scalar("SELECT id FROM forward_rules WHERE name='op1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let Json(updated) = update_rule(
+            auth(1, true),
+            State(state.clone()),
+            Path(first_id),
+            Json(UpdateRuleRequest {
+                send_proxy_protocol: Some(false),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(updated.code, 0, "{}", updated.message);
+
+        let cohort: Vec<bool> = sqlx::query_scalar(
+            "SELECT send_proxy_protocol FROM forward_rules \
+             WHERE device_group_in=11 AND listen_port=443 ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cohort, vec![false, false]);
+        let isolated: Vec<bool> = sqlx::query_scalar(
+            "SELECT send_proxy_protocol FROM forward_rules \
+             WHERE name IN ('other-port', 'other-group') ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(isolated, vec![false, false]);
+
+        let Json(denied) = create_rule(
+            auth(2, false),
+            State(state.clone()),
+            Json(reality("denied", "denied.example.com", 11, 445, true)),
+        )
+        .await;
+        assert_eq!(denied.code, 403);
+
+        let mut raw = rule_req("raw-invalid", 20000, 11, None);
+        raw.send_proxy_protocol = true;
+        let Json(rejected) = create_rule(auth(1, true), State(state), Json(raw)).await;
+        assert_eq!(rejected.code, 400);
     }
 
     /// create_rule enforces that the referenced inbound group belongs to the
@@ -2204,6 +2311,7 @@ mod tests {
             ws_path: None,
             sni: None,
             camouflage_enabled: false,
+            send_proxy_protocol: false,
             target_addr: "127.0.0.1".into(),
             target_port: 80,
             targets: None,

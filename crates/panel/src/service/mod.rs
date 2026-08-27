@@ -1,3 +1,4 @@
+pub mod acme_dns01;
 pub mod announcements;
 pub mod audit;
 pub mod auto_restart;

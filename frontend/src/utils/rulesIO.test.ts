@@ -162,6 +162,20 @@ describe('buildExportJSON', () => {
     expect(entry.camouflage_enabled).toBe(true);
   });
 
+  it('preserves Proxy Protocol and defaults old exports to OFF', () => {
+    const entry: ExportEntry = JSON.parse(buildExportJSON([mkRule({
+      public_transport: 'nginx_sni',
+      sni: 'op1.example.com',
+      send_proxy_protocol: true,
+    })]))[0];
+    expect(entry.send_proxy_protocol).toBe(true);
+    expect(buildImportedRulePayload(asValidatedEntry(entry), 4).send_proxy_protocol).toBe(true);
+
+    const legacy = { name: 'legacy', listen_port: 443, dest: ['backend.example:55443'] };
+    expect(validateImportEntry(legacy)).toBeNull();
+    expect(buildImportedRulePayload(asValidatedEntry(legacy), 4).send_proxy_protocol).toBe(false);
+  });
+
   it('keeps an all-disabled target set importable through targets', () => {
     const entry = JSON.parse(buildExportJSON([mkRule({
       targets: [tgt('disabled.example', 443, false, 1, 1, 1)],
@@ -215,6 +229,15 @@ describe('validateImportEntry', () => {
       dest: ['1.1.1.1:55443'],
       public_transport: 'nginx_sni',
     })).toMatch(/sni/);
+  });
+  it('rejects Proxy Protocol outside nginx_sni', () => {
+    expect(validateImportEntry({
+      name: 'raw',
+      listen_port: 443,
+      dest: ['1.1.1.1:55443'],
+      public_transport: 'raw',
+      send_proxy_protocol: true,
+    })).toMatch(/requires nginx_sni/);
   });
   it('rejects invalid load-balance strategy', () => {
     expect(validateImportEntry({
@@ -345,6 +368,7 @@ describe('buildImportedRulePayload', () => {
       public_transport: 'nginx_sni',
       sni: 'op1.example.com',
       camouflage_enabled: true,
+      send_proxy_protocol: true,
       load_balance_strategy: 'failover',
       targets: [
         tgt('198.51.100.10', 55443, true, 1, 1, 1),
@@ -360,9 +384,11 @@ describe('buildImportedRulePayload', () => {
       public_transport: 'nginx_sni',
       sni: 'op1.example.com',
       camouflage_enabled: true,
+      send_proxy_protocol: true,
       load_balance_strategy: 'failover',
       device_group_in: 99,
     });
+    expect(payload.send_proxy_protocol).toBe(true);
     expect(payload.targets).toEqual([
       { host: '198.51.100.10', port: 55443, enabled: true },
       { host: '198.51.100.11', port: 55443, enabled: false },
@@ -381,6 +407,7 @@ describe('buildImportedRulePayload', () => {
       protocol: 'tcp_udp',
       public_transport: 'raw',
       camouflage_enabled: false,
+      send_proxy_protocol: false,
       load_balance_strategy: 'first',
       device_group_in: 15,
       targets: [{ host: 'legacy.example', port: 443, enabled: true }],

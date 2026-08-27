@@ -1257,6 +1257,7 @@ mod tests {
         let listeners: Vec<ListenerConfig> = (0..1000)
             .map(|i| ListenerConfig {
                 camouflage_required: false,
+                send_proxy_protocol: false,
                 rule_id: i,
                 port: 40000 + (i as u16),
                 protocol: relay_shared::protocol::Protocol::Tcp,

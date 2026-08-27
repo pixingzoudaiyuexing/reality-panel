@@ -40,6 +40,7 @@ export interface ExportEntry {
   public_transport?: string;
   sni?: string;
   camouflage_enabled?: boolean;
+  send_proxy_protocol?: boolean;
   load_balance_strategy?: string;
 }
 
@@ -76,6 +77,7 @@ export function buildExportJSON(rules: ForwardRule[]): string {
       public_transport: publicTransport,
       sni: publicTransport === 'nginx_sni' ? (r.sni?.trim().toLowerCase() || undefined) : undefined,
       camouflage_enabled: r.camouflage_enabled === true,
+      send_proxy_protocol: publicTransport === 'nginx_sni' && r.send_proxy_protocol === true,
       load_balance_strategy: r.load_balance_strategy ?? 'first',
     };
   });
@@ -109,6 +111,7 @@ export interface ImportEntry {
   node_transport?: string;
   sni?: string;
   camouflage_enabled?: boolean;
+  send_proxy_protocol?: boolean;
   load_balance_strategy?: string;
 }
 
@@ -121,6 +124,7 @@ export interface ValidatedImportEntry {
   public_transport?: string;
   sni?: string;
   camouflage_enabled?: boolean;
+  send_proxy_protocol?: boolean;
   load_balance_strategy?: string;
 }
 
@@ -135,6 +139,7 @@ export interface ImportedRulePayload {
   upload_limit_mbps: number;
   download_limit_mbps: number;
   camouflage_enabled: boolean;
+  send_proxy_protocol: boolean;
   sni?: string;
   device_group_in: number;
   target_addr: string;
@@ -222,6 +227,14 @@ export function validateImportEntry(e: unknown): string | null {
     return 'camouflage_enabled must be boolean';
   }
 
+  const sendProxyProtocol = e['send_proxy_protocol'];
+  if (sendProxyProtocol !== undefined && typeof sendProxyProtocol !== 'boolean') {
+    return 'send_proxy_protocol must be boolean';
+  }
+  if (sendProxyProtocol === true && !isSni) {
+    return 'send_proxy_protocol requires nginx_sni';
+  }
+
   const strategy = e['load_balance_strategy'];
   if (strategy !== undefined && (
     typeof strategy !== 'string' || !['first', 'round_robin', 'failover'].includes(strategy)
@@ -255,6 +268,7 @@ export function asValidatedEntry(e: unknown): ValidatedImportEntry {
     public_transport: publicTransport,
     sni,
     camouflage_enabled: o['camouflage_enabled'] as boolean | undefined,
+    send_proxy_protocol: o['send_proxy_protocol'] as boolean | undefined,
     load_balance_strategy: o['load_balance_strategy'] as string | undefined,
   };
 }
@@ -280,6 +294,7 @@ export function buildImportedRulePayload(entry: ValidatedImportEntry, deviceGrou
     upload_limit_mbps: 0,
     download_limit_mbps: 0,
     camouflage_enabled: entry.camouflage_enabled === true,
+    send_proxy_protocol: publicTransport === 'nginx_sni' && entry.send_proxy_protocol === true,
     sni: publicTransport === 'nginx_sni' ? entry.sni : undefined,
     device_group_in: deviceGroupIn,
     target_addr: first.host,

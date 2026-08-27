@@ -320,6 +320,7 @@ pub trait RuleRepository: Send + Sync {
         ws_path: Option<&str>,
         sni: Option<&str>,
         camouflage_enabled: bool,
+        send_proxy_protocol: bool,
         device_group_in: i64,
         device_group_out: Option<i64>,
         forward_mode: &str,
@@ -369,6 +370,7 @@ pub trait RuleRepository: Send + Sync {
         ws_path: Option<&str>,
         sni: Option<&str>,
         camouflage_enabled: bool,
+        send_proxy_protocol: bool,
         device_group_in: i64,
         device_group_out: Option<i64>,
         forward_mode: &str,
@@ -392,7 +394,7 @@ pub trait RuleRepository: Send + Sync {
         id: i64,
         scope: &ResourceScope,
     ) -> Result<Option<Option<i64>>, DbError>;
-    /// Dynamic update of rule fields, scoped. Returns rows affected.
+    /// Dynamic update of legacy rule fields, scoped. Returns rows affected.
     #[allow(clippy::too_many_arguments)]
     async fn update_rule_fields(
         &self,
@@ -408,6 +410,56 @@ pub trait RuleRepository: Send + Sync {
         ws_path: Option<Option<&str>>,
         sni: Option<Option<&str>>,
         camouflage_enabled: Option<bool>,
+        device_group_in: Option<i64>,
+        device_group_out: Option<Option<i64>>,
+        forward_mode: Option<&str>,
+        target_addr: Option<&str>,
+        target_port: Option<i32>,
+        paused: Option<bool>,
+    ) -> Result<u64, DbError> {
+        self.update_rule_fields_with_proxy_protocol(
+            id,
+            scope,
+            name,
+            listen_port,
+            protocol,
+            public_transport,
+            node_transport,
+            entry_transport,
+            route_mode,
+            ws_path,
+            sni,
+            camouflage_enabled,
+            None,
+            device_group_in,
+            device_group_out,
+            forward_mode,
+            target_addr,
+            target_port,
+            paused,
+        )
+        .await
+    }
+
+    /// Extended dynamic update used by nginx_sni Rule edits. When
+    /// `send_proxy_protocol` is present and the resulting row is nginx_sni, the
+    /// whole listener cohort is synchronized in the same database transaction.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_rule_fields_with_proxy_protocol(
+        &self,
+        id: i64,
+        scope: &ResourceScope,
+        name: Option<&str>,
+        listen_port: Option<i32>,
+        protocol: Option<&str>,
+        public_transport: Option<&str>,
+        node_transport: Option<&str>,
+        entry_transport: Option<&str>,
+        route_mode: Option<&str>,
+        ws_path: Option<Option<&str>>,
+        sni: Option<Option<&str>>,
+        camouflage_enabled: Option<bool>,
+        send_proxy_protocol: Option<bool>,
         device_group_in: Option<i64>,
         device_group_out: Option<Option<i64>>,
         forward_mode: Option<&str>,

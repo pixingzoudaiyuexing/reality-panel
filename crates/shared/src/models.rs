@@ -87,6 +87,10 @@ pub struct ForwardRule {
     /// matching Relay-local CamouflageSite is active.
     #[serde(default)]
     pub camouflage_enabled: bool,
+    /// Send HAProxy PROXY protocol v1 from the shared nginx_sni listener to
+    /// every selected upstream. Existing rows default off.
+    #[serde(default)]
+    pub send_proxy_protocol: bool,
     pub target_addr: String,
     pub target_port: i32,
     #[serde(default)]

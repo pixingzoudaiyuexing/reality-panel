@@ -1,4 +1,4 @@
-use crate::protocol::{CamouflageLocalBackend, NodeConfigResponse, Protocol};
+use crate::protocol::{AcmeChallengeMethod, CamouflageLocalBackend, NodeConfigResponse, Protocol};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -42,6 +42,7 @@ struct CanonicalListener {
     ws_path: Option<String>,
     sni: Option<String>,
     camouflage_required: bool,
+    send_proxy_protocol: bool,
     // Target order is intentionally preserved because it affects routing.
     targets: Vec<String>,
     load_balance_strategy: &'static str,
@@ -59,6 +60,7 @@ struct CanonicalCamouflageSite {
     certificate_domain: String,
     expected_public_ip: String,
     renew_before_days: u32,
+    challenge_method: &'static str,
     enabled: bool,
 }
 
@@ -76,6 +78,7 @@ pub fn config_fingerprint(config: &NodeConfigResponse) -> ConfigFingerprint {
             ws_path: listener.ws_path.clone(),
             sni: listener.sni.clone(),
             camouflage_required: listener.camouflage_required,
+            send_proxy_protocol: listener.send_proxy_protocol,
             targets: listener.targets.clone(),
             load_balance_strategy: listener.load_balance_strategy.to_db_str(),
             upload_limit_bps: listener.upload_limit_bps,
@@ -98,6 +101,10 @@ pub fn config_fingerprint(config: &NodeConfigResponse) -> ConfigFingerprint {
             certificate_domain: site.certificate.domain.clone(),
             expected_public_ip: site.certificate.expected_public_ip.clone(),
             renew_before_days: site.certificate.renew_before_days,
+            challenge_method: match site.certificate.challenge_method {
+                AcmeChallengeMethod::Http01 => "http01",
+                AcmeChallengeMethod::Dns01 => "dns01",
+            },
             enabled: site.enabled,
         })
         .collect();
@@ -146,6 +153,7 @@ mod tests {
             ws_path: None,
             sni: Some(format!("op{rule_id}.example.com")),
             camouflage_required: true,
+            send_proxy_protocol: false,
             targets: targets.iter().map(|target| (*target).to_string()).collect(),
             load_balance_strategy: LoadBalanceStrategy::First,
             upload_limit_bps: None,
@@ -164,6 +172,7 @@ mod tests {
                 domain: format!("{id}.example.com"),
                 expected_public_ip: "192.0.2.10".to_string(),
                 renew_before_days: 30,
+                challenge_method: Default::default(),
             },
             enabled: true,
         }
@@ -216,5 +225,25 @@ mod tests {
         let mut changed = config();
         changed.listeners[0].max_connections = Some(10);
         assert_ne!(config_fingerprint(&first), config_fingerprint(&changed));
+    }
+
+    #[test]
+    fn proxy_protocol_change_changes_fingerprint_and_unchanged_state_is_stable() {
+        let off = config();
+        let mut on = config();
+        on.listeners[0].send_proxy_protocol = true;
+
+        assert_ne!(config_fingerprint(&off), config_fingerprint(&on));
+        assert_eq!(config_fingerprint(&off), config_fingerprint(&off));
+        assert_eq!(config_fingerprint(&on), config_fingerprint(&on));
+    }
+
+    #[test]
+    fn acme_challenge_method_change_changes_fingerprint() {
+        let http01 = config();
+        let mut dns01 = config();
+        dns01.camouflage_sites[0].certificate.challenge_method = AcmeChallengeMethod::Dns01;
+
+        assert_ne!(config_fingerprint(&http01), config_fingerprint(&dns01));
     }
 }

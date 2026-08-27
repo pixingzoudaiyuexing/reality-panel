@@ -68,6 +68,8 @@ export interface ForwardRule {
   sni?: string | null;
   /** Relay-local :8443/OpenList camouflage dependency for Reality SNI rules. */
   camouflage_enabled?: boolean;
+  /** Send HAProxy PROXY protocol v1 to the nginx_sni upstream cohort. */
+  send_proxy_protocol?: boolean;
   device_group_in: number;
   device_group_out: number | null;
   forward_mode: string;

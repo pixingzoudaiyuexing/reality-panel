@@ -76,8 +76,8 @@ pub struct CamouflageSiteManager {
     renewal_gate: Arc<RenewalGate>,
     desired: Vec<CamouflageSiteDesired>,
     last_errors: HashMap<String, String>,
+    renewal_warnings: HashMap<String, (String, String)>,
     panel_authority_established: bool,
-    http01_runtime: Option<String>,
 }
 
 impl CamouflageSiteManager {
@@ -88,8 +88,8 @@ impl CamouflageSiteManager {
             renewal_gate: Arc::new(RenewalGate::default()),
             desired: Vec::new(),
             last_errors: HashMap::new(),
+            renewal_warnings: HashMap::new(),
             panel_authority_established: false,
-            http01_runtime: None,
         }
     }
 
@@ -189,6 +189,7 @@ impl CamouflageSiteManager {
                 email: None,
                 expected_public_ip: desired_site.certificate.expected_public_ip.clone(),
                 renew_before_days: desired_site.certificate.renew_before_days,
+                challenge_method: desired_site.certificate.challenge_method,
             });
             let certificate = previous
                 .as_ref()
@@ -271,7 +272,18 @@ impl CamouflageSiteManager {
     pub fn active_snis(&self) -> HashSet<String> {
         self.active
             .as_ref()
-            .map(|manifest| manifest.sites.iter().map(|site| site.sni.clone()).collect())
+            .map(|manifest| {
+                manifest
+                    .sites
+                    .iter()
+                    .filter(|site| {
+                        !self.config.certificate_lifecycle.enabled
+                            || site.certificate.lifecycle.is_none()
+                            || CertificateLifecycle::is_usable(&site.certificate, &site.sni)
+                    })
+                    .map(|site| site.sni.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -348,7 +360,13 @@ impl CamouflageSiteManager {
                 let metadata =
                     active.and_then(|site| inspect_certificate(&site.certificate.cert_path).ok());
                 let error = self.last_errors.get(&desired.site_id).cloned();
-                let is_active = active.is_some() && metadata.is_some();
+                let renewal_warning = self.renewal_warnings.get(&desired.site_id).cloned();
+                let is_active = active.is_some_and(|site| {
+                    metadata.is_some()
+                        && (!self.config.certificate_lifecycle.enabled
+                            || site.certificate.lifecycle.is_none()
+                            || CertificateLifecycle::is_usable(&site.certificate, &site.sni))
+                });
                 let failed = !is_active && error.is_some();
                 CamouflageSiteStatus {
                     site_id: desired.site_id.clone(),
@@ -375,8 +393,8 @@ impl CamouflageSiteManager {
                     // The certificate not-before is the durable Node-local
                     // issuance/renewal timestamp available after restart.
                     last_success: metadata.as_ref().map(|value| value.valid_from.clone()),
-                    last_attempt: None,
-                    last_error: error,
+                    last_attempt: renewal_warning.as_ref().map(|(attempt, _)| attempt.clone()),
+                    last_error: renewal_warning.map(|(_, warning)| warning).or(error),
                     active_generation: active.and_then(|site| {
                         site.certificate
                             .cert_path
@@ -433,8 +451,21 @@ impl CamouflageSiteManager {
         }
 
         let lifecycle = CertificateLifecycle::new(self.config.certificate_lifecycle.clone());
-        lifecycle.prepare_http01_once(&manifest, &mut self.http01_runtime)?;
-        let (candidate, actions) = lifecycle.reconcile_prepared(&manifest)?;
+        let (candidate, actions) = lifecycle.reconcile(&manifest)?;
+        for (site, action) in candidate.sites.iter().zip(actions.iter()) {
+            if *action == LifecycleAction::RenewalWarning {
+                self.renewal_warnings.insert(
+                    site.id.clone(),
+                    (
+                        chrono::Utc::now().to_rfc3339(),
+                        "Certificate remains valid; automatic renewal failed and will be retried"
+                            .into(),
+                    ),
+                );
+            } else {
+                self.renewal_warnings.remove(&site.id);
+            }
+        }
         if self.active.as_ref() == Some(&candidate) && self.runtime_matches(&candidate) {
             return Ok(());
         }
@@ -888,6 +919,7 @@ fn quote_nginx_path(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::time::{Duration as TimeDuration, OffsetDateTime};
 
     fn unique_dir(label: &str) -> PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -906,6 +938,30 @@ mod tests {
         let key_path = dir.join(format!("{name}.key"));
         write_private_file(&cert_path, b"test certificate").unwrap();
         write_private_file(&key_path, b"test private key").unwrap();
+        CertificateReference {
+            cert_path,
+            key_path,
+            lifecycle: None,
+        }
+    }
+
+    fn real_certificate(
+        dir: &Path,
+        name: &str,
+        sni: &str,
+        valid_for_days: i64,
+    ) -> CertificateReference {
+        use rcgen::{CertificateParams, KeyPair};
+        create_private_dir(dir).unwrap();
+        let mut params = CertificateParams::new(vec![sni.to_string()]).unwrap();
+        params.not_before = OffsetDateTime::now_utc() - TimeDuration::days(1);
+        params.not_after = OffsetDateTime::now_utc() + TimeDuration::days(valid_for_days);
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        let cert_path = dir.join(format!("{name}.crt"));
+        let key_path = dir.join(format!("{name}.key"));
+        write_private_file(&cert_path, certificate.pem().as_bytes()).unwrap();
+        write_private_file(&key_path, key.serialize_pem().as_bytes()).unwrap();
         CertificateReference {
             cert_path,
             key_path,
@@ -1148,6 +1204,73 @@ mod tests {
         assert!(!manager.apply_candidate(invalid));
         assert_eq!(fs::read(manager.lkg_path()).unwrap(), before);
         assert!(!manager.lkg_tmp_path().exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_renewal_keeps_route_active_and_does_not_replace_lkg() {
+        let dir = unique_dir("renewal-warning-lkg");
+        let mut manager = manager(&dir, "true", "true");
+        manager.config.certificate_lifecycle = CertificateLifecycleConfig {
+            enabled: true,
+            certbot_binary: PathBuf::from("/bin/false"),
+            certbot_live_dir: dir.join("letsencrypt/live"),
+            webroot: dir.join("webroot"),
+            state_dir: dir.join("certificates"),
+            dns01_hook_binary: PathBuf::from("/opt/relay-node/relay-node"),
+            http01_nginx: NginxSniConfig {
+                enabled: true,
+                conf_path: dir.join("acme.conf"),
+                test_cmd: "true".into(),
+                reload_cmd: "true".into(),
+                default_backend: "127.0.0.1:9".into(),
+                access_log_path: dir.join("stream.log").display().to_string(),
+            },
+        };
+        let lifecycle = CertificateLifecyclePolicy {
+            domain: "op1.example.com".into(),
+            email: None,
+            expected_public_ip: "192.0.2.10".into(),
+            renew_before_days: 30,
+            challenge_method: relay_shared::protocol::AcmeChallengeMethod::Dns01,
+        };
+        let mut reference = real_certificate(&dir, "op1", "op1.example.com", 10);
+        reference.lifecycle = Some(lifecycle);
+        assert!(manager.apply_candidate(CamouflageSitesManifest {
+            sites: vec![CamouflageSite {
+                id: "op1_example_com".into(),
+                sni: "op1.example.com".into(),
+                tls_listener_port: CAMOUFLAGE_TLS_PORT,
+                local_backend: OPENLIST_BACKEND.into(),
+                certificate: reference,
+            }],
+        }));
+        let lkg_before = fs::read(manager.lkg_path()).unwrap();
+        let active = manager.prepare_desired(
+            &[CamouflageSiteDesired {
+                site_id: "op1_example_com".into(),
+                sni: "op1.example.com".into(),
+                tls_listener_port: CAMOUFLAGE_TLS_PORT,
+                local_backend: relay_shared::protocol::CamouflageLocalBackend::OpenList,
+                certificate: relay_shared::protocol::CamouflageCertificatePolicy {
+                    domain: "op1.example.com".into(),
+                    expected_public_ip: "192.0.2.10".into(),
+                    renew_before_days: 30,
+                    challenge_method: relay_shared::protocol::AcmeChallengeMethod::Dns01,
+                },
+                enabled: true,
+            }],
+            true,
+        );
+        assert!(active.contains("op1.example.com"));
+        assert_eq!(fs::read(manager.lkg_path()).unwrap(), lkg_before);
+        let status = manager.status_snapshot();
+        assert_eq!(status[0].site_status, "active");
+        assert_eq!(status[0].certificate_status, "active");
+        assert!(status[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("automatic renewal failed")));
         let _ = fs::remove_dir_all(dir);
     }
 

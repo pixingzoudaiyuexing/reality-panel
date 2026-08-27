@@ -21,7 +21,8 @@ use crate::db::repo::{GroupRepository, ProfileScope, ResourceScope, TunnelProfil
 use crate::db::Repository;
 use relay_shared::models::{DeviceGroup, ForwardRule};
 use relay_shared::protocol::{
-    CamouflageCertificatePolicy, CamouflageLocalBackend, CamouflageSiteDesired, NodeConfigResponse,
+    validate_proxy_protocol_invariants, AcmeChallengeMethod, CamouflageCertificatePolicy,
+    CamouflageLocalBackend, CamouflageSiteDesired, NodeConfigResponse,
 };
 use std::collections::BTreeMap;
 
@@ -30,6 +31,7 @@ pub enum NodeConfigBuildError {
     Database(DbError),
     GroupNotFound,
     NotInboundGroup,
+    InvalidConfig(String),
 }
 
 impl std::fmt::Display for NodeConfigBuildError {
@@ -38,6 +40,7 @@ impl std::fmt::Display for NodeConfigBuildError {
             Self::Database(e) => write!(f, "database error: {}", e),
             Self::GroupNotFound => write!(f, "device group no longer exists"),
             Self::NotInboundGroup => write!(f, "device group is not inbound"),
+            Self::InvalidConfig(message) => write!(f, "invalid node config: {message}"),
         }
     }
 }
@@ -91,6 +94,11 @@ pub async fn build_node_config(
     //    unfiltered cached config ("forward over bill" trade-off). Do not change
     //    without a product decision.
     let rules: Vec<ForwardRule> = db.list_active_for_config(group.id).await?;
+    let dns01_available = db
+        .get(crate::service::dnsmgr::DNSMGR_CONFIG_KEY)
+        .await?
+        .map(|raw| crate::service::dnsmgr::DnsMgrSettings::from_json(Some(&raw)))
+        .is_some_and(|settings| settings.enabled && settings.configured());
 
     // 3 + 4. Resolve targets and build listener configs. Target resolution needs
     //    a DB lookup (outbound group's connect_host), so it stays async and lives
@@ -167,12 +175,19 @@ pub async fn build_node_config(
                             domain: sni,
                             expected_public_ip: group.connect_host.trim().to_string(),
                             renew_before_days: 30,
+                            challenge_method: if dns01_available {
+                                AcmeChallengeMethod::Dns01
+                            } else {
+                                AcmeChallengeMethod::Http01
+                            },
                         },
                         enabled: true,
                     });
             }
         }
     }
+
+    validate_proxy_protocol_invariants(&listeners).map_err(NodeConfigBuildError::InvalidConfig)?;
 
     Ok(NodeConfigResponse {
         listeners,
@@ -239,6 +254,7 @@ fn format_target_endpoint(host: &str, port: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::repo::KvsRepository;
     use crate::db::schema::SCHEMA_SQL;
     use crate::db::sqlite_repo::SqliteRepository;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -545,6 +561,10 @@ mod tests {
         assert_eq!(site.tls_listener_port, 8443);
         assert_eq!(site.certificate.expected_public_ip, "203.0.113.10");
         assert_eq!(site.certificate.renew_before_days, 30);
+        assert_eq!(
+            site.certificate.challenge_method,
+            AcmeChallengeMethod::Http01
+        );
 
         let json = serde_json::to_string(&cfg).unwrap();
         for forbidden in [
@@ -571,5 +591,61 @@ mod tests {
             backend_update.camouflage_sites, cfg.camouflage_sites,
             "same-SNI backend changes must not recreate certificate desired state"
         );
+
+        let repository = repo(&pool);
+        repository
+            .set(
+                crate::service::dnsmgr::DNSMGR_CONFIG_KEY,
+                &serde_json::json!({
+                    "enabled": true,
+                    "base_url": "http://127.0.0.1:18080",
+                    "uid": 7,
+                    "api_key": "panel-only-test-key"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let dns01 = build_node_config(&repository, 10).await.unwrap();
+        assert_eq!(
+            dns01.camouflage_sites[0].certificate.challenge_method,
+            AcmeChallengeMethod::Dns01
+        );
+        let wire = serde_json::to_string(&dns01).unwrap();
+        assert!(!wire.contains("panel-only-test-key"));
+        assert!(!wire.contains("api_key"));
+    }
+
+    #[tokio::test]
+    async fn mixed_proxy_protocol_state_fails_canonical_config_build() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        add_group(&pool, 10, "in", 2).await;
+        add_rule(&pool, 100, 2, 10, 443).await;
+        sqlx::query(
+            "UPDATE forward_rules SET protocol='tcp', public_transport='nginx_sni', \
+             node_transport='nginx_sni', entry_transport='nginx_sni', \
+             sni='op1.example.com' WHERE id=100",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        add_rule(&pool, 101, 2, 10, 443).await;
+        sqlx::query(
+            "UPDATE forward_rules SET protocol='tcp', public_transport='nginx_sni', \
+             node_transport='nginx_sni', entry_transport='nginx_sni', \
+             sni=CASE id WHEN 100 THEN 'op1.example.com' ELSE 'op2.example.com' END, \
+             send_proxy_protocol=CASE id WHEN 100 THEN 1 ELSE 0 END, \
+             target_addr='198.51.100.20', target_port=55443 WHERE id IN (100, 101)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            build_node_config(&repo(&pool), 10).await,
+            Err(NodeConfigBuildError::InvalidConfig(message))
+                if message.contains("mixed upstream Proxy Protocol modes")
+        ));
     }
 }

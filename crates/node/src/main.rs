@@ -1,3 +1,4 @@
+mod acme_dns01;
 mod config;
 mod diagnose;
 mod forwarder;
@@ -61,6 +62,19 @@ fn main() -> ExitCode {
     // touching the network or spawning the service loop. This matches the
     // conventional CLI contract: version/help must not start the service.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if acme_dns01::is_hook_command(&args) {
+        if install_crypto_provider().is_err() {
+            eprintln!("ACME DNS-01 hook failed: TLS provider unavailable");
+            return ExitCode::FAILURE;
+        }
+        return match acme_dns01::run_hook(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("ACME DNS-01 hook failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if let Some(result) = lifecycle::run_helper_from_args(&args) {
         return match result {
             Ok(()) => ExitCode::SUCCESS,

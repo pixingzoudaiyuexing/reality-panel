@@ -38,6 +38,7 @@ impl SqliteRepository {
             ws_path,
             None,
             false,
+            false,
             device_group_in,
             device_group_out,
             forward_mode,
@@ -82,6 +83,7 @@ impl SqliteRepository {
             entry_transport,
             ws_path,
             None,
+            false,
             false,
             device_group_in,
             device_group_out,
@@ -436,6 +438,7 @@ impl RuleRepository for SqliteRepository {
         ws_path: Option<&str>,
         sni: Option<&str>,
         camouflage_enabled: bool,
+        send_proxy_protocol: bool,
         device_group_in: i64,
         device_group_out: Option<i64>,
         forward_mode: &str,
@@ -499,9 +502,9 @@ impl RuleRepository for SqliteRepository {
         let result = sqlx::query(
             "INSERT INTO forward_rules \
                (name, uid, listen_port, protocol, public_transport, node_transport, \
-                route_mode, entry_transport, ws_path, sni, camouflage_enabled, \
+                route_mode, entry_transport, ws_path, sni, camouflage_enabled, send_proxy_protocol, \
                 device_group_in, device_group_out, forward_mode, target_addr, target_port) \
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
              WHERE (SELECT max_rules FROM users WHERE id = ?) = 0 \
                 OR (SELECT COUNT(*) FROM forward_rules WHERE uid = ?) \
                    < (SELECT max_rules FROM users WHERE id = ?)",
@@ -517,6 +520,7 @@ impl RuleRepository for SqliteRepository {
         .bind(ws_path)
         .bind(sni)
         .bind(camouflage_enabled)
+        .bind(send_proxy_protocol)
         .bind(device_group_in)
         .bind(device_group_out)
         .bind(forward_mode)
@@ -553,6 +557,7 @@ impl RuleRepository for SqliteRepository {
         ws_path: Option<&str>,
         sni: Option<&str>,
         camouflage_enabled: bool,
+        send_proxy_protocol: bool,
         device_group_in: i64,
         device_group_out: Option<i64>,
         forward_mode: &str,
@@ -630,9 +635,9 @@ impl RuleRepository for SqliteRepository {
             sqlx::query(
                 "INSERT INTO forward_rules \
                    (name, uid, listen_port, protocol, public_transport, node_transport, \
-                    route_mode, entry_transport, ws_path, sni, camouflage_enabled, \
+                    route_mode, entry_transport, ws_path, sni, camouflage_enabled, send_proxy_protocol, \
                     device_group_in, device_group_out, forward_mode, target_addr, target_port) \
-                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
                  WHERE (SELECT max_rules FROM users WHERE id = ?) = 0 \
                     OR (SELECT COUNT(*) FROM forward_rules WHERE uid = ?) \
                        < (SELECT max_rules FROM users WHERE id = ?)",
@@ -648,6 +653,7 @@ impl RuleRepository for SqliteRepository {
             .bind(ws_path)
             .bind(sni)
             .bind(camouflage_enabled)
+            .bind(send_proxy_protocol)
             .bind(device_group_in)
             .bind(device_group_out)
             .bind(forward_mode)
@@ -667,6 +673,21 @@ impl RuleRepository for SqliteRepository {
             return Ok(None);
         }
         let rule_id = result.last_insert_rowid();
+
+        if is_nginx_sni {
+            try_!(
+                conn,
+                sqlx::query(
+                    "UPDATE forward_rules SET send_proxy_protocol = ? \
+                     WHERE device_group_in = ? AND listen_port = ? AND node_transport = 'nginx_sni'",
+                )
+                .bind(send_proxy_protocol)
+                .bind(device_group_in)
+                .bind(listen_port)
+                .execute(&mut *conn)
+                .await
+            );
+        }
 
         // Targets: DELETE-then-INSERT keeps the SQL identical to
         // replace_rule_targets (the row is brand new, so there are none).
@@ -783,7 +804,7 @@ impl RuleRepository for SqliteRepository {
         Ok(row.map(|(v,)| v))
     }
 
-    async fn update_rule_fields(
+    async fn update_rule_fields_with_proxy_protocol(
         &self,
         id: i64,
         scope: &ResourceScope,
@@ -797,6 +818,7 @@ impl RuleRepository for SqliteRepository {
         ws_path: Option<Option<&str>>,
         sni: Option<Option<&str>>,
         camouflage_enabled: Option<bool>,
+        send_proxy_protocol: Option<bool>,
         device_group_in: Option<i64>,
         device_group_out: Option<Option<i64>>,
         forward_mode: Option<&str>,
@@ -833,6 +855,9 @@ impl RuleRepository for SqliteRepository {
         }
         if camouflage_enabled.is_some() {
             sets.push("camouflage_enabled = ?");
+        }
+        if send_proxy_protocol.is_some() {
+            sets.push("send_proxy_protocol = ?");
         }
         if device_group_in.is_some() {
             sets.push("device_group_in = ?");
@@ -898,6 +923,9 @@ impl RuleRepository for SqliteRepository {
         if let Some(v) = camouflage_enabled {
             q = q.bind(v);
         }
+        if let Some(v) = send_proxy_protocol {
+            q = q.bind(v);
+        }
         if let Some(v) = device_group_in {
             q = q.bind(v);
         }
@@ -921,7 +949,25 @@ impl RuleRepository for SqliteRepository {
             q = q.bind(uid);
         }
 
-        let result = q.execute(&self.pool).await?;
+        let mut tx = self.pool.begin().await?;
+        let result = q.execute(&mut *tx).await?;
+        if result.rows_affected() > 0 {
+            if let Some(enabled) = send_proxy_protocol {
+                sqlx::query(
+                    "UPDATE forward_rules SET send_proxy_protocol = ? \
+                     WHERE node_transport = 'nginx_sni' \
+                       AND (device_group_in, listen_port) = ( \
+                           SELECT device_group_in, listen_port FROM forward_rules \
+                           WHERE id = ? AND node_transport = 'nginx_sni' \
+                       )",
+                )
+                .bind(enabled)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 

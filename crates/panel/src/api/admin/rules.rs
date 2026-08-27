@@ -45,6 +45,9 @@ pub async fn create_rule(
             "camouflage-enabled Reality relay rules are admin-only",
         ));
     }
+    if req.send_proxy_protocol && !user.admin {
+        return Json(err(403, "upstream Proxy Protocol is admin-only"));
+    }
     // v1.0.4: non-admin users with a RESTRICTED permission group (group set +
     // allow_all_groups=false) can only create rules on authorized device
     // groups. An empty authorized list means "no groups allowed" → deny. Legacy
@@ -148,6 +151,15 @@ pub async fn update_rule(
             403,
             "camouflage-enabled Reality relay rules are admin-only",
         ));
+    }
+    if !user.admin
+        && (existing_snapshot
+            .as_ref()
+            .map(|rule| rule.send_proxy_protocol)
+            .unwrap_or(false)
+            || req.send_proxy_protocol == Some(true))
+    {
+        return Json(err(403, "upstream Proxy Protocol is admin-only"));
     }
     // v1.0.4: restricted non-admin users can only switch to authorized device
     // groups. Legacy/allow-all users skip this. DB error → 500.

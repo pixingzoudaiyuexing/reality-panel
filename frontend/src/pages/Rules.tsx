@@ -122,6 +122,17 @@ export function deriveCamouflageStatus(
   return { state: 'unknown', nodes: nodeViews, activeCount, totalCount };
 }
 
+export function camouflageCertificateMessage(
+  certificateState: string | undefined,
+  error: string | undefined,
+  translate: (key: string) => string,
+): string | undefined {
+  if (!error) return undefined;
+  if (certificateState === 'active') return translate('certificateRenewalWarning');
+  if (error.toLowerCase().includes('dns')) return translate('camouflageDnsMismatch');
+  return error;
+}
+
 export interface CamouflageNodeStatusView {
   nodeId?: string;
   relayIp?: string;
@@ -217,6 +228,28 @@ export function CamouflageFormFields({
         <Alert type="info" showIcon title={t('remoteRealityFallbackHint')} style={{ marginBottom: 12 }} />
       )}
     </>
+  );
+}
+
+export function ProxyProtocolFormField({
+  initialValue,
+  isAdmin,
+  t,
+}: {
+  initialValue?: boolean;
+  isAdmin: boolean;
+  t: (key: string) => string;
+}) {
+  return (
+    <Form.Item
+      name="send_proxy_protocol"
+      label={t('sendProxyProtocol')}
+      valuePropName="checked"
+      initialValue={initialValue}
+      extra={t('sendProxyProtocolHint')}
+    >
+      <Switch aria-label={t('sendProxyProtocol')} disabled={!isAdmin} />
+    </Form.Item>
   );
 }
 
@@ -430,6 +463,7 @@ export default function Rules() {
     owner_uid?: number | null;
     sni?: string;
     camouflage_enabled?: boolean;
+    send_proxy_protocol?: boolean;
   }) => {
     const transport = values.public_transport === 'nginx_sni' ? 'nginx_sni' : 'raw';
     const sni = normalizeSni(values.sni);
@@ -453,6 +487,7 @@ export default function Rules() {
       public_transport: transport,
       sni,
       camouflage_enabled: transport === 'nginx_sni' && values.camouflage_enabled === true,
+      send_proxy_protocol: transport === 'nginx_sni' && values.send_proxy_protocol === true,
       tunnel_profile_id: null,
       forward_mode: 'direct',
       route_mode: 'direct',
@@ -476,6 +511,7 @@ export default function Rules() {
       public_transport: r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni' ? 'nginx_sni' : 'raw',
       sni: r.sni ?? undefined,
       camouflage_enabled: r.camouflage_enabled === true,
+      send_proxy_protocol: r.send_proxy_protocol === true,
       device_group_in: r.device_group_in,
       target_addr: r.target_addr, target_port: r.target_port,
       targets: ruleTargets(r),
@@ -498,6 +534,7 @@ export default function Rules() {
       public_transport: r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni' ? 'nginx_sni' : 'raw',
       sni: r.sni ?? undefined,
       camouflage_enabled: r.camouflage_enabled === true,
+      send_proxy_protocol: r.send_proxy_protocol === true,
       device_group_in: r.device_group_in,
       target_addr: r.target_addr,
       target_port: r.target_port,
@@ -574,6 +611,7 @@ export default function Rules() {
     public_transport?: string;
     sni?: string;
     camouflage_enabled?: boolean;
+    send_proxy_protocol?: boolean;
   }) => {
     if (!editing) return;
     const payload: Record<string, unknown> = {};
@@ -593,6 +631,8 @@ export default function Rules() {
     if (newTransport === 'raw' && oldTransport === 'nginx_sni') payload.sni = null;
     const newCamouflage = newTransport === 'nginx_sni' && values.camouflage_enabled === true;
     if (newCamouflage !== (editing.camouflage_enabled === true)) payload.camouflage_enabled = newCamouflage;
+    const newProxyProtocol = newTransport === 'nginx_sni' && values.send_proxy_protocol === true;
+    if (newProxyProtocol !== (editing.send_proxy_protocol === true)) payload.send_proxy_protocol = newProxyProtocol;
     if (values.device_group_in !== undefined && values.device_group_in !== editing.device_group_in) payload.device_group_in = values.device_group_in;
     const newTargets = formTargets(values);
     const oldTargets = ruleTargets(editing);
@@ -932,7 +972,13 @@ export default function Rules() {
                     <Tag>{t('camouflage')}: {node.siteState}</Tag>
                     <Tag>{t('certificate')}: {node.certificateState}</Tag>
                   </Space>
-                  {node.lastError && <div><Text type={view.state === 'failed' ? 'danger' : 'secondary'}>{node.lastError}</Text></div>}
+                  {node.lastError && (
+                    <div>
+                      <Text type={node.certificateState === 'active' ? 'warning' : view.state === 'failed' ? 'danger' : 'secondary'}>
+                        {camouflageCertificateMessage(node.certificateState, node.lastError, t)}
+                      </Text>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -960,8 +1006,8 @@ export default function Rules() {
             {status?.valid_until && <Text type="secondary">{t('expires')}: {new Date(status.valid_until).toLocaleDateString()} ({days}d)</Text>}
             {status?.last_success && <Text type="secondary">{t('lastCertificateSuccess')}: {new Date(status.last_success).toLocaleString()}</Text>}
             {status?.last_error && (
-              <Text type="danger">
-                {status.last_error.toLowerCase().includes('dns') ? t('camouflageDnsMismatch') : status.last_error}
+              <Text type={status.certificate_status === 'active' ? 'warning' : 'danger'}>
+                {camouflageCertificateMessage(status.certificate_status, status.last_error, t)}
               </Text>
             )}
           </Space>
@@ -1078,6 +1124,7 @@ export default function Rules() {
       createForm.setFieldsValue({ protocol: 'tcp', listen_port: createForm.getFieldValue('listen_port') ?? 443 });
     } else {
       createForm.setFieldValue('camouflage_enabled', false);
+      createForm.setFieldValue('send_proxy_protocol', false);
     }
   };
 
@@ -1086,6 +1133,7 @@ export default function Rules() {
       editForm.setFieldsValue({ protocol: 'tcp', listen_port: editForm.getFieldValue('listen_port') ?? 443 });
     } else {
       editForm.setFieldValue('camouflage_enabled', false);
+      editForm.setFieldValue('send_proxy_protocol', false);
     }
   };
 
@@ -1371,6 +1419,7 @@ export default function Rules() {
                       isAdmin={isAdmin}
                       t={t}
                     />
+                    <ProxyProtocolFormField initialValue={false} isAdmin={isAdmin} t={t} />
                   </>
                 )}
                 <Form.Item name="protocol" label={t('protocol')} rules={[{ required: true }]} initialValue="tcp_udp"
@@ -1444,6 +1493,7 @@ export default function Rules() {
                       isAdmin={isAdmin}
                       t={t}
                     />
+                    <ProxyProtocolFormField isAdmin={isAdmin} t={t} />
                   </>
                 )}
                 <Form.Item name="protocol" label={t('protocol')}

@@ -6,6 +6,7 @@
 
 use super::camouflage_site::{CamouflageSite, CamouflageSitesManifest, CertificateReference};
 use super::nginx_sni::{self, NginxSniConfig};
+use relay_shared::protocol::AcmeChallengeMethod;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -30,6 +31,8 @@ pub struct CertificateLifecyclePolicy {
     pub expected_public_ip: String,
     #[serde(default = "default_renew_before_days")]
     pub renew_before_days: u32,
+    #[serde(default)]
+    pub challenge_method: AcmeChallengeMethod,
 }
 
 fn default_renew_before_days() -> u32 {
@@ -43,6 +46,7 @@ pub struct CertificateLifecycleConfig {
     pub certbot_live_dir: PathBuf,
     pub webroot: PathBuf,
     pub state_dir: PathBuf,
+    pub dns01_hook_binary: PathBuf,
     pub http01_nginx: NginxSniConfig,
 }
 
@@ -55,6 +59,7 @@ impl CertificateLifecycleConfig {
             certbot_live_dir: dir.join("letsencrypt/live"),
             webroot: dir.join("webroot"),
             state_dir: dir.join("certificates"),
+            dns01_hook_binary: PathBuf::from("/opt/relay-node/relay-node"),
             http01_nginx: NginxSniConfig {
                 enabled: false,
                 conf_path: dir.join("acme.conf"),
@@ -72,6 +77,7 @@ pub enum LifecycleAction {
     Unchanged,
     Issued,
     Renewed,
+    RenewalWarning,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +175,10 @@ impl CertificateLifecycle<SystemCommandRunner> {
             runner: SystemCommandRunner,
         }
     }
+
+    pub(crate) fn is_usable(reference: &CertificateReference, domain: &str) -> bool {
+        validate_candidate(reference, domain, 0, &SystemCommandRunner, false).is_ok()
+    }
 }
 
 impl<R: CommandRunner> CertificateLifecycle<R> {
@@ -183,11 +193,10 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
         &self,
         source: &CamouflageSitesManifest,
     ) -> Result<(CamouflageSitesManifest, Vec<LifecycleAction>), String> {
-        let mut prepared = None;
-        self.prepare_http01_once(source, &mut prepared)?;
-        self.reconcile_prepared(source)
+        self.reconcile_prepared_with_dns(source, validate_dns)
     }
 
+    #[cfg(test)]
     fn reconcile_with_dns<F>(
         &self,
         source: &CamouflageSitesManifest,
@@ -196,16 +205,7 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
     where
         F: Fn(&str, &str) -> Result<(), String>,
     {
-        let mut prepared = None;
-        self.prepare_http01_once(source, &mut prepared)?;
         self.reconcile_prepared_with_dns(source, dns_validator)
-    }
-
-    pub(crate) fn reconcile_prepared(
-        &self,
-        source: &CamouflageSitesManifest,
-    ) -> Result<(CamouflageSitesManifest, Vec<LifecycleAction>), String> {
-        self.reconcile_prepared_with_dns(source, validate_dns)
     }
 
     fn reconcile_prepared_with_dns<F>(
@@ -222,11 +222,7 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
                 vec![LifecycleAction::Unchanged; source.sites.len()],
             ));
         }
-        if !self.config.http01_nginx.enabled {
-            return Err("certificate lifecycle requires managed Nginx for HTTP-01".into());
-        }
         ensure_private_dir(&self.config.state_dir)?;
-        ensure_directory(&self.config.webroot, 0o755)?;
 
         let mut manifest = source.clone();
         let mut actions = Vec::with_capacity(manifest.sites.len());
@@ -236,46 +232,74 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
                 continue;
             };
             validate_policy(site, &policy)?;
-            dns_validator(&policy.domain, &policy.expected_public_ip)?;
 
-            let active = site.certificate.clone();
-            if validate_candidate(
-                &active,
-                &policy.domain,
-                policy.renew_before_days,
-                &self.runner,
-                false,
-            )
-            .is_ok()
+            let existing = self.discover_existing(site, &policy)?;
+            if let Some(existing) = existing.as_ref() {
+                site.certificate = existing.reference.clone();
+            }
+            if existing
+                .as_ref()
+                .is_some_and(|existing| !existing.renewal_due)
             {
                 actions.push(LifecycleAction::Unchanged);
                 continue;
             }
 
-            let installed_root = self.config.state_dir.join("generations").join(&site.id);
-            let renew = active.cert_path.starts_with(&installed_root)
-                && has_certbot_renewal_config(&self.config.certbot_live_dir, &policy.domain)?;
-            self.invoke_certbot(&policy, renew)?;
+            if policy.challenge_method == AcmeChallengeMethod::Http01 {
+                if !self.config.http01_nginx.enabled {
+                    return Err("certificate lifecycle requires managed Nginx for HTTP-01".into());
+                }
+                dns_validator(&policy.domain, &policy.expected_public_ip)?;
+                let single = CamouflageSitesManifest {
+                    sites: vec![site.clone()],
+                };
+                let mut prepared = None;
+                self.prepare_http01_once(&single, &mut prepared)?;
+            }
 
-            let candidate = CertificateReference {
-                cert_path: self
-                    .config
-                    .certbot_live_dir
-                    .join(&policy.domain)
-                    .join("fullchain.pem"),
-                key_path: self
-                    .config
-                    .certbot_live_dir
-                    .join(&policy.domain)
-                    .join("privkey.pem"),
-                lifecycle: Some(policy.clone()),
+            let renew = existing.is_some();
+            if let Err(error) = self.invoke_certbot(&policy, renew) {
+                if existing.is_some() {
+                    actions.push(LifecycleAction::RenewalWarning);
+                    continue;
+                }
+                return Err(error);
+            }
+
+            let candidate = match self.best_certbot_candidate(&policy)? {
+                Some(candidate) => candidate,
+                None if existing.is_some() => {
+                    actions.push(LifecycleAction::RenewalWarning);
+                    continue;
+                }
+                None => return Err("ACME did not produce a usable certificate".into()),
             };
-            validate_certbot_source(&candidate, &self.config.certbot_live_dir)?;
-            // Fresh candidates must be currently valid, but can be inside the
-            // old generation's renewal window.
-            validate_candidate(&candidate, &policy.domain, 0, &self.runner, true)?;
-            site.certificate =
-                install_candidate(&candidate, &self.config.state_dir, &site.id, &policy)?;
+            if validate_candidate(
+                &candidate,
+                &policy.domain,
+                policy.renew_before_days,
+                &self.runner,
+                true,
+            )
+            .is_err()
+                || existing.as_ref().is_some_and(|existing| {
+                    same_certificate(&candidate, &existing.reference).unwrap_or(true)
+                })
+            {
+                if existing.is_some() {
+                    actions.push(LifecycleAction::RenewalWarning);
+                    continue;
+                }
+                return Err("ACME did not produce a new usable certificate".into());
+            }
+            match install_candidate(&candidate, &self.config.state_dir, &site.id, &policy) {
+                Ok(installed) => site.certificate = installed,
+                Err(_) if existing.is_some() => {
+                    actions.push(LifecycleAction::RenewalWarning);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
             actions.push(if renew {
                 LifecycleAction::Renewed
             } else {
@@ -283,6 +307,87 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
             });
         }
         Ok((manifest, actions))
+    }
+
+    fn discover_existing(
+        &self,
+        site: &CamouflageSite,
+        policy: &CertificateLifecyclePolicy,
+    ) -> Result<Option<ExistingCertificate>, String> {
+        let mut candidates = vec![site.certificate.clone()];
+        candidates.extend(installed_candidates(
+            &self.config.state_dir,
+            &site.id,
+            policy,
+        )?);
+        for mut candidate in candidates {
+            candidate.lifecycle = Some(policy.clone());
+            if validate_candidate(&candidate, &policy.domain, 0, &self.runner, false).is_ok() {
+                let renewal_due = validate_candidate(
+                    &candidate,
+                    &policy.domain,
+                    policy.renew_before_days,
+                    &self.runner,
+                    false,
+                )
+                .is_err();
+                return Ok(Some(ExistingCertificate {
+                    reference: candidate,
+                    renewal_due,
+                }));
+            }
+        }
+        let Some(candidate) = self.best_certbot_candidate(policy)? else {
+            return Ok(None);
+        };
+        let installed = install_candidate(&candidate, &self.config.state_dir, &site.id, policy)?;
+        let renewal_due = validate_candidate(
+            &installed,
+            &policy.domain,
+            policy.renew_before_days,
+            &self.runner,
+            false,
+        )
+        .is_err();
+        Ok(Some(ExistingCertificate {
+            reference: installed,
+            renewal_due,
+        }))
+    }
+
+    fn best_certbot_candidate(
+        &self,
+        policy: &CertificateLifecyclePolicy,
+    ) -> Result<Option<CertificateReference>, String> {
+        let mut candidates = Vec::new();
+        let entries = match fs::read_dir(&self.config.certbot_live_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("cannot inspect Certbot certificates: {error}")),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let candidate = CertificateReference {
+                cert_path: path.join("fullchain.pem"),
+                key_path: path.join("privkey.pem"),
+                lifecycle: Some(policy.clone()),
+            };
+            if validate_certbot_source(&candidate, &self.config.certbot_live_dir).is_ok()
+                && validate_candidate(&candidate, &policy.domain, 0, &self.runner, true).is_ok()
+            {
+                let expires = certificate_not_after(&candidate.cert_path)?;
+                candidates.push((expires, path, candidate));
+            }
+        }
+        candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        Ok(candidates
+            .into_iter()
+            .next()
+            .map(|(_, _, candidate)| candidate))
     }
 
     pub(crate) fn prepare_http01_once(
@@ -329,9 +434,18 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
     ) -> Result<(), String> {
         validate_absolute_path(&self.config.certbot_binary, "Certbot binary")?;
         reject_symlink(&self.config.certbot_binary)?;
+        if policy.challenge_method == AcmeChallengeMethod::Dns01 {
+            validate_absolute_path(&self.config.dns01_hook_binary, "DNS-01 hook binary")?;
+            reject_symlink(&self.config.dns01_hook_binary)?;
+        }
         let output = self.runner.run(
             &self.config.certbot_binary,
-            &certbot_args(policy, renew, &self.config.webroot),
+            &certbot_args(
+                policy,
+                renew,
+                &self.config.webroot,
+                &self.config.dns01_hook_binary,
+            )?,
         )?;
         if output.status.success() {
             Ok(())
@@ -341,51 +455,89 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
     }
 }
 
-fn certbot_args(policy: &CertificateLifecyclePolicy, renew: bool, webroot: &Path) -> Vec<String> {
-    if renew {
-        return vec![
-            "renew".into(),
-            "--non-interactive".into(),
-            "--no-random-sleep-on-renew".into(),
-            "--force-renewal".into(),
-            "--cert-name".into(),
-            policy.domain.clone(),
-        ];
-    }
+fn certbot_args(
+    policy: &CertificateLifecyclePolicy,
+    renew: bool,
+    webroot: &Path,
+    hook_binary: &Path,
+) -> Result<Vec<String>, String> {
     let mut args = vec![
         "certonly".into(),
         "--non-interactive".into(),
         "--agree-tos".into(),
-        "--webroot".into(),
-        "--webroot-path".into(),
-        webroot.display().to_string(),
         "--cert-name".into(),
         policy.domain.clone(),
         "-d".into(),
         policy.domain.clone(),
     ];
+    if renew {
+        args.push("--force-renewal".into());
+    }
+    match policy.challenge_method {
+        AcmeChallengeMethod::Http01 => args.extend([
+            "--webroot".into(),
+            "--webroot-path".into(),
+            webroot.display().to_string(),
+        ]),
+        AcmeChallengeMethod::Dns01 => {
+            let binary = quote_shell_arg(hook_binary)?;
+            args.extend([
+                "--manual".into(),
+                "--preferred-challenges".into(),
+                "dns".into(),
+                "--manual-auth-hook".into(),
+                format!("/usr/bin/env {binary} acme-dns01-hook auth"),
+                "--manual-cleanup-hook".into(),
+                format!("/usr/bin/env {binary} acme-dns01-hook cleanup"),
+            ]);
+        }
+    }
     match &policy.email {
         Some(email) => args.extend(["--email".into(), email.clone()]),
         None => args.push("--register-unsafely-without-email".into()),
     }
-    args
+    Ok(args)
 }
 
-fn has_certbot_renewal_config(live_dir: &Path, domain: &str) -> Result<bool, String> {
-    let parent = live_dir
-        .parent()
-        .ok_or_else(|| "invalid Certbot live directory".to_string())?;
-    let path = parent.join("renewal").join(format!("{domain}.conf"));
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err("Certbot renewal configuration must not be a symlink".into())
-        }
-        Ok(metadata) => Ok(metadata.is_file()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!(
-            "cannot inspect Certbot renewal configuration: {error}"
-        )),
-    }
+#[derive(Clone)]
+struct ExistingCertificate {
+    reference: CertificateReference,
+    renewal_due: bool,
+}
+
+fn installed_candidates(
+    state_dir: &Path,
+    site_id: &str,
+    policy: &CertificateLifecyclePolicy,
+) -> Result<Vec<CertificateReference>, String> {
+    let root = state_dir.join("generations").join(site_id);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| right.cmp(left));
+    Ok(paths
+        .into_iter()
+        .map(|path| CertificateReference {
+            cert_path: path.join("fullchain.pem"),
+            key_path: path.join("privkey.pem"),
+            lifecycle: Some(policy.clone()),
+        })
+        .collect())
+}
+
+fn certificate_not_after(path: &Path) -> Result<i64, String> {
+    let data = fs::read(path).map_err(|_| "certificate is unavailable")?;
+    let (_, pem) = parse_x509_pem(&data).map_err(|_| "invalid certificate PEM")?;
+    let (_, certificate) =
+        X509Certificate::from_der(&pem.contents).map_err(|_| "invalid certificate DER")?;
+    Ok(certificate.validity().not_after.timestamp())
 }
 
 fn validate_policy(
@@ -522,7 +674,12 @@ fn validate_certificate_validity(
     {
         return Err("certificate SAN does not match camouflage SNI".into());
     }
-    let remaining = certificate.validity().not_after.timestamp() - now;
+    let not_before = certificate.validity().not_before.timestamp();
+    let not_after = certificate.validity().not_after.timestamp();
+    if not_before > now || not_after <= not_before || not_after <= now {
+        return Err("certificate validity window is not currently usable".into());
+    }
+    let remaining = not_after - now;
     if remaining <= Duration::from_secs(u64::from(renew_before_days) * 86_400).as_secs() as i64 {
         return Err("certificate is expired or inside renewal threshold".into());
     }
@@ -698,6 +855,20 @@ fn normalize_pem(bytes: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+fn same_certificate(
+    left: &CertificateReference,
+    right: &CertificateReference,
+) -> Result<bool, String> {
+    let left = fs::read(&left.cert_path).map_err(|_| "certificate is unavailable")?;
+    let right = fs::read(&right.cert_path).map_err(|_| "certificate is unavailable")?;
+    Ok(normalize_pem(&left) == normalize_pem(&right))
+}
+
+fn quote_shell_arg(path: &Path) -> Result<String, String> {
+    let value = path.to_str().ok_or("DNS-01 hook path is not UTF-8")?;
+    Ok(format!("'{}'", value.replace('\'', "'\"'\"'")))
+}
+
 fn is_safe_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -723,6 +894,7 @@ fn is_valid_domain(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::time::{Duration as TimeDuration, OffsetDateTime};
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -735,6 +907,25 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| "unexpected command".into())
+        }
+    }
+
+    struct ReplacingRunner {
+        live_cert: PathBuf,
+        live_key: PathBuf,
+        cert: Vec<u8>,
+        key: Vec<u8>,
+    }
+
+    impl CommandRunner for ReplacingRunner {
+        fn run(&self, program: &Path, _: &[String]) -> Result<Output, String> {
+            if program == Path::new("/bin/true") {
+                write_private_file(&self.live_cert, &self.cert)?;
+                write_private_file(&self.live_key, &self.key)?;
+                Ok(output(true, b""))
+            } else {
+                Ok(output(true, b"same"))
+            }
         }
     }
 
@@ -759,9 +950,25 @@ mod tests {
     }
 
     fn write_test_certificate(dir: &Path, names: Vec<String>) -> (PathBuf, PathBuf) {
+        write_test_certificate_with_window(
+            dir,
+            names,
+            OffsetDateTime::now_utc() - TimeDuration::days(1),
+            OffsetDateTime::now_utc() + TimeDuration::days(90),
+        )
+    }
+
+    fn write_test_certificate_with_window(
+        dir: &Path,
+        names: Vec<String>,
+        not_before: OffsetDateTime,
+        not_after: OffsetDateTime,
+    ) -> (PathBuf, PathBuf) {
         use rcgen::{CertificateParams, KeyPair};
         ensure_private_dir(dir).unwrap();
-        let params = CertificateParams::new(names).unwrap();
+        let mut params = CertificateParams::new(names).unwrap();
+        params.not_before = not_before;
+        params.not_after = not_after;
         let key = KeyPair::generate().unwrap();
         let certificate = params.self_signed(&key).unwrap();
         let cert_path = dir.join("fullchain.pem");
@@ -777,6 +984,37 @@ mod tests {
             email: Some("ops@example.com".into()),
             expected_public_ip: "127.0.0.1".into(),
             renew_before_days: 30,
+            challenge_method: AcmeChallengeMethod::Http01,
+        }
+    }
+
+    fn enabled_config(dir: &Path) -> CertificateLifecycleConfig {
+        CertificateLifecycleConfig {
+            enabled: true,
+            certbot_binary: "/bin/true".into(),
+            certbot_live_dir: dir.join("letsencrypt/live"),
+            webroot: dir.join("webroot"),
+            state_dir: dir.join("state"),
+            dns01_hook_binary: PathBuf::from("/opt/relay-node/relay-node"),
+            http01_nginx: NginxSniConfig {
+                enabled: true,
+                conf_path: dir.join("acme.conf"),
+                test_cmd: "true".into(),
+                reload_cmd: "true".into(),
+                default_backend: "127.0.0.1:9".into(),
+                access_log_path: dir.join("stream.log").display().to_string(),
+            },
+        }
+    }
+
+    fn lifecycle_manifest(
+        reference: CertificateReference,
+        lifecycle_policy: CertificateLifecyclePolicy,
+    ) -> CamouflageSitesManifest {
+        let mut reference = reference;
+        reference.lifecycle = Some(lifecycle_policy);
+        CamouflageSitesManifest {
+            sites: vec![site(Path::new("/unused"), reference)],
         }
     }
 
@@ -792,23 +1030,57 @@ mod tests {
 
     #[test]
     fn first_issuance_uses_certonly_without_a_renewal_record() {
-        let args = certbot_args(&policy("site.example.com"), false, Path::new("/webroot"));
+        let args = certbot_args(
+            &policy("site.example.com"),
+            false,
+            Path::new("/webroot"),
+            Path::new("/opt/relay-node/relay-node"),
+        )
+        .unwrap();
         assert_eq!(args[0], "certonly");
         assert!(args
             .windows(2)
             .any(|pair| pair == ["-d", "site.example.com"]));
-        assert!(!has_certbot_renewal_config(
-            Path::new("/definitely/missing/live"),
-            "site.example.com"
-        )
-        .unwrap());
     }
 
     #[test]
     fn renewal_policy_forces_renewal_independently_of_certbot_default() {
-        let args = certbot_args(&policy("site.example.com"), true, Path::new("/unused"));
-        assert_eq!(args[0], "renew");
+        let args = certbot_args(
+            &policy("site.example.com"),
+            true,
+            Path::new("/unused"),
+            Path::new("/opt/relay-node/relay-node"),
+        )
+        .unwrap();
+        assert_eq!(args[0], "certonly");
         assert!(args.iter().any(|arg| arg == "--force-renewal"));
+    }
+
+    #[test]
+    fn dns01_hooks_quote_the_binary_and_never_embed_credentials() {
+        let mut dns_policy = policy("site.example.com");
+        dns_policy.challenge_method = AcmeChallengeMethod::Dns01;
+        let args = certbot_args(
+            &dns_policy,
+            false,
+            Path::new("/unused"),
+            Path::new("/opt/relay node/relay-node's binary"),
+        )
+        .unwrap();
+        let auth = args
+            .windows(2)
+            .find(|pair| pair[0] == "--manual-auth-hook")
+            .map(|pair| pair[1].clone())
+            .unwrap();
+        assert_eq!(
+            auth,
+            "/usr/bin/env '/opt/relay node/relay-node'\"'\"'s binary' acme-dns01-hook auth"
+        );
+        assert_eq!(auth.split_whitespace().next(), Some("/usr/bin/env"));
+        let serialized = args.join(" ");
+        for forbidden in ["NODE_TOKEN", "DNSMGR", "api_key", "uid="] {
+            assert!(!serialized.contains(forbidden));
+        }
     }
 
     #[test]
@@ -881,6 +1153,7 @@ mod tests {
             certbot_live_dir: dir.join("letsencrypt/live"),
             webroot: dir.join("webroot"),
             state_dir: dir.join("state"),
+            dns01_hook_binary: PathBuf::from("/opt/relay-node/relay-node"),
             http01_nginx: NginxSniConfig {
                 enabled: true,
                 conf_path: dir.join("acme.conf"),
@@ -916,6 +1189,7 @@ mod tests {
             certbot_live_dir: dir.join("letsencrypt/live"),
             webroot: dir.join("webroot"),
             state_dir: dir.join("state"),
+            dns01_hook_binary: PathBuf::from("/opt/relay-node/relay-node"),
             http01_nginx: NginxSniConfig {
                 enabled: true,
                 conf_path: dir.join("acme.conf"),
@@ -1007,59 +1281,231 @@ mod tests {
     }
 
     #[test]
-    fn successful_renewal_installs_a_new_generation_without_overwriting_old() {
-        let dir = unique_dir("renewal");
-        let live = dir.join("letsencrypt/live/site.example.com");
-        let (cert_path, key_path) = write_test_certificate(&live, vec!["site.example.com".into()]);
-        ensure_private_dir(&dir.join("letsencrypt/archive")).unwrap();
-        let old_cert = dir.join("state/generations/site/generation-old/fullchain.pem");
-        let old_key = dir.join("state/generations/site/generation-old/privkey.pem");
-        write_private_file(&old_cert, b"expired-old-certificate").unwrap();
-        write_private_file(&old_key, b"expired-old-key").unwrap();
-        let renewal = dir.join("letsencrypt/renewal/site.example.com.conf");
-        write_private_file(&renewal, b"renewal-config").unwrap();
-        let source = CamouflageSitesManifest {
-            sites: vec![site(
-                &dir,
-                CertificateReference {
-                    cert_path: old_cert.clone(),
-                    key_path: old_key,
-                    lifecycle: Some(policy("site.example.com")),
-                },
-            )],
-        };
-        let config = CertificateLifecycleConfig {
-            enabled: true,
-            certbot_binary: "/bin/true".into(),
-            certbot_live_dir: dir.join("letsencrypt/live"),
-            webroot: dir.join("webroot"),
-            state_dir: dir.join("state"),
-            http01_nginx: NginxSniConfig {
-                enabled: true,
-                conf_path: dir.join("acme.conf"),
-                test_cmd: "true".into(),
-                reload_cmd: "true".into(),
-                default_backend: "127.0.0.1:9".into(),
-                access_log_path: dir.join("stream.log").display().to_string(),
+    fn healthy_active_certificate_is_a_true_noop_without_http01_preparation() {
+        let dir = unique_dir("healthy-noop");
+        let (cert_path, key_path) =
+            write_test_certificate(&dir.join("active"), vec!["site.example.com".into()]);
+        let source = lifecycle_manifest(
+            CertificateReference {
+                cert_path: cert_path.clone(),
+                key_path,
+                lifecycle: None,
             },
-        };
+            policy("site.example.com"),
+        );
         let lifecycle = CertificateLifecycle::with_runner(
-            config,
+            enabled_config(&dir),
             FakeRunner(Mutex::new(VecDeque::from([
-                output(true, b""),
+                output(true, b"same"),
+                output(true, b"same"),
                 output(true, b"same"),
                 output(true, b"same"),
             ]))),
+        );
+        let (candidate, actions) = lifecycle
+            .reconcile_with_dns(&source, |_, _| panic!("healthy cert must skip DNS"))
+            .unwrap();
+        assert_eq!(actions, vec![LifecycleAction::Unchanged]);
+        assert_eq!(candidate.sites[0].certificate.cert_path, cert_path);
+        assert!(!dir.join("acme.conf").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn healthy_managed_generation_and_certbot_candidate_are_reused_without_acme() {
+        let dir = unique_dir("discovery");
+        let managed = dir.join("state/generations/site/generation-2");
+        let (managed_cert, managed_key) =
+            write_test_certificate(&managed, vec!["site.example.com".into()]);
+        let missing = CertificateReference {
+            cert_path: dir.join("pending/fullchain.pem"),
+            key_path: dir.join("pending/privkey.pem"),
+            lifecycle: None,
+        };
+        let lifecycle = CertificateLifecycle::with_runner(
+            enabled_config(&dir),
+            FakeRunner(Mutex::new(VecDeque::from([
+                output(true, b"same"),
+                output(true, b"same"),
+                output(true, b"same"),
+                output(true, b"same"),
+            ]))),
+        );
+        let (managed_result, actions) = lifecycle
+            .reconcile_with_dns(
+                &lifecycle_manifest(missing.clone(), policy("site.example.com")),
+                |_, _| panic!("managed reuse must skip DNS"),
+            )
+            .unwrap();
+        assert_eq!(actions, vec![LifecycleAction::Unchanged]);
+        assert_eq!(managed_result.sites[0].certificate.cert_path, managed_cert);
+        assert_eq!(managed_result.sites[0].certificate.key_path, managed_key);
+
+        fs::remove_dir_all(dir.join("state/generations")).unwrap();
+        let live = dir.join("letsencrypt/live/site.example.com-0001");
+        let (certbot_cert, _) = write_test_certificate(&live, vec!["site.example.com".into()]);
+        ensure_private_dir(&dir.join("letsencrypt/archive")).unwrap();
+        let lifecycle = CertificateLifecycle::with_runner(
+            enabled_config(&dir),
+            FakeRunner(Mutex::new(VecDeque::from([
+                output(true, b"same"),
+                output(true, b"same"),
+                output(true, b"same"),
+                output(true, b"same"),
+            ]))),
+        );
+        let (adopted, actions) = lifecycle
+            .reconcile_with_dns(
+                &lifecycle_manifest(missing, policy("site.example.com")),
+                |_, _| panic!("Certbot adoption must skip DNS"),
+            )
+            .unwrap();
+        assert_eq!(actions, vec![LifecycleAction::Unchanged]);
+        assert_ne!(adopted.sites[0].certificate.cert_path, certbot_cert);
+        assert!(adopted.sites[0]
+            .certificate
+            .cert_path
+            .starts_with(dir.join("state/generations/site")));
+        assert_eq!(
+            fs::read(&adopted.sites[0].certificate.cert_path).unwrap(),
+            fs::read(certbot_cert).unwrap()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn near_expiry_dns01_failure_retains_the_usable_certificate_as_warning() {
+        let dir = unique_dir("renewal-warning-dns01");
+        let (old_cert, old_key) = write_test_certificate_with_window(
+            &dir.join("old"),
+            vec!["site.example.com".into()],
+            OffsetDateTime::now_utc() - TimeDuration::days(1),
+            OffsetDateTime::now_utc() + TimeDuration::days(10),
+        );
+        let mut dns_policy = policy("site.example.com");
+        dns_policy.challenge_method = AcmeChallengeMethod::Dns01;
+        let source = lifecycle_manifest(
+            CertificateReference {
+                cert_path: old_cert.clone(),
+                key_path: old_key,
+                lifecycle: None,
+            },
+            dns_policy,
+        );
+        let lifecycle = CertificateLifecycle::with_runner(
+            enabled_config(&dir),
+            FakeRunner(Mutex::new(VecDeque::from([
+                output(true, b"same"),
+                output(true, b"same"),
+                output(false, b""),
+            ]))),
+        );
+        let (candidate, actions) = lifecycle
+            .reconcile_with_dns(&source, |_, _| panic!("DNS-01 must not require A lookup"))
+            .unwrap();
+        assert_eq!(actions, vec![LifecycleAction::RenewalWarning]);
+        assert_eq!(candidate.sites[0].certificate.cert_path, old_cert);
+        assert!(!dir.join("acme.conf").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn near_expiry_http01_failure_retains_the_usable_certificate_as_warning() {
+        let dir = unique_dir("renewal-warning-http01");
+        let (old_cert, old_key) = write_test_certificate_with_window(
+            &dir.join("old"),
+            vec!["site.example.com".into()],
+            OffsetDateTime::now_utc() - TimeDuration::days(1),
+            OffsetDateTime::now_utc() + TimeDuration::days(10),
+        );
+        let source = lifecycle_manifest(
+            CertificateReference {
+                cert_path: old_cert.clone(),
+                key_path: old_key,
+                lifecycle: None,
+            },
+            policy("site.example.com"),
+        );
+        let lifecycle = CertificateLifecycle::with_runner(
+            enabled_config(&dir),
+            FakeRunner(Mutex::new(VecDeque::from([
+                output(true, b"same"),
+                output(true, b"same"),
+                output(false, b""),
+            ]))),
+        );
+        let (candidate, actions) = lifecycle
+            .reconcile_with_dns(&source, |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(actions, vec![LifecycleAction::RenewalWarning]);
+        assert_eq!(candidate.sites[0].certificate.cert_path, old_cert);
+        assert!(dir.join("acme.conf").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_usable_certificate_and_issuance_failure_is_hard_failure() {
+        let dir = unique_dir("issuance-hard-failure");
+        let mut dns_policy = policy("site.example.com");
+        dns_policy.challenge_method = AcmeChallengeMethod::Dns01;
+        let source = lifecycle_manifest(
+            CertificateReference {
+                cert_path: dir.join("missing/fullchain.pem"),
+                key_path: dir.join("missing/privkey.pem"),
+                lifecycle: None,
+            },
+            dns_policy,
+        );
+        let lifecycle = CertificateLifecycle::with_runner(
+            enabled_config(&dir),
+            FakeRunner(Mutex::new(VecDeque::from([output(false, b"")]))),
+        );
+        assert!(lifecycle
+            .reconcile_with_dns(&source, |_, _| panic!("DNS-01 must not require A lookup"))
+            .is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn successful_renewal_installs_a_new_generation_without_overwriting_old() {
+        let dir = unique_dir("renewal");
+        let live = dir.join("letsencrypt/live/site.example.com");
+        ensure_private_dir(&dir.join("letsencrypt/archive")).unwrap();
+        let (old_cert, old_key) = write_test_certificate_with_window(
+            &dir.join("old"),
+            vec!["site.example.com".into()],
+            OffsetDateTime::now_utc() - TimeDuration::days(1),
+            OffsetDateTime::now_utc() + TimeDuration::days(10),
+        );
+        let old_bytes = fs::read(&old_cert).unwrap();
+        let (replacement_cert, replacement_key) =
+            write_test_certificate(&dir.join("replacement"), vec!["site.example.com".into()]);
+        let source = lifecycle_manifest(
+            CertificateReference {
+                cert_path: old_cert.clone(),
+                key_path: old_key,
+                lifecycle: None,
+            },
+            policy("site.example.com"),
+        );
+        let lifecycle = CertificateLifecycle::with_runner(
+            enabled_config(&dir),
+            ReplacingRunner {
+                live_cert: live.join("fullchain.pem"),
+                live_key: live.join("privkey.pem"),
+                cert: fs::read(&replacement_cert).unwrap(),
+                key: fs::read(&replacement_key).unwrap(),
+            },
         );
         let (candidate, actions) = lifecycle
             .reconcile_with_dns(&source, |_, _| Ok(()))
             .unwrap();
         assert_eq!(actions, vec![LifecycleAction::Renewed]);
         assert_ne!(candidate.sites[0].certificate.cert_path, old_cert);
-        assert_eq!(fs::read(old_cert).unwrap(), b"expired-old-certificate");
+        assert_eq!(fs::read(&old_cert).unwrap(), old_bytes);
         assert_eq!(
             fs::read(candidate.sites[0].certificate.cert_path.clone()).unwrap(),
-            fs::read(cert_path).unwrap()
+            fs::read(replacement_cert).unwrap()
         );
         assert_eq!(
             fs::metadata(candidate.sites[0].certificate.key_path.clone())
@@ -1071,8 +1517,46 @@ mod tests {
         );
         assert_eq!(
             fs::read(candidate.sites[0].certificate.key_path.clone()).unwrap(),
-            fs::read(key_path).unwrap()
+            fs::read(replacement_key).unwrap()
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_renewal_output_retains_old_usable_certificate() {
+        let dir = unique_dir("invalid-renewal-output");
+        let live = dir.join("letsencrypt/live/site.example.com");
+        ensure_private_dir(&dir.join("letsencrypt/archive")).unwrap();
+        let (old_cert, old_key) = write_test_certificate_with_window(
+            &dir.join("old"),
+            vec!["site.example.com".into()],
+            OffsetDateTime::now_utc() - TimeDuration::days(1),
+            OffsetDateTime::now_utc() + TimeDuration::days(10),
+        );
+        let (wrong_cert, wrong_key) =
+            write_test_certificate(&dir.join("wrong"), vec!["other.example.com".into()]);
+        let source = lifecycle_manifest(
+            CertificateReference {
+                cert_path: old_cert.clone(),
+                key_path: old_key,
+                lifecycle: None,
+            },
+            policy("site.example.com"),
+        );
+        let lifecycle = CertificateLifecycle::with_runner(
+            enabled_config(&dir),
+            ReplacingRunner {
+                live_cert: live.join("fullchain.pem"),
+                live_key: live.join("privkey.pem"),
+                cert: fs::read(wrong_cert).unwrap(),
+                key: fs::read(wrong_key).unwrap(),
+            },
+        );
+        let (candidate, actions) = lifecycle
+            .reconcile_with_dns(&source, |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(actions, vec![LifecycleAction::RenewalWarning]);
+        assert_eq!(candidate.sites[0].certificate.cert_path, old_cert);
         let _ = fs::remove_dir_all(dir);
     }
 

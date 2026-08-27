@@ -8,6 +8,7 @@
 
 use md5::{Digest, Md5};
 use reqwest::{redirect::Policy, StatusCode, Url};
+use serde::Deserialize;
 use serde_json::Value;
 use std::fmt;
 use std::time::Duration;
@@ -192,6 +193,25 @@ impl DnsMgrClient {
         request.validate()?;
         let fields = self.mutation_fields(request, Some(record_id));
         let endpoint = self.endpoint(&["record", "update", &domain_id.to_string()])?;
+        let value = self.read_json_once(&endpoint, &fields).await?;
+        parse_mutation_response(&value)
+    }
+
+    /// Delete exactly one provider record identity. This is intentionally a
+    /// single-attempt mutation: callers reconcile an ambiguous outcome through
+    /// record discovery instead of risking deletion of a different record.
+    pub(crate) async fn delete_record(
+        &self,
+        domain_id: u64,
+        record_id: &str,
+    ) -> Result<DnsMgrMutationAccepted, DnsMgrError> {
+        validate_id(domain_id, "domain_id")?;
+        if record_id.trim().is_empty() {
+            return Err(DnsMgrError::InvalidRequest("record_id is empty".into()));
+        }
+        let mut fields = self.signed_fields(current_timestamp());
+        fields.push(("recordid".into(), record_id.to_string()));
+        let endpoint = self.endpoint(&["record", "delete", &domain_id.to_string()])?;
         let value = self.read_json_once(&endpoint, &fields).await?;
         parse_mutation_response(&value)
     }
@@ -478,7 +498,9 @@ pub(crate) struct DnsMgrRecord {
     pub domain: Option<String>,
     pub host: String,
     pub record_type: String,
-    pub value: String,
+    /// DNSMgr providers return this as either a scalar value or a list of
+    /// values. The client normalizes both wire forms without losing values.
+    pub values: Vec<String>,
     pub line: String,
     pub line_name: Option<String>,
     pub ttl: u64,
@@ -487,6 +509,28 @@ pub(crate) struct DnsMgrRecord {
     pub weight: Option<i64>,
     pub remark: Option<String>,
     pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DnsMgrRecordValue {
+    Scalar(String),
+    Multiple(Vec<String>),
+}
+
+impl DnsMgrRecordValue {
+    fn into_values(self) -> Result<Vec<String>, DnsMgrError> {
+        let values = match self {
+            Self::Scalar(value) => vec![value],
+            Self::Multiple(values) => values,
+        };
+        if values.is_empty() {
+            return Err(DnsMgrError::MalformedResponse(
+                "record value array must not be empty".into(),
+            ));
+        }
+        Ok(values)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -687,12 +731,23 @@ fn parse_domain_detail(value: &Value) -> Result<DnsMgrDomainDetail, DnsMgrError>
 
 fn parse_record(row: &Value) -> Result<DnsMgrRecord, DnsMgrError> {
     let object = required_object(row, "record row")?;
+    let value = object
+        .get("Value")
+        .cloned()
+        .ok_or_else(|| DnsMgrError::MalformedResponse("record value is missing".into()))?;
+    let values = serde_json::from_value::<DnsMgrRecordValue>(value)
+        .map_err(|_| {
+            DnsMgrError::MalformedResponse(
+                "record value must be a string or array of strings".into(),
+            )
+        })?
+        .into_values()?;
     Ok(DnsMgrRecord {
         record_id: required_string(object.get("RecordId"), "record id")?,
         domain: optional_string(object.get("Domain"), "record domain")?,
         host: required_string(object.get("Name"), "record host")?,
         record_type: required_string(object.get("Type"), "record type")?,
-        value: required_string(object.get("Value"), "record value")?,
+        values,
         line: scalar_string(object.get("Line"), "record line")?,
         line_name: optional_string(object.get("LineName"), "record line name")?,
         ttl: required_u64(object.get("TTL"), "record ttl")?,
@@ -1036,6 +1091,73 @@ mod tests {
         assert_eq!(form.get("subdomain"), Some(&"op1".into()));
         assert_eq!(form.get("type"), Some(&"A".into()));
         assert_eq!(form.get("status"), Some(&"1".into()));
+    }
+
+    #[tokio::test]
+    async fn record_list_normalizes_scalar_and_array_values_without_losing_entries() {
+        let router = Router::new().route(
+            "/api/record/data/7",
+            post(|| async {
+                Json(json!({
+                    "total": 3,
+                    "rows": [
+                        {
+                            "RecordId": "scalar", "Domain": "example.co.uk", "Name": "op1",
+                            "Type": "A", "Value": "192.0.2.10", "Line": "default",
+                            "TTL": 300, "Status": "1"
+                        },
+                        {
+                            "RecordId": "array", "Domain": "example.co.uk", "Name": "op1",
+                            "Type": "A", "Value": ["192.0.2.10"], "Line": "default",
+                            "TTL": 300, "Status": "1"
+                        },
+                        {
+                            "RecordId": "multi", "Domain": "example.co.uk", "Name": "op1",
+                            "Type": "A", "Value": ["192.0.2.1", "192.0.2.10"], "Line": "default",
+                            "TTL": 300, "Status": "1"
+                        }
+                    ]
+                }))
+            }),
+        );
+        let (base_url, handle) = spawn_mock(router).await;
+        let page = client(&base_url)
+            .list_records(7, &RecordListParams::default())
+            .await
+            .unwrap();
+        handle.abort();
+
+        assert_eq!(page.rows[0].values, ["192.0.2.10"]);
+        assert_eq!(page.rows[1].values, page.rows[0].values);
+        assert_eq!(page.rows[2].values, ["192.0.2.1", "192.0.2.10"]);
+    }
+
+    #[tokio::test]
+    async fn record_list_rejects_malformed_or_empty_value_forms() {
+        for value in [json!(null), json!(42), json!([]), json!(["192.0.2.10", 42])] {
+            let router = Router::new().route(
+                "/api/record/data/7",
+                post({
+                    let value = value.clone();
+                    move || async move {
+                        Json(json!({
+                            "total": 1,
+                            "rows": [{
+                                "RecordId": "invalid", "Domain": "example.co.uk", "Name": "op1",
+                                "Type": "A", "Value": value, "Line": "default",
+                                "TTL": 300, "Status": "1"
+                            }]
+                        }))
+                    }
+                }),
+            );
+            let (base_url, handle) = spawn_mock(router).await;
+            let result = client(&base_url)
+                .list_records(7, &RecordListParams::default())
+                .await;
+            handle.abort();
+            assert!(matches!(result, Err(DnsMgrError::MalformedResponse(_))));
+        }
     }
 
     #[tokio::test]

@@ -610,6 +610,16 @@ pub async fn create_rule(
         validate_reality_targets(&targets)
             .map_err(|message| CreateRuleError::BadRequest(message.into()))?;
     }
+    if req.send_proxy_protocol && !caller_admin {
+        return Err(CreateRuleError::BadRequest(
+            "upstream Proxy Protocol is admin-only".into(),
+        ));
+    }
+    if req.send_proxy_protocol && req.public_transport != PublicTransport::NginxSni {
+        return Err(CreateRuleError::BadRequest(
+            "send_proxy_protocol can only be enabled for nginx_sni transport".into(),
+        ));
+    }
     let ws_path: Option<String> = if req.public_transport == PublicTransport::Ws {
         req.ws_path
             .as_ref()
@@ -663,6 +673,7 @@ pub async fn create_rule(
                     .then_some(sni.as_deref())
                     .flatten(),
                 req.camouflage_enabled,
+                req.send_proxy_protocol,
                 req.device_group_in,
                 req.device_group_out,
                 &req.forward_mode,
@@ -816,6 +827,7 @@ pub async fn update_rule(
         || req.ws_path.is_some()
         || req.sni.is_some()
         || req.camouflage_enabled.is_some()
+        || req.send_proxy_protocol.is_some()
         || req.device_group_in.is_some()
         || req.device_group_out.is_some()
         || req.forward_mode.is_some()
@@ -840,6 +852,7 @@ pub async fn update_rule(
         || req.ws_path.is_some()
         || req.sni.is_some()
         || req.camouflage_enabled.is_some()
+        || req.send_proxy_protocol.is_some()
         || req.device_group_in.is_some()
         || req.device_group_out.is_some()
         || req.forward_mode.is_some()
@@ -1009,6 +1022,14 @@ pub async fn update_rule(
         validate_reality_targets(&effective_targets)
             .map_err(|message| UpdateRuleError::BadRequest(message.into()))?;
     }
+    let effective_send_proxy_protocol = req
+        .send_proxy_protocol
+        .unwrap_or(existing.send_proxy_protocol);
+    if effective_send_proxy_protocol && effective_transport != PublicTransport::NginxSni {
+        return Err(UpdateRuleError::BadRequest(
+            "send_proxy_protocol can only be enabled for nginx_sni transport".into(),
+        ));
+    }
 
     if let Some(new_proto) = req.protocol.as_ref() {
         let effective_pid = match req.tunnel_profile_id {
@@ -1105,9 +1126,24 @@ pub async fn update_rule(
             None
         };
     let sni_update: Option<Option<&str>> = normalized_sni_update.as_ref().map(|v| v.as_deref());
+    let proxy_protocol_update = if effective_transport == PublicTransport::NginxSni {
+        if req.send_proxy_protocol.is_some()
+            || req.listen_port.is_some()
+            || req.device_group_in.is_some()
+            || req.public_transport.is_some()
+        {
+            Some(effective_send_proxy_protocol)
+        } else {
+            None
+        }
+    } else if existing.send_proxy_protocol {
+        Some(false)
+    } else {
+        None
+    };
 
     let update_result = if has_scalar_field {
-        db.update_rule_fields(
+        db.update_rule_fields_with_proxy_protocol(
             id,
             scope,
             req.name.as_deref(),
@@ -1120,6 +1156,7 @@ pub async fn update_rule(
             ws_path,
             sni_update,
             req.camouflage_enabled,
+            proxy_protocol_update,
             req.device_group_in,
             device_group_out_arg,
             req.forward_mode.as_deref(),

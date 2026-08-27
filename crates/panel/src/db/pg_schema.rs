@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     ws_host TEXT,
     sni TEXT,
     camouflage_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    send_proxy_protocol BOOLEAN NOT NULL DEFAULT FALSE,
     target_addr TEXT NOT NULL,
     target_port INTEGER NOT NULL,
     load_balance_strategy TEXT NOT NULL DEFAULT 'first',
@@ -467,7 +468,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 32;
+pub const PG_SCHEMA_VERSION: i32 = 33;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1718,6 +1719,22 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 32: dns_record_syncs table present");
     }
 
+    if current < 33 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE forward_rules ADD COLUMN IF NOT EXISTS send_proxy_protocol BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (33) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 33: forward_rules.send_proxy_protocol present");
+    }
+
     Ok(())
 }
 
@@ -1778,7 +1795,7 @@ mod tests {
 
     #[test]
     fn pg_schema_version_matches_latest_migration() {
-        assert_eq!(PG_SCHEMA_VERSION, 32);
+        assert_eq!(PG_SCHEMA_VERSION, 33);
     }
 
     #[test]
@@ -1804,6 +1821,11 @@ mod tests {
         assert!(PG_SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS dns_record_syncs"));
         assert!(PG_SCHEMA_SQL.contains("idx_dns_record_syncs_due"));
         assert!(PG_SCHEMA_SQL.contains("ON DELETE CASCADE"));
+    }
+
+    #[test]
+    fn pg_schema_defaults_proxy_protocol_off() {
+        assert!(PG_SCHEMA_SQL.contains("send_proxy_protocol BOOLEAN NOT NULL DEFAULT FALSE"));
     }
 
     // The real baseline schema must split into runnable statements, and no

@@ -652,6 +652,7 @@ mod tests {
             camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
                 camouflage_required: false,
+                send_proxy_protocol: false,
                 rule_id: 1,
                 port: 22001,
                 protocol: Protocol::Tcp,
@@ -670,6 +671,7 @@ mod tests {
             camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
                 camouflage_required: false,
+                send_proxy_protocol: false,
                 port: 0,
                 ..old.listeners[0].clone()
             }],

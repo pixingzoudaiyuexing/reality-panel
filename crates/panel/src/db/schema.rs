@@ -164,6 +164,9 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     -- Corrected Stage 3.3: opt-in Relay-local :8443/OpenList camouflage
     -- dependency for nginx_sni Reality relay rules.
     camouflage_enabled INTEGER NOT NULL DEFAULT 0,
+    -- Upstream HAProxy PROXY protocol v1 for the shared nginx_sni listener.
+    -- Existing rules remain OFF after upgrade.
+    send_proxy_protocol INTEGER NOT NULL DEFAULT 0,
     target_addr TEXT NOT NULL,
     target_port INTEGER NOT NULL,
     -- v0.4.6: multi-target load-balancing strategy.
@@ -2041,6 +2044,16 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .await?;
     tracing::info!("Migration 48: dns_record_syncs table present");
 
+    // ── Migration 49: optional upstream PROXY protocol for nginx_sni ──
+    add_column_if_missing(
+        pool,
+        "forward_rules",
+        "send_proxy_protocol",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    tracing::info!("Migration 49: forward_rules.send_proxy_protocol present");
+
     Ok(())
 }
 
@@ -2530,6 +2543,7 @@ mod tests {
             ("forward_rules", "public_transport"),
             ("forward_rules", "node_transport"),
             ("forward_rules", "route_mode"),
+            ("forward_rules", "send_proxy_protocol"),
             ("device_groups", "capabilities"),
             ("device_groups", "region"),
             ("device_groups", "line_type"),
@@ -2542,8 +2556,8 @@ mod tests {
         // entry_transport='raw' (Migration 4 default), public/node_transport
         // also 'raw' (v0.4.0 defaults — a raw rule needs no backfill UPDATE),
         // tunnel_profile_id=NULL, capabilities default on the group.
-        let rule: (String, String, String, Option<i64>) = sqlx::query_as(
-            "SELECT entry_transport, public_transport, node_transport, tunnel_profile_id \
+        let rule: (String, String, String, Option<i64>, bool) = sqlx::query_as(
+            "SELECT entry_transport, public_transport, node_transport, tunnel_profile_id, send_proxy_protocol \
              FROM forward_rules WHERE name='r1'",
         )
         .fetch_one(&pool)
@@ -2556,6 +2570,7 @@ mod tests {
             rule.3.is_none(),
             "existing rule must have NULL tunnel_profile_id"
         );
+        assert!(!rule.4, "existing rule must default Proxy Protocol to OFF");
 
         // device_groups.capabilities must be backfilled to the tcp/udp default.
         let caps: (String,) = sqlx::query_as("SELECT capabilities FROM device_groups WHERE id=1")

@@ -32,7 +32,7 @@ pub(crate) fn extract_config_protocol_version(headers: &HeaderMap) -> Option<u32
 /// and the WS upgrade path so both paths refuse consistently.
 pub(crate) fn config_protocol_compatible(headers: &HeaderMap) -> bool {
     match extract_config_protocol_version(headers) {
-        Some(v) => v == CONFIG_PROTOCOL_VERSION,
+        Some(v) => config_protocol_versions_compatible(CONFIG_PROTOCOL_VERSION, v),
         None => false,
     }
 }
@@ -105,6 +105,83 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
                 "config unavailable: transient database error",
             )
                 .into_response()
+        }
+    }
+}
+
+pub async fn present_acme_dns01(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::service::acme_dns01::AcmeDns01Request>,
+) -> Response {
+    acme_dns01_operation(state, headers, request, true).await
+}
+
+pub async fn cleanup_acme_dns01(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::service::acme_dns01::AcmeDns01Request>,
+) -> Response {
+    acme_dns01_operation(state, headers, request, false).await
+}
+
+async fn acme_dns01_operation(
+    state: AppState,
+    headers: HeaderMap,
+    request: crate::service::acme_dns01::AcmeDns01Request,
+    present: bool,
+) -> Response {
+    let Some(token) = extract_node_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let group = match state.db.find_by_token(&token).await {
+        Ok(Some(group)) if group.group_type == "in" => group,
+        Ok(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let config =
+        match crate::service::node_config::build_node_config(state.db.as_ref(), group.id).await {
+            Ok(config) => config,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+    let authorized = config.camouflage_sites.iter().any(|site| {
+        site.enabled
+            && site
+                .sni
+                .eq_ignore_ascii_case(request.sni.trim_end_matches('.'))
+            && site.certificate.challenge_method == AcmeChallengeMethod::Dns01
+    });
+    if !authorized {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"code": "ACME_DNS01_SNI_NOT_AUTHORIZED"})),
+        )
+            .into_response();
+    }
+
+    let result = if present {
+        crate::service::acme_dns01::present(state.db.as_ref(), group.id, &request).await
+    } else {
+        crate::service::acme_dns01::cleanup(state.db.as_ref(), group.id, &request).await
+    };
+    match result {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => {
+            let status = match error {
+                crate::service::acme_dns01::AcmeDns01Error::InvalidRequest => {
+                    StatusCode::BAD_REQUEST
+                }
+                crate::service::acme_dns01::AcmeDns01Error::Conflict => StatusCode::CONFLICT,
+                crate::service::acme_dns01::AcmeDns01Error::Unavailable => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                crate::service::acme_dns01::AcmeDns01Error::Provider
+                | crate::service::acme_dns01::AcmeDns01Error::PropagationTimeout
+                | crate::service::acme_dns01::AcmeDns01Error::Database => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            };
+            (status, Json(serde_json::json!({"code": error.code()}))).into_response()
         }
     }
 }
@@ -479,6 +556,18 @@ mod tests {
         headers
     }
 
+    #[test]
+    fn config_protocol_v7_is_rejected_and_v8_is_accepted() {
+        let mut v7 = HeaderMap::new();
+        v7.insert("X-Config-Protocol-Version", "7".parse().unwrap());
+        assert!(!config_protocol_compatible(&v7));
+
+        let mut v8 = HeaderMap::new();
+        v8.insert("X-Config-Protocol-Version", "8".parse().unwrap());
+        assert!(config_protocol_compatible(&v8));
+        assert!(!config_protocol_compatible(&HeaderMap::new()));
+    }
+
     async fn user_traffic(pool: &SqlitePool, uid: i64) -> i64 {
         let (v,): (i64,) = sqlx::query_as("SELECT traffic_used FROM users WHERE id=?")
             .bind(uid)
@@ -737,6 +826,69 @@ mod tests {
         };
         let Json(resp) = report_status(State(state.clone()), h, Json(req)).await;
         assert_eq!(resp.code, 401, "missing token → business 401, not HTTP 401");
+    }
+
+    #[tokio::test]
+    async fn acme_dns01_api_requires_group_scoped_eligible_sni() {
+        let (state, pool) = seeded_state().await;
+        sqlx::query("UPDATE device_groups SET connect_host='192.0.2.10' WHERE id=10")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE forward_rules SET protocol='tcp', public_transport='nginx_sni', \
+             node_transport='nginx_sni', entry_transport='nginx_sni', \
+             sni='site.example.com', camouflage_enabled=1 WHERE id=100",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        state
+            .db
+            .set(
+                crate::service::dnsmgr::DNSMGR_CONFIG_KEY,
+                &serde_json::json!({
+                    "enabled": true,
+                    "base_url": "http://127.0.0.1:9",
+                    "uid": 7,
+                    "api_key": "panel-only-test-key"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let unrelated = crate::service::acme_dns01::AcmeDns01Request {
+            node_id: "node-a".into(),
+            sni: "unrelated.example.com".into(),
+            value: "challenge-token-123456".into(),
+        };
+        let denied =
+            present_acme_dns01(State(state.clone()), auth_headers("tok-A"), Json(unrelated)).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let eligible = crate::service::acme_dns01::AcmeDns01Request {
+            node_id: "node-a".into(),
+            sni: "site.example.com".into(),
+            value: "challenge-token-123456".into(),
+        };
+        let provider_unavailable =
+            present_acme_dns01(State(state.clone()), auth_headers("tok-A"), Json(eligible)).await;
+        assert_eq!(
+            provider_unavailable.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let missing_auth = present_acme_dns01(
+            State(state),
+            HeaderMap::new(),
+            Json(crate::service::acme_dns01::AcmeDns01Request {
+                node_id: "node-a".into(),
+                sni: "site.example.com".into(),
+                value: "challenge-token-123456".into(),
+            }),
+        )
+        .await;
+        assert_eq!(missing_auth.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// A missing token must never be presented as an authoritative empty plan.

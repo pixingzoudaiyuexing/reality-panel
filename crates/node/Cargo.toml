@@ -59,3 +59,4 @@ x509-parser = "0.16"
 # so it does NOT reintroduce the CryptoProvider ambiguity this PR fixes. Used
 # only to mint a self-signed cert for an in-test TLS websocket server.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+time = "0.3"

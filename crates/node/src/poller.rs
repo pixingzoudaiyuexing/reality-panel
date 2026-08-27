@@ -608,6 +608,7 @@ pub(crate) fn commit_cache_at(
 }
 
 pub(crate) fn validate_config(config: &NodeConfigResponse) -> Result<(), String> {
+    relay_shared::protocol::validate_proxy_protocol_invariants(&config.listeners)?;
     for listener in &config.listeners {
         if listener.port == 0 {
             return Err(format!("rule {} has port 0", listener.rule_id));
@@ -923,6 +924,7 @@ mod tests {
             camouflage_sites: vec![],
             listeners: vec![relay_shared::protocol::ListenerConfig {
                 camouflage_required: false,
+                send_proxy_protocol: false,
                 rule_id,
                 port: 20000 + rule_id as u16,
                 protocol: relay_shared::protocol::Protocol::Tcp,
@@ -991,6 +993,7 @@ mod tests {
             camouflage_sites: vec![],
             listeners: vec![relay_shared::protocol::ListenerConfig {
                 camouflage_required: false,
+                send_proxy_protocol: false,
                 rule_id: 2,
                 port: 443,
                 protocol: relay_shared::protocol::Protocol::Tcp,
@@ -1007,6 +1010,37 @@ mod tests {
 
         assert!(!apply_and_commit_at(&manager, &failed, &paths).await);
         assert_eq!(load_cache_at(&paths).unwrap().listeners[0].rule_id, 1);
+        cleanup_cache(&paths);
+    }
+
+    #[tokio::test]
+    async fn mixed_proxy_protocol_config_is_rejected_without_overwriting_lkg() {
+        let paths = cache_paths_for_test("mixed-proxy-protocol");
+        let old = cache_config(1);
+        commit_cache_at(&old, &paths).unwrap();
+        let manager = Arc::new(Mutex::new(ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        )));
+        let mut first = cache_config(2).listeners.remove(0);
+        first.port = 443;
+        first.node_transport = NodeTransport::NginxSni;
+        first.sni = Some("op1.example.com".into());
+        first.send_proxy_protocol = true;
+        let mut second = first.clone();
+        second.rule_id = 3;
+        second.sni = Some("op2.example.com".into());
+        second.send_proxy_protocol = false;
+        let invalid = NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners: vec![first, second],
+        };
+
+        assert!(!apply_and_commit_at(&manager, &invalid, &paths).await);
+        assert_eq!(
+            serde_json::to_value(load_cache_at(&paths).unwrap()).unwrap(),
+            serde_json::to_value(old).unwrap()
+        );
         cleanup_cache(&paths);
     }
 
@@ -1187,6 +1221,7 @@ mod tests {
                 domain: sni.into(),
                 expected_public_ip: "203.0.113.10".into(),
                 renew_before_days: 30,
+                challenge_method: Default::default(),
             },
             enabled: true,
         }
@@ -1199,6 +1234,7 @@ mod tests {
     ) -> relay_shared::protocol::ListenerConfig {
         relay_shared::protocol::ListenerConfig {
             camouflage_required: true,
+            send_proxy_protocol: false,
             rule_id,
             port: 443,
             protocol: relay_shared::protocol::Protocol::Tcp,

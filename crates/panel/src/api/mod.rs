@@ -391,6 +391,14 @@ pub fn routes() -> Router<AppState> {
         // Node (polled by relay-node binary)
         .route("/node/config", axum::routing::get(node::get_config))
         .route(
+            "/node/acme-dns01/present",
+            axum::routing::post(node::present_acme_dns01),
+        )
+        .route(
+            "/node/acme-dns01/cleanup",
+            axum::routing::post(node::cleanup_acme_dns01),
+        )
+        .route(
             "/node/lifecycle-artifacts/{operation_id}",
             axum::routing::get(node_ops::download_artifact),
         )

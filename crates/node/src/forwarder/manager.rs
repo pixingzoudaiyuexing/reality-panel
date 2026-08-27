@@ -1179,6 +1179,7 @@ mod tests {
             camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
                 camouflage_required: false,
+                send_proxy_protocol: false,
                 rule_id: 1,
                 port,
                 protocol: proto,
@@ -1205,6 +1206,7 @@ mod tests {
             camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
                 camouflage_required: false,
+                send_proxy_protocol: false,
                 rule_id: 1,
                 port,
                 protocol: proto,
@@ -1275,6 +1277,7 @@ mod tests {
             ws_path: None,
             sni: None,
             camouflage_required: false,
+            send_proxy_protocol: false,
             targets: vec!["127.0.0.1:2".into()],
             load_balance_strategy: LoadBalanceStrategy::First,
             upload_limit_bps: None,
@@ -1569,6 +1572,7 @@ mod tests {
             listeners: vec![
                 ListenerConfig {
                     camouflage_required: false,
+                    send_proxy_protocol: false,
                     rule_id: 1,
                     port: 40001,
                     protocol: Protocol::Tcp,
@@ -1583,6 +1587,7 @@ mod tests {
                 },
                 ListenerConfig {
                     camouflage_required: false,
+                    send_proxy_protocol: false,
                     rule_id: 2,
                     port: 40002,
                     protocol: Protocol::Udp,
@@ -1654,6 +1659,7 @@ mod tests {
             listeners: vec![
                 ListenerConfig {
                     camouflage_required: false,
+                    send_proxy_protocol: false,
                     rule_id: 1,
                     port: 40050,
                     protocol: Protocol::Tcp,
@@ -1668,6 +1674,7 @@ mod tests {
                 },
                 ListenerConfig {
                     camouflage_required: false,
+                    send_proxy_protocol: false,
                     rule_id: 2,
                     port: 40050,
                     protocol: Protocol::Udp,
@@ -1792,6 +1799,7 @@ mod tests {
             camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
                 camouflage_required: false,
+                send_proxy_protocol: false,
                 rule_id: 1,
                 port: 40065,
                 protocol: Protocol::Tcp,
@@ -1828,6 +1836,7 @@ mod tests {
             camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
                 camouflage_required: false,
+                send_proxy_protocol: false,
                 rule_id: 1,
                 port: 40066,
                 protocol: Protocol::Tcp,
@@ -1897,6 +1906,7 @@ mod tests {
             listeners: vec![
                 ListenerConfig {
                     camouflage_required: false,
+                    send_proxy_protocol: false,
                     rule_id: 1,
                     port: 40070,
                     protocol: Protocol::Tcp,
@@ -1911,6 +1921,7 @@ mod tests {
                 },
                 ListenerConfig {
                     camouflage_required: false,
+                    send_proxy_protocol: false,
                     rule_id: 2,
                     port: 40071,
                     protocol: Protocol::Tcp,
@@ -1935,6 +1946,7 @@ mod tests {
             listeners: vec![
                 ListenerConfig {
                     camouflage_required: false,
+                    send_proxy_protocol: false,
                     rule_id: 1,
                     port: 40070,
                     protocol: Protocol::Tcp,
@@ -1949,6 +1961,7 @@ mod tests {
                 },
                 ListenerConfig {
                     camouflage_required: false,
+                    send_proxy_protocol: false,
                     rule_id: 2,
                     port: 40071,
                     protocol: Protocol::Tcp,
@@ -2219,6 +2232,7 @@ mod tests {
             listeners: vec![
                 ListenerConfig {
                     camouflage_required: false,
+                    send_proxy_protocol: false,
                     rule_id: 1,
                     port: 40004,
                     protocol: Protocol::Tcp,
@@ -2233,6 +2247,7 @@ mod tests {
                 },
                 ListenerConfig {
                     camouflage_required: false,
+                    send_proxy_protocol: false,
                     rule_id: 1,
                     port: 40004,
                     protocol: Protocol::Udp,
@@ -2256,6 +2271,7 @@ mod tests {
             camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
                 camouflage_required: false,
+                send_proxy_protocol: false,
                 rule_id: 1,
                 port: 40004,
                 protocol: Protocol::Tcp,
@@ -2344,6 +2360,7 @@ mod tests {
             camouflage_sites: vec![],
             listeners: vec![ListenerConfig {
                 camouflage_required: false,
+                send_proxy_protocol: false,
                 rule_id: 7,
                 port: 443,
                 protocol: Protocol::Tcp,

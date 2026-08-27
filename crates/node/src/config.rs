@@ -192,6 +192,8 @@ impl NodeConfig {
                     certbot_live_dir: PathBuf::from(&self.certbot_live_dir),
                     webroot: PathBuf::from(&self.certificate_http01_webroot),
                     state_dir: PathBuf::from(&self.certificate_state_dir),
+                    dns01_hook_binary: std::env::current_exe()
+                        .unwrap_or_else(|_| PathBuf::from("/opt/relay-node/relay-node")),
                     http01_nginx: crate::forwarder::nginx_sni::NginxSniConfig {
                         enabled: self.nginx_sni_enabled,
                         conf_path: PathBuf::from(&self.certificate_http01_conf_path),

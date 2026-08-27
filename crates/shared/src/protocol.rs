@@ -35,7 +35,15 @@ use serde::{Deserialize, Serialize};
 /// v6 = corrected Stage 3.3: NodeConfigResponse gains typed camouflage desired
 /// state and nginx_sni listeners can declare that their route depends on the
 /// matching Relay-local camouflage site being active.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 6;
+/// v7 = nginx_sni listeners can require upstream PROXY protocol v1. The gate
+/// prevents an older node from silently ignoring the new data-plane semantic.
+/// v8 = Panel-selected ACME DNS-01. The gate prevents a v7 node from silently
+/// ignoring DNS-01 hooks and the Panel-backed challenge lifecycle.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 8;
+
+pub fn config_protocol_versions_compatible(panel: u32, node: u32) -> bool {
+    panel == node
+}
 
 // === Auth ===
 #[derive(Debug, Serialize, Deserialize)]
@@ -168,6 +176,18 @@ pub struct CamouflageCertificatePolicy {
     pub expected_public_ip: String,
     #[serde(default = "default_renew_before_days")]
     pub renew_before_days: u32,
+    /// Optional ACME integration selected by the Panel. Older v7 Panels omit
+    /// this field and newer Nodes safely retain the HTTP-01 compatibility path.
+    #[serde(default)]
+    pub challenge_method: AcmeChallengeMethod,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcmeChallengeMethod {
+    #[default]
+    Http01,
+    Dns01,
 }
 
 fn default_true() -> bool {
@@ -210,6 +230,10 @@ pub struct ListenerConfig {
     /// the old immediate-activation behaviour via the false default.
     #[serde(default)]
     pub camouflage_required: bool,
+    /// When true, the shared nginx_sni stream listener sends PROXY protocol v1
+    /// to every upstream. All routes sharing the same port must agree.
+    #[serde(default)]
+    pub send_proxy_protocol: bool,
     pub targets: Vec<String>,
     /// v0.4.6: how the node picks among `targets` for each new connection /
     /// UDP session. Defaults to `First` so old configs and v0.4.5 rows behave
@@ -301,6 +325,7 @@ pub fn build_listeners_for_rule(
             ws_path: rule.ws_path.clone(),
             sni: rule.sni.clone(),
             camouflage_required: rule.camouflage_enabled,
+            send_proxy_protocol: rule.send_proxy_protocol,
             targets: targets.clone(),
             load_balance_strategy: LoadBalanceStrategy::from_db_str(&rule.load_balance_strategy),
             // v0.4.6: convert the user-facing Mbps caps to bytes/sec here so the
@@ -321,6 +346,36 @@ pub fn build_listeners_for_rule(
             },
         })
         .collect()
+}
+
+/// Validate listener-wide PROXY protocol semantics before a canonical config
+/// is delivered or applied. nginx stream enables upstream PROXY protocol at
+/// the shared server/listener level, so every SNI route on one port must agree.
+pub fn validate_proxy_protocol_invariants(listeners: &[ListenerConfig]) -> Result<(), String> {
+    let mut nginx_by_port = std::collections::BTreeMap::<u16, bool>::new();
+    for listener in listeners {
+        if listener.send_proxy_protocol && listener.node_transport != NodeTransport::NginxSni {
+            return Err(format!(
+                "rule {} enables Proxy Protocol outside nginx_sni",
+                listener.rule_id
+            ));
+        }
+        if listener.node_transport == NodeTransport::NginxSni {
+            match nginx_by_port.get(&listener.port) {
+                Some(enabled) if *enabled != listener.send_proxy_protocol => {
+                    return Err(format!(
+                        "mixed upstream Proxy Protocol modes on nginx_sni port {}",
+                        listener.port
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    nginx_by_port.insert(listener.port, listener.send_proxy_protocol);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Note: in NodeConfigResponse, a TcpUdp rule is expanded into TWO separate
@@ -522,7 +577,7 @@ pub struct TrafficEntry {
 }
 
 /// Relay-local reconciliation state. This is additive status telemetry and is
-/// intentionally independent of the v6 desired-config compatibility gate.
+/// intentionally independent of desired-config compatibility gate revisions.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ReconciliationStatusState {
@@ -682,7 +737,7 @@ pub struct StatusReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provisioning_capabilities: Option<ProvisioningCapabilities>,
     /// Stage 4: optional reconciliation telemetry. Older nodes omit it and
-    /// older Panels safely ignore it; CONFIG_PROTOCOL_VERSION remains v6.
+    /// older Panels safely ignore it; it does not itself change the config gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciliation: Option<ReconciliationStatus>,
 }
@@ -1118,6 +1173,10 @@ pub struct CreateRuleRequest {
     /// nginx_sni Reality relay rule. Admin-only at the API boundary.
     #[serde(default)]
     pub camouflage_enabled: bool,
+    /// Enable upstream PROXY protocol v1 for this nginx_sni listener cohort.
+    /// Existing clients and exports omit it and therefore remain off.
+    #[serde(default)]
+    pub send_proxy_protocol: bool,
     pub target_addr: String,
     pub target_port: u16,
     /// v0.4.6: optional multi-target list. Omitted means use the legacy
@@ -1174,6 +1233,10 @@ pub struct UpdateRuleRequest {
     /// Toggle the Relay-local camouflage dependency. Omitted keeps current.
     #[serde(default)]
     pub camouflage_enabled: Option<bool>,
+    /// Update upstream PROXY protocol v1 for the entire nginx_sni listener
+    /// cohort. Omitted keeps the current setting.
+    #[serde(default)]
+    pub send_proxy_protocol: Option<bool>,
     pub target_addr: Option<String>,
     pub target_port: Option<u16>,
     /// v0.4.6: replace the rule's target list. Omitted keeps current targets.
@@ -1524,6 +1587,7 @@ mod tests {
             ws_host: None,
             sni: None,
             camouflage_enabled: false,
+            send_proxy_protocol: false,
             target_addr: "127.0.0.1".into(),
             target_port: 53,
             targets: Vec::new(),
@@ -1603,6 +1667,44 @@ mod tests {
         assert_eq!(ls.len(), 1);
         assert_eq!(ls[0].node_transport, NodeTransport::NginxSni);
         assert_eq!(ls[0].sni.as_deref(), Some("op1.example.com"));
+    }
+
+    #[test]
+    fn build_listeners_passes_through_proxy_protocol_setting() {
+        let mut r = rule(4, "tcp", "nginx_sni");
+        r.sni = Some("op1.example.com".into());
+        r.send_proxy_protocol = true;
+        let ls = build_listeners_for_rule(&r, vec!["10.0.0.1:55443".into()]);
+        assert_eq!(ls.len(), 1);
+        assert!(ls[0].send_proxy_protocol);
+    }
+
+    #[test]
+    fn proxy_protocol_invariants_reject_non_nginx_and_mixed_listener_modes() {
+        let mut nginx = build_listeners_for_rule(
+            &{
+                let mut r = rule(5, "tcp", "nginx_sni");
+                r.listen_port = 443;
+                r.sni = Some("op1.example.com".into());
+                r
+            },
+            vec!["10.0.0.1:55443".into()],
+        );
+        let mut second = nginx[0].clone();
+        second.rule_id = 6;
+        second.sni = Some("op2.example.com".into());
+        second.send_proxy_protocol = true;
+        nginx.push(second);
+        assert!(validate_proxy_protocol_invariants(&nginx)
+            .unwrap_err()
+            .contains("mixed upstream Proxy Protocol modes"));
+
+        let mut raw = nginx[0].clone();
+        raw.node_transport = NodeTransport::Raw;
+        raw.send_proxy_protocol = true;
+        assert!(validate_proxy_protocol_invariants(&[raw])
+            .unwrap_err()
+            .contains("outside nginx_sni"));
     }
 
     #[test]
@@ -1778,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_status_is_optional_and_protocol_v6_compatible() {
+    fn reconciliation_status_is_optional_and_protocol_compatible() {
         let legacy = r#"{
             "cpu_usage": 1.0,
             "mem_usage": 2.0,
@@ -1787,7 +1889,7 @@ mod tests {
         }"#;
         let report: StatusReport = serde_json::from_str(legacy).unwrap();
         assert!(report.reconciliation.is_none());
-        assert_eq!(CONFIG_PROTOCOL_VERSION, 6);
+        assert_eq!(CONFIG_PROTOCOL_VERSION, 8);
 
         let status = ReconciliationStatus {
             state: ReconciliationStatusState::Converged,
@@ -1801,5 +1903,22 @@ mod tests {
         let encoded = serde_json::to_string(&status).unwrap();
         assert!(encoded.contains("CONVERGED"));
         assert!(encoded.contains("PANEL"));
+    }
+
+    #[test]
+    fn omitted_acme_challenge_method_remains_http01_on_protocol_v8() {
+        let policy: CamouflageCertificatePolicy = serde_json::from_str(
+            r#"{"domain":"site.example.com","expected_public_ip":"192.0.2.10","renew_before_days":30}"#,
+        )
+        .unwrap();
+        assert_eq!(policy.challenge_method, AcmeChallengeMethod::Http01);
+        assert_eq!(CONFIG_PROTOCOL_VERSION, 8);
+    }
+
+    #[test]
+    fn dns01_protocol_v8_pairings_fail_closed() {
+        assert!(!config_protocol_versions_compatible(7, 8));
+        assert!(!config_protocol_versions_compatible(8, 7));
+        assert!(config_protocol_versions_compatible(8, 8));
     }
 }

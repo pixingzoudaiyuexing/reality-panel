@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { Form } from 'antd';
-import { CamouflageFormFields, deriveCamouflageStatus, DnsStatusCell } from './Rules';
+import { CamouflageFormFields, camouflageCertificateMessage, deriveCamouflageStatus, DnsStatusCell, ProxyProtocolFormField } from './Rules';
 import type { NodeStatus, RuleDnsStatus } from '../api/types';
 
 // ============================================================
@@ -140,6 +140,19 @@ describe('camouflage observed status', () => {
     ...overrides,
   });
 
+  it('renders renewal failure as a warning while an existing certificate remains active', () => {
+    const translate = (key: string) => key;
+    expect(camouflageCertificateMessage(
+      'active',
+      'Certificate remains valid; automatic renewal failed and will be retried',
+      translate,
+    )).toBe('certificateRenewalWarning');
+    expect(camouflageCertificateMessage('failed', 'DNS lookup failed', translate))
+      .toBe('camouflageDnsMismatch');
+    expect(camouflageCertificateMessage('failed', 'hard certificate failure', translate))
+      .toBe('hard certificate failure');
+  });
+
   it('returns unknown when no Relay has useful observed state', () => {
     const result = deriveCamouflageStatus(rule, []);
     expect(result.state).toBe('unknown');
@@ -266,6 +279,21 @@ describe('camouflage rule form fields', () => {
 
     expect(screen.getByRole('switch', { name: 'camouflage' })).toBeDisabled();
     expect(screen.getByText('camouflageAdminOnly')).toBeInTheDocument();
+  });
+});
+
+describe('Proxy Protocol rule form field', () => {
+  const t = (key: string) => key;
+
+  it('defaults OFF and warns an administrator about the upstream requirement', () => {
+    render(<Form><ProxyProtocolFormField initialValue={false} isAdmin t={t} /></Form>);
+    expect(screen.getByRole('switch', { name: 'sendProxyProtocol' })).not.toBeChecked();
+    expect(screen.getByText('sendProxyProtocolHint')).toBeInTheDocument();
+  });
+
+  it('is disabled for non-admin users', () => {
+    render(<Form><ProxyProtocolFormField initialValue={false} isAdmin={false} t={t} /></Form>);
+    expect(screen.getByRole('switch', { name: 'sendProxyProtocol' })).toBeDisabled();
   });
 });
 
