@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   asValidatedEntry,
   buildExportJSON,
+  buildImportedRulePayload,
   parseDest,
   ruleTargets,
   validateImportEntry,
@@ -131,8 +132,44 @@ describe('buildExportJSON', () => {
       protocol: 'tcp',
       public_transport: 'nginx_sni',
       sni: 'op1.example.com',
+      camouflage_enabled: false,
       load_balance_strategy: 'round_robin',
     });
+  });
+
+  it('preserves all targets in order, including disabled targets', () => {
+    const entry: ExportEntry = JSON.parse(buildExportJSON([mkRule({
+      targets: [
+        tgt('first.example', 443, true, 1, 1, 1),
+        tgt('standby.example', 8443, false, 2, 1, 2),
+        tgt('last.example', 9443, true, 3, 1, 3),
+      ],
+    })]))[0];
+    expect(entry.targets).toEqual([
+      { host: 'first.example', port: 443, enabled: true },
+      { host: 'standby.example', port: 8443, enabled: false },
+      { host: 'last.example', port: 9443, enabled: true },
+    ]);
+    expect(entry.dest).toEqual(['first.example:443', 'last.example:9443']);
+  });
+
+  it('preserves an enabled camouflage setting', () => {
+    const entry: ExportEntry = JSON.parse(buildExportJSON([mkRule({
+      public_transport: 'nginx_sni',
+      sni: 'op1.example.com',
+      camouflage_enabled: true,
+    })]))[0];
+    expect(entry.camouflage_enabled).toBe(true);
+  });
+
+  it('keeps an all-disabled target set importable through targets', () => {
+    const entry = JSON.parse(buildExportJSON([mkRule({
+      targets: [tgt('disabled.example', 443, false, 1, 1, 1)],
+    })]))[0];
+    expect(entry.dest).toEqual([]);
+    expect(validateImportEntry(entry)).toBeNull();
+    expect(buildImportedRulePayload(asValidatedEntry(entry), 4).targets)
+      .toEqual([{ host: 'disabled.example', port: 443, enabled: false }]);
   });
 });
 
@@ -274,6 +311,80 @@ describe('asValidatedEntry', () => {
     expect(typed.public_transport).toBe('nginx_sni');
     expect(typed.sni).toBe('op1.example.com');
     expect(typed.load_balance_strategy).toBe('failover');
+  });
+});
+
+describe('buildImportedRulePayload', () => {
+  it('round-trips a simple TCP rule into the selected destination group', () => {
+    const source = mkRule({
+      name: 'simple-tcp',
+      listen_port: 12000,
+      protocol: 'tcp',
+      target_addr: '203.0.113.10',
+      target_port: 443,
+    });
+    const entry = JSON.parse(buildExportJSON([source]))[0];
+    expect(validateImportEntry(entry)).toBeNull();
+    const payload = buildImportedRulePayload(asValidatedEntry(entry), 72);
+    expect(payload).toMatchObject({
+      name: 'simple-tcp',
+      listen_port: 12000,
+      protocol: 'tcp',
+      public_transport: 'raw',
+      device_group_in: 72,
+      target_addr: '203.0.113.10',
+      target_port: 443,
+    });
+  });
+
+  it('round-trips Reality SNI forwarding metadata and target order', () => {
+    const source = mkRule({
+      name: 'op1',
+      listen_port: 443,
+      protocol: 'tcp',
+      public_transport: 'nginx_sni',
+      sni: 'op1.example.com',
+      camouflage_enabled: true,
+      load_balance_strategy: 'failover',
+      targets: [
+        tgt('198.51.100.10', 55443, true, 1, 1, 1),
+        tgt('198.51.100.11', 55443, false, 2, 1, 2),
+        tgt('198.51.100.12', 55443, true, 3, 1, 3),
+      ],
+    });
+    const entry = JSON.parse(buildExportJSON([source]))[0];
+    expect(validateImportEntry(entry)).toBeNull();
+    const payload = buildImportedRulePayload(asValidatedEntry(entry), 99);
+    expect(payload).toMatchObject({
+      protocol: 'tcp',
+      public_transport: 'nginx_sni',
+      sni: 'op1.example.com',
+      camouflage_enabled: true,
+      load_balance_strategy: 'failover',
+      device_group_in: 99,
+    });
+    expect(payload.targets).toEqual([
+      { host: '198.51.100.10', port: 55443, enabled: true },
+      { host: '198.51.100.11', port: 55443, enabled: false },
+      { host: '198.51.100.12', port: 55443, enabled: true },
+    ]);
+  });
+
+  it('keeps the old dest-only format importable with safe defaults', () => {
+    const oldEntry = {
+      name: 'legacy',
+      listen_port: 10000,
+      dest: ['legacy.example:443'],
+    };
+    expect(validateImportEntry(oldEntry)).toBeNull();
+    expect(buildImportedRulePayload(asValidatedEntry(oldEntry), 15)).toMatchObject({
+      protocol: 'tcp_udp',
+      public_transport: 'raw',
+      camouflage_enabled: false,
+      load_balance_strategy: 'first',
+      device_group_in: 15,
+      targets: [{ host: 'legacy.example', port: 443, enabled: true }],
+    });
   });
 });
 

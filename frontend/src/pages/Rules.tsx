@@ -9,7 +9,7 @@ import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 import { useAuth } from '../auth/useAuth';
-import { asValidatedEntry, buildExportJSON, parseDest, ruleTargets, validateImportEntry } from '../utils/rulesIO';
+import { asValidatedEntry, buildExportJSON, buildImportedRulePayload, ruleTargets, validateImportEntry } from '../utils/rulesIO';
 
 const { Text } = Typography;
 const { TextArea } = Input;
@@ -526,15 +526,6 @@ export default function Rules() {
     message.success(t('exported'));
   };
 
-const IMPORT_DEFAULTS = {
-  protocol: 'tcp_udp' as const,
-  public_transport: 'raw' as const,
-  forward_mode: 'direct' as const,
-  route_mode: 'direct' as const,
-  load_balance_strategy: 'first' as const,
-  upload_limit_mbps: 0,
-  download_limit_mbps: 0,
-};
   const handleImport = async () => {
     if (!importGroupId) {
       message.error(t('selectInboundGroup'));
@@ -556,27 +547,9 @@ const IMPORT_DEFAULTS = {
       const err = validateImportEntry(e);
       if (err) { results.push(`❌ ${label}: ${err}`); continue; }
       const entry = asValidatedEntry(e);
-      const targets = entry.dest.map(d => {
-        // validateImportEntry already rejected any unparseable dest above, so
-        // parseDest is non-null here; fall back to a safe default defensively.
-        const p = parseDest(d) ?? { host: '', port: 0 };
-        return { host: p.host, port: p.port, enabled: true };
-      });
-      const first = targets[0];
-      const importedTransport = entry.public_transport === 'nginx_sni' ? 'nginx_sni' : IMPORT_DEFAULTS.public_transport;
       try {
         const res = await api.post<unknown, ApiEnvelope<null>>('/rules', {
-          name: entry.name,
-          listen_port: entry.listen_port,
-          ...IMPORT_DEFAULTS,
-          protocol: importedTransport === 'nginx_sni' ? 'tcp' : (entry.protocol ?? IMPORT_DEFAULTS.protocol),
-          public_transport: importedTransport,
-          sni: importedTransport === 'nginx_sni' ? entry.sni : undefined,
-          load_balance_strategy: entry.load_balance_strategy ?? IMPORT_DEFAULTS.load_balance_strategy,
-          device_group_in: importGroupId,
-          target_addr: first.host,
-          target_port: first.port,
-          targets,
+          ...buildImportedRulePayload(entry, importGroupId),
           // v1.0.6: attribute to the target user when an admin imports via the
           // user-management entry (/rules?owner_uid=X); else owner = caller.
           owner_uid: filterOwnerUid ?? undefined,
