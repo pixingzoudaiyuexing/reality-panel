@@ -817,6 +817,188 @@ async fn rule_create_full_cross_group_no_crosstalk() {
     assert_eq!(b_targets[2].host, "b3.example.com");
 }
 
+#[tokio::test]
+async fn rule_create_full_port_conflicts_match_insert() {
+    let db = repo().await;
+    seed_group(&db, 1).await;
+    seed_group(&db, 2).await;
+
+    assert!(<SqliteRepository as RuleRepository>::create_rule_full(
+        &db,
+        "raw-a",
+        1,
+        31000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        None,
+        false,
+        false,
+        1,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+        &[],
+        "first",
+        0,
+        0,
+        None,
+    )
+    .await
+    .unwrap()
+    .is_some());
+    assert!(matches!(
+        <SqliteRepository as RuleRepository>::create_rule_full(
+            &db,
+            "raw-duplicate",
+            1,
+            31000,
+            "tcp",
+            "raw",
+            "raw",
+            "direct",
+            "raw",
+            None,
+            None,
+            false,
+            false,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+            &[],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await,
+        Err(DbError::PortConflict)
+    ));
+    assert!(<SqliteRepository as RuleRepository>::create_rule_full(
+        &db,
+        "raw-other-group",
+        1,
+        31000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        None,
+        false,
+        false,
+        2,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+        &[],
+        "first",
+        0,
+        0,
+        None,
+    )
+    .await
+    .unwrap()
+    .is_some());
+
+    for (name, sni) in [("sni-a", "a.example.com"), ("sni-b", "b.example.com")] {
+        assert!(<SqliteRepository as RuleRepository>::create_rule_full(
+            &db,
+            name,
+            1,
+            31001,
+            "tcp",
+            "nginx_sni",
+            "nginx_sni",
+            "direct",
+            "nginx_sni",
+            None,
+            Some(sni),
+            false,
+            false,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            55443,
+            &[],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await
+        .unwrap()
+        .is_some());
+    }
+    assert!(matches!(
+        <SqliteRepository as RuleRepository>::create_rule_full(
+            &db,
+            "sni-duplicate",
+            1,
+            31001,
+            "tcp",
+            "nginx_sni",
+            "nginx_sni",
+            "direct",
+            "nginx_sni",
+            None,
+            Some("A.EXAMPLE.COM"),
+            false,
+            false,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            55443,
+            &[],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await,
+        Err(DbError::PortConflict)
+    ));
+    assert!(matches!(
+        <SqliteRepository as RuleRepository>::create_rule_full(
+            &db,
+            "raw-on-sni-port",
+            1,
+            31001,
+            "tcp",
+            "raw",
+            "raw",
+            "direct",
+            "raw",
+            None,
+            None,
+            false,
+            false,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+            &[],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await,
+        Err(DbError::PortConflict)
+    ));
+}
+
 /// v1.2 regression: create_rule_full is one transaction, so a failure in the
 /// targets write (here a port=0 target violates the table's CHECK constraint)
 /// must roll back the rule-row INSERT — no half-rule left behind.

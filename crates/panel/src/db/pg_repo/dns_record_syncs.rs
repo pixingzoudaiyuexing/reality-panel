@@ -56,7 +56,7 @@ impl DnsRecordSyncRepository for PgRepository {
             "UPDATE dns_record_syncs SET fqdn = $1, record_type = $2, expected_value = $3,\
                  line = $4, line_key = $5, state = $6, ownership = $7,\
                  mutation_verified_at = NULL, last_observed_at = NULL, propagated_at = NULL,\
-                 last_error_category = $8, attempt_count = 0, next_attempt_at = $9, updated_at = $10\
+                 last_error_category = $8, attempt_count = 0, next_attempt_at = $9, updated_at = $10 \
              WHERE rule_id = $11",
         )
         .bind(fqdn)
@@ -86,7 +86,7 @@ impl DnsRecordSyncRepository for PgRepository {
     ) -> Result<u64, DbError> {
         Ok(sqlx::query(
             "UPDATE dns_record_syncs SET state = $1, ownership = $2,\
-                 last_error_category = $3, attempt_count = 0, next_attempt_at = $4, updated_at = $5\
+                 last_error_category = $3, attempt_count = 0, next_attempt_at = $4, updated_at = $5 \
              WHERE rule_id = $6",
         )
         .bind(state)
@@ -134,8 +134,8 @@ impl DnsRecordSyncRepository for PgRepository {
         Ok(sqlx::query(
             "UPDATE dns_record_syncs SET state = $1, ownership = $2,\
                  mutation_verified_at = $3, last_observed_at = $4, propagated_at = $5,\
-                 last_error_category = $6, attempt_count = $7, next_attempt_at = $8, updated_at = $9\
-             WHERE rule_id = $10 AND fqdn = $11 AND record_type = $12 AND expected_value = $13\
+                 last_error_category = $6, attempt_count = $7, next_attempt_at = $8, updated_at = $9 \
+             WHERE rule_id = $10 AND fqdn = $11 AND record_type = $12 AND expected_value = $13 \
                AND line = $14 AND line_key = $15 AND state = $16",
         )
         .bind(state)

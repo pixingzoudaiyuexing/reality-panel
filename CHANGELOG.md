@@ -7,6 +7,11 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.0.0] - 2026-08-29
+
+First stable Reality Panel release. This promotes the accepted rc.6 code line
+without changing runtime behavior or config protocol 8.
+
 ## [1.0.0-rc.6] - 2026-08-28
 
 Release candidate update for installer reliability, product branding,

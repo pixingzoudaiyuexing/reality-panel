@@ -467,7 +467,10 @@ impl RuleRepository for SqliteRepository {
                AND ( \
                     (? = 1 AND node_transport = 'nginx_sni' AND lower(COALESCE(sni, '')) = lower(?)) \
                  OR (? = 1 AND node_transport != 'nginx_sni' AND protocol IN ('tcp', 'tcp_udp')) \
-                 OR (? = 0 AND node_transport = 'nginx_sni' AND ? = 1) \
+                 OR (? = 0 AND ? = 1 AND ( \
+                        node_transport = 'nginx_sni' \
+                     OR (node_transport != 'nginx_sni' AND protocol IN ('tcp', 'tcp_udp')) \
+                 )) \
                  OR ( (? = 1 AND protocol IN ('udp', 'tcp_udp')) ) \
                ) \
              LIMIT 1",
@@ -608,7 +611,10 @@ impl RuleRepository for SqliteRepository {
                    AND ( \
                         (? = 1 AND node_transport = 'nginx_sni' AND lower(COALESCE(sni, '')) = lower(?)) \
                      OR (? = 1 AND node_transport != 'nginx_sni' AND protocol IN ('tcp', 'tcp_udp')) \
-                     OR (? = 0 AND node_transport = 'nginx_sni' AND ? = 1) \
+                     OR (? = 0 AND ? = 1 AND ( \
+                            node_transport = 'nginx_sni' \
+                         OR (node_transport != 'nginx_sni' AND protocol IN ('tcp', 'tcp_udp')) \
+                     )) \
                      OR ( (? = 1 AND protocol IN ('udp', 'tcp_udp')) ) \
                    ) \
                  LIMIT 1",

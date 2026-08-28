@@ -18,11 +18,11 @@ store Reality private material. The control protocol is version 8.
 ## Install
 
 Versioned GitHub Releases are the only supported production source. The
-current release candidate is installed explicitly:
+current stable release is installed explicitly:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.6/install.sh \
-  | bash -s -- install --version v1.0.0-rc.6 --public-panel-url http://203.0.113.10:18888
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0/install.sh \
+  | bash -s -- install --version v1.0.0 --public-panel-url http://203.0.113.10:18888
 ```
 
 The supported first-release host is Debian 12 amd64 with systemd. The
@@ -67,7 +67,7 @@ Default uninstall removes the local Panel service, installed binaries,
 frontend, and Node artifacts but retains local configuration and data:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.6/install.sh \
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0/install.sh \
   | bash -s -- uninstall
 ```
 
@@ -110,4 +110,4 @@ client authentication still requires a real client connection; the Panel does
 not claim a complete automated VLESS fallback test without one.
 
 See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) for the fresh VPS
-release-candidate acceptance sequence.
+release acceptance sequence.

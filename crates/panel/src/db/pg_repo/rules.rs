@@ -487,6 +487,7 @@ impl RuleRepository for PgRepository {
                     ($3 AND node_transport = 'nginx_sni' AND lower(COALESCE(sni, '')) = lower($4)) \
                  OR ($3 AND node_transport != 'nginx_sni' AND protocol IN ('tcp', 'tcp_udp')) \
                  OR (NOT $3 AND node_transport = 'nginx_sni' AND $5) \
+                 OR ($5 AND node_transport != 'nginx_sni' AND protocol IN ('tcp', 'tcp_udp')) \
                  OR ($6 AND protocol IN ('udp', 'tcp_udp')) \
                ) \
              LIMIT 1",
@@ -640,6 +641,7 @@ impl RuleRepository for PgRepository {
                         ($3 AND node_transport = 'nginx_sni' AND lower(COALESCE(sni, '')) = lower($4)) \
                      OR ($3 AND node_transport != 'nginx_sni' AND protocol IN ('tcp', 'tcp_udp')) \
                      OR (NOT $3 AND node_transport = 'nginx_sni' AND $5) \
+                     OR ($5 AND node_transport != 'nginx_sni' AND protocol IN ('tcp', 'tcp_udp')) \
                      OR ($6 AND protocol IN ('udp', 'tcp_udp')) \
                    ) \
                  LIMIT 1",

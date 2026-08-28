@@ -5,12 +5,12 @@ relays. It provides Relay node management, Nginx Stream forwarding, Proxy
 Protocol v1, DNSMgr A records, DNS-01 certificates, OpenList camouflage,
 last-known-good recovery, lifecycle operations, diagnostics, and reapply.
 
-Production installs use only versioned GitHub Release assets. The current RC
-can be installed with:
+Production installs use only versioned GitHub Release assets. The current
+stable release can be installed with:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.6/install.sh \
-  | bash -s -- install --version v1.0.0-rc.6 --public-panel-url http://203.0.113.10:18888
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0/install.sh \
+  | bash -s -- install --version v1.0.0 --public-panel-url http://203.0.113.10:18888
 ```
 
 The installer targets Debian 12 amd64 with systemd, verifies every asset with
@@ -35,7 +35,7 @@ reality-panel-update v1.0.0
 Default uninstall retains local data and requires typing `UNINSTALL`:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.6/install.sh \
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0/install.sh \
   | bash -s -- uninstall
 ```
 
@@ -57,5 +57,5 @@ Diagnostics cover SNI, backend TCP, certificate, camouflage, and PROXY
 configuration. VLESS client authentication and full fallback E2E still need a
 real client connection.
 
-See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) for the RC
+See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) for the release
 acceptance sequence.

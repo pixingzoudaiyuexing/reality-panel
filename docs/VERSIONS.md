@@ -1,7 +1,7 @@
 # Release Contract
 
 Reality Panel uses one release tag and one compatibility version for the Panel
-and Node. The current candidate is `v1.0.0-rc.6`; the wire protocol remains
+and Node. The current stable release is `v1.0.0`; the wire protocol remains
 `CONFIG_PROTOCOL_VERSION = 8`.
 
 ## Release assets
@@ -36,9 +36,10 @@ is a production update source.
 Run before tagging:
 
 ```bash
-bash scripts/release-check.sh 1.0.0-rc.6
+bash scripts/release-check.sh 1.0.0
 ```
 
 The default updater resolves the latest non-prerelease `v*` Release. An
-explicit version may select `v1.0.0-rc.6` or a later stable tag. This permits
-an in-place RC-to-stable upgrade without changing database or runtime paths.
+explicit version may select `v1.0.0-rc.6`, `v1.0.0`, or a later stable tag.
+This permits an in-place RC-to-stable upgrade without changing database or
+runtime paths.

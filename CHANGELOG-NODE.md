@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.0.0] - 2026-08-29
+
+First stable relay-node release. This promotes the accepted rc.6 code line
+without changing Node runtime behavior or config protocol 8.
+
 ## [1.0.0-rc.6] - 2026-08-28
 
 Adds the managed global HTTP-to-HTTPS redirect, safely disables only the

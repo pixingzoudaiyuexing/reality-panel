@@ -658,6 +658,78 @@ async fn pg_rule_insert_quota_guarded_tcp_udp_share_port() {
     cleanup(&db).await;
 }
 
+#[tokio::test]
+async fn pg_rule_insert_quota_guarded_nginx_sni_shares_port_by_sni() {
+    let Some(db) = repo("rule_nginx_sni_share").await else {
+        return;
+    };
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (1, 'gin', 'in', 'tok-1', 1)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let insert_sni = |name: &'static str, sni: &'static str| {
+        let db = &db;
+        async move {
+            <PgRepository as RuleRepository>::insert_quota_guarded(
+                db,
+                name,
+                1,
+                443,
+                "tcp",
+                "nginx_sni",
+                "nginx_sni",
+                "direct",
+                "nginx_sni",
+                None,
+                Some(sni),
+                false,
+                false,
+                1,
+                None,
+                "direct",
+                "127.0.0.1",
+                55443,
+            )
+            .await
+        }
+    };
+
+    insert_sni("op1", "op1.example.com").await.unwrap();
+    insert_sni("op2", "op2.example.com").await.unwrap();
+
+    match insert_sni("op1-dup-case", "OP1.EXAMPLE.COM").await {
+        Err(DbError::PortConflict) => {}
+        other => panic!("expected PortConflict for duplicate SNI, got {:?}", other),
+    }
+
+    match db
+        .insert_quota_guarded(
+            "raw",
+            1,
+            443,
+            "tcp",
+            "raw",
+            "raw",
+            "direct",
+            "raw",
+            None,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+        )
+        .await
+    {
+        Err(DbError::PortConflict) => {}
+        other => panic!(
+            "expected PortConflict for raw TCP on SNI port, got {:?}",
+            other
+        ),
+    }
+    cleanup(&db).await;
+}
+
 /// v0.4.11 PR4 (PG parity): same port on a DIFFERENT group is allowed;
 /// different users sharing one group share its pool.
 #[tokio::test]
@@ -941,6 +1013,197 @@ async fn pg_rule_create_full_cross_group_no_crosstalk() {
     assert_eq!(b_targets.len(), 3, "rule B got its three targets");
     assert_eq!(b_targets[0].host, "b1.example.com");
     assert_eq!(b_targets[2].host, "b3.example.com");
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_rule_create_full_port_conflicts_match_insert() {
+    let Some(db) = repo("rule_full_port_conflicts").await else {
+        return;
+    };
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (1, 'gin', 'in', 'tok-1', 1)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (2, 'gin2', 'in', 'tok-2', 1)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    assert!(<PgRepository as RuleRepository>::create_rule_full(
+        &db,
+        "raw-a",
+        1,
+        31000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        None,
+        false,
+        false,
+        1,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+        &[],
+        "first",
+        0,
+        0,
+        None,
+    )
+    .await
+    .unwrap()
+    .is_some());
+    assert!(matches!(
+        <PgRepository as RuleRepository>::create_rule_full(
+            &db,
+            "raw-duplicate",
+            1,
+            31000,
+            "tcp",
+            "raw",
+            "raw",
+            "direct",
+            "raw",
+            None,
+            None,
+            false,
+            false,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+            &[],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await,
+        Err(DbError::PortConflict)
+    ));
+    assert!(<PgRepository as RuleRepository>::create_rule_full(
+        &db,
+        "raw-other-group",
+        1,
+        31000,
+        "tcp",
+        "raw",
+        "raw",
+        "direct",
+        "raw",
+        None,
+        None,
+        false,
+        false,
+        2,
+        None,
+        "direct",
+        "127.0.0.1",
+        80,
+        &[],
+        "first",
+        0,
+        0,
+        None,
+    )
+    .await
+    .unwrap()
+    .is_some());
+
+    for (name, sni) in [("sni-a", "a.example.com"), ("sni-b", "b.example.com")] {
+        assert!(<PgRepository as RuleRepository>::create_rule_full(
+            &db,
+            name,
+            1,
+            31001,
+            "tcp",
+            "nginx_sni",
+            "nginx_sni",
+            "direct",
+            "nginx_sni",
+            None,
+            Some(sni),
+            false,
+            false,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            55443,
+            &[],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await
+        .unwrap()
+        .is_some());
+    }
+    assert!(matches!(
+        <PgRepository as RuleRepository>::create_rule_full(
+            &db,
+            "sni-duplicate",
+            1,
+            31001,
+            "tcp",
+            "nginx_sni",
+            "nginx_sni",
+            "direct",
+            "nginx_sni",
+            None,
+            Some("A.EXAMPLE.COM"),
+            false,
+            false,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            55443,
+            &[],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await,
+        Err(DbError::PortConflict)
+    ));
+    assert!(matches!(
+        <PgRepository as RuleRepository>::create_rule_full(
+            &db,
+            "raw-on-sni-port",
+            1,
+            31001,
+            "tcp",
+            "raw",
+            "raw",
+            "direct",
+            "raw",
+            None,
+            None,
+            false,
+            false,
+            1,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+            &[],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await,
+        Err(DbError::PortConflict)
+    ));
     cleanup(&db).await;
 }
 
@@ -5490,7 +5753,7 @@ async fn pg_admin_order_list_pages_without_overlap() {
 }
 
 #[tokio::test]
-async fn pg_dns_record_binding_contract_matches_sqlite() {
+async fn pg_dns_record_bindings_preserve_exact_ownership_and_enforce_uniqueness() {
     let Some(db) = repo("dns_binding").await else {
         return;
     };
@@ -5572,7 +5835,7 @@ async fn pg_dns_record_binding_contract_matches_sqlite() {
 }
 
 #[tokio::test]
-async fn pg_dns_record_sync_contract_matches_sqlite() {
+async fn pg_dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
     let Some(db) = repo("dns_sync").await else {
         return;
     };
