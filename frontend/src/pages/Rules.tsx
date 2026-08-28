@@ -50,6 +50,28 @@ export function isRealityRule(rule: Pick<ForwardRule, 'public_transport' | 'node
   return rule.public_transport === 'nginx_sni' || rule.node_transport === 'nginx_sni';
 }
 
+type RealityRuntimeChecks = {
+  config: Pick<RealityDiagnosis['config'], 'check'>;
+  nginx: Pick<RealityDiagnosis['nginx'], 'check'>;
+  runtime: Pick<RealityDiagnosis['runtime'], 'check'>;
+};
+
+export function diagnoseRuntimeStatus(listenerRunning: boolean, reality?: RealityRuntimeChecks) {
+  if (!reality) {
+    return {
+      healthy: listenerRunning,
+      labelKey: listenerRunning ? 'diagnoseListenerRunning' : 'diagnoseListenerStopped',
+    };
+  }
+  const healthy = reality.config.check.state === 'pass'
+    && reality.nginx.check.state === 'pass'
+    && reality.runtime.check.state === 'pass';
+  return {
+    healthy,
+    labelKey: healthy ? 'diagnoseRealityRunning' : 'diagnoseRealityFailed',
+  };
+}
+
 export function compactRealityStatus(
   rule: Pick<ForwardRule, 'camouflage_enabled'>,
   dns: RuleDnsStatus | undefined,
@@ -1612,14 +1634,17 @@ function DiagnoseNodeRow({ node, t, isAdmin }: { node: NodeDiagnoseStatus; t: (k
   const labelWithId = isAdmin
     ? <Tooltip title={t('diagnoseNodeIdLabel') + node.node_id}>{labelText}</Tooltip>
     : labelText;
+  const runtimeStatus = node.status === 'result'
+    ? diagnoseRuntimeStatus(node.listener_running, node.reality)
+    : null;
   return (
     <div>
       <Space wrap align="center">
         {labelWithId}
         {node.status === 'result' && (
           <>
-            <Tag color={node.listener_running ? 'green' : 'red'}>
-              {node.listener_running ? t('diagnoseListenerRunning') : t('diagnoseListenerStopped')}
+            <Tag color={runtimeStatus?.healthy ? 'green' : 'red'}>
+              {t(runtimeStatus?.labelKey ?? 'diagnoseListenerStopped')}
             </Tag>
             {node.listen_port ? <Text type="secondary">:{node.listen_port}</Text> : null}
             {node.protocol ? <Tag>{node.protocol}</Tag> : null}

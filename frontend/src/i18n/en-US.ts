@@ -583,6 +583,8 @@ export const enUS: Dict = {
   diagnoseNodeIdLabel: 'Troubleshoot node_id: ',
   diagnoseListenerRunning: 'listener running',
   diagnoseListenerStopped: 'listener NOT running',
+  diagnoseRealityRunning: 'Nginx SNI running',
+  diagnoseRealityFailed: 'Nginx SNI unhealthy',
   diagnoseUnsupportedPrefix: 'node version ',
   diagnoseUnsupportedSuffix: ' — diagnose protocol too old, please upgrade relay-node to ≥0.4.14',
   diagnoseOffline: 'control channel offline — cannot dispatch',

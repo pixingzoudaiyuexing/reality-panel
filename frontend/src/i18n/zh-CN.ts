@@ -580,6 +580,8 @@ export const zhCN = {
   diagnoseNodeIdLabel: '排障 node_id：',
   diagnoseListenerRunning: '监听运行中',
   diagnoseListenerStopped: '监听未运行',
+  diagnoseRealityRunning: 'Nginx SNI 运行中',
+  diagnoseRealityFailed: 'Nginx SNI 异常',
   diagnoseUnsupportedPrefix: '节点版本 ',
   diagnoseUnsupportedSuffix: ' —— 诊断协议过旧，请升级 relay-node 至 ≥0.4.14',
   diagnoseOffline: '控制通道离线，无法下发',

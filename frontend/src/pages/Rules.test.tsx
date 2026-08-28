@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { Form } from 'antd';
-import { CamouflageFormFields, camouflageCertificateMessage, compactRealityStatus, deriveCamouflageStatus, DnsStatusCell, isRealityRule, ProxyProtocolFormField } from './Rules';
-import type { NodeStatus, RuleDnsStatus } from '../api/types';
+import { CamouflageFormFields, camouflageCertificateMessage, compactRealityStatus, deriveCamouflageStatus, diagnoseRuntimeStatus, DnsStatusCell, isRealityRule, ProxyProtocolFormField } from './Rules';
+import type { NodeStatus, RealityDiagnosis, RuleDnsStatus } from '../api/types';
 
 // ============================================================
 // Pure-function tests for Rules.tsx helpers
@@ -311,6 +311,49 @@ describe('Reality rule controls and compact status', () => {
       view,
       translate,
     ).certificate).toMatch(/^OK (88|89)d$/);
+  });
+});
+
+describe('diagnosis runtime status', () => {
+  const reality = (overrides: Partial<RealityDiagnosis> = {}): RealityDiagnosis => ({
+    config: { check: { state: 'pass' }, listen_port: 443, sni: 'op1.example.com', targets: ['192.0.2.1:443'], send_proxy_protocol: true },
+    nginx: { check: { state: 'pass' }, plan_contains_rule: true, mapping_matches: true, managed_file_matches: true, config_valid: true, service_healthy: true },
+    runtime: { check: { state: 'pass' }, listen_443: true, listen_8443: true },
+    backends: [],
+    certificate: { check: { state: 'pass' }, renewal: { state: 'pass' }, certificate_status: 'active', san_match: true, cert_key_match: true, tls_handshake: { state: 'pass' } },
+    camouflage: { check: { state: 'pass' }, site_status: 'active', tls_listener_port: 8443, local_backend: '127.0.0.1:5244', http_status: 200 },
+    fallback: { check: { state: 'not_tested' }, authenticated_reality_path: false },
+    vless_authentication: { state: 'not_tested' },
+    ...overrides,
+  });
+
+  it('preserves the ordinary listener stopped label', () => {
+    expect(diagnoseRuntimeStatus(false)).toEqual({
+      healthy: false,
+      labelKey: 'diagnoseListenerStopped',
+    });
+  });
+
+  it('uses Reality runtime health instead of the ManagedListener flag', () => {
+    expect(diagnoseRuntimeStatus(false, reality())).toEqual({
+      healthy: true,
+      labelKey: 'diagnoseRealityRunning',
+    });
+  });
+
+  it('reports a failed Reality core runtime as unhealthy', () => {
+    const failed = reality({ runtime: { check: { state: 'fail' }, listen_443: false, listen_8443: true } });
+    expect(diagnoseRuntimeStatus(true, failed)).toEqual({
+      healthy: false,
+      labelKey: 'diagnoseRealityFailed',
+    });
+  });
+
+  it('does not let a renewal warning change the Reality runtime label', () => {
+    const warning = reality({
+      certificate: { check: { state: 'pass' }, renewal: { state: 'warning' }, certificate_status: 'active', san_match: true, cert_key_match: true, tls_handshake: { state: 'pass' } },
+    });
+    expect(diagnoseRuntimeStatus(false, warning).labelKey).toBe('diagnoseRealityRunning');
   });
 });
 

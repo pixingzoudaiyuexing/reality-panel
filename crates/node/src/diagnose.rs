@@ -267,18 +267,22 @@ fn build_reality_diagnosis(
         backends,
         certificate,
         camouflage: camouflage_status,
-        fallback: RealityFallbackDiagnosis {
-            check: check(
-                "not_tested",
-                "requires a VLESS client credential and does not run from relay-node",
-            ),
-            http_status: None,
-            authenticated_reality_path: false,
-        },
+        fallback: fallback_diagnosis(),
         vless_authentication: check(
             "not_tested",
             "relay-node does not possess client UUID or Reality credentials",
         ),
+    }
+}
+
+fn fallback_diagnosis() -> RealityFallbackDiagnosis {
+    RealityFallbackDiagnosis {
+        check: check(
+            "not_tested",
+            "the full :443 -> remote Reality -> :8443 fallback path is not probed by relay-node",
+        ),
+        http_status: None,
+        authenticated_reality_path: false,
     }
 }
 
@@ -662,5 +666,16 @@ mod tests {
             renewal.detail.as_deref(),
             Some("renewal failed; will retry")
         );
+    }
+
+    #[test]
+    fn fallback_probe_is_not_conflated_with_vless_client_authentication() {
+        let fallback = fallback_diagnosis();
+        assert_eq!(fallback.check.state, "not_tested");
+        assert_eq!(fallback.http_status, None);
+        assert!(!fallback.authenticated_reality_path);
+        let detail = fallback.check.detail.as_deref().unwrap();
+        assert!(detail.contains(":443 -> remote Reality -> :8443"));
+        assert!(!detail.contains("credential"));
     }
 }
