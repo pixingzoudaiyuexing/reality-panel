@@ -1980,9 +1980,10 @@ mod tests {
 
         let old_reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let old_port = old_reserve.local_addr().unwrap().port();
-        drop(old_reserve);
         let new_reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let new_port = new_reserve.local_addr().unwrap().port();
+        assert_ne!(old_port, new_port);
+        drop(old_reserve);
         drop(new_reserve);
         let old = raw_config(old_port);
         let mut new = raw_config(new_port);

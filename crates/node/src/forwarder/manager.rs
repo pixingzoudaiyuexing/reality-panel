@@ -1314,12 +1314,10 @@ mod tests {
     #[tokio::test]
     async fn runtime_inspection_targets_dead_raw_tcp_only() {
         let mut mgr = fresh_mgr();
-        mgr.set_listen_addresses_for_test("127.0.0.1", "");
         let reserve_a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let reserve_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port_a = reserve_a.local_addr().unwrap().port();
         let port_b = reserve_b.local_addr().unwrap().port();
-        drop(reserve_a);
         drop(reserve_b);
         let mut config = raw_config(port_a, Protocol::Tcp);
         config.listeners.push(ListenerConfig {
@@ -1337,23 +1335,38 @@ mod tests {
             download_limit_bps: None,
             max_connections: None,
         });
-        assert!(mgr.apply_config(&config).await);
+
+        let live_key = (port_a, Protocol::Tcp, NodeTransport::Raw);
+        mgr.listeners.insert(
+            live_key,
+            ManagedListener {
+                handle: tokio::spawn(std::future::pending()),
+                fingerprint: ListenerFingerprint::from_listener(&config.listeners[0]),
+            },
+        );
         let dead_key = (port_b, Protocol::Tcp, NodeTransport::Raw);
-        mgr.listeners.get(&dead_key).unwrap().handle.abort();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let dead_handle = tokio::spawn(async {});
+        for _ in 0..10 {
+            if dead_handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(dead_handle.is_finished());
+        mgr.listeners.insert(
+            dead_key,
+            ManagedListener {
+                handle: dead_handle,
+                fingerprint: ListenerFingerprint::from_listener(&config.listeners[1]),
+            },
+        );
+
         let observation = mgr.inspect_runtime(&config);
         assert!(!observation.healthy);
         assert!(observation.drifted_listener_keys.contains(&dead_key));
-        assert!(!observation.drifted_listener_keys.contains(&(
-            port_a,
-            Protocol::Tcp,
-            NodeTransport::Raw
-        )));
-        mgr.apply_config(&NodeConfigResponse {
-            camouflage_sites: vec![],
-            listeners: vec![],
-        })
-        .await;
+        assert!(!observation.drifted_listener_keys.contains(&live_key));
+        mgr.listeners.remove(&live_key).unwrap().handle.abort();
+        drop(reserve_a);
     }
 
     #[tokio::test]
