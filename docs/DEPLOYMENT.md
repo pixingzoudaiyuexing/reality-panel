@@ -8,14 +8,16 @@ not the v1 production deployment path.
 ## Install
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.5/install.sh \
-  | bash -s -- install --version v1.0.0-rc.5 --public-panel-url http://203.0.113.10:18888
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.6/install.sh \
+  | bash -s -- install --version v1.0.0-rc.6 --public-panel-url http://203.0.113.10:18888
 ```
 
 The installer checks Linux, amd64, Debian 12, root, and systemd; downloads
 the Panel, Node, frontend, and scripts from the same Release; and verifies
 each item against `SHA256SUMS`. It creates only the internal secrets required
-by the application. It never generates or prints an admin password.
+by the application. On a genuinely fresh install, the healthy completion
+output shows the seeded `admin` credentials once; upgrades and retained
+databases never print a default password.
 
 ## Configuration
 
@@ -47,7 +49,7 @@ when the new health check fails.
 ## Uninstall
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.5/install.sh \
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.6/install.sh \
   | bash -s -- uninstall
 ```
 

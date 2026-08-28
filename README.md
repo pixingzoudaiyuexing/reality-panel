@@ -17,12 +17,12 @@ store Reality private material. The control protocol is version 8.
 
 ## Install
 
-Versioned GitHub Releases are the only supported production source. The first
-release candidate is installed explicitly:
+Versioned GitHub Releases are the only supported production source. The
+current release candidate is installed explicitly:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.5/install.sh \
-  | bash -s -- install --version v1.0.0-rc.5 --public-panel-url http://203.0.113.10:18888
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.6/install.sh \
+  | bash -s -- install --version v1.0.0-rc.6 --public-panel-url http://203.0.113.10:18888
 ```
 
 The supported first-release host is Debian 12 amd64 with systemd. The
@@ -31,6 +31,8 @@ installer downloads the Panel binary, frontend, matching Node binary, and
 atomic installation. `PUBLIC_PANEL_URL` accepts a credential-free
 `http://IP:PORT` or `https://hostname` origin with no path, query, or fragment.
 HTTP is supported intentionally; HTTPS is recommended where available.
+After a genuinely fresh install, the success output shows the seeded admin
+credentials once and requires changing the password on first login.
 
 After login, configure DNSMgr in Admin settings and deploy Relay nodes from
 the Panel. The Panel-managed path keeps Node artifacts and compatibility
@@ -65,7 +67,7 @@ Default uninstall removes the local Panel service, installed binaries,
 frontend, and Node artifacts but retains local configuration and data:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.5/install.sh \
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.6/install.sh \
   | bash -s -- uninstall
 ```
 

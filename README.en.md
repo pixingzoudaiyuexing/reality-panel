@@ -5,12 +5,12 @@ relays. It provides Relay node management, Nginx Stream forwarding, Proxy
 Protocol v1, DNSMgr A records, DNS-01 certificates, OpenList camouflage,
 last-known-good recovery, lifecycle operations, diagnostics, and reapply.
 
-Production installs use only versioned GitHub Release assets. The first RC can
-be installed with:
+Production installs use only versioned GitHub Release assets. The current RC
+can be installed with:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.5/install.sh \
-  | bash -s -- install --version v1.0.0-rc.5 --public-panel-url http://203.0.113.10:18888
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.6/install.sh \
+  | bash -s -- install --version v1.0.0-rc.6 --public-panel-url http://203.0.113.10:18888
 ```
 
 The installer targets Debian 12 amd64 with systemd, verifies every asset with
@@ -18,6 +18,8 @@ The installer targets Debian 12 amd64 with systemd, verifies every asset with
 one Release. `PUBLIC_PANEL_URL` accepts a credential-free `http://IP:PORT` or
 `https://hostname` origin with no path, query, or fragment. HTTP is supported
 intentionally.
+After a genuinely fresh install, the success output shows the seeded admin
+credentials once and requires changing the password on first login.
 
 Panel-managed Node deployment is the normal path. Manual Bootstrap is an
 advanced recovery path. The first installation installs
@@ -33,7 +35,7 @@ reality-panel-update v1.0.0
 Default uninstall retains local data and requires typing `UNINSTALL`:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.5/install.sh \
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.6/install.sh \
   | bash -s -- uninstall
 ```
 

@@ -43,7 +43,7 @@ EOF
 cat > "$FAKE_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
-    *api/v1/health*) printf '{"status":"ok","version":"1.0.0-rc.5"}\n' ;;
+    *api/v1/health*) printf '{"status":"ok","version":"1.0.0-rc.6"}\n' ;;
     *) exit 1 ;;
 esac
 EOF
@@ -59,11 +59,11 @@ chmod 0755 "$FAKE_BIN/systemctl" "$FAKE_BIN/curl" "$FAKE_BIN/file"
 
 cat > "$RELEASE_DIR/reality-panel-linux-amd64" <<'EOF'
 #!/usr/bin/env bash
-printf 'relay-panel 1.0.0-rc.5\n'
+printf 'relay-panel 1.0.0-rc.6\n'
 EOF
 cat > "$RELEASE_DIR/reality-node-linux-amd64" <<'EOF'
 #!/usr/bin/env bash
-printf 'relay-node 1.0.0-rc.5\n'
+printf 'relay-node 1.0.0-rc.6\n'
 EOF
 chmod 0755 "$RELEASE_DIR/reality-panel-linux-amd64" "$RELEASE_DIR/reality-node-linux-amd64"
 mkdir "$TMP/web"
@@ -88,7 +88,7 @@ chmod 0755 "$TEST_DEPLOY"
 run_deploy() {
     local mode="${1:-install}"
     HARNESS_LOG="$LOG" HARNESS_DATA_ROOT="$DATA_ROOT" PATH="$FAKE_BIN:$PATH" \
-        RELEASE_DIR="$RELEASE_DIR" RELEASE_VERSION=v1.0.0-rc.5 \
+        RELEASE_DIR="$RELEASE_DIR" RELEASE_VERSION=v1.0.0-rc.6 \
         PUBLIC_PANEL_URL=http://203.0.113.10:18888 bash "$TEST_DEPLOY" "$mode"
 }
 

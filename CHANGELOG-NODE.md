@@ -7,6 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.0.0-rc.6] - 2026-08-28
+
+Adds the managed global HTTP-to-HTTPS redirect, safely disables only the
+standard Debian default-site symlink, and preserves the redirect across
+certificate lifecycle work. Reality SNI `:443`, camouflage `:8443`, Proxy
+Protocol behavior, Reality `xver=0`, and config protocol 8 remain unchanged.
+
 ## [1.0.0-rc.5] - 2026-08-28
 
 Release candidate update for the Panel-side relay-node artifact metadata

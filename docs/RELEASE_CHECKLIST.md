@@ -1,4 +1,4 @@
-# Reality Panel v1.0.0-rc.5 Acceptance
+# Reality Panel v1.0.0-rc.6 Acceptance
 
 Run this checklist on a new Debian 12 amd64 Panel VPS and a new Relay VPS.
 Record command output without recording credentials, tokens, private keys, or
@@ -9,7 +9,8 @@ one-time enrollment secrets.
 3. Verify `relay-panel.service` is enabled, active, and health returns 200.
 4. Verify the Panel version equals the selected release tag.
 5. Verify SQLite migrations and `PRAGMA integrity_check` pass.
-6. Verify the frontend loads and the first-login/default-admin flow works.
+6. Verify the frontend loads, RealityPanel branding is visible, and the fresh
+   install reports default-admin credentials only once.
 7. Configure DNSMgr through Admin settings without exposing its API key.
 8. Verify DNSMgr connection test and credential redaction in UI/API/logs.
 9. Verify a new Relay host is clean and supports the required architecture.
@@ -19,7 +20,8 @@ one-time enrollment secrets.
 13. Create a Reality SNI rule with the intended destination and SNI.
 14. Verify the rule-authorized A record and public authoritative DNS value.
 15. Verify DNS-01 challenge, certificate ACTIVE, and Nginx activation.
-16. Verify camouflage fallback on `:8443` and public HTTP response.
+16. Verify camouflage fallback on `:8443`, HTTPS response, and global `:80`
+    redirect preserving the original Host and request URI.
 17. Verify the Reality route is active and Relay remains L4 transparent.
 18. Enable remote Reality/Xray backend Proxy Protocol receive and wait for its
     backend/Xray reload.
@@ -32,6 +34,9 @@ one-time enrollment secrets.
 25. Upgrade Panel in place from the RC to a later stable Release; verify data,
     Rules, DNSMgr, Node IDs, LKG, certificates, and frontend are preserved.
 26. Upgrade Node through Panel; verify identity, runtime, LKG, and WS recover.
+27. Verify both positional and `--version` updater forms accept the rc.6 tag.
+28. Verify an exact legacy default site name migrates to RealityPanel while a
+    custom site name remains unchanged.
 
 Do not treat plaintext HTTP as a failure when it is the configured
 `PUBLIC_PANEL_URL` transport. Do not use real credentials in captured evidence.

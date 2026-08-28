@@ -7,6 +7,34 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.0.0-rc.6] - 2026-08-28
+
+Release candidate update for installer reliability, product branding,
+diagnostics, Node capability gates, and Relay HTTP behavior.
+
+### Added
+
+- Read-only Reality dependency diagnosis for DNSMgr, DNS synchronization,
+  certificates, routes, and their blocking chain.
+- A managed global `:80` redirect to the original Host and URI over HTTPS,
+  with Debian default-site conflict checks and transactional rollback.
+
+### Fixed
+
+- Positional updater tags no longer collide with Debian's `/etc/os-release`
+  `VERSION` variable; positional and `--version` forms are covered by tests.
+- Reality Panel rc.5 and newer Nodes satisfy the lifecycle and rule-restart
+  capability gates while genuinely old Nodes remain restricted.
+- Fresh install credentials and install/update/uninstall success are shown
+  only after health and state checks succeed.
+- New camouflage certificate desired state consistently uses Panel DNS-01
+  instead of silently falling back to HTTP-01 when DNSMgr is unavailable.
+
+### Changed
+
+- User-visible branding is Reality Panel / RealityPanel. Only an exact legacy
+  default site name is migrated; custom site names remain unchanged.
+
 ## [1.0.0-rc.5] - 2026-08-28
 
 Release candidate update that repairs relay-node artifact metadata
