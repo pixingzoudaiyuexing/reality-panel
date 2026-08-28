@@ -8,8 +8,8 @@ not the v1 production deployment path.
 ## Install
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.3/install.sh \
-  | bash -s -- install --version v1.0.0-rc.3 --public-panel-url http://203.0.113.10:18888
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.4/install.sh \
+  | bash -s -- install --version v1.0.0-rc.4 --public-panel-url http://203.0.113.10:18888
 ```
 
 The installer checks Linux, amd64, Debian 12, root, and systemd; downloads
@@ -47,7 +47,7 @@ when the new health check fails.
 ## Uninstall
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.3/install.sh \
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.4/install.sh \
   | bash -s -- uninstall
 ```
 

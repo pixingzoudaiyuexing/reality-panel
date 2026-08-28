@@ -9,8 +9,8 @@ Production installs use only versioned GitHub Release assets. The first RC can
 be installed with:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.3/install.sh \
-  | bash -s -- install --version v1.0.0-rc.3 --public-panel-url http://203.0.113.10:18888
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.4/install.sh \
+  | bash -s -- install --version v1.0.0-rc.4 --public-panel-url http://203.0.113.10:18888
 ```
 
 The installer targets Debian 12 amd64 with systemd, verifies every asset with
@@ -33,7 +33,7 @@ reality-panel-update v1.0.0
 Default uninstall retains local data and requires typing `UNINSTALL`:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.3/install.sh \
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.4/install.sh \
   | bash -s -- uninstall
 ```
 
