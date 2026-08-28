@@ -197,7 +197,7 @@ fn raise_nofile_limit() {}
 fn print_help() {
     println!("relay-node {}", VERSION);
     println!();
-    println!("A forwarding node for RelayPanel. Runs as a long-lived service.");
+    println!("A forwarding node for Reality Panel. Runs as a long-lived service.");
     println!();
     println!("Usage: relay-node [OPTIONS]");
     println!();

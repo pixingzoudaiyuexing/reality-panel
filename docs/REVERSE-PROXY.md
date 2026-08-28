@@ -1,6 +1,6 @@
 # Reverse Proxy Guide
 
-RelayPanel serves a web UI + REST API + WebSocket endpoint from a single HTTP
+Reality Panel serves a web UI + REST API + WebSocket endpoint from a single HTTP
 port (`18888` by default). This guide covers putting the panel behind a reverse
 proxy for TLS termination, custom domains, and production hardening.
 
@@ -125,7 +125,7 @@ If node logs show `websocket error` or keeps reconnecting:
 
 ## TLS Simple vs. panel HTTPS
 
-RelayPanel has two separate TLS concerns — they are **not the same thing**:
+Reality Panel has two separate TLS concerns — they are **not the same thing**:
 
 | | Panel admin HTTPS | TLS Simple (node-side) |
 |---|---|---|

@@ -202,7 +202,7 @@ pub async fn test_notify(
     Json(req): Json<TestNotifyRequest>,
 ) -> Json<ApiResponse<TestNotifyResponse>> {
     let cfg = load(&state).await;
-    let text = "✅ RelayPanel 测试消息\n\n如果你收到这条消息，说明通知配置正确。";
+    let text = "✅ Reality Panel 测试消息\n\n如果你收到这条消息，说明通知配置正确。";
 
     let (result, report) = match req.channel.as_str() {
         "telegram" => {
@@ -214,7 +214,7 @@ pub async fn test_notify(
             (result, report)
         }
         "email" => {
-            let result = notify::send_email(&cfg, "RelayPanel 测试消息", text).await;
+            let result = notify::send_email(&cfg, "Reality Panel 测试消息", text).await;
             let report = notify::SendReport {
                 telegram: None,
                 email: Some(result.clone()),

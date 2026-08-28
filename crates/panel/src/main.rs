@@ -60,6 +60,12 @@ async fn main() {
 
     let db = open_database(&config).await;
 
+    match service::site::migrate_legacy_default_name(db.as_ref()).await {
+        Ok(true) => tracing::info!("migrated legacy default site name to RealityPanel"),
+        Ok(false) => {}
+        Err(error) => panic!("Failed to migrate site name: {error}"),
+    }
+
     // v0.4.10 PR3: seed the app_settings row from REGISTRATION_ENABLED on the
     // very first boot. insert_settings_if_absent is a no-op once the row
     // exists, so the env var can NEVER re-enable registration after an admin
@@ -146,7 +152,7 @@ async fn main() {
 
     let addr: SocketAddr = config.listen.parse().expect("Invalid listen address");
     tracing::info!(
-        "RelayPanel listening on {} (public dir: {})",
+        "Reality Panel listening on {} (public dir: {})",
         addr,
         config.public_dir
     );

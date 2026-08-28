@@ -15,7 +15,7 @@ use crate::service::password::{generate_password, hash_password};
 use std::sync::Arc;
 
 pub const USAGE: &str = "\
-RelayPanel — self-hosted TCP/UDP forwarding panel
+Reality Panel — self-hosted TCP/UDP forwarding panel
 
 USAGE:
     relay-panel                                 start the server (default)

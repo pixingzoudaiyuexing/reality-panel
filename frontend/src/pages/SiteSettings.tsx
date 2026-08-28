@@ -105,7 +105,7 @@ export default function SiteSettings() {
           extra={t('siteNameHint')}
           rules={[{ max: MAX_NAME, message: t('siteFieldTooLong') }]}
         >
-          <Input placeholder="RelayPanel" showCount maxLength={MAX_NAME} />
+          <Input placeholder="RealityPanel" showCount maxLength={MAX_NAME} />
         </Form.Item>
         <Form.Item
           name="subtitle"

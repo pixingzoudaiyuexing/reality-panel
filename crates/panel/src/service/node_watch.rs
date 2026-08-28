@@ -288,7 +288,7 @@ async fn announce_offline(
     } else {
         "offline"
     };
-    let report = notify::send_all(cfg, "RelayPanel 节点离线告警", &text).await;
+    let report = notify::send_all(cfg, "Reality Panel 节点离线告警", &text).await;
     notify::record_report(state.db.as_ref(), event, Some(node_key), &report).await;
     log_report(node_key, event, &report);
 }
@@ -307,7 +307,7 @@ async fn announce_recovery(
         "🟢 节点已恢复\n\n{}\n已重新上报状态。",
         describe(node_key, status_json)
     );
-    let report = notify::send_all(cfg, "RelayPanel 节点恢复", &text).await;
+    let report = notify::send_all(cfg, "Reality Panel 节点恢复", &text).await;
     notify::record_report(state.db.as_ref(), "recovery", Some(node_key), &report).await;
     log_report(node_key, "recovery", &report);
 }
@@ -327,7 +327,7 @@ async fn announce_version_outdated(
         describe(node_key, status_json),
         latest_version,
     );
-    let report = notify::send_all(cfg, "RelayPanel 节点版本过旧", &text).await;
+    let report = notify::send_all(cfg, "Reality Panel 节点版本过旧", &text).await;
     notify::record_report(
         state.db.as_ref(),
         "version_outdated",

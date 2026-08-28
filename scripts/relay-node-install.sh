@@ -981,7 +981,7 @@ if [ "$NGINX_SNI" = "1" ]; then
 set -euo pipefail
 docker rm -f '${SNI_NGINX_DOCKER_NAME}' >/dev/null 2>&1 || true
 rm -rf '${NGINX_DOCKER_ROOT}'
-echo "Removed Nginx Docker container and files for RelayPanel."
+echo "Removed Nginx Docker container and files for Reality Panel."
 UNINSTALLEOF
         chmod 700 "${INSTALL_DIR}/uninstall-nginx-docker.sh"
     fi

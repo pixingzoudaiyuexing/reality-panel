@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::db::repo::Repository;
+
 pub const SITE_CONFIG_KEY: &str = "site:config";
 
 /// Length caps. These are not security boundaries — they stop an accidental
@@ -22,7 +24,8 @@ pub const MAX_CONTACT: usize = 256;
 
 /// Falls back to the current hardcoded brand, so an operator who never opens
 /// the page sees exactly what they saw before.
-pub const DEFAULT_NAME: &str = "RelayPanel";
+pub const DEFAULT_NAME: &str = "RealityPanel";
+const LEGACY_DEFAULT_NAME: &str = "RelayPanel";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -104,9 +107,37 @@ impl SiteConfig {
     }
 }
 
+/// 只迁移旧版精确默认值；用户自定义站点名及未知 JSON 字段原样保留。
+pub async fn migrate_legacy_default_name(db: &dyn Repository) -> Result<bool, String> {
+    let Some(raw) = db.get(SITE_CONFIG_KEY).await.map_err(|e| e.to_string())? else {
+        return Ok(false);
+    };
+    let Some(migrated) = migrate_legacy_default_name_json(&raw) else {
+        return Ok(false);
+    };
+    db.set(SITE_CONFIG_KEY, &migrated)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+fn migrate_legacy_default_name_json(raw: &str) -> Option<String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let object = value.as_object_mut()?;
+    if object.get("site_name").and_then(serde_json::Value::as_str) != Some(LEGACY_DEFAULT_NAME) {
+        return None;
+    }
+    object.insert(
+        "site_name".into(),
+        serde_json::Value::String(DEFAULT_NAME.into()),
+    );
+    serde_json::to_string(&value).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::repo::KvsRepository;
 
     /// A missing or damaged row must still yield a usable brand. Rendering an
     /// empty site name would make every page look broken, including the login
@@ -194,5 +225,65 @@ mod tests {
         let out = cfg.sanitized();
         assert_eq!(out.site_name, DEFAULT_NAME);
         assert_eq!(out.subtitle, "hi");
+    }
+
+    #[test]
+    fn exact_legacy_default_name_migrates_without_losing_other_fields() {
+        let migrated = migrate_legacy_default_name_json(
+            r#"{"site_name":"RelayPanel","subtitle":"保留","future":{"flag":true}}"#,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&migrated).unwrap();
+        assert_eq!(value["site_name"], "RealityPanel");
+        assert_eq!(value["subtitle"], "保留");
+        assert_eq!(value["future"]["flag"], true);
+    }
+
+    #[test]
+    fn custom_site_names_are_never_migrated() {
+        for name in ["我的中转", "CloudGap", "Test Panel", "RealityPanel"] {
+            let raw = serde_json::json!({"site_name": name}).to_string();
+            assert_eq!(migrate_legacy_default_name_json(&raw), None, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_migration_is_idempotent_and_preserves_custom_names() {
+        use crate::db::schema::SCHEMA_SQL;
+        use crate::db::sqlite_repo::SqliteRepository;
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        let repository = SqliteRepository::new(pool);
+        repository
+            .set(
+                SITE_CONFIG_KEY,
+                r#"{"site_name":"RelayPanel","contact":"ops"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(migrate_legacy_default_name(&repository).await.unwrap());
+        assert!(!migrate_legacy_default_name(&repository).await.unwrap());
+        assert_eq!(
+            SiteConfig::from_json(repository.get(SITE_CONFIG_KEY).await.unwrap().as_deref())
+                .site_name,
+            DEFAULT_NAME
+        );
+
+        repository
+            .set(SITE_CONFIG_KEY, r#"{"site_name":"CloudGap"}"#)
+            .await
+            .unwrap();
+        assert!(!migrate_legacy_default_name(&repository).await.unwrap());
+        assert_eq!(
+            SiteConfig::from_json(repository.get(SITE_CONFIG_KEY).await.unwrap().as_deref())
+                .site_name,
+            "CloudGap"
+        );
     }
 }

@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve RelayPanel.
+Thanks for helping improve Reality Panel.
 
 ## Commit / PR conventions
 

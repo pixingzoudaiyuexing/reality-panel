@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <title>RelayPanel</title>
+  <title>RealityPanel</title>
   <defs>
     <linearGradient id="relay-gradient" x1="8" y1="5" x2="57" y2="61" gradientUnits="userSpaceOnUse">
       <stop stop-color="#818CF8"/>

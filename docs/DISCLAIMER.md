@@ -1,6 +1,6 @@
 # 免责声明 / Disclaimer
 
-> 本项目（RelayPanel）是一个开源的流量转发工具，基于开源项目进行二次开发，
+> 本项目（Reality Panel）是一个开源的流量转发工具，基于开源项目进行二次开发，
 > **仅供个人学习与研究使用**。请务必在合法、合规、安全的前提下使用本项目。
 
 ---
@@ -45,7 +45,7 @@
 
 ### Use at Your Own Risk
 
-RelayPanel is an open-source traffic-forwarding tool, derived from other
+Reality Panel is an open-source traffic-forwarding tool, derived from other
 open-source projects. It is intended **for personal study and research only**.
 The authors assume **no responsibility** for any direct or indirect loss
 arising from the use of this project, and provide no warranty, guarantee, or
