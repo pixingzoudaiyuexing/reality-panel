@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, ToSocketAddrs};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
@@ -222,91 +222,105 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
                 vec![LifecycleAction::Unchanged; source.sites.len()],
             ));
         }
-        ensure_private_dir(&self.config.state_dir)?;
+        self.ensure_https_redirect()?;
+        let outcome = (|| {
+            ensure_private_dir(&self.config.state_dir)?;
 
-        let mut manifest = source.clone();
-        let mut actions = Vec::with_capacity(manifest.sites.len());
-        for site in &mut manifest.sites {
-            let Some(policy) = site.certificate.lifecycle.clone() else {
-                actions.push(LifecycleAction::Unchanged);
-                continue;
-            };
-            validate_policy(site, &policy)?;
-
-            let existing = self.discover_existing(site, &policy)?;
-            if let Some(existing) = existing.as_ref() {
-                site.certificate = existing.reference.clone();
-            }
-            if existing
-                .as_ref()
-                .is_some_and(|existing| !existing.renewal_due)
-            {
-                actions.push(LifecycleAction::Unchanged);
-                continue;
-            }
-
-            if policy.challenge_method == AcmeChallengeMethod::Http01 {
-                if !self.config.http01_nginx.enabled {
-                    return Err("certificate lifecycle requires managed Nginx for HTTP-01".into());
-                }
-                dns_validator(&policy.domain, &policy.expected_public_ip)?;
-                let single = CamouflageSitesManifest {
-                    sites: vec![site.clone()],
+            let mut manifest = source.clone();
+            let mut actions = Vec::with_capacity(manifest.sites.len());
+            for site in &mut manifest.sites {
+                let Some(policy) = site.certificate.lifecycle.clone() else {
+                    actions.push(LifecycleAction::Unchanged);
+                    continue;
                 };
-                let mut prepared = None;
-                self.prepare_http01_once(&single, &mut prepared)?;
-            }
+                validate_policy(site, &policy)?;
 
-            let renew = existing.is_some();
-            if let Err(error) = self.invoke_certbot(&policy, renew) {
-                if existing.is_some() {
-                    actions.push(LifecycleAction::RenewalWarning);
+                let existing = self.discover_existing(site, &policy)?;
+                if let Some(existing) = existing.as_ref() {
+                    site.certificate = existing.reference.clone();
+                }
+                if existing
+                    .as_ref()
+                    .is_some_and(|existing| !existing.renewal_due)
+                {
+                    actions.push(LifecycleAction::Unchanged);
                     continue;
                 }
-                return Err(error);
-            }
 
-            let candidate = match self.best_certbot_candidate(&policy)? {
-                Some(candidate) => candidate,
-                None if existing.is_some() => {
-                    actions.push(LifecycleAction::RenewalWarning);
-                    continue;
+                if policy.challenge_method == AcmeChallengeMethod::Http01 {
+                    if !self.config.http01_nginx.enabled {
+                        return Err(
+                            "certificate lifecycle requires managed Nginx for HTTP-01".into()
+                        );
+                    }
+                    dns_validator(&policy.domain, &policy.expected_public_ip)?;
+                    let single = CamouflageSitesManifest {
+                        sites: vec![site.clone()],
+                    };
+                    let mut prepared = None;
+                    self.prepare_http01_once(&single, &mut prepared)?;
                 }
-                None => return Err("ACME did not produce a usable certificate".into()),
-            };
-            if validate_candidate(
-                &candidate,
-                &policy.domain,
-                policy.renew_before_days,
-                &self.runner,
-                true,
-            )
-            .is_err()
-                || existing.as_ref().is_some_and(|existing| {
-                    same_certificate(&candidate, &existing.reference).unwrap_or(true)
-                })
-            {
-                if existing.is_some() {
-                    actions.push(LifecycleAction::RenewalWarning);
-                    continue;
+
+                let renew = existing.is_some();
+                if let Err(error) = self.invoke_certbot(&policy, renew) {
+                    if existing.is_some() {
+                        actions.push(LifecycleAction::RenewalWarning);
+                        continue;
+                    }
+                    return Err(error);
                 }
-                return Err("ACME did not produce a new usable certificate".into());
+
+                let candidate = match self.best_certbot_candidate(&policy)? {
+                    Some(candidate) => candidate,
+                    None if existing.is_some() => {
+                        actions.push(LifecycleAction::RenewalWarning);
+                        continue;
+                    }
+                    None => return Err("ACME did not produce a usable certificate".into()),
+                };
+                if validate_candidate(
+                    &candidate,
+                    &policy.domain,
+                    policy.renew_before_days,
+                    &self.runner,
+                    true,
+                )
+                .is_err()
+                    || existing.as_ref().is_some_and(|existing| {
+                        same_certificate(&candidate, &existing.reference).unwrap_or(true)
+                    })
+                {
+                    if existing.is_some() {
+                        actions.push(LifecycleAction::RenewalWarning);
+                        continue;
+                    }
+                    return Err("ACME did not produce a new usable certificate".into());
+                }
+                match install_candidate(&candidate, &self.config.state_dir, &site.id, &policy) {
+                    Ok(installed) => site.certificate = installed,
+                    Err(_) if existing.is_some() => {
+                        actions.push(LifecycleAction::RenewalWarning);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+                actions.push(if renew {
+                    LifecycleAction::Renewed
+                } else {
+                    LifecycleAction::Issued
+                });
             }
-            match install_candidate(&candidate, &self.config.state_dir, &site.id, &policy) {
-                Ok(installed) => site.certificate = installed,
-                Err(_) if existing.is_some() => {
-                    actions.push(LifecycleAction::RenewalWarning);
-                    continue;
-                }
-                Err(error) => return Err(error),
-            }
-            actions.push(if renew {
-                LifecycleAction::Renewed
-            } else {
-                LifecycleAction::Issued
-            });
+            Ok((manifest, actions))
+        })();
+
+        // HTTP-01 历史快照可能在兼容签发期间临时占用该托管文件；无论签发
+        // 成功或失败都恢复全局跳转。当前 Panel desired 固定使用 DNS-01。
+        let redirect = self.ensure_https_redirect();
+        match (outcome, redirect) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(result), Ok(())) => Ok(result),
         }
-        Ok((manifest, actions))
     }
 
     fn discover_existing(
@@ -424,6 +438,40 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
             |_| "HTTP-01 Nginx preflight failed (port 80 may be unavailable)".to_string(),
         )?;
         *prepared = Some(rendered);
+        Ok(())
+    }
+
+    /// 收敛 Node 托管的 :80 全局 HTTPS 跳转。只移除 Debian 标准 default
+    /// site 链接；未知文件或链接一律 fail closed。Nginx preflight/reload 失败
+    /// 时恢复该链接以及之前的托管片段。
+    pub(crate) fn ensure_https_redirect(&self) -> Result<(), String> {
+        if !self.config.enabled || !self.config.http01_nginx.enabled {
+            return Ok(());
+        }
+        let rendered = render_https_redirect();
+        let default_site = debian_default_site_path(&self.config.http01_nginx.conf_path);
+        let removed_link = match default_site.as_deref() {
+            Some(path) => disable_debian_default_site(path)?,
+            None => None,
+        };
+        if removed_link.is_none()
+            && fs::read(&self.config.http01_nginx.conf_path)
+                .ok()
+                .as_deref()
+                == Some(rendered.as_bytes())
+        {
+            return Ok(());
+        }
+        let previous = fs::read(&self.config.http01_nginx.conf_path).ok();
+        if let Err(error) =
+            nginx_sni::apply_rendered(rendered.as_bytes(), &self.config.http01_nginx)
+        {
+            if let (Some(path), Some(target)) = (default_site.as_deref(), removed_link.as_deref()) {
+                let _ = symlink(target, path);
+                let _ = nginx_sni::restore_rendered(previous.as_deref(), &self.config.http01_nginx);
+            }
+            return Err(format!("HTTPS redirect Nginx preflight failed: {error}"));
+        }
         Ok(())
     }
 
@@ -574,6 +622,58 @@ fn validate_dns(domain: &str, expected: &str) -> Result<(), String> {
     } else {
         Err("DNS does not resolve the certificate domain to this node".into())
     }
+}
+
+fn render_https_redirect() -> String {
+    "# generated by relay-node; global HTTP to HTTPS redirect\n\
+server {\n\
+    listen 80 default_server;\n\
+    listen [::]:80 default_server;\n\
+    server_name _;\n\
+    return 301 https://$host$request_uri;\n\
+}\n"
+    .into()
+}
+
+fn debian_default_site_path(conf_path: &Path) -> Option<PathBuf> {
+    conf_path
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "nginx"))
+        .map(|nginx_root| nginx_root.join("sites-enabled/default"))
+}
+
+fn disable_debian_default_site(path: &Path) -> Result<Option<PathBuf>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect Debian Nginx default site: {error}")),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Err("refusing to remove non-symlink Nginx default site".into());
+    }
+    let target = fs::read_link(path)
+        .map_err(|error| format!("cannot read Debian Nginx default site link: {error}"))?;
+    let resolved = if target.is_absolute() {
+        target.clone()
+    } else {
+        path.parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join(&target)
+    };
+    let expected = path
+        .parent()
+        .and_then(Path::parent)
+        .map(|nginx_root| nginx_root.join("sites-available/default"))
+        .ok_or("invalid Nginx default site path")?;
+    let resolved =
+        fs::canonicalize(&resolved).map_err(|_| "Nginx default site link target is unavailable")?;
+    let expected = fs::canonicalize(&expected)
+        .map_err(|_| "Debian Nginx default site target is unavailable")?;
+    if resolved != expected {
+        return Err("refusing to remove non-Debian Nginx default site link".into());
+    }
+    fs::remove_file(path).map_err(|error| format!("cannot disable Nginx default site: {error}"))?;
+    Ok(Some(target))
 }
 
 fn render_http01_vhost(domains: &[&str], webroot: &Path) -> Result<String, String> {
@@ -1213,6 +1313,54 @@ mod tests {
     }
 
     #[test]
+    fn global_https_redirect_preserves_host_uri_and_query() {
+        let rendered = render_https_redirect();
+        assert!(rendered.contains("listen 80 default_server;"));
+        assert!(rendered.contains("listen [::]:80 default_server;"));
+        assert!(rendered.contains("return 301 https://$host$request_uri;"));
+        assert!(!rendered.contains("server_name site.example.com"));
+        assert!(!rendered.contains("ssl_preread"));
+        assert!(!rendered.contains("8443"));
+    }
+
+    #[test]
+    fn https_redirect_removes_only_the_debian_default_site_link() {
+        let dir = unique_dir("https-redirect");
+        let nginx = dir.join("nginx");
+        fs::create_dir_all(nginx.join("conf.d")).unwrap();
+        fs::create_dir_all(nginx.join("sites-enabled")).unwrap();
+        fs::create_dir_all(nginx.join("sites-available")).unwrap();
+        fs::write(nginx.join("sites-available/default"), "stock default").unwrap();
+        symlink(
+            "../sites-available/default",
+            nginx.join("sites-enabled/default"),
+        )
+        .unwrap();
+        let mut config = enabled_config(&dir);
+        config.http01_nginx.conf_path = nginx.join("conf.d/relay-panel-acme.conf");
+        let lifecycle = CertificateLifecycle::new(config);
+        lifecycle.ensure_https_redirect().unwrap();
+        assert!(!nginx.join("sites-enabled/default").exists());
+        assert_eq!(
+            fs::read_to_string(nginx.join("conf.d/relay-panel-acme.conf")).unwrap(),
+            render_https_redirect()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn https_redirect_refuses_an_unknown_default_site() {
+        let dir = unique_dir("https-redirect-conflict");
+        let nginx = dir.join("nginx");
+        fs::create_dir_all(nginx.join("sites-enabled")).unwrap();
+        fs::write(nginx.join("sites-enabled/default"), "custom config").unwrap();
+        let error = disable_debian_default_site(&nginx.join("sites-enabled/default")).unwrap_err();
+        assert!(error.contains("non-symlink"));
+        assert!(nginx.join("sites-enabled/default").is_file());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn failed_acme_and_candidate_install_preserve_old_generation() {
         let dir = unique_dir("generation");
         let old = dir.join("state/generations/site/generation-old/fullchain.pem");
@@ -1307,7 +1455,10 @@ mod tests {
             .unwrap();
         assert_eq!(actions, vec![LifecycleAction::Unchanged]);
         assert_eq!(candidate.sites[0].certificate.cert_path, cert_path);
-        assert!(!dir.join("acme.conf").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("acme.conf")).unwrap(),
+            render_https_redirect()
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1405,7 +1556,10 @@ mod tests {
             .unwrap();
         assert_eq!(actions, vec![LifecycleAction::RenewalWarning]);
         assert_eq!(candidate.sites[0].certificate.cert_path, old_cert);
-        assert!(!dir.join("acme.conf").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("acme.conf")).unwrap(),
+            render_https_redirect()
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

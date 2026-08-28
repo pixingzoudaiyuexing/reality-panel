@@ -65,6 +65,44 @@ snapshot_file() {
   fi
 }
 
+snapshot_symlink() {
+  local key="$1" path="$2" source
+  source="$(managed_path "$path")"
+  if [ -L "$source" ]; then
+    printf 'present\n' > "$TRANSACTION_DIR/$key.link-state"
+    readlink "$source" > "$TRANSACTION_DIR/$key.link-target"
+  elif [ -e "$source" ]; then
+    fail "TRANSACTION_INVALID: expected symlink path is not a symlink: $path"
+  else
+    printf 'absent\n' > "$TRANSACTION_DIR/$key.link-state"
+  fi
+}
+
+symlink_matches_snapshot() {
+  local key="$1" path="$2" target state
+  target="$(managed_path "$path")"
+  state="$(cat "$TRANSACTION_DIR/$key.link-state")"
+  if [ "$state" = present ]; then
+    [ -L "$target" ] && [ "$(readlink "$target")" = "$(cat "$TRANSACTION_DIR/$key.link-target")" ]
+  else
+    [ ! -e "$target" ] && [ ! -L "$target" ]
+  fi
+}
+
+restore_symlink_if_changed() {
+  local key="$1" path="$2" target state
+  symlink_matches_snapshot "$key" "$path" && return 0
+  target="$(managed_path "$path")"
+  state="$(cat "$TRANSACTION_DIR/$key.link-state")"
+  rm -f -- "$target"
+  if [ "$state" = present ]; then
+    install -d -m 0755 "$(dirname "$target")"
+    ln -s -- "$(cat "$TRANSACTION_DIR/$key.link-target")" "$target"
+  elif [ "$state" != absent ]; then
+    return 1
+  fi
+}
+
 restore_file() {
   local key="$1" path="$2" target backup state staged
   target="$(managed_path "$path")"
@@ -201,6 +239,7 @@ capture_transaction() {
   snapshot_file sni_conf "$NGINX_SNI_CONF_PATH"
   snapshot_file wrapper_conf "$CAMOUFLAGE_WRAPPER_CONF_PATH"
   snapshot_file http01_conf "$CERTIFICATE_HTTP01_CONF_PATH"
+  snapshot_symlink nginx_default_site /etc/nginx/sites-enabled/default
   snapshot_file fallback_cert /etc/nginx/relay-panel-certs/fallback.crt
   snapshot_file fallback_key /etc/nginx/relay-panel-certs/fallback.key
   snapshot_file capabilities /opt/relay-node/provisioning-capabilities.json
@@ -279,6 +318,8 @@ rollback_transaction() {
     path="${item#*:}"
     file_matches_snapshot "$key" "$path" || nginx_files_changed=1
   done
+  symlink_matches_snapshot nginx_default_site /etc/nginx/sites-enabled/default \
+    || nginx_files_changed=1
 
   restore_file_if_changed binary /opt/relay-node/relay-node || failed=1
   restore_file_if_changed env /etc/relay-node/relay-node.env || failed=1
@@ -288,6 +329,7 @@ rollback_transaction() {
   restore_file_if_changed sni_conf "$NGINX_SNI_CONF_PATH" || failed=1
   restore_file_if_changed wrapper_conf "$CAMOUFLAGE_WRAPPER_CONF_PATH" || failed=1
   restore_file_if_changed http01_conf "$CERTIFICATE_HTTP01_CONF_PATH" || failed=1
+  restore_symlink_if_changed nginx_default_site /etc/nginx/sites-enabled/default || failed=1
   restore_file_if_changed fallback_cert /etc/nginx/relay-panel-certs/fallback.crt || failed=1
   restore_file_if_changed fallback_key /etc/nginx/relay-panel-certs/fallback.key || failed=1
   restore_file_if_changed capabilities /opt/relay-node/provisioning-capabilities.json || failed=1
@@ -360,6 +402,7 @@ rollback_transaction() {
   file_matches_snapshot sni_conf "$NGINX_SNI_CONF_PATH" || failed=1
   file_matches_snapshot wrapper_conf "$CAMOUFLAGE_WRAPPER_CONF_PATH" || failed=1
   file_matches_snapshot http01_conf "$CERTIFICATE_HTTP01_CONF_PATH" || failed=1
+  symlink_matches_snapshot nginx_default_site /etc/nginx/sites-enabled/default || failed=1
   file_matches_snapshot fallback_cert /etc/nginx/relay-panel-certs/fallback.crt || failed=1
   file_matches_snapshot fallback_key /etc/nginx/relay-panel-certs/fallback.key || failed=1
   file_matches_snapshot capabilities /opt/relay-node/provisioning-capabilities.json || failed=1
@@ -384,7 +427,8 @@ rollback_transaction() {
     printf 'rolled_back\n' > "$TRANSACTION_DIR/state"
     rm -rf -- "$TRANSACTION_DIR/files"
     find "$TRANSACTION_DIR" -maxdepth 1 -type f \
-      \( -name '*.state' -o -name '*.dir-state' -o -name '*.sha256' \
+      \( -name '*.state' -o -name '*.dir-state' -o -name '*.link-state' \
+         -o -name '*.link-target' -o -name '*.sha256' \
          -o -name '*.active' -o -name '*.enabled' \) \
       -delete
     return 0
@@ -403,7 +447,8 @@ commit_transaction() {
   rm -rf -- "$TRANSACTION_DIR/files"
   rm -rf -- "$TRANSACTION_DIR/candidate"
   find "$TRANSACTION_DIR" -maxdepth 1 -type f \
-    \( -name '*.state' -o -name '*.dir-state' -o -name '*.sha256' \
+    \( -name '*.state' -o -name '*.dir-state' -o -name '*.link-state' \
+       -o -name '*.link-target' -o -name '*.sha256' \
        -o -name '*.active' -o -name '*.enabled' \
        -o -name '*.path' \) \
     -delete
@@ -516,6 +561,47 @@ is_managed_camouflage_config() {
     && grep -qF 'proxy_pass http://127.0.0.1:5244;' "$path"
 }
 
+ensure_https_redirect() {
+  local conf default_site target tmp
+  conf="$(nginx_path "$CERTIFICATE_HTTP01_CONF_PATH")"
+  default_site="$(nginx_path /etc/nginx/sites-enabled/default)"
+
+  if [ -L "$default_site" ]; then
+    target="$(readlink "$default_site")"
+    case "$target" in
+      ../sites-available/default|/etc/nginx/sites-available/default)
+        rm -f -- "$default_site"
+        NGINX_RELOAD_REQUIRED=1
+        ;;
+      *) fail "NGINX_CONFIG_CONFLICT: refusing to remove non-Debian default site link" ;;
+    esac
+  elif [ -e "$default_site" ]; then
+    fail "NGINX_CONFIG_CONFLICT: refusing to remove non-symlink default site"
+  fi
+
+  if [ -f "$conf" ] \
+    && ! grep -qE '^# generated by relay-node; (ACME HTTP-01 only|global HTTP to HTTPS redirect)$' "$conf"; then
+    fail "NGINX_CONFIG_CONFLICT: :80 config is not relay-node-managed"
+  fi
+  install -d -m 0755 "$(dirname "$conf")"
+  tmp="$conf.tmp"
+  cat > "$tmp" <<'EOF'
+# generated by relay-node; global HTTP to HTTPS redirect
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 301 https://$host$request_uri;
+}
+EOF
+  if [ -f "$conf" ] && cmp -s "$tmp" "$conf"; then
+    rm -f -- "$tmp"
+  else
+    mv -f -- "$tmp" "$conf"
+    NGINX_RELOAD_REQUIRED=1
+  fi
+}
+
 is_managed_listener_config() {
   local port="$1"
   case "$port" in
@@ -527,7 +613,7 @@ is_managed_listener_config() {
       is_managed_camouflage_config "$(nginx_path "$CAMOUFLAGE_WRAPPER_CONF_PATH")"
       ;;
     80)
-      grep -qF '# generated by relay-node; ACME HTTP-01 only' \
+      grep -qE '^# generated by relay-node; (ACME HTTP-01 only|global HTTP to HTTPS redirect)$' \
         "$(nginx_path "$CERTIFICATE_HTTP01_CONF_PATH")" 2>/dev/null
       ;;
     *) return 1 ;;
@@ -551,9 +637,9 @@ ensure_listener_is_managed_or_free() {
     *nginx*) ;;
     *) fail "PORT_CONFLICT: :$port is owned by an unmanaged process" ;;
   esac
-  # HTTP-01 adds an exact-domain HTTP vhost and can safely share an existing
-  # Nginx :80 listener. Public stream :443 and camouflage :8443 are exclusive
-  # data-plane listeners and therefore require RelayPanel ownership.
+  # :80 is an Nginx HTTP listener and can already be active before our managed
+  # redirect is installed. Public stream :443 and camouflage :8443 are exclusive
+  # data-plane listeners and therefore require Reality Panel ownership.
   if [ "$port" = 80 ]; then
     return 0
   fi
@@ -577,7 +663,7 @@ ensure_public_camouflage_fallback() {
 
   if [ -f "$conf" ]; then
     is_managed_camouflage_config "$conf" \
-      || fail "NGINX_CONFIG_CONFLICT: camouflage :8443 config is not RelayPanel-managed"
+      || fail "NGINX_CONFIG_CONFLICT: camouflage :8443 config is not Reality Panel-managed"
     if grep -qF '# generated by relay-node; TLS camouflage sites' "$conf"; then
       return 0
     fi
@@ -633,14 +719,14 @@ stream {
     fi
   done)"
   if [ -n "$external_streams" ]; then
-    fail "NGINX_STREAM_CONFLICT: existing non-RelayPanel top-level stream context: $(printf '%s' "$external_streams" | tr '\n' ' ')"
+    fail "NGINX_STREAM_CONFLICT: existing non-Reality Panel top-level stream context: $(printf '%s' "$external_streams" | tr '\n' ' ')"
   fi
 
   include_locations="$(grep -RFlx -- "$include_line" "$nginx_dir" 2>/dev/null || true)"
   if [ -n "$include_locations" ]; then
     include_count="$(printf '%s\n' "$include_locations" | sed '/^$/d' | wc -l | tr -d ' ')"
     if [ "$include_count" != 1 ] || [ "$include_locations" != "$nginx_conf" ]; then
-      fail "NGINX_STREAM_CONFLICT: RelayPanel stream include is duplicated or outside nginx.conf"
+      fail "NGINX_STREAM_CONFLICT: Reality Panel stream include is duplicated or outside nginx.conf"
     fi
   else
     printf '\n%s\n' "$include_line" >> "$nginx_conf"
@@ -679,6 +765,12 @@ fi
 if [ "${1:-}" = "--test-public-fallback" ]; then
   NGINX_ROOT="${2:?test nginx root required}"
   ensure_public_camouflage_fallback
+  exit 0
+fi
+
+if [ "${1:-}" = "--test-https-redirect" ]; then
+  NGINX_ROOT="${2:?test nginx root required}"
+  ensure_https_redirect
   exit 0
 fi
 
@@ -819,6 +911,7 @@ step_ok
 
 step nginx-layout
 ensure_relay_panel_stream_layout
+ensure_https_redirect
 step_ok
 
 step relay-node-files
@@ -890,7 +983,7 @@ fi
 install -d -m 0700 "$TRANSACTION_DIR/candidate"
 cat > "$TRANSACTION_DIR/candidate/relay-node.service" <<'EOF'
 [Unit]
-Description=RelayPanel relay-node
+Description=Reality Panel relay-node
 After=network-online.target docker.service nginx.service
 Wants=network-online.target
 

@@ -94,12 +94,6 @@ pub async fn build_node_config(
     //    unfiltered cached config ("forward over bill" trade-off). Do not change
     //    without a product decision.
     let rules: Vec<ForwardRule> = db.list_active_for_config(group.id).await?;
-    let dns01_available = db
-        .get(crate::service::dnsmgr::DNSMGR_CONFIG_KEY)
-        .await?
-        .map(|raw| crate::service::dnsmgr::DnsMgrSettings::from_json(Some(&raw)))
-        .is_some_and(|settings| settings.enabled && settings.configured());
-
     // 3 + 4. Resolve targets and build listener configs. Target resolution needs
     //    a DB lookup (outbound group's connect_host), so it stays async and lives
     //    here; the pure ListenerConfig assembly (transport/ws_path/protocol) is
@@ -175,11 +169,9 @@ pub async fn build_node_config(
                             domain: sni,
                             expected_public_ip: group.connect_host.trim().to_string(),
                             renew_before_days: 30,
-                            challenge_method: if dns01_available {
-                                AcmeChallengeMethod::Dns01
-                            } else {
-                                AcmeChallengeMethod::Http01
-                            },
+                            // Reality Panel 的证书权威路径固定使用 Panel DNS-01。
+                            // DNSMgr 未就绪时由依赖状态阻塞签发，不降级到 :80 HTTP-01。
+                            challenge_method: AcmeChallengeMethod::Dns01,
                         },
                         enabled: true,
                     });
@@ -254,7 +246,6 @@ fn format_target_endpoint(host: &str, port: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::repo::KvsRepository;
     use crate::db::schema::SCHEMA_SQL;
     use crate::db::sqlite_repo::SqliteRepository;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -563,7 +554,7 @@ mod tests {
         assert_eq!(site.certificate.renew_before_days, 30);
         assert_eq!(
             site.certificate.challenge_method,
-            AcmeChallengeMethod::Http01
+            AcmeChallengeMethod::Dns01
         );
 
         let json = serde_json::to_string(&cfg).unwrap();
@@ -593,26 +584,12 @@ mod tests {
         );
 
         let repository = repo(&pool);
-        repository
-            .set(
-                crate::service::dnsmgr::DNSMGR_CONFIG_KEY,
-                &serde_json::json!({
-                    "enabled": true,
-                    "base_url": "http://127.0.0.1:18080",
-                    "uid": 7,
-                    "api_key": "panel-only-test-key"
-                })
-                .to_string(),
-            )
-            .await
-            .unwrap();
         let dns01 = build_node_config(&repository, 10).await.unwrap();
         assert_eq!(
             dns01.camouflage_sites[0].certificate.challenge_method,
             AcmeChallengeMethod::Dns01
         );
         let wire = serde_json::to_string(&dns01).unwrap();
-        assert!(!wire.contains("panel-only-test-key"));
         assert!(!wire.contains("api_key"));
     }
 

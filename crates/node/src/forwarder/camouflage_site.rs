@@ -157,6 +157,12 @@ impl CamouflageSiteManager {
             return true;
         }
 
+        if let Err(error) = CertificateLifecycle::new(self.config.certificate_lifecycle.clone())
+            .ensure_https_redirect()
+        {
+            tracing::warn!("managed HTTP redirect is not converged: {}", error);
+        }
+
         let recovered = self.load_lkg().ok();
         let mut recovered_applied = false;
         if let Some(manifest) = recovered.as_ref() {
