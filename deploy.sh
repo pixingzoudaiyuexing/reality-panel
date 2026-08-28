@@ -12,6 +12,7 @@ SERVICE_FILE="/etc/systemd/system/relay-panel.service"
 info() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
 fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
+success() { printf '\033[32m\342\234\223 %s\033[0m\n' "$*"; }
 
 confirm() {
     local expected="$1" prompt="$2" answer=""
@@ -47,10 +48,12 @@ uninstall_panel() {
     if [ "$purge" -eq 1 ]; then
         rm -rf -- "$CONFIG_ROOT" "$DATA_ROOT"
         info "Reality Panel and local data removed."
+        info "Panel local data was purged."
     else
         info "Reality Panel removed; retained $CONFIG_ROOT and $DATA_ROOT."
     fi
     info "Remote Relay nodes were not contacted."
+    success "卸载成功"
 }
 
 mode="${1:-}"
@@ -83,6 +86,10 @@ install -d -o relay-panel -g relay-panel -m 0750 "$DATA_ROOT"
 install -d -m 0750 "$CONFIG_ROOT"
 
 env_file="$CONFIG_ROOT/relay-panel.env"
+created_default_admin=0
+if [ "$mode" = install ] && [ ! -e "$DATA_ROOT/data.db" ]; then
+    created_default_admin=1
+fi
 if [ ! -e "$env_file" ]; then
     jwt_secret="$(openssl rand -hex 32)"
     panel_key="$(openssl rand -hex 32)"
@@ -203,3 +210,15 @@ ln -sfn "$SCRIPT_ROOT/update.sh" "$UPDATE_COMMAND"
 info "Reality Panel $release_tag is active and healthy."
 info "Panel URL: $public_url"
 info "Node artifact: $INSTALL_ROOT/node-assets/amd64/relay-node ($node_sha)"
+if [ "$mode" = install ]; then
+    success "安装成功"
+else
+    success "升级成功"
+fi
+if [ "$created_default_admin" -eq 1 ] && [ -f "$DATA_ROOT/data.db" ]; then
+    initial_admin="$(sqlite3 "$DATA_ROOT/data.db" \
+        "SELECT username FROM users WHERE id = 1 AND must_change_password = 1 LIMIT 1;" 2>/dev/null || true)"
+    if [ "$initial_admin" = admin ]; then
+        printf '管理员账号：%s\n初始密码：%s\n请首次登录后立即修改密码\n' "$initial_admin" 'admin123'
+    fi
+fi

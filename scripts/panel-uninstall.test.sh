@@ -102,6 +102,7 @@ run_uninstall --yes --purge
 [ ! -e "$CONFIG_ROOT" ] || fail "--yes purge retained config"
 [ ! -e "$DATA_ROOT" ] || fail "--yes purge retained data"
 [ -e "$UNRELATED" ] || fail "--yes purge removed unrelated path"
+run_uninstall --yes --purge | grep -Fq '✓ 卸载成功' || fail "uninstall success marker missing"
 ok "--yes purge removes only the local Panel deployment"
 
 # Missing and partial installations are safe and idempotent.

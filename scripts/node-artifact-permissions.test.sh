@@ -34,6 +34,10 @@ fi
 cat > "$FAKE_BIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'systemctl %s\n' "$*" >> "$HARNESS_LOG"
+if [ "${1:-}" = restart ] && [ ! -e "$HARNESS_DATA_ROOT/data.db" ]; then
+    sqlite3 "$HARNESS_DATA_ROOT/data.db" \
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, must_change_password INTEGER); INSERT INTO users VALUES (1, 'admin', 1);"
+fi
 exit 0
 EOF
 cat > "$FAKE_BIN/curl" <<'EOF'
@@ -82,12 +86,16 @@ sed \
 chmod 0755 "$TEST_DEPLOY"
 
 run_deploy() {
-    HARNESS_LOG="$LOG" PATH="$FAKE_BIN:$PATH" \
+    local mode="${1:-install}"
+    HARNESS_LOG="$LOG" HARNESS_DATA_ROOT="$DATA_ROOT" PATH="$FAKE_BIN:$PATH" \
         RELEASE_DIR="$RELEASE_DIR" RELEASE_VERSION=v1.0.0-rc.5 \
-        PUBLIC_PANEL_URL=http://203.0.113.10:18888 bash "$TEST_DEPLOY" install
+        PUBLIC_PANEL_URL=http://203.0.113.10:18888 bash "$TEST_DEPLOY" "$mode"
 }
 
-run_deploy
+fresh_output="$(run_deploy install)"
+grep -Fq '✓ 安装成功' <<<"$fresh_output" || fail "fresh success marker missing"
+grep -Fq '管理员账号：admin' <<<"$fresh_output" || fail "fresh admin username missing"
+grep -Fq '初始密码：admin123' <<<"$fresh_output" || fail "fresh admin password missing"
 metadata="$INSTALL_ROOT/node-assets/amd64/metadata.json"
 [ "$(stat -c '%a' "$metadata")" = "644" ] || fail "fresh metadata mode is not 0644"
 [ "$(stat -c '%U:%G' "$metadata")" = "root:root" ] || fail "fresh metadata owner changed"
@@ -99,7 +107,11 @@ sqlite3 "$DATA_ROOT/data.db" \
     'CREATE TABLE harness_sentinel (value TEXT NOT NULL); INSERT INTO harness_sentinel VALUES ("database sentinel");'
 chmod 0600 "$metadata"
 [ "$(stat -c '%a' "$metadata")" = "600" ] || fail "failed to create rc.4 permission fixture"
-run_deploy
+update_output="$(run_deploy update)"
+grep -Fq '✓ 升级成功' <<<"$update_output" || fail "update success marker missing"
+if grep -Fq '初始密码' <<<"$update_output"; then
+    fail "upgrade exposed the initial password"
+fi
 [ "$(stat -c '%a' "$metadata")" = "644" ] || fail "update did not repair metadata mode"
 [ "$(stat -c '%U:%G' "$metadata")" = "root:root" ] || fail "update changed metadata owner"
 runuser -u relay-panel -- cat "$metadata" >/dev/null || fail "relay-panel cannot read repaired metadata"
@@ -107,5 +119,13 @@ grep -Fq 'JWT_SECRET=preserve-me' "$CONFIG_ROOT/relay-panel.env" || fail "update
 sqlite3 "$DATA_ROOT/data.db" 'SELECT value FROM harness_sentinel;' | \
     grep -Fqx 'database sentinel' || fail "update changed database"
 ok "0600 metadata was repaired to 0644 without changing config or data"
+
+rm -f -- "$DATA_ROOT/data.db"
+partial_output="$(run_deploy install)"
+grep -Fq '管理员账号：admin' <<<"$partial_output" || \
+    fail "partial install did not report the newly created default admin"
+grep -Fq 'JWT_SECRET=preserve-me' "$CONFIG_ROOT/relay-panel.env" || \
+    fail "partial install changed existing secrets"
+ok "partial install reports a newly created admin without changing existing secrets"
 
 printf 'node artifact permission contract: PASS\n'

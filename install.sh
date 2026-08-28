@@ -13,6 +13,7 @@ UPDATE_COMMAND="/usr/local/sbin/reality-panel-update"
 info() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
 fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
+success() { printf '\033[32m\342\234\223 %s\033[0m\n' "$*"; }
 
 usage() {
     cat <<'EOF'
@@ -105,10 +106,12 @@ local_uninstall() {
     if [ "$purge" -eq 1 ]; then
         rm -rf -- "$CONFIG_ROOT" "$DATA_ROOT"
         info "Reality Panel binaries, configuration, and local data removed."
+        info "Panel local data was purged."
     else
         info "Reality Panel removed; configuration remains in $CONFIG_ROOT and data in $DATA_ROOT."
     fi
     info "Remote Relay nodes were not contacted."
+    success "卸载成功"
 }
 
 command_name="${1:-install}"
@@ -129,40 +132,47 @@ esac
 [ "$(id -u)" -eq 0 ] || fail "Run as root."
 [ "$(uname -s)" = "Linux" ] || fail "Only Linux is supported."
 [ "$(uname -m)" = "x86_64" ] || fail "Reality Panel v1 requires Linux amd64 (x86_64)."
-[ -r /etc/os-release ] || fail "Cannot identify the operating system."
-# shellcheck disable=SC1091
-. /etc/os-release
-[ "${ID:-}" = "debian" ] && [ "${VERSION_ID:-}" = "12" ] || \
+os_release_file="${REALITY_PANEL_OS_RELEASE_FILE:-/etc/os-release}"
+[ -r "$os_release_file" ] || fail "Cannot identify the operating system."
+# 在子 shell 中读取系统信息，避免 Debian 的 VERSION 污染目标发布版本。
+os_id="$(. "$os_release_file"; printf '%s' "${ID:-}")"
+os_version_id="$(. "$os_release_file"; printf '%s' "${VERSION_ID:-}")"
+[ "$os_id" = "debian" ] && [ "$os_version_id" = "12" ] || \
     fail "The supported v1 host is Debian 12 amd64."
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required."
 
-version="${VERSION:-}"
-if [ "$command_name" = "install" ] && [ -z "$version" ]; then
-    version="$DEFAULT_RELEASE_TAG"
+target_version="${TARGET_VERSION:-}"
+if [ "$command_name" = "install" ] && [ -z "$target_version" ]; then
+    target_version="$DEFAULT_RELEASE_TAG"
 fi
 public_url="${PUBLIC_PANEL_URL:-}"
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --version) [ "$#" -ge 2 ] || fail "--version requires a value"; version="$2"; shift 2 ;;
+        --version) [ "$#" -ge 2 ] || fail "--version requires a value"; target_version="$2"; shift 2 ;;
         --public-panel-url) [ "$#" -ge 2 ] || fail "--public-panel-url requires a value"; public_url="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
-        v*) [ "$command_name" = "update" ] && [ -z "$version" ] || fail "Unexpected argument: $1"; version="$1"; shift ;;
+        v*) [ "$command_name" = "update" ] && [ -z "$target_version" ] || fail "Unexpected argument: $1"; target_version="$1"; shift ;;
         *) fail "Unknown option: $1" ;;
     esac
 done
+
+if [ "${REALITY_PANEL_TEST_PARSE_ONLY:-0}" = 1 ]; then
+    printf 'command=%s\ntarget_version=%s\npublic_url=%s\n' "$command_name" "$target_version" "$public_url"
+    exit 0
+fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq ca-certificates curl file openssl sqlite3 tar >/dev/null
 
-if [ "$command_name" = "update" ] && [ -z "$version" ]; then
+if [ "$command_name" = "update" ] && [ -z "$target_version" ]; then
     info "Resolving latest stable Reality Panel release..."
     latest_url="$(curl --proto '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' \
         "https://github.com/$REPOSITORY/releases/latest")"
-    version="${latest_url##*/}"
+    target_version="${latest_url##*/}"
 fi
-[ -n "$version" ] || fail "Install requires --version vX.Y.Z (RC tags are allowed)."
-valid_release_tag "$version" || fail "Invalid release tag: $version"
+[ -n "$target_version" ] || fail "Install requires --version vX.Y.Z (RC tags are allowed)."
+valid_release_tag "$target_version" || fail "Invalid release tag: $target_version"
 
 env_file="$CONFIG_ROOT/relay-panel.env"
 if [ -z "$public_url" ] && [ -r "$env_file" ]; then
@@ -177,8 +187,8 @@ valid_public_panel_url "$public_url" || fail "PUBLIC_PANEL_URL must be a credent
 
 tmp="$(mktemp -d)"
 trap 'rm -rf -- "$tmp"' EXIT
-base="https://github.com/$REPOSITORY/releases/download/$version"
-info "Downloading verified assets for $version..."
+base="https://github.com/$REPOSITORY/releases/download/$target_version"
+info "Downloading verified assets for $target_version..."
 curl --proto '=https' --tlsv1.2 -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
 assets=(reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh update.sh deploy.sh)
 for asset in "${assets[@]}"; do
@@ -192,5 +202,5 @@ done
 chmod +x "$tmp/install.sh" "$tmp/update.sh" "$tmp/deploy.sh" \
     "$tmp/reality-panel-linux-amd64" "$tmp/reality-node-linux-amd64"
 
-RELEASE_DIR="$tmp" RELEASE_VERSION="$version" PUBLIC_PANEL_URL="$public_url" \
+RELEASE_DIR="$tmp" RELEASE_VERSION="$target_version" PUBLIC_PANEL_URL="$public_url" \
     exec "$tmp/deploy.sh" "$command_name"
