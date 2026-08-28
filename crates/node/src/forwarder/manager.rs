@@ -1009,6 +1009,59 @@ impl ForwarderManager {
             .and_then(|plan| plan.rule_id_for(port, sni))
     }
 
+    pub fn nginx_sni_rule_for_id(
+        &self,
+        rule_id: i64,
+    ) -> Option<crate::forwarder::nginx_sni::NginxSniRule> {
+        self.nginx_sni_plan
+            .as_ref()
+            .and_then(|plan| plan.rule_for_id(rule_id))
+    }
+
+    pub fn nginx_sni_runtime_observation(
+        &self,
+    ) -> Option<crate::forwarder::nginx_sni::NginxRuntimeObservation> {
+        self.nginx_sni_plan.as_ref().map(|plan| {
+            crate::forwarder::nginx_sni::inspect_rendered(plan.render().as_bytes(), &self.nginx_sni)
+        })
+    }
+
+    pub fn nginx_sni_expected_fingerprint(&self) -> Option<String> {
+        self.nginx_sni_plan.as_ref().map(|plan| {
+            relay_shared::reconciliation::fingerprint_bytes(plan.render().as_bytes()).to_string()
+        })
+    }
+
+    pub fn nginx_sni_tcp_port_listening(port: u16) -> bool {
+        socket_bound(port, Protocol::Tcp).unwrap_or(false)
+    }
+
+    /// Rebuild only the shared nginx_sni plan from the node's accepted config.
+    /// This never invokes the camouflage or certificate managers and never
+    /// restarts the relay process.
+    pub async fn reapply_nginx_sni(&mut self, rule_id: i64) -> Result<(), String> {
+        let config = self
+            .last_config
+            .clone()
+            .ok_or_else(|| "no accepted configuration is available".to_string())?;
+        let present = config.listeners.iter().any(|listener| {
+            listener.rule_id == rule_id
+                && listener.node_transport == NodeTransport::NginxSni
+                && listener.protocol == Protocol::Tcp
+        });
+        if !present {
+            return Err("nginx_sni rule is not present in the accepted configuration".into());
+        }
+        if self
+            .apply_config_scoped(&config, &HashSet::new(), true, false)
+            .await
+        {
+            Ok(())
+        } else {
+            Err("nginx_sni configuration test or reload failed".into())
+        }
+    }
+
     /// v1.2.0: restart ONE rule — drop every connection it is currently
     /// forwarding, then rebuild its listeners from the last applied config.
     ///
@@ -2500,5 +2553,69 @@ mod tests {
             })
             .await
         );
+    }
+
+    #[tokio::test]
+    async fn reapply_rebuilds_complete_sni_plan_without_managed_raw_listeners() {
+        let mut mgr = fresh_mgr();
+        let dir = std::env::temp_dir().join(format!(
+            "relay-panel-manager-reapply-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("relay.conf");
+        mgr.set_nginx_sni_config_for_test(NginxSniConfig {
+            enabled: true,
+            conf_path: path.clone(),
+            test_cmd: "true".into(),
+            reload_cmd: "true".into(),
+            default_backend: "127.0.0.1:9".into(),
+            access_log_path: "/tmp/relay-panel-test.log".into(),
+        });
+        let sni_listener = |rule_id: i64, sni: &str, target: &str| ListenerConfig {
+            rule_id,
+            port: 443,
+            protocol: Protocol::Tcp,
+            node_transport: NodeTransport::NginxSni,
+            ws_path: None,
+            sni: Some(sni.into()),
+            camouflage_required: false,
+            send_proxy_protocol: false,
+            targets: vec![target.into()],
+            load_balance_strategy: LoadBalanceStrategy::First,
+            upload_limit_bps: None,
+            download_limit_bps: None,
+            max_connections: None,
+        };
+        let config = NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners: vec![
+                sni_listener(10, "op1.example.com", "192.0.2.10:55443"),
+                sni_listener(11, "op2.example.com", "192.0.2.11:55443"),
+            ],
+        };
+
+        assert!(mgr.apply_config(&config).await);
+        assert!(mgr.listener_keys().is_empty(), "SNI rules are Nginx-owned");
+        assert!(mgr.nginx_sni_rule_for_id(10).is_some());
+        assert!(mgr.nginx_sni_rule_for_id(11).is_some());
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(mgr.reapply_nginx_sni(10).await.is_ok());
+        let reapplied = std::fs::read(&path).unwrap();
+        assert_eq!(reapplied, before);
+        let rendered = String::from_utf8_lossy(&reapplied);
+        assert!(rendered.contains("relay_panel_sni_rule_10_443_op1_example_com"));
+        assert!(rendered.contains("relay_panel_sni_rule_11_443_op2_example_com"));
+        assert!(mgr.listener_keys().is_empty());
+
+        mgr.nginx_sni.test_cmd = "false".into();
+        assert!(mgr.reapply_nginx_sni(10).await.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(mgr.nginx_sni_rule_for_id(11).is_some());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

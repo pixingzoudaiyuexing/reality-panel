@@ -370,6 +370,37 @@ async fn connect_and_run(
                                 );
                             }
                         } else if let Some(command) = serde_json::from_str::<
+                            relay_shared::protocol::ReapplyNginxSniMessage,
+                        >(&text)
+                        .ok()
+                        .filter(|command| command.msg_type == "reapply_nginx_sni")
+                        {
+                            if command.node_id != node_id {
+                                tracing::warn!(
+                                    "websocket: ignoring nginx_sni reapply for another node"
+                                );
+                            } else {
+                                tracing::info!(
+                                    "websocket: reapply_nginx_sni request_id={} rule_id={}",
+                                    command.request_id,
+                                    command.rule_id
+                                );
+                                let mgr = manager.clone();
+                                let cfg = config.clone();
+                                let nid = node_id.to_string();
+                                tokio::spawn(async move {
+                                    crate::reapply::run_and_report(
+                                        &mgr,
+                                        &cfg,
+                                        &nid,
+                                        command.request_id,
+                                        command.rule_id,
+                                        command.challenge,
+                                    )
+                                    .await;
+                                });
+                            }
+                        } else if let Some(command) = serde_json::from_str::<
                             relay_shared::protocol::NodeLifecycleCommand,
                         >(&text)
                         .ok()
@@ -439,13 +470,14 @@ async fn connect_and_run(
                             );
                             let cfg = config.clone();
                             let mgr = manager.clone();
+                            let sites = camouflage.clone();
                             let nid = node_id.to_string();
                             let req_id = dm.request_id.clone();
                             let rid = dm.rule_id;
                             let challenge = dm.challenge.clone();
                             tokio::spawn(async move {
                                 crate::diagnose::run_and_report(
-                                    &mgr, &cfg, &nid, req_id, rid, challenge,
+                                    &mgr, &sites, &cfg, &nid, req_id, rid, challenge,
                                 )
                                 .await;
                             });

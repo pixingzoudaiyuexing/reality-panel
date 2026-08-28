@@ -57,11 +57,99 @@ pub struct DiagnoseRun {
 #[derive(Clone, Default)]
 pub struct DiagnoseRegistry {
     inner: Arc<Mutex<HashMap<String, DiagnoseRun>>>,
+    reapply: Arc<Mutex<HashMap<String, ReapplyRun>>>,
+}
+
+#[derive(Debug)]
+pub struct ReapplyRun {
+    pub rule_id: i64,
+    pub started_at: Instant,
+    pub challenge: String,
+    pub expected_node_ids: Vec<String>,
+    pub results: HashMap<String, relay_shared::protocol::ReapplyNginxSniResult>,
 }
 
 impl DiagnoseRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub async fn start_reapply(
+        &self,
+        rule_id: i64,
+        expected_node_ids: Vec<String>,
+    ) -> (String, String) {
+        let request_id = uuid_v4_str();
+        let challenge = uuid_v4_str();
+        self.reapply.lock().await.insert(
+            request_id.clone(),
+            ReapplyRun {
+                rule_id,
+                started_at: Instant::now(),
+                challenge: challenge.clone(),
+                expected_node_ids,
+                results: HashMap::new(),
+            },
+        );
+        (request_id, challenge)
+    }
+
+    pub async fn record_reapply(
+        &self,
+        request_id: &str,
+        result: relay_shared::protocol::ReapplyNginxSniResult,
+    ) -> bool {
+        let mut map = self.reapply.lock().await;
+        let Some(run) = map.get_mut(request_id) else {
+            return false;
+        };
+        if run.rule_id != result.rule_id
+            || !run.expected_node_ids.iter().any(|id| id == &result.node_id)
+            || result.challenge.is_empty()
+            || result.challenge != run.challenge
+        {
+            return false;
+        }
+        run.results.insert(result.node_id.clone(), result);
+        true
+    }
+
+    pub async fn all_reapply_received(&self, request_id: &str) -> bool {
+        let map = self.reapply.lock().await;
+        map.get(request_id)
+            .is_none_or(|run| run.results.len() >= run.expected_node_ids.len())
+    }
+
+    pub async fn snapshot_reapply(
+        &self,
+        request_id: &str,
+    ) -> Option<(i64, Vec<relay_shared::protocol::ReapplyNginxSniResult>)> {
+        let map = self.reapply.lock().await;
+        let run = map.get(request_id)?;
+        Some((
+            run.rule_id,
+            run.expected_node_ids
+                .iter()
+                .filter_map(|id| run.results.get(id).cloned())
+                .collect(),
+        ))
+    }
+
+    pub async fn remove_reapply(&self, request_id: &str) {
+        self.reapply.lock().await.remove(request_id);
+    }
+
+    pub async fn retain_reapply_expected(
+        &self,
+        request_id: &str,
+        keep: &std::collections::HashSet<String>,
+    ) -> usize {
+        let mut map = self.reapply.lock().await;
+        let Some(run) = map.get_mut(request_id) else {
+            return 0;
+        };
+        run.expected_node_ids.retain(|id| keep.contains(id));
+        run.expected_node_ids.len()
     }
 
     /// Register a new run. Returns the request_id and the per-run challenge
@@ -165,6 +253,10 @@ impl DiagnoseRegistry {
         let now = Instant::now();
         let mut map = self.inner.lock().await;
         map.retain(|_, run| now.duration_since(run.started_at) < DIAGNOSE_TIMEOUT * 2);
+        self.reapply
+            .lock()
+            .await
+            .retain(|_, run| now.duration_since(run.started_at) < DIAGNOSE_TIMEOUT * 2);
     }
 }
 
@@ -723,6 +815,7 @@ mod tests {
             protocol: "tcp".into(),
             transport: "raw".into(),
             results: vec![],
+            reality: None,
         }
     }
 
@@ -831,6 +924,34 @@ mod tests {
         let r = mk_result("r", "n");
         assert!(r.results.is_empty());
         let _ = TargetProbeOutcome::Timeout; // variant exists
+    }
+
+    #[tokio::test]
+    async fn reapply_registry_requires_exact_rule_node_and_challenge() {
+        let reg = DiagnoseRegistry::new();
+        let (rid, challenge) = reg.start_reapply(7, vec!["node-a".into()]).await;
+        let wrong = relay_shared::protocol::ReapplyNginxSniResult {
+            msg_type: "reapply_nginx_sni_result".into(),
+            request_id: rid.clone(),
+            rule_id: 7,
+            node_id: "node-a".into(),
+            challenge: "wrong".into(),
+            success: true,
+            error: None,
+        };
+        assert!(!reg.record_reapply(&rid, wrong).await);
+
+        let valid = relay_shared::protocol::ReapplyNginxSniResult {
+            msg_type: "reapply_nginx_sni_result".into(),
+            request_id: rid.clone(),
+            rule_id: 7,
+            node_id: "node-a".into(),
+            challenge,
+            success: true,
+            error: None,
+        };
+        assert!(reg.record_reapply(&rid, valid).await);
+        assert!(reg.all_reapply_received(&rid).await);
     }
 
     /// v0.4.15: every NodeDiagnoseStatus variant carries group_name + public_ip

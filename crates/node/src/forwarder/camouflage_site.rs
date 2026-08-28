@@ -408,6 +408,15 @@ impl CamouflageSiteManager {
             .collect()
     }
 
+    pub fn active_site_for_sni(&self, sni: &str) -> Option<CamouflageSite> {
+        self.active
+            .as_ref()?
+            .sites
+            .iter()
+            .find(|site| site.sni.eq_ignore_ascii_case(sni))
+            .cloned()
+    }
+
     fn reconcile_and_apply_manifest(&mut self, manifest: CamouflageSitesManifest) -> bool {
         match self.try_reconcile_and_apply_manifest(manifest) {
             Ok(()) => true,

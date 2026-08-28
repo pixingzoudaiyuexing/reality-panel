@@ -19,6 +19,7 @@ pub struct NginxSniConfig {
 #[derive(Clone, Debug)]
 pub struct NginxRuntimeObservation {
     pub fingerprint: ConfigFingerprint,
+    pub deployed_fingerprint: Option<ConfigFingerprint>,
     pub healthy: bool,
     pub managed_file_exists: bool,
     pub file_matches: bool,
@@ -146,6 +147,13 @@ impl NginxSniPlan {
             .iter()
             .find(|r| r.listen_port == port && r.sni == sni)
             .map(|r| r.rule_id)
+    }
+
+    pub fn rule_for_id(&self, rule_id: i64) -> Option<NginxSniRule> {
+        self.rules
+            .iter()
+            .find(|rule| rule.rule_id == rule_id)
+            .cloned()
     }
 
     pub fn render(&self) -> String {
@@ -367,6 +375,7 @@ pub fn inspect_rendered(expected: &[u8], cfg: &NginxSniConfig) -> NginxRuntimeOb
     if !cfg.enabled {
         return NginxRuntimeObservation {
             fingerprint: fingerprint_bytes(b"nginx-disabled"),
+            deployed_fingerprint: None,
             healthy: true,
             managed_file_exists: false,
             file_matches: true,
@@ -391,6 +400,7 @@ pub fn inspect_rendered(expected: &[u8], cfg: &NginxSniConfig) -> NginxRuntimeOb
 
     NginxRuntimeObservation {
         fingerprint: fingerprint_bytes(&evidence),
+        deployed_fingerprint: actual.as_deref().map(fingerprint_bytes),
         healthy: managed_file_exists && file_matches && config_valid && service_healthy,
         managed_file_exists,
         file_matches,

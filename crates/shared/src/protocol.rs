@@ -1017,6 +1017,140 @@ pub fn node_supports_restart_rule(version: Option<&str>) -> bool {
     (major, minor, patch) >= (1, 2, 0)
 }
 
+/// Panel -> node control operation for the shared nginx_sni plan. This is an
+/// optional control message, so it does not change the config snapshot wire
+/// format or CONFIG_PROTOCOL_VERSION.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReapplyNginxSniMessage {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub node_id: String,
+    pub rule_id: i64,
+    pub request_id: String,
+    pub challenge: String,
+}
+
+impl ReapplyNginxSniMessage {
+    pub fn new(node_id: String, rule_id: i64, request_id: String, challenge: String) -> Self {
+        Self {
+            msg_type: "reapply_nginx_sni".into(),
+            node_id,
+            rule_id,
+            request_id,
+            challenge,
+        }
+    }
+}
+
+/// Node -> panel result for a reapply operation. The error is deliberately a
+/// short, sanitized description; no command output or configuration secrets
+/// are returned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReapplyNginxSniResult {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub request_id: String,
+    pub rule_id: i64,
+    pub node_id: String,
+    pub challenge: String,
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A compact, structured read-only check shared by all Reality diagnosis
+/// layers. `state` is a stable value (`pass`, `warning`, `fail`, or
+/// `not_tested`); `detail` is for operator-facing context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealityCheck {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealityConfigDiagnosis {
+    pub check: RealityCheck,
+    pub listen_port: u16,
+    pub sni: Option<String>,
+    pub targets: Vec<String>,
+    pub send_proxy_protocol: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealityNginxDiagnosis {
+    pub check: RealityCheck,
+    pub plan_contains_rule: bool,
+    pub mapping_matches: bool,
+    pub expected_fingerprint: Option<String>,
+    pub deployed_fingerprint: Option<String>,
+    pub managed_file_matches: bool,
+    pub config_valid: bool,
+    pub service_healthy: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealityRuntimeDiagnosis {
+    pub check: RealityCheck,
+    pub listen_443: bool,
+    pub listen_8443: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealityBackendDiagnosis {
+    pub address: String,
+    pub check: RealityCheck,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealityCertificateDiagnosis {
+    pub check: RealityCheck,
+    /// Certificate usability and renewal outcome are intentionally separate:
+    /// a valid existing certificate remains a PASS when a renewal attempt has
+    /// failed and will be retried.
+    pub renewal: RealityCheck,
+    pub certificate_status: String,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+    pub san_match: bool,
+    pub cert_key_match: bool,
+    pub issuer: Option<String>,
+    pub valid_until: Option<String>,
+    pub remaining_days: Option<i64>,
+    pub tls_handshake: RealityCheck,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealityCamouflageDiagnosis {
+    pub check: RealityCheck,
+    pub site_status: String,
+    pub tls_listener_port: u16,
+    pub local_backend: String,
+    pub http_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealityFallbackDiagnosis {
+    pub check: RealityCheck,
+    pub http_status: Option<u16>,
+    /// False when the probe intentionally stops before VLESS authentication.
+    pub authenticated_reality_path: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealityDiagnosis {
+    pub config: RealityConfigDiagnosis,
+    pub nginx: RealityNginxDiagnosis,
+    pub runtime: RealityRuntimeDiagnosis,
+    pub backends: Vec<RealityBackendDiagnosis>,
+    pub certificate: RealityCertificateDiagnosis,
+    pub camouflage: RealityCamouflageDiagnosis,
+    pub fallback: RealityFallbackDiagnosis,
+    pub vless_authentication: RealityCheck,
+}
+
 /// Outcome of probing ONE target from the node (TCP-only since v0.4.9).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1072,6 +1206,11 @@ pub struct DiagnoseResult {
     /// Per-target probe results (max 32, matching the rule target cap).
     #[serde(default)]
     pub results: Vec<DiagnoseTargetResult>,
+    /// Reality/nginx_sni rules use a dedicated read-only layered report. The
+    /// field is optional so old nodes and ordinary TCP/UDP diagnosis remain
+    /// wire-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reality: Option<RealityDiagnosis>,
 }
 
 /// Compare a reported node_version against "0.4.9". Returns true if the node
@@ -1920,5 +2059,35 @@ mod tests {
         assert!(!config_protocol_versions_compatible(7, 8));
         assert!(!config_protocol_versions_compatible(8, 7));
         assert!(config_protocol_versions_compatible(8, 8));
+    }
+
+    #[test]
+    fn reality_diagnosis_keeps_certificate_and_renewal_states_separate() {
+        let diagnosis = RealityCertificateDiagnosis {
+            check: RealityCheck {
+                state: "pass".into(),
+                detail: Some("certificate is usable".into()),
+            },
+            renewal: RealityCheck {
+                state: "warning".into(),
+                detail: Some("renewal failed; existing certificate retained".into()),
+            },
+            certificate_status: "active".into(),
+            cert_path: Some("/etc/relay-panel/cert.pem".into()),
+            key_path: Some("/etc/relay-panel/key.pem".into()),
+            san_match: true,
+            cert_key_match: true,
+            issuer: Some("test issuer".into()),
+            valid_until: None,
+            remaining_days: Some(21),
+            tls_handshake: RealityCheck {
+                state: "pass".into(),
+                detail: None,
+            },
+        };
+        let encoded = serde_json::to_value(diagnosis).unwrap();
+        assert_eq!(encoded["check"]["state"], "pass");
+        assert_eq!(encoded["renewal"]["state"], "warning");
+        assert_eq!(encoded["remaining_days"], 21);
     }
 }

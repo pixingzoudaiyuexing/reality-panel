@@ -4,6 +4,7 @@ mod diagnose;
 mod forwarder;
 mod lifecycle;
 mod poller;
+mod reapply;
 mod reconciler;
 mod reporter;
 mod updater;

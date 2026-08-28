@@ -18,6 +18,7 @@ pub mod node_enrollment;
 pub mod node_ops;
 pub mod notify;
 mod provisioning;
+pub mod reapply;
 pub mod redeem;
 pub mod restart;
 pub mod security_headers;
@@ -208,6 +209,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/rules/{id}/restart",
             axum::routing::post(restart::restart_rule),
+        )
+        .route(
+            "/rules/{id}/reapply",
+            axum::routing::post(reapply::reapply_nginx_sni),
         )
         // v0.4.12: device groups are admin-only shared infrastructure again.
         // Writes use the AdminOnly guard; the service layer operates with
@@ -415,5 +420,9 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/node/diagnose_result",
             axum::routing::post(diagnose::receive_diagnose_result),
+        )
+        .route(
+            "/node/reapply_nginx_sni_result",
+            axum::routing::post(reapply::receive_reapply_result),
         )
 }
