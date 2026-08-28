@@ -9,8 +9,10 @@ use super::certificate_lifecycle::{
     CertificateLifecyclePolicy, LifecycleAction, RenewalGate,
 };
 use super::nginx_sni::{self, NginxSniConfig};
-use relay_shared::protocol::{CamouflageLocalBackend, CamouflageSiteDesired, CamouflageSiteStatus};
-use relay_shared::reconciliation::{fingerprint_bytes, ConfigFingerprint};
+use relay_shared::protocol::{
+    CamouflageLocalBackend, CamouflageSiteDesired, CamouflageSiteStatus, NodeConfigResponse,
+};
+use relay_shared::reconciliation::{config_fingerprint, fingerprint_bytes, ConfigFingerprint};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -18,6 +20,7 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
 
 pub const CAMOUFLAGE_TLS_PORT: u16 = 8443;
 pub const OPENLIST_BACKEND: &str = "127.0.0.1:5244";
@@ -69,15 +72,47 @@ pub struct CamouflageRuntimeObservation {
     pub(crate) ownership: CamouflageRuntimeOwnership,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CamouflageSiteManager {
     config: CamouflageSiteConfig,
     active: Option<CamouflageSitesManifest>,
     renewal_gate: Arc<RenewalGate>,
+    acme_gate: Arc<std::sync::Mutex<()>>,
+    apply_gate: Arc<AsyncMutex<()>>,
     desired: Vec<CamouflageSiteDesired>,
+    desired_generation: u64,
+    desired_fingerprint: ConfigFingerprint,
+    runtime_revision: u64,
     last_errors: HashMap<String, String>,
     renewal_warnings: HashMap<String, (String, String)>,
     panel_authority_established: bool,
+}
+
+#[derive(Clone)]
+struct CertificateReconcileSnapshot {
+    generation: u64,
+    fingerprint: ConfigFingerprint,
+    runtime_revision: u64,
+    manifest: CamouflageSitesManifest,
+    active: Option<CamouflageSitesManifest>,
+    config: CamouflageSiteConfig,
+    renewal_gate: Arc<RenewalGate>,
+    acme_gate: Arc<std::sync::Mutex<()>>,
+    apply_gate: Arc<AsyncMutex<()>>,
+    desired_request: bool,
+}
+
+struct CertificateReconcileResult {
+    snapshot: CertificateReconcileSnapshot,
+    outcome: Result<(CamouflageSitesManifest, Vec<LifecycleAction>), String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconcileCommit {
+    Applied,
+    Failed,
+    InFlight,
+    Stale,
 }
 
 impl CamouflageSiteManager {
@@ -86,10 +121,32 @@ impl CamouflageSiteManager {
             config,
             active: None,
             renewal_gate: Arc::new(RenewalGate::default()),
+            acme_gate: Arc::new(std::sync::Mutex::new(())),
+            apply_gate: Arc::new(AsyncMutex::new(())),
             desired: Vec::new(),
+            desired_generation: 0,
+            desired_fingerprint: camouflage_desired_fingerprint(&[]),
+            runtime_revision: 0,
             last_errors: HashMap::new(),
             renewal_warnings: HashMap::new(),
             panel_authority_established: false,
+        }
+    }
+
+    fn update_desired(&mut self, desired: &[CamouflageSiteDesired], panel_authoritative: bool) {
+        let next: Vec<_> = desired
+            .iter()
+            .filter(|site| site.enabled)
+            .cloned()
+            .collect();
+        let next_fingerprint = camouflage_desired_fingerprint(&next);
+        if next_fingerprint != self.desired_fingerprint {
+            self.desired_generation = self.desired_generation.wrapping_add(1);
+            self.desired_fingerprint = next_fingerprint;
+        }
+        self.desired = next;
+        if panel_authoritative {
+            self.panel_authority_established = true;
         }
     }
 
@@ -106,6 +163,7 @@ impl CamouflageSiteManager {
             match self.apply_runtime(manifest) {
                 Ok(()) => {
                     self.active = Some(manifest.clone());
+                    self.runtime_revision = self.runtime_revision.wrapping_add(1);
                     recovered_applied = true;
                 }
                 Err(error) => {
@@ -131,6 +189,7 @@ impl CamouflageSiteManager {
     /// Legacy source manifests are not an authority for runtime recovery.
     /// Certificate reconciliation begins only after a validated Panel snapshot
     /// has established an active modern LKG.
+    #[cfg(test)]
     pub fn reconcile_from_source(&mut self) -> bool {
         tracing::warn!(
             "legacy camouflage source manifest is not authoritative; waiting for Panel sync"
@@ -141,6 +200,7 @@ impl CamouflageSiteManager {
     /// Scheduler path after Panel ownership has been established. The active
     /// LKG carries both the Node-owned generation and lifecycle policy, so it
     /// remains renewable while the Panel is unavailable.
+    #[cfg(test)]
     pub fn reconcile_active(&mut self) -> bool {
         let Some(manifest) = self.active.clone() else {
             return self.reconcile_from_source();
@@ -151,20 +211,16 @@ impl CamouflageSiteManager {
     /// Prepare all Panel-desired sites while retaining old active sites. The
     /// caller activates dependent :443 listeners only for the returned SNI set,
     /// then calls `finalize_for_listener_snis` to remove unreferenced wrappers.
+    #[cfg(test)]
     pub fn prepare_desired(
         &mut self,
         desired: &[CamouflageSiteDesired],
         panel_authoritative: bool,
     ) -> HashSet<String> {
-        self.desired = desired
-            .iter()
-            .filter(|site| site.enabled)
-            .cloned()
-            .collect();
+        self.update_desired(desired, panel_authoritative);
         if !panel_authoritative {
             return self.active_snis();
         }
-        self.panel_authority_established = true;
         if self.desired.is_empty() && self.active.is_none() {
             return HashSet::new();
         }
@@ -197,13 +253,6 @@ impl CamouflageSiteManager {
                     let mut certificate = site.certificate.clone();
                     certificate.lifecycle = lifecycle.clone();
                     certificate
-                })
-                .or_else(|| {
-                    latest_installed_certificate(
-                        &self.config.certificate_lifecycle.state_dir,
-                        &desired_site.site_id,
-                        lifecycle.clone(),
-                    )
                 })
                 .unwrap_or_else(|| {
                     let pending = self
@@ -248,7 +297,101 @@ impl CamouflageSiteManager {
         self.active_snis()
     }
 
+    fn active_reconcile_snapshot(&self) -> Option<CertificateReconcileSnapshot> {
+        Some(CertificateReconcileSnapshot {
+            generation: self.desired_generation,
+            fingerprint: self.desired_fingerprint.clone(),
+            runtime_revision: self.runtime_revision,
+            manifest: self.active.clone()?,
+            active: self.active.clone(),
+            config: self.config.clone(),
+            renewal_gate: Arc::clone(&self.renewal_gate),
+            acme_gate: Arc::clone(&self.acme_gate),
+            apply_gate: Arc::clone(&self.apply_gate),
+            desired_request: false,
+        })
+    }
+
+    fn desired_reconcile_snapshot(
+        &mut self,
+        desired: &[CamouflageSiteDesired],
+        panel_authoritative: bool,
+    ) -> Option<CertificateReconcileSnapshot> {
+        self.update_desired(desired, panel_authoritative);
+        if !panel_authoritative || self.desired.is_empty() {
+            return None;
+        }
+
+        let mut candidate = self
+            .active
+            .clone()
+            .unwrap_or(CamouflageSitesManifest { sites: Vec::new() });
+        for desired_site in &self.desired {
+            if let Err(error) = validate_desired(desired_site) {
+                self.last_errors
+                    .insert(desired_site.site_id.clone(), sanitize_error(&error));
+                continue;
+            }
+            let previous = candidate
+                .sites
+                .iter()
+                .find(|site| site.id == desired_site.site_id || site.sni == desired_site.sni)
+                .cloned();
+            let lifecycle = Some(CertificateLifecyclePolicy {
+                domain: desired_site.certificate.domain.clone(),
+                email: None,
+                expected_public_ip: desired_site.certificate.expected_public_ip.clone(),
+                renew_before_days: desired_site.certificate.renew_before_days,
+                challenge_method: desired_site.certificate.challenge_method,
+            });
+            let certificate = previous
+                .as_ref()
+                .map(|site| {
+                    let mut certificate = site.certificate.clone();
+                    certificate.lifecycle = lifecycle.clone();
+                    certificate
+                })
+                .unwrap_or_else(|| {
+                    let pending = self
+                        .config
+                        .certificate_lifecycle
+                        .state_dir
+                        .join("pending")
+                        .join(&desired_site.site_id);
+                    CertificateReference {
+                        cert_path: pending.join("fullchain.pem"),
+                        key_path: pending.join("privkey.pem"),
+                        lifecycle,
+                    }
+                });
+            candidate
+                .sites
+                .retain(|site| site.id != desired_site.site_id && site.sni != desired_site.sni);
+            candidate.sites.push(CamouflageSite {
+                id: desired_site.site_id.clone(),
+                sni: desired_site.sni.clone(),
+                tls_listener_port: desired_site.tls_listener_port,
+                local_backend: OPENLIST_BACKEND.to_string(),
+                certificate,
+            });
+        }
+
+        Some(CertificateReconcileSnapshot {
+            generation: self.desired_generation,
+            fingerprint: self.desired_fingerprint.clone(),
+            runtime_revision: self.runtime_revision,
+            manifest: candidate,
+            active: self.active.clone(),
+            config: self.config.clone(),
+            renewal_gate: Arc::clone(&self.renewal_gate),
+            acme_gate: Arc::clone(&self.acme_gate),
+            apply_gate: Arc::clone(&self.apply_gate),
+            desired_request: true,
+        })
+    }
+
     /// Remove sites only after the effective listener transaction succeeded.
+    #[cfg(test)]
     pub fn finalize_for_listener_snis(&mut self, referenced_snis: &HashSet<String>) -> bool {
         if !self.panel_authority_established && self.desired.is_empty() {
             return true;
@@ -333,6 +476,7 @@ impl CamouflageSiteManager {
         }
     }
 
+    #[cfg(test)]
     pub fn repair_active_runtime(&mut self, expected_snis: &HashSet<String>) -> bool {
         let Some(active) = self.active.clone() else {
             return expected_snis.is_empty();
@@ -417,6 +561,7 @@ impl CamouflageSiteManager {
             .cloned()
     }
 
+    #[cfg(test)]
     fn reconcile_and_apply_manifest(&mut self, manifest: CamouflageSitesManifest) -> bool {
         match self.try_reconcile_and_apply_manifest(manifest) {
             Ok(()) => true,
@@ -430,37 +575,18 @@ impl CamouflageSiteManager {
         }
     }
 
+    #[cfg(test)]
     fn try_reconcile_and_apply_manifest(
         &mut self,
-        mut manifest: CamouflageSitesManifest,
+        manifest: CamouflageSitesManifest,
     ) -> Result<(), String> {
-        let site_ids = manifest
-            .sites
-            .iter()
-            .filter(|site| site.certificate.lifecycle.is_some())
-            .map(|site| site.id.clone())
-            .collect();
-        let renewal_gate = Arc::clone(&self.renewal_gate);
-        let Some(_renewal_lease) = renewal_gate.try_acquire(site_ids) else {
-            return Err("camouflage certificate renewal already in progress".into());
-        };
-        // The source manifest carries policy, while a healthy LKG carries the
-        // active Node-owned generation. Do not regress a periodic check back
-        // to a Certbot live path after a successful install.
-        if let Some(active) = &self.active {
-            for site in &mut manifest.sites {
-                if let Some(previous) = active.sites.iter().find(|old| old.id == site.id) {
-                    if site.certificate.lifecycle.is_some() {
-                        let lifecycle = site.certificate.lifecycle.clone();
-                        site.certificate = previous.certificate.clone();
-                        site.certificate.lifecycle = lifecycle;
-                    }
-                }
-            }
-        }
-
-        let lifecycle = CertificateLifecycle::new(self.config.certificate_lifecycle.clone());
-        let (candidate, actions) = lifecycle.reconcile(&manifest)?;
+        let (candidate, actions) = run_certificate_reconcile(
+            &self.config,
+            &self.renewal_gate,
+            &self.acme_gate,
+            manifest,
+            self.active.as_ref(),
+        )?;
         for (site, action) in candidate.sites.iter().zip(actions.iter()) {
             if *action == LifecycleAction::RenewalWarning {
                 self.renewal_warnings.insert(
@@ -546,6 +672,7 @@ impl CamouflageSiteManager {
         }
 
         self.active = Some(candidate.clone());
+        self.runtime_revision = self.runtime_revision.wrapping_add(1);
         tracing::info!(
             sites = candidate.sites.len(),
             "camouflage sites applied and committed as local LKG"
@@ -649,6 +776,394 @@ impl CamouflageSiteManager {
     }
 }
 
+const RECONCILE_IN_FLIGHT: &str = "camouflage certificate renewal already in progress";
+
+fn camouflage_desired_fingerprint(desired: &[CamouflageSiteDesired]) -> ConfigFingerprint {
+    config_fingerprint(&NodeConfigResponse {
+        listeners: Vec::new(),
+        camouflage_sites: desired.to_vec(),
+    })
+}
+
+fn run_certificate_reconcile(
+    config: &CamouflageSiteConfig,
+    renewal_gate: &Arc<RenewalGate>,
+    acme_gate: &Arc<std::sync::Mutex<()>>,
+    mut manifest: CamouflageSitesManifest,
+    active: Option<&CamouflageSitesManifest>,
+) -> Result<(CamouflageSitesManifest, Vec<LifecycleAction>), String> {
+    // Certbot uses its default shared config/work/log roots. Keep that tool
+    // serialized independently from the state mutex; status reads remain free.
+    let _acme_lease = acme_gate
+        .lock()
+        .map_err(|_| "certificate lifecycle gate is unavailable".to_string())?;
+    let site_ids = manifest
+        .sites
+        .iter()
+        .filter(|site| site.certificate.lifecycle.is_some())
+        .map(|site| site.id.clone())
+        .collect();
+    let Some(_renewal_lease) = renewal_gate.try_acquire(site_ids) else {
+        return Err(RECONCILE_IN_FLIGHT.into());
+    };
+
+    // The source manifest carries policy, while a healthy LKG carries the
+    // active Node-owned generation. Do not regress a periodic check back to a
+    // Certbot live path after a successful install.
+    if let Some(active) = active {
+        for site in &mut manifest.sites {
+            if let Some(previous) = active.sites.iter().find(|old| old.id == site.id) {
+                if site.certificate.lifecycle.is_some() {
+                    let lifecycle = site.certificate.lifecycle.clone();
+                    site.certificate = previous.certificate.clone();
+                    site.certificate.lifecycle = lifecycle;
+                }
+            }
+        }
+    }
+
+    CertificateLifecycle::new(config.certificate_lifecycle.clone()).reconcile(&manifest)
+}
+
+fn run_snapshot(snapshot: CertificateReconcileSnapshot) -> CertificateReconcileResult {
+    tracing::info!(
+        generation = snapshot.generation,
+        fingerprint = %snapshot.fingerprint,
+        sites = snapshot.manifest.sites.len(),
+        "camouflage certificate reconcile started"
+    );
+    let outcome = run_certificate_reconcile(
+        &snapshot.config,
+        &snapshot.renewal_gate,
+        &snapshot.acme_gate,
+        snapshot.manifest.clone(),
+        snapshot.active.as_ref(),
+    );
+    tracing::info!(
+        generation = snapshot.generation,
+        fingerprint = %snapshot.fingerprint,
+        success = outcome.is_ok(),
+        "camouflage certificate reconcile slow work completed"
+    );
+    CertificateReconcileResult { snapshot, outcome }
+}
+
+fn activate_candidate_external(
+    config: CamouflageSiteConfig,
+    active: Option<CamouflageSitesManifest>,
+    candidate: CamouflageSitesManifest,
+) -> bool {
+    let mut detached = CamouflageSiteManager::new(config);
+    detached.active = active;
+    if detached.active.as_ref() == Some(&candidate) && detached.runtime_matches(&candidate) {
+        return true;
+    }
+    detached.apply_candidate(candidate)
+}
+
+async fn commit_snapshot(
+    shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
+    result: CertificateReconcileResult,
+) -> ReconcileCommit {
+    let CertificateReconcileResult { snapshot, outcome } = result;
+    let _apply_lease = snapshot.apply_gate.lock().await;
+
+    {
+        let current = shared.lock().await;
+        if current.desired_generation != snapshot.generation
+            || current.desired_fingerprint != snapshot.fingerprint
+            || current.runtime_revision != snapshot.runtime_revision
+        {
+            tracing::info!(
+                old_generation = snapshot.generation,
+                current_generation = current.desired_generation,
+                old_runtime_revision = snapshot.runtime_revision,
+                current_runtime_revision = current.runtime_revision,
+                old_fingerprint = %snapshot.fingerprint,
+                current_fingerprint = %current.desired_fingerprint,
+                "stale camouflage certificate reconcile result discarded"
+            );
+            return ReconcileCommit::Stale;
+        }
+    }
+
+    let (candidate, actions) = match outcome {
+        Ok(value) => value,
+        Err(error) if error == RECONCILE_IN_FLIGHT => return ReconcileCommit::InFlight,
+        Err(error) => {
+            let current_snapshot = shared.lock().await.clone();
+            let active_snis = tokio::task::spawn_blocking(move || current_snapshot.active_snis())
+                .await
+                .unwrap_or_default();
+            let mut current = shared.lock().await;
+            if current.desired_generation != snapshot.generation
+                || current.desired_fingerprint != snapshot.fingerprint
+                || current.runtime_revision != snapshot.runtime_revision
+            {
+                return ReconcileCommit::Stale;
+            }
+            if snapshot.desired_request {
+                for site in &current.desired.clone() {
+                    if !active_snis.contains(&site.sni) {
+                        current
+                            .last_errors
+                            .insert(site.site_id.clone(), sanitize_error(&error));
+                    }
+                }
+            }
+            return ReconcileCommit::Failed;
+        }
+    };
+
+    let config = snapshot.config.clone();
+    let active = snapshot.active.clone();
+    let candidate_for_apply = candidate.clone();
+    let activated = tokio::task::spawn_blocking(move || {
+        activate_candidate_external(config, active, candidate_for_apply)
+    })
+    .await
+    .unwrap_or(false);
+
+    let mut current = shared.lock().await;
+    if current.desired_generation != snapshot.generation
+        || current.desired_fingerprint != snapshot.fingerprint
+        || current.runtime_revision != snapshot.runtime_revision
+    {
+        tracing::error!(
+            old_generation = snapshot.generation,
+            current_generation = current.desired_generation,
+            old_runtime_revision = snapshot.runtime_revision,
+            current_runtime_revision = current.runtime_revision,
+            "camouflage generation changed while the apply gate was held"
+        );
+        return ReconcileCommit::Stale;
+    }
+    if !activated {
+        if snapshot.desired_request {
+            let current_snapshot = current.clone();
+            drop(current);
+            let active_snis = tokio::task::spawn_blocking(move || current_snapshot.active_snis())
+                .await
+                .unwrap_or_default();
+            current = shared.lock().await;
+            for site in &current.desired.clone() {
+                if !active_snis.contains(&site.sni) {
+                    current.last_errors.insert(
+                        site.site_id.clone(),
+                        "camouflage runtime validation or LKG commit failed".into(),
+                    );
+                }
+            }
+        }
+        return ReconcileCommit::Failed;
+    }
+
+    for (site, action) in candidate.sites.iter().zip(actions.iter()) {
+        if *action == LifecycleAction::RenewalWarning {
+            current.renewal_warnings.insert(
+                site.id.clone(),
+                (
+                    chrono::Utc::now().to_rfc3339(),
+                    "Certificate remains valid; automatic renewal failed and will be retried"
+                        .into(),
+                ),
+            );
+        } else {
+            current.renewal_warnings.remove(&site.id);
+        }
+    }
+    if snapshot.desired_request {
+        for site in &current.desired.clone() {
+            current.last_errors.remove(&site.site_id);
+        }
+    }
+    if current.active.as_ref() != Some(&candidate) {
+        current.runtime_revision = current.runtime_revision.wrapping_add(1);
+    }
+    current.active = Some(candidate);
+    tracing::info!(
+        generation = snapshot.generation,
+        fingerprint = %snapshot.fingerprint,
+        "camouflage certificate reconcile result committed"
+    );
+    ReconcileCommit::Applied
+}
+
+pub async fn reconcile_active_shared(shared: &Arc<AsyncMutex<CamouflageSiteManager>>) -> bool {
+    let snapshot = {
+        let current = shared.lock().await;
+        current.active_reconcile_snapshot()
+    };
+    let Some(snapshot) = snapshot else {
+        tracing::warn!(
+            "legacy camouflage source manifest is not authoritative; waiting for Panel sync"
+        );
+        return false;
+    };
+    let result = match tokio::task::spawn_blocking(move || run_snapshot(snapshot)).await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!("camouflage certificate worker failed: {error}");
+            return false;
+        }
+    };
+    matches!(
+        commit_snapshot(shared, result).await,
+        ReconcileCommit::Applied | ReconcileCommit::InFlight | ReconcileCommit::Stale
+    )
+}
+
+pub async fn prepare_desired_shared(
+    shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
+    desired: &[CamouflageSiteDesired],
+    panel_authoritative: bool,
+) -> HashSet<String> {
+    let apply_gate = {
+        let current = shared.lock().await;
+        Arc::clone(&current.apply_gate)
+    };
+    let snapshot = {
+        let _apply_lease = apply_gate.lock().await;
+        let mut current = shared.lock().await;
+        current.desired_reconcile_snapshot(desired, panel_authoritative)
+    };
+    let Some(snapshot) = snapshot else {
+        return active_snis_shared(shared).await;
+    };
+
+    if snapshot.config.certificate_lifecycle.enabled {
+        let shared = Arc::clone(shared);
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(move || run_snapshot(snapshot)).await {
+                Ok(result) => {
+                    let _ = commit_snapshot(&shared, result).await;
+                }
+                Err(error) => tracing::error!("camouflage certificate worker failed: {error}"),
+            }
+        });
+    } else {
+        // Disabled lifecycle is a local, deterministic manifest transition and
+        // is kept inline for startup/recovery compatibility.
+        let result = run_snapshot(snapshot);
+        let _ = commit_snapshot(shared, result).await;
+    }
+    active_snis_shared(shared).await
+}
+
+pub async fn active_snis_shared(
+    shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
+) -> HashSet<String> {
+    let snapshot = shared.lock().await.clone();
+    tokio::task::spawn_blocking(move || snapshot.active_snis())
+        .await
+        .unwrap_or_default()
+}
+
+pub async fn runtime_apply_guard(
+    shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    let gate = {
+        let current = shared.lock().await;
+        Arc::clone(&current.apply_gate)
+    };
+    gate.lock_owned().await
+}
+
+pub async fn finalize_for_listener_snis_shared_under_apply_gate(
+    shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
+    referenced_snis: &HashSet<String>,
+) -> bool {
+    let (config, active, candidate) = {
+        let current = shared.lock().await;
+        if !current.panel_authority_established && current.desired.is_empty() {
+            return true;
+        }
+        let Some(active) = current.active.clone() else {
+            return referenced_snis.is_empty();
+        };
+        let candidate = CamouflageSitesManifest {
+            sites: active
+                .sites
+                .iter()
+                .filter(|site| referenced_snis.contains(&site.sni))
+                .cloned()
+                .collect(),
+        };
+        if active == candidate {
+            return true;
+        }
+        (current.config.clone(), Some(active), candidate)
+    };
+    let candidate_for_apply = candidate.clone();
+    let applied = tokio::task::spawn_blocking(move || {
+        activate_candidate_external(config, active, candidate_for_apply)
+    })
+    .await
+    .unwrap_or(false);
+    if applied {
+        let mut current = shared.lock().await;
+        current.active = Some(candidate);
+        current.runtime_revision = current.runtime_revision.wrapping_add(1);
+    }
+    applied
+}
+
+pub async fn repair_active_runtime_shared(
+    shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
+    expected_snis: &HashSet<String>,
+) -> bool {
+    let _apply_lease = runtime_apply_guard(shared).await;
+    let (config, active) = {
+        let current = shared.lock().await;
+        let Some(active) = current.active.clone() else {
+            return expected_snis.is_empty();
+        };
+        let active_snis: HashSet<_> = active.sites.iter().map(|site| site.sni.clone()).collect();
+        if !expected_snis.is_subset(&active_snis) {
+            return false;
+        }
+        (current.config.clone(), active)
+    };
+    let active_for_work = active.clone();
+    let applied = tokio::task::spawn_blocking(move || {
+        let detached = CamouflageSiteManager::new(config.clone());
+        if detached.runtime_matches(&active_for_work) {
+            return true;
+        }
+        activate_candidate_external(config, Some(active_for_work.clone()), active_for_work)
+    })
+    .await
+    .unwrap_or(false);
+    if !applied {
+        return false;
+    }
+    shared.lock().await.active.as_ref() == Some(&active)
+}
+
+pub async fn status_snapshot_shared(
+    shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
+) -> Vec<CamouflageSiteStatus> {
+    let snapshot = shared.lock().await.clone();
+    tokio::task::spawn_blocking(move || snapshot.status_snapshot())
+        .await
+        .unwrap_or_default()
+}
+
+pub async fn runtime_observation_shared(
+    shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
+    expected_snis: &HashSet<String>,
+) -> CamouflageRuntimeObservation {
+    let snapshot = shared.lock().await.clone();
+    let expected = expected_snis.clone();
+    tokio::task::spawn_blocking(move || snapshot.inspect_runtime(&expected))
+        .await
+        .unwrap_or_else(|_| CamouflageRuntimeObservation {
+            fingerprint: fingerprint_bytes(b"camouflage-runtime-inspection-failed"),
+            healthy: false,
+            ownership: CamouflageRuntimeOwnership::ModernExpectedMissing,
+        })
+}
+
 pub fn validate_manifest(manifest: &CamouflageSitesManifest) -> Result<(), String> {
     let mut ids = HashSet::new();
     let mut names = HashSet::new();
@@ -705,29 +1220,6 @@ fn validate_desired(site: &CamouflageSiteDesired) -> Result<(), String> {
 fn sanitize_error(error: &str) -> String {
     let compact = error.replace(['\r', '\n'], " ");
     compact.chars().take(240).collect()
-}
-
-fn latest_installed_certificate(
-    state_dir: &Path,
-    site_id: &str,
-    lifecycle: Option<CertificateLifecyclePolicy>,
-) -> Option<CertificateReference> {
-    let generations = state_dir.join("generations").join(site_id);
-    let mut entries: Vec<_> = fs::read_dir(generations)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
-        .collect();
-    entries.sort_by_key(|entry| entry.file_name());
-    entries.into_iter().rev().find_map(|entry| {
-        let cert_path = entry.path().join("fullchain.pem");
-        let key_path = entry.path().join("privkey.pem");
-        (cert_path.is_file() && key_path.is_file()).then_some(CertificateReference {
-            cert_path,
-            key_path,
-            lifecycle: lifecycle.clone(),
-        })
-    })
 }
 
 pub fn render_camouflage_config(manifest: &CamouflageSitesManifest) -> Result<Vec<u8>, String> {
@@ -1492,6 +1984,366 @@ mod tests {
         site.certificate.key_path = link;
         let mut manager = manager(&dir, "true", "true");
         assert!(!manager.apply_candidate(CamouflageSitesManifest { sites: vec![site] }));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn desired_site(site_id: &str, sni: &str) -> CamouflageSiteDesired {
+        CamouflageSiteDesired {
+            site_id: site_id.into(),
+            sni: sni.into(),
+            tls_listener_port: CAMOUFLAGE_TLS_PORT,
+            local_backend: CamouflageLocalBackend::OpenList,
+            certificate: relay_shared::protocol::CamouflageCertificatePolicy {
+                domain: sni.into(),
+                expected_public_ip: "192.0.2.10".into(),
+                renew_before_days: 30,
+                challenge_method: relay_shared::protocol::AcmeChallengeMethod::Dns01,
+            },
+            enabled: true,
+        }
+    }
+
+    fn successful_result(snapshot: CertificateReconcileSnapshot) -> CertificateReconcileResult {
+        let actions = vec![LifecycleAction::Unchanged; snapshot.manifest.sites.len()];
+        let candidate = snapshot.manifest.clone();
+        CertificateReconcileResult {
+            snapshot,
+            outcome: Ok((candidate, actions)),
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_certificate_work_does_not_hold_camouflage_state_lock() {
+        let dir = unique_dir("slow-work-short-lock");
+        let mut state = manager(&dir, "true", "true");
+        assert!(state.apply_candidate(manifest(&dir)));
+        state.update_desired(&[desired_site("op1", "op1.example.com")], true);
+        let shared = Arc::new(AsyncMutex::new(state));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let task = {
+            let shared = Arc::clone(&shared);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                let snapshot = shared.lock().await.active_reconcile_snapshot().unwrap();
+                entered.notify_one();
+                release.notified().await;
+                commit_snapshot(&shared, successful_result(snapshot)).await
+            })
+        };
+
+        entered.notified().await;
+        let status = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            status_snapshot_shared(&shared),
+        )
+        .await
+        .expect("status reporting must not wait for certificate work");
+        assert_eq!(status.len(), 1);
+        release.notify_one();
+        assert_eq!(task.await.unwrap(), ReconcileCommit::Applied);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn unchanged_generation_accepts_certificate_result() {
+        let dir = unique_dir("unchanged-generation");
+        let mut state = manager(&dir, "true", "true");
+        assert!(state.apply_candidate(manifest(&dir)));
+        state.update_desired(&[desired_site("op1", "op1.example.com")], true);
+        let snapshot = state.active_reconcile_snapshot().unwrap();
+        let shared = Arc::new(AsyncMutex::new(state));
+
+        assert_eq!(
+            commit_snapshot(&shared, successful_result(snapshot)).await,
+            ReconcileCommit::Applied
+        );
+        assert_eq!(
+            shared.lock().await.active.as_ref().unwrap().sites[0].id,
+            "op1"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn changed_generation_discards_success_without_overwriting_new_state() {
+        let dir = unique_dir("stale-success");
+        let mut state = manager(&dir, "true", "true");
+        let old = manifest(&dir);
+        assert!(state.apply_candidate(old));
+        let old_desired = desired_site("op1", "op1.example.com");
+        let snapshot = state
+            .desired_reconcile_snapshot(&[old_desired], true)
+            .unwrap();
+        let new = CamouflageSitesManifest {
+            sites: vec![site(&dir, "op2", "op2.example.com")],
+        };
+        state.update_desired(&[desired_site("op2", "op2.example.com")], true);
+        state.active = Some(new.clone());
+        let shared = Arc::new(AsyncMutex::new(state));
+
+        assert_eq!(
+            commit_snapshot(&shared, successful_result(snapshot)).await,
+            ReconcileCommit::Stale
+        );
+        assert_eq!(shared.lock().await.active, Some(new));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn changed_generation_discards_failure_without_marking_new_state() {
+        let dir = unique_dir("stale-failure");
+        let mut state = manager(&dir, "true", "true");
+        assert!(state.apply_candidate(manifest(&dir)));
+        let old_desired = desired_site("op1", "op1.example.com");
+        let snapshot = state
+            .desired_reconcile_snapshot(&[old_desired], true)
+            .unwrap();
+        assert!(snapshot.desired_request);
+        state.update_desired(&[desired_site("op2", "op2.example.com")], true);
+        let shared = Arc::new(AsyncMutex::new(state));
+        let result = CertificateReconcileResult {
+            snapshot,
+            outcome: Err("controlled old-generation failure".into()),
+        };
+
+        assert_eq!(
+            commit_snapshot(&shared, result).await,
+            ReconcileCommit::Stale
+        );
+        assert!(shared.lock().await.last_errors.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn runtime_finalization_makes_older_certificate_result_stale() {
+        let dir = unique_dir("stale-after-finalization");
+        let mut state = manager(&dir, "true", "true");
+        assert!(state.apply_candidate(manifest(&dir)));
+        state.update_desired(&[desired_site("op1", "op1.example.com")], true);
+        let snapshot = state.active_reconcile_snapshot().unwrap();
+        let shared = Arc::new(AsyncMutex::new(state));
+        {
+            let _apply_guard = runtime_apply_guard(&shared).await;
+            assert!(
+                finalize_for_listener_snis_shared_under_apply_gate(&shared, &HashSet::new(),).await
+            );
+        }
+        assert!(shared.lock().await.active_snis().is_empty());
+
+        assert_eq!(
+            commit_snapshot(&shared, successful_result(snapshot)).await,
+            ReconcileCommit::Stale
+        );
+        assert!(shared.lock().await.active_snis().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn shared_reconcile_keeps_active_certificate_and_records_renewal_warning() {
+        let dir = unique_dir("shared-renewal-warning");
+        let mut state = manager(&dir, "true", "true");
+        state.config.certificate_lifecycle = CertificateLifecycleConfig {
+            enabled: true,
+            certbot_binary: PathBuf::from("/bin/false"),
+            certbot_live_dir: dir.join("letsencrypt/live"),
+            webroot: dir.join("webroot"),
+            state_dir: dir.join("certificates"),
+            dns01_hook_binary: PathBuf::from("/opt/relay-node/relay-node"),
+            http01_nginx: NginxSniConfig {
+                enabled: true,
+                conf_path: dir.join("acme.conf"),
+                test_cmd: "true".into(),
+                reload_cmd: "true".into(),
+                default_backend: "127.0.0.1:9".into(),
+                access_log_path: dir.join("stream.log").display().to_string(),
+            },
+        };
+        let desired = desired_site("op1", "op1.example.com");
+        let mut reference = real_certificate(&dir, "op1", "op1.example.com", 10);
+        reference.lifecycle = Some(CertificateLifecyclePolicy {
+            domain: desired.certificate.domain.clone(),
+            email: None,
+            expected_public_ip: desired.certificate.expected_public_ip.clone(),
+            renew_before_days: desired.certificate.renew_before_days,
+            challenge_method: desired.certificate.challenge_method,
+        });
+        assert!(state.apply_candidate(CamouflageSitesManifest {
+            sites: vec![CamouflageSite {
+                id: "op1".into(),
+                sni: "op1.example.com".into(),
+                tls_listener_port: CAMOUFLAGE_TLS_PORT,
+                local_backend: OPENLIST_BACKEND.into(),
+                certificate: reference,
+            }],
+        }));
+        let shared = Arc::new(AsyncMutex::new(state));
+
+        let active = prepare_desired_shared(&shared, &[desired], true).await;
+        assert!(active.contains("op1.example.com"));
+        let status = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let status = status_snapshot_shared(&shared).await;
+                if status[0].last_error.is_some() {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background renewal result must commit");
+        assert_eq!(status[0].site_status, "active");
+        assert_eq!(status[0].certificate_status, "active");
+        assert!(status[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("automatic renewal failed")));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn desired_reconcile_returns_and_reports_while_acme_gate_is_blocked() {
+        let dir = unique_dir("blocked-acme-status");
+        let mut state = manager(&dir, "true", "true");
+        state.config.certificate_lifecycle.enabled = true;
+        state.config.certificate_lifecycle.certbot_binary = PathBuf::from("/bin/false");
+        let acme_gate = Arc::clone(&state.acme_gate);
+        let shared = Arc::new(AsyncMutex::new(state));
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = acme_gate.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+
+        let desired = desired_site("op1", "op1.example.com");
+        let active = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            prepare_desired_shared(&shared, &[desired], true),
+        )
+        .await
+        .expect("desired reconciliation must not wait for ACME");
+        assert!(active.is_empty());
+        let status = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            status_snapshot_shared(&shared),
+        )
+        .await
+        .expect("status must remain available while ACME is blocked");
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].certificate_status, "pending");
+
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !shared.lock().await.last_errors.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked worker must finish before test cleanup");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn newer_generation_waits_for_old_acme_work_and_runs_afterward() {
+        let dir = unique_dir("generation-acme-queue");
+        let mut state = manager(&dir, "true", "true");
+        state.config.certificate_lifecycle.enabled = true;
+        state.config.certificate_lifecycle.certbot_binary = PathBuf::from("/bin/false");
+        let acme_gate = Arc::clone(&state.acme_gate);
+        let shared = Arc::new(AsyncMutex::new(state));
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn({
+            let acme_gate = Arc::clone(&acme_gate);
+            move || {
+                let _guard = acme_gate.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+        });
+        locked_rx.recv().unwrap();
+
+        let mut old = desired_site("same_site", "op1.example.com");
+        old.certificate.domain = old.sni.clone();
+        let mut new = desired_site("same_site", "op2.example.com");
+        new.certificate.domain = new.sni.clone();
+        assert!(prepare_desired_shared(&shared, &[old], true)
+            .await
+            .is_empty());
+        assert!(prepare_desired_shared(&shared, &[new], true)
+            .await
+            .is_empty());
+
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let state = shared.lock().await;
+                if state.desired[0].sni == "op2.example.com"
+                    && state.last_errors.contains_key("same_site")
+                {
+                    break;
+                }
+                drop(state);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("new generation must run after old ACME work releases the gate");
+        tokio::task::spawn_blocking(move || drop(acme_gate.lock().unwrap()))
+            .await
+            .unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn blocked_op1_work_does_not_block_other_site_state_access() {
+        let dir = unique_dir("multi-site-short-lock");
+        let mut state = manager(&dir, "true", "true");
+        let three = vec![
+            desired_site("op1", "op1.example.com"),
+            desired_site("op2", "op2.example.com"),
+            desired_site("op3", "op3.example.com"),
+        ];
+        state.update_desired(&three, true);
+        let shared = Arc::new(AsyncMutex::new(state));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let shared = Arc::clone(&shared);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                let snapshot = shared
+                    .lock()
+                    .await
+                    .desired_reconcile_snapshot(&three, true)
+                    .unwrap();
+                entered.notify_one();
+                release.notified().await;
+                snapshot.generation
+            })
+        };
+
+        entered.notified().await;
+        let status = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            status_snapshot_shared(&shared),
+        )
+        .await
+        .expect("op2/op3 status must remain readable while op1 work is blocked");
+        assert_eq!(status.len(), 3);
+        release.notify_one();
+        assert!(task.await.unwrap() > 0);
         let _ = fs::remove_dir_all(dir);
     }
 }

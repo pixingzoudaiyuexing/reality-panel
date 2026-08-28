@@ -296,8 +296,7 @@ async fn run() {
             interval.tick().await;
             loop {
                 interval.tick().await;
-                let mut sites = camouflage_sites.lock().await;
-                if !sites.reconcile_active() {
+                if !forwarder::camouflage_site::reconcile_active_shared(&camouflage_sites).await {
                     tracing::warn!(
                         "camouflage certificate lifecycle check failed; keeping active runtime"
                     );
@@ -464,7 +463,8 @@ async fn run() {
             let mgr = manager.lock().await;
             (mgr.take_listener_errors().await, mgr.active_rule_ids())
         };
-        let camouflage_status = camouflage_sites.lock().await.status_snapshot();
+        let camouflage_status =
+            forwarder::camouflage_site::status_snapshot_shared(&camouflage_sites).await;
         let reconciliation_status = reconciler.lock().await.status_snapshot();
         reporter::report_status(
             &config,

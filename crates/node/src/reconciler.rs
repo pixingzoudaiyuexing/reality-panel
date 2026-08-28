@@ -504,7 +504,10 @@ impl Reconciler {
                 && self.last_panel_desired.as_ref() == Some(snapshot.fingerprint())
                 && self.last_applied.as_ref() == Some(&effective_fingerprint);
             let local_recovery = snapshot.source() == AuthoritySource::LocalRecovery;
-            if panel_unchanged || local_recovery {
+            let withheld_dependency_ready = panel_unchanged
+                && effective_fingerprint != *snapshot.fingerprint()
+                && poller::camouflage_dependencies_ready(camouflage, snapshot.config()).await;
+            if (panel_unchanged || local_recovery) && !withheld_dependency_ready {
                 let inspection = poller::inspect_runtime(manager, camouflage, &effective).await;
                 if inspection.healthy {
                     return ReconciliationResult {
@@ -572,6 +575,11 @@ impl Reconciler {
                     dependency_withheld: effective_fingerprint != *snapshot.fingerprint(),
                     recovery_source: snapshot.recovery_source(),
                 };
+            }
+            if withheld_dependency_ready {
+                tracing::info!(
+                    "previously withheld camouflage dependency is ready; applying desired config"
+                );
             }
         }
 
@@ -1229,6 +1237,66 @@ mod tests {
                 .modified()
                 .unwrap(),
             cache_before
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_background_camouflage_dependency_reapplies_withheld_listener() {
+        let dir = std::env::temp_dir().join(format!(
+            "relaypanel-reconciler-background-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = poller::CachePaths {
+            primary: dir.join("config-cache.json"),
+            backup: dir.join("config-cache.backup.json"),
+            tmp: dir.join("config-cache.json.tmp"),
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manager = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        manager.set_nginx_sni_config_for_test(test_nginx_config(&dir));
+        let manager = Arc::new(Mutex::new(manager));
+        let camouflage = Arc::new(Mutex::new(compatibility_camouflage_manager(&dir)));
+        let input = ReconciliationInput::validated_panel(desired()).unwrap();
+        let mut reconciler = Reconciler::new();
+
+        let first = reconciler
+            .reconcile_with_test_paths(&manager, &camouflage, input.clone(), paths.clone())
+            .await;
+        assert_eq!(first.state, ReconciliationState::DependencyWithheld);
+        assert!(manager
+            .lock()
+            .await
+            .current_config()
+            .unwrap()
+            .listeners
+            .is_empty());
+
+        assert!(camouflage
+            .lock()
+            .await
+            .apply_candidate(modern_camouflage_manifest(&dir)));
+        let second = reconciler
+            .reconcile_with_test_paths(&manager, &camouflage, input, paths)
+            .await;
+        assert_eq!(second.state, ReconciliationState::Converged);
+        assert!(!second.dependency_withheld);
+        assert_eq!(
+            manager
+                .lock()
+                .await
+                .current_config()
+                .unwrap()
+                .listeners
+                .len(),
+            1
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

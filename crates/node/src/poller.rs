@@ -222,11 +222,19 @@ async fn apply_coordinated(
         return CoordinatedApplyOutcome::rejected();
     }
 
-    // Keep the camouflage lock through listener apply, listener LKG commit,
-    // and stale-site finalization. HTTP polling and WebSocket pushes can race;
-    // this makes the two-resource transaction observe one desired snapshot.
-    let mut sites = camouflage.lock().await;
-    let active_snis = sites.prepare_desired(&desired.camouflage_sites, allow_cleanup);
+    // Certificate work snapshots desired state and runs independently. The
+    // apply gate below preserves listener/LKG/finalization ordering without
+    // retaining the camouflage state mutex through external work.
+    let active_snis = crate::forwarder::camouflage_site::prepare_desired_shared(
+        camouflage,
+        &desired.camouflage_sites,
+        allow_cleanup,
+    )
+    .await;
+    // Serialize cross-resource runtime changes without holding camouflage
+    // state. Certificate/status work can still read the state mutex freely.
+    let _camouflage_apply_guard =
+        crate::forwarder::camouflage_site::runtime_apply_guard(camouflage).await;
     let (effective, referenced_snis, dependency_withheld) =
         build_effective_config(desired, previous, &active_snis);
 
@@ -264,7 +272,12 @@ async fn apply_coordinated(
     if !allow_cleanup {
         return CoordinatedApplyOutcome::applied(effective, dependency_withheld);
     }
-    if !sites.finalize_for_listener_snis(&referenced_snis) {
+    if !crate::forwarder::camouflage_site::finalize_for_listener_snis_shared_under_apply_gate(
+        camouflage,
+        &referenced_snis,
+    )
+    .await
+    {
         tracing::warn!("listener applied, but stale camouflage finalization failed");
         return CoordinatedApplyOutcome::failed(
             effective.clone(),
@@ -286,10 +299,11 @@ pub(crate) async fn inspect_runtime(
 ) -> RuntimeInspection {
     let forwarder = manager.lock().await.inspect_runtime(effective);
     let expected_camouflage_snis = effective_camouflage_snis(effective);
-    let camouflage = camouflage
-        .lock()
-        .await
-        .inspect_runtime(&expected_camouflage_snis);
+    let camouflage = crate::forwarder::camouflage_site::runtime_observation_shared(
+        camouflage,
+        &expected_camouflage_snis,
+    )
+    .await;
     tracing::debug!(
         ownership = ?camouflage.ownership,
         healthy = camouflage.healthy,
@@ -351,8 +365,12 @@ pub(crate) async fn repair_runtime(
 ) -> bool {
     if inspection.camouflage_drift {
         let expected_camouflage_snis = effective_camouflage_snis(effective);
-        let mut sites = camouflage.lock().await;
-        if !sites.repair_active_runtime(&expected_camouflage_snis) {
+        if !crate::forwarder::camouflage_site::repair_active_runtime_shared(
+            camouflage,
+            &expected_camouflage_snis,
+        )
+        .await
+        {
             tracing::warn!("camouflage runtime repair failed");
             return false;
         }
@@ -377,6 +395,23 @@ fn effective_camouflage_snis(effective: &NodeConfigResponse) -> std::collections
         .collect()
 }
 
+pub(crate) async fn camouflage_dependencies_ready(
+    camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    desired: &NodeConfigResponse,
+) -> bool {
+    let required: std::collections::HashSet<_> = desired
+        .listeners
+        .iter()
+        .filter(|listener| listener.camouflage_required)
+        .filter_map(|listener| listener.sni.clone())
+        .collect();
+    if required.is_empty() {
+        return true;
+    }
+    let active = crate::forwarder::camouflage_site::active_snis_shared(camouflage).await;
+    required.is_subset(&active)
+}
+
 pub(crate) async fn retry_pending_finalization(
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
     pending: &mut PendingFinalization,
@@ -390,8 +425,13 @@ pub(crate) async fn retry_pending_finalization(
         pending.lkg_committed = true;
     }
 
-    let sites = &mut *camouflage.lock().await;
-    if !sites.finalize_for_listener_snis(&pending.referenced_snis) {
+    let _apply_guard = crate::forwarder::camouflage_site::runtime_apply_guard(camouflage).await;
+    if !crate::forwarder::camouflage_site::finalize_for_listener_snis_shared_under_apply_gate(
+        camouflage,
+        &pending.referenced_snis,
+    )
+    .await
+    {
         tracing::warn!("pending camouflage finalization still unavailable");
         return false;
     }

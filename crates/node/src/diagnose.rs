@@ -99,11 +99,13 @@ async fn diagnose(
         (manager.listener_info_for_rule_tcp(rule_id), reality)
     };
     let reality = if let Some((config, listener)) = reality {
-        let camouflage = camouflage.lock().await;
+        // Certificate/OpenSSL inspection uses an immutable snapshot so a
+        // diagnosis never retains the shared camouflage state mutex.
+        let camouflage = camouflage.lock().await.clone();
         let manager = manager.lock().await;
         let mut diagnosis =
             build_reality_diagnosis(&manager, config.as_ref(), &listener, &camouflage);
-        drop(camouflage);
+        drop(manager);
         diagnosis.backends = reality_backend_results(&listener.targets).await;
         if let Some(sni) = diagnosis.config.sni.as_deref() {
             match probe_local_camouflage(sni, diagnosis.camouflage.tls_listener_port).await {
