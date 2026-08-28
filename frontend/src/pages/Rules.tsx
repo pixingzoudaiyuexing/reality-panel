@@ -4,7 +4,7 @@ import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, ReapplyResponse, NodeStatus, CamouflageSiteStatus, RuleDnsStatus, RealityDiagnosis } from '../api/types';
+import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, ReapplyResponse, NodeStatus, CamouflageSiteStatus, RuleDnsStatus, RealityCheck, RealityDiagnosis } from '../api/types';
 import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
@@ -70,6 +70,14 @@ export function diagnoseRuntimeStatus(listenerRunning: boolean, reality?: Realit
     healthy,
     labelKey: healthy ? 'diagnoseRealityRunning' : 'diagnoseRealityFailed',
   };
+}
+
+export function diagnosisStateDisplay(state: string, t: (key: string) => string) {
+  if (state === 'pass') return { color: 'green', label: 'PASS' };
+  if (state === 'warning') return { color: 'gold', label: 'WARN' };
+  if (state === 'blocked') return { color: 'orange', label: t('blocked') };
+  if (state === 'not_tested') return { color: 'default', label: t('notTested') };
+  return { color: 'red', label: 'FAIL' };
 }
 
 export function compactRealityStatus(
@@ -1600,6 +1608,26 @@ export default function Rules() {
           <>
             <Alert type="info" showIcon style={{ marginBottom: 16 }}
               title={t('diagnoseScopeHint')} />
+            {diagnoseResult.dependencies && (
+              <>
+                {diagnoseResult.dependencies.blocking_chain.length > 0 && (
+                  <Alert
+                    type="warning"
+                    showIcon
+                    style={{ marginBottom: 16 }}
+                    title={t('diagnoseBlockingChain')}
+                    description={diagnoseResult.dependencies.blocking_chain.join(' -> ')}
+                  />
+                )}
+                <Typography.Title level={5}>{t('diagnoseDependencies')}</Typography.Title>
+                <Space orientation="vertical" size={6} style={{ width: '100%', marginBottom: 12 }}>
+                  <Text strong>{t('dnsmgr')}</Text><RealityCheckView check={diagnoseResult.dependencies.dnsmgr} t={t} />
+                  <Text strong>{t('dns')}</Text><RealityCheckView check={diagnoseResult.dependencies.dns_sync} t={t} />
+                  <Text strong>{t('certificateDetails')}</Text><RealityCheckView check={diagnoseResult.dependencies.certificate} t={t} />
+                  <Text strong>{t('routeDetails')}</Text><RealityCheckView check={diagnoseResult.dependencies.route} t={t} />
+                </Space>
+              </>
+            )}
             {/* v0.4.14: only the relay-node's OWN TCP diagnosis is shown — the
                 node's listener status + its node→target TCP connectivity/latency.
                 The latency is the node→target TCP handshake time, NOT a client
@@ -1676,15 +1704,18 @@ function DiagnoseNodeRow({ node, t, isAdmin }: { node: NodeDiagnoseStatus; t: (k
   );
 }
 
-function RealityDiagnosisView({ diagnosis, t }: { diagnosis: RealityDiagnosis; t: (key: string) => string }) {
-  const status = (check: { state: string; detail?: string | null }) => (
+function RealityCheckView({ check, t }: { check: RealityCheck; t: (key: string) => string }) {
+  const display = diagnosisStateDisplay(check.state, t);
+  return (
     <Space size={6} wrap>
-      <Tag color={check.state === 'pass' ? 'green' : check.state === 'warning' ? 'gold' : check.state === 'not_tested' ? 'default' : 'red'}>
-        {check.state === 'pass' ? 'PASS' : check.state === 'warning' ? 'WARN' : check.state === 'not_tested' ? t('notTested') : 'FAIL'}
-      </Tag>
+      <Tag color={display.color}>{display.label}</Tag>
       {check.detail && <Text type="secondary">{check.detail}</Text>}
     </Space>
   );
+}
+
+function RealityDiagnosisView({ diagnosis, t }: { diagnosis: RealityDiagnosis; t: (key: string) => string }) {
+  const status = (check: RealityCheck) => <RealityCheckView check={check} t={t} />;
   return (
     <Space orientation="vertical" size={8} style={{ width: '100%', marginTop: 8 }}>
       <Typography.Text strong>{t('realityConfigLayer')}</Typography.Text>{status(diagnosis.config.check)}

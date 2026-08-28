@@ -16,7 +16,7 @@
 // on-demand read-only probe, not persistent state.
 
 use relay_shared::protocol::{
-    node_supports_directed_diagnose, DiagnoseResult, DiagnoseRuleMessage,
+    node_supports_directed_diagnose, DiagnoseResult, DiagnoseRuleMessage, RealityCheck,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -320,6 +320,156 @@ pub struct DiagnoseResponse {
     pub request_id: String,
     pub rule_id: i64,
     pub nodes: Vec<NodeDiagnoseStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<RealityDependencyDiagnosis>,
+}
+
+/// Panel 可独立观察的 Reality 依赖链。该结构只进入 HTTP 响应，不改变 Node
+/// wire protocol，也不会触发 DNS、证书或运行时写操作。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RealityDependencyDiagnosis {
+    pub dnsmgr: RealityCheck,
+    pub dns_sync: RealityCheck,
+    pub certificate: RealityCheck,
+    pub route: RealityCheck,
+    pub blocking_chain: Vec<String>,
+}
+
+fn dependency_check(state: &str, detail: impl Into<String>) -> RealityCheck {
+    RealityCheck {
+        state: state.into(),
+        detail: Some(detail.into()),
+    }
+}
+
+fn result_reality_checks(
+    nodes: &[NodeDiagnoseStatus],
+) -> impl Iterator<Item = &relay_shared::protocol::RealityDiagnosis> {
+    nodes.iter().filter_map(|node| match node {
+        NodeDiagnoseStatus::Result { result, .. } => result.reality.as_ref(),
+        _ => None,
+    })
+}
+
+async fn reality_dependencies(
+    state: &AppState,
+    rule_id: i64,
+    reality_rule: bool,
+    nodes: &[NodeDiagnoseStatus],
+) -> Option<RealityDependencyDiagnosis> {
+    if !reality_rule {
+        return None;
+    }
+
+    let settings = state
+        .db
+        .get(crate::service::dnsmgr::DNSMGR_CONFIG_KEY)
+        .await
+        .ok()
+        .flatten()
+        .map(|raw| crate::service::dnsmgr::DnsMgrSettings::from_json(Some(&raw)))
+        .unwrap_or_default();
+    let automation_ready = settings.enabled && settings.configured();
+    let dnsmgr = if automation_ready {
+        dependency_check("pass", "DNSMgr is enabled and configured")
+    } else {
+        dependency_check("fail", "DNSMgr is disabled or not configured")
+    };
+
+    let dns_status = crate::api::admin::project_rule_dns_status(state, &settings, rule_id)
+        .await
+        .ok();
+    let dns_sync = match dns_status.as_ref() {
+        Some(status) if !status.eligible => dependency_check(
+            "fail",
+            "Rule is not eligible for managed A-record synchronization",
+        ),
+        Some(_) if !automation_ready => dependency_check("blocked", "DNSMgr is not ready"),
+        Some(status) if status.sync_state == "PROPAGATED" => dependency_check(
+            "pass",
+            format!(
+                "{} resolves to {}",
+                status.fqdn.as_deref().unwrap_or("configured SNI"),
+                status.expected_value.as_deref().unwrap_or("the Relay")
+            ),
+        ),
+        Some(status)
+            if matches!(
+                status.sync_state.as_str(),
+                "FAILED" | "CONFLICT" | "INVALID_CONFIG" | "MUTATION_OUTCOME_UNKNOWN"
+            ) =>
+        {
+            dependency_check(
+                "fail",
+                status
+                    .last_error_category
+                    .clone()
+                    .unwrap_or_else(|| status.sync_state.clone()),
+            )
+        }
+        Some(status) => dependency_check(
+            "blocked",
+            format!("DNS synchronization is {}", status.sync_state),
+        ),
+        None => dependency_check("blocked", "DNS synchronization state is unavailable"),
+    };
+
+    let any_certificate_pass =
+        result_reality_checks(nodes).any(|diagnosis| diagnosis.certificate.check.state == "pass");
+    let any_certificate_fail =
+        result_reality_checks(nodes).any(|diagnosis| diagnosis.certificate.check.state == "fail");
+    let certificate = if any_certificate_pass {
+        dependency_check("pass", "At least one Relay reports a usable certificate")
+    } else if dns_sync.state != "pass" {
+        dependency_check("blocked", "Public DNS is not ready")
+    } else if any_certificate_fail {
+        dependency_check("fail", "Relay certificate check failed")
+    } else {
+        dependency_check("not_tested", "No Relay certificate result was returned")
+    };
+
+    let any_route_pass =
+        result_reality_checks(nodes).any(|diagnosis| diagnosis.runtime.check.state == "pass");
+    let any_route_fail =
+        result_reality_checks(nodes).any(|diagnosis| diagnosis.runtime.check.state == "fail");
+    let route = if any_route_pass {
+        dependency_check("pass", "At least one Relay reports an active Reality route")
+    } else if certificate.state != "pass" {
+        dependency_check("blocked", "A usable certificate is not ready")
+    } else if any_route_fail {
+        dependency_check("fail", "Relay Reality listener is not converged")
+    } else {
+        dependency_check("not_tested", "No Relay runtime result was returned")
+    };
+
+    let blocking_chain = [&dnsmgr, &dns_sync, &certificate, &route]
+        .into_iter()
+        .filter(|check| check.state != "pass")
+        .filter_map(|check| check.detail.clone())
+        .collect();
+    Some(RealityDependencyDiagnosis {
+        dnsmgr,
+        dns_sync,
+        certificate,
+        route,
+        blocking_chain,
+    })
+}
+
+async fn diagnose_response(
+    state: &AppState,
+    request_id: String,
+    rule_id: i64,
+    reality_rule: bool,
+    nodes: Vec<NodeDiagnoseStatus>,
+) -> DiagnoseResponse {
+    let dependencies = reality_dependencies(state, rule_id, reality_rule, &nodes).await;
+    DiagnoseResponse {
+        request_id,
+        rule_id,
+        nodes,
+        dependencies,
+    }
 }
 
 /// A node's status row from kvs, parsed for diagnosis scheduling. v0.4.15:
@@ -409,6 +559,9 @@ pub async fn diagnose_rule(
     }
 
     let group_id = rule.device_group_in;
+    let reality_rule = rule.public_transport == "nginx_sni"
+        || rule.node_transport == "nginx_sni"
+        || rule.camouflage_enabled;
 
     // v0.4.15: load the inbound group ONCE — its name is attached to every
     // node row for display ("分组名 · 公网IP"), avoiding a per-node lookup. If
@@ -498,11 +651,9 @@ pub async fn diagnose_rule(
             user.admin,
             rule_id
         );
-        return Json(ApiResponse::success(DiagnoseResponse {
-            request_id: String::new(),
-            rule_id,
-            nodes: statuses,
-        }));
+        return Json(ApiResponse::success(
+            diagnose_response(&state, String::new(), rule_id, reality_rule, statuses).await,
+        ));
     }
 
     // 5. Register the run + dispatch a DIRECTED probe to each candidate
@@ -555,11 +706,9 @@ pub async fn diagnose_rule(
             user.admin,
             rule_id
         );
-        return Json(ApiResponse::success(DiagnoseResponse {
-            request_id: String::new(),
-            rule_id,
-            nodes: statuses,
-        }));
+        return Json(ApiResponse::success(
+            diagnose_response(&state, String::new(), rule_id, reality_rule, statuses).await,
+        ));
     }
 
     // 6. Wait for results up to the deadline, polling the registry.
@@ -622,11 +771,9 @@ pub async fn diagnose_rule(
         replied_count
     );
 
-    Json(ApiResponse::success(DiagnoseResponse {
-        request_id,
-        rule_id,
-        nodes: statuses,
-    }))
+    Json(ApiResponse::success(
+        diagnose_response(&state, request_id, rule_id, reality_rule, statuses).await,
+    ))
 }
 
 /// POST /api/v1/node/diagnose_result — a node reports its probe results back.
@@ -799,7 +946,68 @@ fn classify_node(n: &NodeStatusRow, online: &std::collections::HashSet<String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::system::ReleaseCache;
+    use crate::api::ws::NodeConnections;
+    use crate::config::Config;
+    use crate::db::schema::SCHEMA_SQL;
+    use crate::db::sqlite_repo::SqliteRepository;
     use relay_shared::protocol::{DiagnoseResult, TargetProbeOutcome};
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::Arc;
+
+    async fn test_state() -> (AppState, sqlx::SqlitePool) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, password, admin) VALUES (2, 'u2', 'hash', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (10, 'relay', 'in', 'token-10', 2, '192.0.2.10')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port, \
+              protocol, public_transport, node_transport, entry_transport, sni, camouflage_enabled) \
+             VALUES (100, 'op1', 2, 443, 10, '198.51.100.20', 55443, \
+                     'tcp', 'nginx_sni', 'nginx_sni', 'nginx_sni', 'op1.example.com', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState {
+            db: Arc::new(SqliteRepository::new(pool.clone())),
+            config: Config {
+                database_path: "sqlite::memory:".into(),
+                listen: "127.0.0.1:0".into(),
+                key: "test-key".into(),
+                jwt_secret: "test-secret".into(),
+                public_dir: "public".into(),
+                public_panel_url: String::new(),
+                registration_enabled: false,
+                cors_origins: vec![],
+                geoip_enabled: false,
+                geoip_cache_ttl: 60,
+            },
+            release_cache: ReleaseCache::new(),
+            node_connections: NodeConnections::new(),
+            node_operations: crate::api::node_ops::NodeOperationRegistry::new(),
+            deployments: crate::api::node_deploy::DeploymentRegistry::default(),
+            diagnose: DiagnoseRegistry::new(),
+            geoip_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+        (state, pool)
+    }
 
     fn mk_result(req: &str, nid: &str) -> DiagnoseResult {
         DiagnoseResult {
@@ -817,6 +1025,26 @@ mod tests {
             results: vec![],
             reality: None,
         }
+    }
+
+    #[tokio::test]
+    async fn disabled_dnsmgr_explains_the_full_blocking_chain_without_writes() {
+        let (state, pool) = test_state().await;
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dns_record_syncs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let diagnosis = reality_dependencies(&state, 100, true, &[]).await.unwrap();
+        assert_eq!(diagnosis.dnsmgr.state, "fail");
+        assert_eq!(diagnosis.dns_sync.state, "blocked");
+        assert_eq!(diagnosis.certificate.state, "blocked");
+        assert_eq!(diagnosis.route.state, "blocked");
+        assert_eq!(diagnosis.blocking_chain.len(), 4);
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dns_record_syncs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "diagnosis must remain read-only");
     }
 
     /// Stamp a result with the run's challenge so it passes the record() check.

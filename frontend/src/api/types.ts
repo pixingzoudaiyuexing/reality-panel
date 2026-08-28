@@ -680,7 +680,7 @@ export interface DiagnoseResult {
 }
 
 export interface RealityCheck {
-  state: 'pass' | 'warning' | 'fail' | 'not_tested' | string;
+  state: 'pass' | 'warning' | 'fail' | 'blocked' | 'not_tested' | string;
   detail?: string | null;
 }
 
@@ -717,6 +717,13 @@ export interface DiagnoseResponse {
   request_id: string;
   rule_id: number;
   nodes: NodeDiagnoseStatus[];
+  dependencies?: {
+    dnsmgr: RealityCheck;
+    dns_sync: RealityCheck;
+    certificate: RealityCheck;
+    route: RealityCheck;
+    blocking_chain: string[];
+  };
 }
 
 export interface ReapplyNodeStatus {

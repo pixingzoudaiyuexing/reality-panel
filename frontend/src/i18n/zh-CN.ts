@@ -1,6 +1,6 @@
 export const zhCN = {
   // Brand
-  brand: 'RelayPanel',
+  brand: 'RealityPanel',
   subtitle: 'TCP/UDP 转发管理',
 
   // Login
@@ -341,7 +341,7 @@ export const zhCN = {
   groupNodes: '节点',
   groupRate: '实时速率',
   groupTraffic: '累计流量',
-  groupTrafficHint: '组内节点自开机以来上报流量之和，节点重启后该节点计数会重新开始；可能包含非 RelayPanel 转发流量。',
+  groupTrafficHint: '组内节点自开机以来上报流量之和，节点重启后该节点计数会重新开始；可能包含非 Reality Panel 转发流量。',
   resourceDetails: '详情',
   diskMount: '挂载点',
   diskUsed: '已使用',
@@ -399,7 +399,7 @@ export const zhCN = {
   totalDownload: '累计下载',
   machineUpload: '整机上行',
   machineDownload: '整机下行',
-  machineTrafficHint: '统计选定出口网卡（默认为默认路由网卡，可用 NETWORK_INTERFACE 指定）自开机以来的累计流量，含 SSH、系统更新等所有流量，非 RelayPanel 转发量；服务器重启后清零。',
+  machineTrafficHint: '统计选定出口网卡（默认为默认路由网卡，可用 NETWORK_INTERFACE 指定）自开机以来的累计流量，含 SSH、系统更新等所有流量，非 Reality Panel 转发量；服务器重启后清零。',
   nicInterface: '网卡',
   publicIp: '公网 IP',
   ip: 'IP',
@@ -415,7 +415,7 @@ export const zhCN = {
   nodeRestartConfirm: 'systemd 重启期间转发会短暂中断，是否继续？',
   nodeUninstall: '卸载节点',
   nodeUninstallConfirmTitle: '卸载 relay-node',
-  nodeUninstallConfirm: '只删除 RelayPanel Node 运行时；保留 OpenList 数据、Docker、Nginx、证书及未知 Nginx 文件。请输入 UNINSTALL 继续。',
+  nodeUninstallConfirm: '只删除 Reality Panel Node 运行时；保留 OpenList 数据、Docker、Nginx、证书及未知 Nginx 文件。请输入 UNINSTALL 继续。',
   nodeArtifactMissing: 'Panel 没有匹配架构的 artifact',
   nodeOperationFailed: '节点操作失败',
   nodeOperation_logs: 'relay-node 日志',
@@ -469,7 +469,7 @@ export const zhCN = {
   copyFailed: '复制失败，请手动复制',
   nodeBootstrapTitle: '部署基础节点',
   nodeBootstrapSshTab: 'SSH 一键部署',
-  nodeBootstrapSshRecommended: '推荐方式：RelayPanel 通过 SSH 连接 Relay，并执行同一套共享 provisioning 事务。',
+  nodeBootstrapSshRecommended: '推荐方式：Reality Panel 通过 SSH 连接 Relay，并执行同一套共享 provisioning 事务。',
   nodeBootstrapGroup: '入口设备分组',
   nodeBootstrapHost: '服务器 IP / Host',
   nodeBootstrapPort: 'SSH 端口',
@@ -599,6 +599,10 @@ export const zhCN = {
   certificateRenewal: '续期',
   statusDetails: '状态详情',
   notTested: '未测试',
+  blocked: 'BLOCKED',
+  diagnoseBlockingChain: '当前阻塞链',
+  diagnoseDependencies: 'Panel 依赖状态',
+  dnsmgr: 'DNSMgr',
   configConsistent: '配置一致',
   configDrifted: '配置漂移',
   realityConfigLayer: '配置层',
@@ -836,7 +840,7 @@ export const zhCN = {
   // ── v1.2.4: 站点设置 ──
   siteSettings: '站点设置',
   siteName: '站点名称',
-  siteNameHint: '显示在登录页、左侧边栏和浏览器标签标题。留空则使用 RelayPanel。',
+  siteNameHint: '显示在登录页、左侧边栏和浏览器标签标题。留空则使用 RealityPanel。',
   siteSubtitle: '副标题',
   siteSubtitleHint: '登录页站点名称下方的小字。留空则使用默认文案。',
   siteAnnouncement: '公告',

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { Form } from 'antd';
-import { CamouflageFormFields, camouflageCertificateMessage, compactRealityStatus, deriveCamouflageStatus, diagnoseRuntimeStatus, DnsStatusCell, isRealityRule, ProxyProtocolFormField } from './Rules';
+import { CamouflageFormFields, camouflageCertificateMessage, compactRealityStatus, deriveCamouflageStatus, diagnosisStateDisplay, diagnoseRuntimeStatus, DnsStatusCell, isRealityRule, ProxyProtocolFormField } from './Rules';
 import type { NodeStatus, RealityDiagnosis, RuleDnsStatus } from '../api/types';
 
 // ============================================================
@@ -331,6 +331,13 @@ describe('diagnosis runtime status', () => {
     expect(diagnoseRuntimeStatus(false)).toEqual({
       healthy: false,
       labelKey: 'diagnoseListenerStopped',
+    });
+  });
+
+  it('renders dependency blocking as BLOCKED instead of FAIL', () => {
+    expect(diagnosisStateDisplay('blocked', (key) => key)).toEqual({
+      color: 'orange',
+      label: 'blocked',
     });
   });
 

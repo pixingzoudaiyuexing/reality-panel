@@ -311,7 +311,7 @@ fn status_from_sync(
     }
 }
 
-async fn project_rule_dns_status(
+pub(crate) async fn project_rule_dns_status(
     state: &AppState,
     settings: &DnsMgrSettings,
     rule_id: i64,

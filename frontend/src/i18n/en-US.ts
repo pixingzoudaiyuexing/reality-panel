@@ -2,7 +2,7 @@ import type { Dict } from './zh-CN';
 
 export const enUS: Dict = {
   // Brand
-  brand: 'RelayPanel',
+  brand: 'RealityPanel',
   subtitle: 'TCP/UDP forwarding management',
 
   // Login
@@ -344,7 +344,7 @@ export const enUS: Dict = {
   groupNodes: 'Nodes',
   groupRate: 'Live Rate',
   groupTraffic: 'Cumulative Traffic',
-  groupTrafficHint: 'Sum of traffic reported by nodes in this group since boot; a node restart resets its own counter. May include non-RelayPanel traffic.',
+  groupTrafficHint: 'Sum of traffic reported by nodes in this group since boot; a node restart resets its own counter. May include non-Reality Panel traffic.',
   resourceDetails: 'Details',
   diskMount: 'Mount',
   diskUsed: 'Used',
@@ -402,7 +402,7 @@ export const enUS: Dict = {
   totalDownload: 'Total Download',
   machineUpload: 'Machine Upload',
   machineDownload: 'Machine Download',
-  machineTrafficHint: 'Traffic counted on the selected egress interface (default: the default-route NIC; set NETWORK_INTERFACE to override) since OS boot. Includes SSH, system updates, and all other traffic — NOT RelayPanel forwarded traffic. Resets when the server reboots.',
+  machineTrafficHint: 'Traffic counted on the selected egress interface (default: the default-route NIC; set NETWORK_INTERFACE to override) since OS boot. Includes SSH, system updates, and all other traffic — NOT Reality Panel forwarded traffic. Resets when the server reboots.',
   nicInterface: 'NIC',
   publicIp: 'Public IP',
   ip: 'IP',
@@ -418,7 +418,7 @@ export const enUS: Dict = {
   nodeRestartConfirm: 'relay-node will briefly stop forwarding while systemd restarts it. Continue?',
   nodeUninstall: 'Uninstall',
   nodeUninstallConfirmTitle: 'Uninstall relay-node',
-  nodeUninstallConfirm: 'This removes only the RelayPanel node runtime. OpenList data, Docker, Nginx, certificates, and unknown Nginx files are preserved. Type UNINSTALL to continue.',
+  nodeUninstallConfirm: 'This removes only the Reality Panel node runtime. OpenList data, Docker, Nginx, certificates, and unknown Nginx files are preserved. Type UNINSTALL to continue.',
   nodeArtifactMissing: 'No matching Panel artifact',
   nodeOperationFailed: 'Node operation failed',
   nodeOperation_logs: 'relay-node logs',
@@ -472,7 +472,7 @@ export const enUS: Dict = {
   copyFailed: 'Copy failed, please copy manually',
   nodeBootstrapTitle: 'Bootstrap Node',
   nodeBootstrapSshTab: 'SSH one-click deployment',
-  nodeBootstrapSshRecommended: 'Recommended: RelayPanel connects to the Relay over SSH and runs the shared provisioning transaction.',
+  nodeBootstrapSshRecommended: 'Recommended: Reality Panel connects to the Relay over SSH and runs the shared provisioning transaction.',
   nodeBootstrapGroup: 'Inbound Device Group',
   nodeBootstrapHost: 'Server IP / Host',
   nodeBootstrapPort: 'SSH Port',
@@ -602,6 +602,10 @@ export const enUS: Dict = {
   certificateRenewal: 'Renewal',
   statusDetails: 'Status details',
   notTested: 'not tested',
+  blocked: 'BLOCKED',
+  diagnoseBlockingChain: 'Current blocking chain',
+  diagnoseDependencies: 'Panel dependencies',
+  dnsmgr: 'DNSMgr',
   configConsistent: 'configuration consistent',
   configDrifted: 'configuration drifted',
   realityConfigLayer: 'Configuration',
@@ -841,7 +845,7 @@ export const enUS: Dict = {
   // ── v1.2.4: site settings ──
   siteSettings: 'Site Settings',
   siteName: 'Site name',
-  siteNameHint: 'Shown on the login page, in the sidebar, and as the browser tab title. Empty falls back to RelayPanel.',
+  siteNameHint: 'Shown on the login page, in the sidebar, and as the browser tab title. Empty falls back to RealityPanel.',
   siteSubtitle: 'Subtitle',
   siteSubtitleHint: 'Small text under the name on the login page. Empty keeps the default.',
   siteAnnouncement: 'Announcement',
