@@ -20,6 +20,7 @@ pub mod notify;
 mod provisioning;
 pub mod reapply;
 pub mod redeem;
+pub mod relay_preference;
 pub mod restart;
 pub mod security_headers;
 pub mod site;
@@ -230,6 +231,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/groups/{id}/rotate-token",
             axum::routing::post(admin::rotate_group_token),
+        )
+        .route(
+            "/groups/{group_id}/relay-preference",
+            axum::routing::get(relay_preference::get_relay_preference),
         )
         // v0.4.11 PR3: shared infrastructure — regular users can discover and
         // bind rules to inbound groups owned by an admin.

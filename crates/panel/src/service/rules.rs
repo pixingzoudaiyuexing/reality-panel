@@ -426,6 +426,12 @@ async fn validate_camouflage_relay_ip(
             CreateRuleError::Database(error)
         })?
         .ok_or_else(|| CreateRuleError::BadRequest("device_group_in not found".into()))?;
+    // Reality inbound Relays are identified by node_id + status telemetry;
+    // connect_host is retained for legacy/outbound compatibility and may be
+    // empty for an inbound camouflage group.
+    if group.group_type == "in" && group.connect_host.trim().is_empty() {
+        return Ok(());
+    }
     let ip: IpAddr = group.connect_host.trim().parse().map_err(|_| {
         CreateRuleError::BadRequest(
             "camouflage requires device_group_in.connect_host to be the Relay public IP".into(),
@@ -1439,5 +1445,35 @@ mod tests {
             let off = pseudo_random_offset(span);
             assert!(off < span, "offset {} must be < span {}", off, span);
         }
+    }
+
+    #[tokio::test]
+    async fn empty_connect_host_is_allowed_only_for_reality_inbound_group() {
+        use crate::db::schema::SCHEMA_SQL;
+        use crate::db::sqlite_repo::SqliteRepository;
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (90, 'reality-in', 'in', 'in-token', 1, ''), \
+                    (91, 'outbound', 'out', 'out-token', 1, '')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = SqliteRepository::new(pool);
+        assert!(validate_camouflage_relay_ip(&repo, 90, "test")
+            .await
+            .is_ok());
+        assert!(validate_camouflage_relay_ip(&repo, 91, "test")
+            .await
+            .is_err());
     }
 }
