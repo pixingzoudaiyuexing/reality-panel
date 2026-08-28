@@ -1,18 +1,44 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, within, act } from '@testing-library/react';
+import { render, screen, within, act, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 // Mock the api client before importing the page. The page GETs the list and
 // DELETEs by id; POST is only used for generate/void.
-const { mockGet, mockPost, mockDelete } = vi.hoisted(() => ({
+const {
+  mockGet,
+  mockPost,
+  mockDelete,
+  mockMessageSuccess,
+  mockMessageWarning,
+  mockMessageError,
+} = vi.hoisted(() => ({
   mockGet: vi.fn(),
   mockPost: vi.fn(),
   mockDelete: vi.fn(),
+  mockMessageSuccess: vi.fn(),
+  mockMessageWarning: vi.fn(),
+  mockMessageError: vi.fn(),
 }));
 
 vi.mock('../api/client', () => ({
   default: { get: mockGet, post: mockPost, delete: mockDelete },
 }));
+
+// Static antd messages schedule a global portal cleanup after the test's own
+// UI has converged. Keep the real controls, but make notification delivery
+// synchronous and directly assertable in this file.
+vi.mock('antd', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('antd')>();
+  return {
+    ...actual,
+    message: {
+      ...actual.message,
+      success: mockMessageSuccess,
+      warning: mockMessageWarning,
+      error: mockMessageError,
+    },
+  };
+});
 
 import RedeemCodes from './RedeemCodes';
 import type { RedeemCode } from '../api/types';
@@ -44,6 +70,9 @@ beforeEach(() => {
   mockGet.mockReset();
   mockPost.mockReset();
   mockDelete.mockReset();
+  mockMessageSuccess.mockReset();
+  mockMessageWarning.mockReset();
+  mockMessageError.mockReset();
   mockGet.mockResolvedValue(ok({ items: rows, total: rows.length }));
 });
 
@@ -103,10 +132,16 @@ describe('RedeemCodes', () => {
 
     const enabled = screen.getByRole('button', { name: /delete.*\(2\)/i });
     expect(enabled).toBeEnabled();
+    mockGet.mockResolvedValue(ok({ items: [rows[0]], total: 1 }));
     await user.click(enabled);
     const confirm = await screen.findByRole('button', { name: /^OK$/i });
     await user.click(confirm);
 
     expect(mockDelete).toHaveBeenCalledWith('/admin/redeem-codes', { data: { ids: [3, 5] } });
+    await waitFor(() => {
+      expect(screen.queryByText('UNUS-0000-0000-000A')).not.toBeInTheDocument();
+      expect(screen.queryByText('VOID-VOID-VOID-VOID')).not.toBeInTheDocument();
+    });
+    expect(mockMessageSuccess).toHaveBeenCalledOnce();
   });
 });

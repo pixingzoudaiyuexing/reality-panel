@@ -4,11 +4,32 @@ import userEvent from '@testing-library/user-event';
 
 // Mock the api client before importing the page. Shop calls /plans,
 // /user/orders and /user/me on mount, and POSTs /user/redeem on top-up.
-const { mockGet, mockPost } = vi.hoisted(() => ({ mockGet: vi.fn(), mockPost: vi.fn() }));
+const { mockGet, mockPost, mockMessageSuccess, mockMessageError } = vi.hoisted(() => ({
+  mockGet: vi.fn(),
+  mockPost: vi.fn(),
+  mockMessageSuccess: vi.fn(),
+  mockMessageError: vi.fn(),
+}));
 
 vi.mock('../api/client', () => ({
   default: { get: mockGet, post: mockPost },
 }));
+
+// Static antd messages create a global portal with scheduled cleanup. That is
+// outside this test's contract and can outlive jsdom teardown in a fast CI
+// worker, so keep the real components while making message delivery observable
+// and synchronous.
+vi.mock('antd', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('antd')>();
+  return {
+    ...actual,
+    message: {
+      ...actual.message,
+      success: mockMessageSuccess,
+      error: mockMessageError,
+    },
+  };
+});
 
 import Shop from './Shop';
 
@@ -28,6 +49,8 @@ const me = (balance: string) => ({
 beforeEach(() => {
   mockGet.mockReset();
   mockPost.mockReset();
+  mockMessageSuccess.mockReset();
+  mockMessageError.mockReset();
   mockGet.mockImplementation((url: string) => {
     if (url === '/plans') return Promise.resolve(ok([]));
     if (url === '/user/orders') return Promise.resolve(ok([]));
@@ -76,5 +99,6 @@ describe('Shop top-up entry', () => {
 
     expect(mockPost).toHaveBeenCalledWith('/user/redeem', { code: 'test0-test0-test0-t' });
     expect(await screen.findByText('25.50')).toBeInTheDocument();
+    expect(mockMessageSuccess).toHaveBeenCalledOnce();
   });
 });
