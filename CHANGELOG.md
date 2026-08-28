@@ -1,12 +1,24 @@
 # Changelog
 
-All notable changes to RelayPanel are documented here.
+All notable changes to Reality Panel are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-Node-only changes are in **CHANGELOG-NODE.md** (panel and node release on
-independent `v*` / `node-v*` tracks since this release).
+Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
+
+## [1.0.0-rc.1] - 2026-08-28
+
+First Reality Panel release candidate. Panel and relay-node are built together
+from one tagged source revision and distributed as verified Linux amd64
+Release assets.
+
+### Included
+
+- Reality SNI relay, Proxy Protocol v1, DNSMgr, DNS-01, certificates, and
+  OpenList camouflage.
+- Node lifecycle, LKG recovery, diagnostics, and reapply.
+- Release-only install/update workflow with SHA-256 verification.
 
 ## [1.2.9] - 2026-08-14
 

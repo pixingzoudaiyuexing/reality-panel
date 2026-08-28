@@ -21,23 +21,34 @@ use tower_http::services::{ServeDir, ServeFile};
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Version/help are metadata-only commands. They must work before an
+    // installation has a configuration file so release installers can verify
+    // a downloaded binary without starting the service or requiring secrets.
+    if matches!(args.first().map(String::as_str), Some("--version" | "-V")) {
+        println!("relay-panel {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if matches!(
+        args.first().map(String::as_str),
+        Some("--help" | "-h" | "help")
+    ) {
+        print!("{}", cli::USAGE);
+        return;
+    }
+
     let config = Config::load();
 
     // v1.2.5: CLI subcommands run against the same database and then exit —
     // they never start the HTTP server. Checked before anything else binds a
     // port, so a recovery command works on a host where the panel is already
     // running.
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(cmd) = args.first() {
         match cmd.as_str() {
             "reset-admin-password" => {
                 let db = open_database(&config).await;
                 let username = args.get(1).map(String::as_str).unwrap_or("admin");
                 std::process::exit(cli::reset_admin_password(db, username).await);
-            }
-            "--help" | "-h" | "help" => {
-                print!("{}", cli::USAGE);
-                std::process::exit(0);
             }
             other => {
                 eprintln!("未知命令：{other}\n");

@@ -19,6 +19,7 @@ RelayPanel — self-hosted TCP/UDP forwarding panel
 
 USAGE:
     relay-panel                                 start the server (default)
+    relay-panel --version                       print the compiled version
     relay-panel reset-admin-password [USER]     reset a password, print a new one
     relay-panel --help                          show this
 

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-const REPO: &str = "pixingzoudaiyuexing/relay-panel";
+const REPO: &str = "pixingzoudaiyuexing/reality-panel";
 const CACHE_TTL: Duration = Duration::from_secs(1800); // 30 minutes
 
 /// Cached GitHub Release info. Shared across all requests via AppState.
@@ -24,11 +24,9 @@ struct CachedRelease {
     data: CachedReleases,
 }
 
-/// v1.2: panel and node now release on independent tracks (`v*` vs `node-v*`),
-/// so the version check fetches BOTH the latest panel release and the latest
-/// node release from the same GitHub `/releases` list, splitting by tag
-/// prefix. Each side is independent: a panel-only update must NOT change the
-/// node's "latest", and a node release must NOT be offered as a panel update.
+/// Reality Panel releases ship matching Panel and Node binaries under one
+/// `v*` tag. Both update projections therefore come from the same verified
+/// GitHub Release.
 #[derive(Clone)]
 struct CachedReleases {
     panel: Option<GitHubRelease>,
@@ -88,8 +86,8 @@ impl ReleaseCache {
         });
     }
 
-    /// v1.2: resolve the latest NODE release version (bare, e.g. "1.1.0") for
-    /// the directed node-upgrade command. Returns:
+    /// Resolve the matching Node version (bare, e.g. "1.0.0") from the latest
+    /// stable Reality Panel release. Returns:
     /// - `Ok(Some(version))` — a node release was found.
     /// - `Ok(None)`           — the check succeeded but there is no node
     ///   release yet (caller should treat as "no upgrade target available").
@@ -112,7 +110,7 @@ impl ReleaseCache {
         Ok(releases
             .node
             .as_ref()
-            .and_then(|r| r.tag_name.strip_prefix("node-v"))
+            .and_then(|r| r.tag_name.strip_prefix('v'))
             .map(|s| s.to_string()))
     }
 }
@@ -140,10 +138,10 @@ pub struct VersionInfo {
     /// this to decide compatibility — previously the frontend hardcoded "1",
     /// which mislabeled healthy nodes after the constant was bumped to 2.
     pub config_protocol_version: u32,
-    /// v1.2: the latest NODE release tag (e.g. "1.1.0"), resolved from the
-    /// highest `node-v*` GitHub release. Nodes compare their own version
-    /// against THIS (not the panel version) to decide upgrade eligibility.
-    /// Empty when no node release exists or the check failed.
+    /// The Node version from the latest stable unified `v*` Release. Panel and
+    /// Node artifacts are built together, so this projection intentionally
+    /// matches the Panel release version. Empty when no release exists or the
+    /// check failed.
     pub latest_node_version: String,
     /// v1.2: true if the node-version lookup failed. The frontend must show an
     /// "unknown / check failed" state (NOT a green "up to date" or an upgrade
@@ -157,32 +155,9 @@ fn parse_version(s: &str) -> Option<semver::Version> {
     semver::Version::parse(cleaned).ok()
 }
 
-/// v1.2: classify a GitHub release tag and parse its version. Returns the
-/// track ("panel" for `v*`, "node" for `node-v*`) + the parsed semver, or None
-/// for tags that belong to neither track or fail to parse. This is the single
-/// point that keeps `node-v*` from being misread as a panel upgrade (and vice
-/// versa). A bare `v*` is a PANEL tag; `node-v*` is a NODE tag. Anything else
-/// (branches-as-tags, `sdk-v*`, etc.) is ignored.
-enum ReleaseTrack {
-    Panel,
-    Node,
-}
-
-fn classify_tag(tag: &str) -> Option<(ReleaseTrack, semver::Version)> {
-    if let Some(rest) = tag.strip_prefix("node-v") {
-        return semver::Version::parse(rest)
-            .ok()
-            .map(|v| (ReleaseTrack::Node, v));
-    }
-    // `node-v` already handled above, so a plain `v*` here is unambiguously a
-    // panel tag (a hypothetical `node-1.0.0` without the `v` is not a real
-    // release tag in this project).
-    if let Some(rest) = tag.strip_prefix('v') {
-        return semver::Version::parse(rest)
-            .ok()
-            .map(|v| (ReleaseTrack::Panel, v));
-    }
-    None
+/// Accept only the unified Reality Panel release tag namespace.
+fn release_version(tag: &str) -> Option<semver::Version> {
+    semver::Version::parse(tag.strip_prefix('v')?).ok()
 }
 
 /// Whether pre-releases count as "latest" when looking for updates.
@@ -192,21 +167,16 @@ fn classify_tag(tag: &str) -> Option<(ReleaseTrack, semver::Version)> {
 /// the full `/releases` list instead and pick the highest semver tag, allowing
 /// pre-releases while this project is in pre-release. Flip to `false` once we
 /// ship a stable 1.0 and only want to notify users about stable releases.
-const ALLOW_PRERELEASE_UPDATES: bool = true;
+const ALLOW_PRERELEASE_UPDATES: bool = false;
 
-/// Fetch releases from GitHub and pick the newest eligible PANEL release and
-/// the newest eligible NODE release (from the same `/releases` list, split by
-/// tag prefix: `v*` → panel, `node-v*` → node).
+/// Fetch releases from GitHub and pick the newest eligible unified release.
 ///
 /// Why not `/releases/latest`: that endpoint only returns the latest
 /// **non-prerelease** release, so during the pre-release phase it returns an
 /// old (or no) release. Instead we list `/releases`, drop drafts (never
 /// installable), classify each tag, and take the greatest semver PER TRACK.
-/// Pre-releases are included when `ALLOW_PRERELEASE_UPDATES` is true.
-///
-/// v1.2: a `node-v*` tag is NEVER considered a panel update, and a `v*` tag is
-/// NEVER considered a node update. This is the fix for the bug where a node
-/// release could be misread as a panel version.
+/// Pre-releases are excluded from the default update channel. Operators may
+/// still install a specific RC tag through the release installer.
 ///
 /// Returns:
 /// - `Ok(CachedReleases)`  - call succeeded; each track is Some if an eligible
@@ -273,33 +243,29 @@ async fn fetch_github_releases() -> Result<CachedReleases, String> {
         }
     };
 
-    // Per-track selection: drop drafts, apply prerelease filter, classify each
-    // tag, then take the highest semver WITHIN each track.
+    // Drop drafts and prereleases, then take the highest unified v* release.
     let eligible = releases
         .into_iter()
         .filter(|r| !r.draft)
         .filter(|r| ALLOW_PRERELEASE_UPDATES || !r.prerelease);
 
-    let mut panel: Option<(semver::Version, GitHubRelease)> = None;
-    let mut node: Option<(semver::Version, GitHubRelease)> = None;
+    let mut latest: Option<(semver::Version, GitHubRelease)> = None;
     for r in eligible {
-        let Some((track, v)) = classify_tag(&r.tag_name) else {
+        let Some(v) = release_version(&r.tag_name) else {
             continue;
         };
-        let slot = match track {
-            ReleaseTrack::Panel => &mut panel,
-            ReleaseTrack::Node => &mut node,
-        };
-        match slot {
-            None => *slot = Some((v, r)),
-            Some((best, _)) if &v > best => *slot = Some((v, r)),
+        match &latest {
+            None => latest = Some((v, r)),
+            Some((best, _)) if &v > best => latest = Some((v, r)),
             _ => {}
         }
     }
 
+    let release = latest.map(|(_, release)| release);
+
     Ok(CachedReleases {
-        panel: panel.map(|(_, r)| r),
-        node: node.map(|(_, r)| r),
+        panel: release.clone(),
+        node: release,
     })
 }
 
@@ -408,7 +374,7 @@ pub async fn get_version(
     let latest_node_version = releases
         .node
         .as_ref()
-        .and_then(|r| r.tag_name.strip_prefix("node-v"))
+        .and_then(|r| r.tag_name.strip_prefix('v'))
         .map(|s| s.to_string())
         .unwrap_or_default();
 
@@ -535,7 +501,7 @@ mod tests {
         // Real-world v0.2.0 shape: body is null
         let json = r#"{
             "tag_name": "v0.2.0",
-            "html_url": "https://github.com/pixingzoudaiyuexing/relay-panel/releases/tag/v0.2.0",
+            "html_url": "https://github.com/pixingzoudaiyuexing/reality-panel/releases/tag/v0.2.0",
             "body": null,
             "published_at": "2026-05-01T00:00:00Z",
             "draft": false,
@@ -671,34 +637,26 @@ mod tests {
         assert!(cache.get().await.is_none());
 
         // After set(), get() returns Some and a second get() still returns Some
-        // (within CACHE_TTL). The cache now holds BOTH tracks.
-        let panel = GitHubRelease {
+        // (within CACHE_TTL). Both projections point at one release.
+        let release = GitHubRelease {
             tag_name: "v1.1.0".to_string(),
-            html_url: Some("https://example.com/panel".to_string()),
-            body: Some("panel notes".to_string()),
-            published_at: Some("2026-07-02T00:00:00Z".to_string()),
-            draft: false,
-            prerelease: false,
-        };
-        let node = GitHubRelease {
-            tag_name: "node-v1.1.0".to_string(),
-            html_url: Some("https://example.com/node".to_string()),
-            body: Some("node notes".to_string()),
+            html_url: Some("https://example.com/release".to_string()),
+            body: Some("release notes".to_string()),
             published_at: Some("2026-07-02T00:00:00Z".to_string()),
             draft: false,
             prerelease: false,
         };
         cache
             .set(CachedReleases {
-                panel: Some(panel),
-                node: Some(node),
+                panel: Some(release.clone()),
+                node: Some(release),
             })
             .await;
         let got = cache.get().await;
         assert!(got.is_some(), "cache hit within TTL");
         let cached = got.unwrap();
         assert_eq!(cached.panel.as_ref().unwrap().tag_name, "v1.1.0");
-        assert_eq!(cached.node.as_ref().unwrap().tag_name, "node-v1.1.0");
+        assert_eq!(cached.node.as_ref().unwrap().tag_name, "v1.1.0");
 
         // `?refresh=true` semantics: invalidate() empties the cache, the next
         // get() returns None (forcing a fresh GitHub fetch).
@@ -729,96 +687,42 @@ mod tests {
         assert!(cached.node.is_none());
     }
 
-    // ---- v1.2: tag classification (panel `v*` vs node `node-v*`) ----
+    // ---- unified Reality Panel v* release classification ----
 
     #[test]
-    fn classify_panel_v_tag() {
-        let (track, v) = classify_tag("v1.1.0").expect("v* is a panel tag");
-        assert!(matches!(track, ReleaseTrack::Panel));
+    fn release_version_accepts_stable_and_prerelease_v_tags() {
+        let v = release_version("v1.1.0").expect("v* is a release tag");
         assert_eq!(v, semver::Version::new(1, 1, 0));
+        assert_eq!(
+            release_version("v1.0.0-rc.1").unwrap(),
+            semver::Version::parse("1.0.0-rc.1").unwrap()
+        );
     }
 
     #[test]
-    fn classify_node_v_tag() {
-        let (track, v) = classify_tag("node-v1.1.0").expect("node-v* is a node tag");
-        assert!(matches!(track, ReleaseTrack::Node));
-        assert_eq!(v, semver::Version::new(1, 1, 0));
+    fn release_version_ignores_other_namespaces() {
+        assert!(release_version("main").is_none());
+        assert!(release_version("sdk-v1.0.0").is_none());
+        assert!(release_version("node-v1.1.0").is_none());
+        assert!(release_version("not-a-version").is_none());
     }
 
     #[test]
-    fn classify_ignores_non_release_tags() {
-        // Branch names / arbitrary tags belong to neither track.
-        assert!(classify_tag("main").is_none());
-        assert!(classify_tag("sdk-v1.0.0").is_none());
-        assert!(classify_tag("not-a-version").is_none());
-        // A node tag without the `v` is not a real release tag in this project.
-        assert!(classify_tag("node-1.1.0").is_none());
-    }
-
-    /// v1.2 core fix: a `node-v*` release must NEVER be selected as the panel
-    /// latest, and a `v*` release must NEVER be selected as the node latest.
-    /// Mirrors the per-track selection in fetch_github_releases.
-    #[test]
-    fn per_track_selection_keeps_panel_and_node_separate() {
+    fn stable_selection_excludes_prerelease_and_other_tag_namespaces() {
         let json = r#"[
             { "tag_name": "v1.1.0", "draft": false },
             { "tag_name": "v1.0.9", "draft": false },
-            { "tag_name": "node-v1.1.0", "draft": false },
-            { "tag_name": "node-v1.0.8", "draft": false }
+            { "tag_name": "v1.2.0-rc.1", "draft": false, "prerelease": true },
+            { "tag_name": "node-v9.0.0", "draft": false }
         ]"#;
         let releases: Vec<GitHubRelease> = serde_json::from_str(json).unwrap();
-
-        let eligible = releases.into_iter().filter(|r| !r.draft);
-        let mut panel: Option<(semver::Version, GitHubRelease)> = None;
-        let mut node: Option<(semver::Version, GitHubRelease)> = None;
-        for r in eligible {
-            let Some((track, v)) = classify_tag(&r.tag_name) else {
-                continue;
-            };
-            let slot = match track {
-                ReleaseTrack::Panel => &mut panel,
-                ReleaseTrack::Node => &mut node,
-            };
-            match slot {
-                None => *slot = Some((v, r)),
-                Some((best, _)) if &v > best => *slot = Some((v, r)),
-                _ => {}
-            }
-        }
-
-        // Panel latest = v1.1.0 (the node-v* tags are excluded from panel).
-        assert_eq!(panel.unwrap().1.tag_name, "v1.1.0");
-        // Node latest = node-v1.1.0 (the v* tags are excluded from node).
-        assert_eq!(node.unwrap().1.tag_name, "node-v1.1.0");
-    }
-
-    /// v1.2: when panel ships 1.2.0 but the node is still on 1.1.0, the
-    /// panel track must reflect 1.2.0 and the node track 1.1.0 — independent.
-    /// This is the exact scenario the task calls out (panel 1.2.0, node 1.1.0).
-    #[test]
-    fn panel_can_be_ahead_of_node_independently() {
-        let json = r#"[
-            { "tag_name": "v1.2.0", "draft": false },
-            { "tag_name": "node-v1.1.0", "draft": false }
-        ]"#;
-        let releases: Vec<GitHubRelease> = serde_json::from_str(json).unwrap();
-        let mut panel: Option<(semver::Version, GitHubRelease)> = None;
-        let mut node: Option<(semver::Version, GitHubRelease)> = None;
-        for r in releases.into_iter().filter(|r| !r.draft) {
-            let Some((track, v)) = classify_tag(&r.tag_name) else {
-                continue;
-            };
-            let slot = match track {
-                ReleaseTrack::Panel => &mut panel,
-                ReleaseTrack::Node => &mut node,
-            };
-            match slot {
-                None => *slot = Some((v, r)),
-                Some((best, _)) if &v > best => *slot = Some((v, r)),
-                _ => {}
-            }
-        }
-        assert_eq!(panel.unwrap().1.tag_name, "v1.2.0");
-        assert_eq!(node.unwrap().1.tag_name, "node-v1.1.0");
+        let picked = releases
+            .into_iter()
+            .filter(|release| !release.draft && !release.prerelease)
+            .filter_map(|release| {
+                release_version(&release.tag_name).map(|version| (version, release))
+            })
+            .max_by(|(left, _), (right, _)| left.cmp(right));
+        assert_eq!(picked.unwrap().1.tag_name, "v1.1.0");
     }
 }

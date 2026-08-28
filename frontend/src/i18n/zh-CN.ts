@@ -107,7 +107,7 @@ export const zhCN = {
   entryTransportTls: 'TLS Simple',
   entryTransportWs: 'WebSocket',
   entryTransportUdpOnlyRaw: 'UDP 规则仅支持原始连接',
-  sniHint: '客户端 REALITY/TLS 握手里携带的 serverName，例如 op1.13886.xyz。',
+  sniHint: '客户端 REALITY/TLS 握手里携带的 serverName，例如 op1.example.com。',
   sniRequired: '请输入 SNI 域名',
   sniTcpOnly: 'SNI 路由基于 TLS ClientHello，只支持 TCP。',
   sniListenPortHint: '通常填写 443；同一入口端口可按不同 SNI 分流到不同节点。',

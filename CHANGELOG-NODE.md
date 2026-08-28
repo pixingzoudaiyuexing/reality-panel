@@ -1,15 +1,17 @@
 # Changelog — relay-node
 
-All notable changes to the **relay-node** binary are documented here. This is a
-SEPARATE changelog from `CHANGELOG.md` (which covers the panel + cross-cutting
-features): panel and node release on independent version tracks (`node-vX.Y.Z`
-tags vs panel `vX.Y.Z` tags), so each has its own history. A node release's
-GitHub Release body is extracted from this file by
-`scripts/extract-changelog.sh <version> CHANGELOG-NODE.md`.
+All notable changes to the **relay-node** binary are documented here. This
+binary is released together with the Panel under one `vX.Y.Z` tag.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
+
+## [1.0.0-rc.1] - 2026-08-28
+
+First Reality Panel release candidate for the relay-node binary. Includes the
+validated Reality SNI, Proxy Protocol, lifecycle, reconciliation, recovery,
+diagnostics, and camouflage runtime.
 
 ## [1.2.2] - 2026-08-13
 

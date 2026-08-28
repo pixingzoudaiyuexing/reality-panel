@@ -829,7 +829,7 @@ mod tests {
                 7,
                 443,
                 "reality.example.com",
-                &["141.11.219.133:55443"],
+                &["198.51.100.10:55443"],
                 LoadBalanceStrategy::First,
             )],
             "127.0.0.1:9",
@@ -838,7 +838,7 @@ mod tests {
         .unwrap();
         let rendered = plan.render();
         assert_eq!(rendered.matches("listen 443;").count(), 1);
-        assert!(rendered.contains("141.11.219.133:55443"));
+        assert!(rendered.contains("198.51.100.10:55443"));
         assert!(!rendered.contains("127.0.0.1:24443"));
     }
 
@@ -850,7 +850,7 @@ mod tests {
                     7,
                     443,
                     "same.example.com",
-                    &["141.11.219.133:55443"],
+                    &["198.51.100.10:55443"],
                     LoadBalanceStrategy::First,
                 ),
                 listener(
