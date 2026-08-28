@@ -7,7 +7,7 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
-## [1.0.0-rc.1] - 2026-08-28
+## [1.0.0-rc.2] - 2026-08-28
 
 First Reality Panel release candidate. Panel and relay-node are built together
 from one tagged source revision and distributed as verified Linux amd64
