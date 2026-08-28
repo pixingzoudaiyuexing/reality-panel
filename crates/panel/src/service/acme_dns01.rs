@@ -9,11 +9,14 @@ use crate::service::dnsmgr::{
     ZoneResolution,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures_util::future::join_all;
+use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 use hickory_resolver::TokioAsyncResolver;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -188,7 +191,7 @@ async fn present_with_observer(
     persist_state(db, &state).await?;
 
     if propagation
-        .wait_for_value(&txt_fqdn, &request.value)
+        .wait_for_value(&txt_fqdn, &zone.zone_name, &request.value)
         .await
         .is_err()
     {
@@ -205,15 +208,15 @@ async fn present_with_observer(
 
 #[async_trait::async_trait]
 trait TxtPropagationObserver: Send + Sync {
-    async fn wait_for_value(&self, fqdn: &str, expected: &str) -> Result<(), ()>;
+    async fn wait_for_value(&self, fqdn: &str, zone_name: &str, expected: &str) -> Result<(), ()>;
 }
 
 struct SystemTxtPropagation;
 
 #[async_trait::async_trait]
 impl TxtPropagationObserver for SystemTxtPropagation {
-    async fn wait_for_value(&self, fqdn: &str, expected: &str) -> Result<(), ()> {
-        wait_for_txt(fqdn, expected).await
+    async fn wait_for_value(&self, fqdn: &str, zone_name: &str, expected: &str) -> Result<(), ()> {
+        wait_for_authoritative_txt(fqdn, zone_name, expected).await
     }
 }
 
@@ -475,20 +478,19 @@ async fn list_txt_records(
     Ok(rows)
 }
 
-async fn wait_for_txt(fqdn: &str, expected: &str) -> Result<(), ()> {
-    let resolver = TokioAsyncResolver::tokio_from_system_conf().map_err(|_| ())?;
+async fn wait_for_authoritative_txt(fqdn: &str, zone_name: &str, expected: &str) -> Result<(), ()> {
+    let system_resolver = TokioAsyncResolver::tokio_from_system_conf().map_err(|_| ())?;
+    let authoritative_resolvers = authoritative_resolvers(&system_resolver, zone_name).await?;
     let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
     loop {
-        if resolver.txt_lookup(fqdn).await.is_ok_and(|lookup| {
-            lookup.iter().any(|txt| {
-                let value = txt
-                    .txt_data()
-                    .iter()
-                    .flat_map(|part| part.iter().copied())
-                    .collect::<Vec<_>>();
-                value == expected.as_bytes()
-            })
-        }) {
+        let visible = join_all(authoritative_resolvers.iter().map(|resolver| async move {
+            resolver
+                .txt_lookup(fqdn)
+                .await
+                .is_ok_and(|lookup| txt_lookup_matches(&lookup, expected))
+        }))
+        .await;
+        if visible.iter().all(|matched| *matched) {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -496,6 +498,56 @@ async fn wait_for_txt(fqdn: &str, expected: &str) -> Result<(), ()> {
         }
         tokio::time::sleep(PROPAGATION_INTERVAL).await;
     }
+}
+
+async fn authoritative_resolvers(
+    system_resolver: &TokioAsyncResolver,
+    zone_name: &str,
+) -> Result<Vec<TokioAsyncResolver>, ()> {
+    let nameservers = system_resolver.ns_lookup(zone_name).await.map_err(|_| ())?;
+    let mut addresses = HashSet::<IpAddr>::new();
+    for nameserver in nameservers.iter() {
+        let ips = system_resolver
+            .lookup_ip(nameserver.0.clone())
+            .await
+            .map_err(|_| ())?;
+        addresses.extend(ips.iter());
+    }
+    if addresses.is_empty() {
+        return Err(());
+    }
+
+    let mut options = ResolverOpts::default();
+    options.attempts = 1;
+    options.timeout = Duration::from_secs(3);
+    options.recursion_desired = false;
+    Ok(addresses
+        .into_iter()
+        .map(|address| {
+            TokioAsyncResolver::tokio(
+                ResolverConfig::from_parts(
+                    None,
+                    Vec::new(),
+                    vec![NameServerConfig::new(
+                        SocketAddr::new(address, 53),
+                        Protocol::Udp,
+                    )],
+                ),
+                options.clone(),
+            )
+        })
+        .collect())
+}
+
+fn txt_lookup_matches(lookup: &hickory_resolver::lookup::TxtLookup, expected: &str) -> bool {
+    lookup.iter().any(|txt| {
+        let value = txt
+            .txt_data()
+            .iter()
+            .flat_map(|part| part.iter().copied())
+            .collect::<Vec<_>>();
+        value == expected.as_bytes()
+    })
 }
 
 fn validate_request(request: &AcmeDns01Request) -> Result<String, AcmeDns01Error> {
@@ -597,7 +649,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TxtPropagationObserver for FixedPropagation {
-        async fn wait_for_value(&self, _: &str, _: &str) -> Result<(), ()> {
+        async fn wait_for_value(&self, _: &str, _: &str, _: &str) -> Result<(), ()> {
             self.0.then_some(()).ok_or(())
         }
     }
