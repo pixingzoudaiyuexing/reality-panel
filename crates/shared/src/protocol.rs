@@ -925,10 +925,25 @@ pub enum NodeLifecycleEventStatus {
     Failed,
 }
 
+/// 新 Reality Panel 从 1.0.0-rc.x 重新编号，但 rc.5 起已经包含旧 1.2.x
+/// 产品线的 lifecycle/restart 能力。只识别这一明确候选版本线，避免把历史
+/// 1.0.0 stable 或真正缺少能力的旧 Node 放过门槛。
+fn is_reality_panel_capable_rc(version: &str) -> bool {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .strip_prefix("1.0.0-rc.")
+        .and_then(|rc| rc.parse::<u64>().ok())
+        .is_some_and(|rc| rc >= 5)
+}
+
 pub fn node_supports_lifecycle(version: Option<&str>) -> bool {
     let Some(version) = version else {
         return false;
     };
+    if is_reality_panel_capable_rc(version) {
+        return true;
+    }
     let mut parts = version.trim_start_matches('v').split('.');
     let parsed = (
         parts.next().and_then(|part| part.parse::<u64>().ok()),
@@ -1009,6 +1024,9 @@ pub fn node_supports_restart_rule(version: Option<&str>) -> bool {
     let Some(v) = version else {
         return false;
     };
+    if is_reality_panel_capable_rc(v) {
+        return true;
+    }
     let base = v.split('-').next().unwrap_or("");
     let mut parts = base.split('.');
     let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -1945,6 +1963,9 @@ mod tests {
         assert!(node_supports_restart_rule(Some("1.2.0-rc1")));
         assert!(node_supports_restart_rule(Some("1.3.0")));
         assert!(node_supports_restart_rule(Some("2.0.0")));
+        assert!(node_supports_restart_rule(Some("1.0.0-rc.5")));
+        assert!(node_supports_restart_rule(Some("v1.0.0-rc.6")));
+        assert!(!node_supports_restart_rule(Some("1.0.0-rc.4")));
     }
 
     /// A rule's `max_connections` reaches the wire, and 0 means "no cap" rather
@@ -1999,6 +2020,9 @@ mod tests {
         assert!(node_supports_lifecycle(Some("1.2.3")));
         assert!(node_supports_lifecycle(Some("1.2.3-rc1")));
         assert!(node_supports_lifecycle(Some("2.0.0")));
+        assert!(node_supports_lifecycle(Some("1.0.0-rc.5")));
+        assert!(node_supports_lifecycle(Some("v1.0.0-rc.6")));
+        assert!(!node_supports_lifecycle(Some("1.0.0-rc.4")));
         assert_eq!(lifecycle_artifact_architecture("x86_64"), Some("amd64"));
         assert_eq!(lifecycle_artifact_architecture("amd64"), Some("amd64"));
         assert_eq!(lifecycle_artifact_architecture("aarch64"), Some("arm64"));
