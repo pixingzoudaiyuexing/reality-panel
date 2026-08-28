@@ -33,14 +33,16 @@ upgrade use this same root.
 ## Upgrade
 
 ```bash
-/usr/local/sbin/reality-panel-update
-/usr/local/sbin/reality-panel-update v1.0.0
+reality-panel-update
+reality-panel-update v1.0.0
 ```
 
-The first form selects the latest stable Release; the second selects an exact
-tag, including an RC. The updater verifies the complete release before an
-atomic switch, preserves data/configuration/secrets and runtime state, and
-restores the previous release when the new health check fails.
+The first installation writes this executable command to
+`/usr/local/sbin/reality-panel-update`. The first form selects the latest stable
+Release; the second selects an exact tag, including an RC. The updater verifies
+the complete release before an atomic switch, preserves
+data/configuration/secrets and runtime state, and restores the previous release
+when the new health check fails.
 
 ## Uninstall
 
@@ -64,6 +66,7 @@ The Panel selects the matching Release artifact from its local
 transactional SSH or Manual Bootstrap flow. Manual Bootstrap accepts both HTTP
 and HTTPS Panel endpoints and is intended for advanced recovery.
 
-Proxy Protocol v1 requires the backend receive setting first, a completed
-v2node/Xray reload and runtime check, then Relay send last. Disable in the
-reverse order. Reality `xver=0` is independent and remains `0`.
+Proxy Protocol v1 requires receive to be enabled on the remote Reality/Xray
+backend first, followed by a completed backend/Xray reload and runtime check;
+enable Relay sending last. Disable in the reverse order. Reality `xver=0` is
+independent and remains `0`.

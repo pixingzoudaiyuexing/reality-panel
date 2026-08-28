@@ -26,8 +26,19 @@ grep -q 'SHA256SUMS' "$ROOT/.github/workflows/binary-release.yml" || fail "check
 grep -q 'container: rust:1.96-bookworm' "$ROOT/.github/workflows/binary-release.yml" || fail "release binaries are not built on Debian 12"
 grep -q 'releases/download' "$ROOT/install.sh" || fail "installer is not Release-only"
 grep -q 'PUBLIC_PANEL_URL' "$ROOT/install.sh" || fail "PUBLIC_PANEL_URL contract missing"
+grep -Fq 'install -m 0755 "$release_dir/update.sh" "$SCRIPT_ROOT/update.sh"' "$ROOT/deploy.sh" || \
+    fail "first install does not install the updater"
+grep -Fq 'ln -sfn "$SCRIPT_ROOT/update.sh" "$UPDATE_COMMAND"' "$ROOT/deploy.sh" || \
+    fail "reality-panel-update command is not installed"
+grep -Fq 'exec "$installer" update "$@"' "$ROOT/update.sh" || \
+    fail "updater does not preserve default and explicit-tag arguments"
+grep -Fq 'releases/latest' "$ROOT/install.sh" || fail "default updater is not stable-Release-only"
 grep -q 'ASSET_NAME="reality-node-linux-${ARCH}"' "$ROOT/scripts/relay-node-install.sh" || fail "legacy Node installer asset name is stale"
 grep -q '/SHA256SUMS"' "$ROOT/scripts/relay-node-install.sh" || fail "legacy Node installer does not use the unified checksum manifest"
+public_docs=("$ROOT"/README*.md "$ROOT"/CHANGELOG*.md "$ROOT"/docs/*.md)
+if grep -Ein 'V2Board|v2node|wyx2685/v2board|wyx2685/v2node' "${public_docs[@]}"; then
+    fail "public documentation names a product-specific Reality backend"
+fi
 for script in install.sh deploy.sh update.sh scripts/relay-node-install.sh; do
     bash -n "$ROOT/$script" || fail "shell syntax failed: $script"
 done

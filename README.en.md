@@ -20,13 +20,14 @@ one Release. `PUBLIC_PANEL_URL` accepts a credential-free `http://IP:PORT` or
 intentionally.
 
 Panel-managed Node deployment is the normal path. Manual Bootstrap is an
-advanced recovery path. The installed updater selects the latest stable
-Release or an explicit tag, verifies it, preserves all application/runtime
-state, and rolls back a failed health check:
+advanced recovery path. The first installation installs
+`/usr/local/sbin/reality-panel-update` on the Panel host. The updater selects
+the latest stable Release or an explicit tag, verifies it, preserves all
+application/runtime state, and rolls back a failed health check:
 
 ```bash
-/usr/local/sbin/reality-panel-update
-/usr/local/sbin/reality-panel-update v1.0.0
+reality-panel-update
+reality-panel-update v1.0.0
 ```
 
 Default uninstall retains local data and requires typing `UNINSTALL`:
@@ -40,9 +41,10 @@ Use `--yes` only for deliberate automation and `--purge` only to delete local
 database/configuration/secrets. Remote Relays, DNSMgr, and Reality backends
 are never contacted.
 
-For Proxy Protocol v1, enable backend receive first, wait for the v2node/Xray
-reload and verify its runtime setting, then enable Relay sending. Disable in
-the reverse order. Reality `xver=0` remains `0` and is separate from PROXY.
+For Proxy Protocol v1, enable receive on the remote Reality/Xray backend first,
+wait for its reload and verify the runtime receive setting, then enable Relay
+sending last. Disable in the reverse order. Reality `xver=0` remains `0` and is
+separate from Relay-to-backend HAProxy PROXY protocol.
 
 DNSMgr is Panel-only, ownership-aware, A-record-only automation. It fails
 closed on external conflicts, verifies mutations, never automatically manages

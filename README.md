@@ -38,17 +38,21 @@ checks in one release. Manual Bootstrap is an advanced recovery path.
 
 ## Update
 
-The installed updater uses the latest stable Release by default:
+The first Panel installation installs the updater at
+`/usr/local/sbin/reality-panel-update`. It is available directly on the Panel
+host and uses the latest stable Release by default:
 
 ```bash
-/usr/local/sbin/reality-panel-update
+reality-panel-update
 ```
 
 To select a specific stable or prerelease tag:
 
 ```bash
-/usr/local/sbin/reality-panel-update v1.0.0
+reality-panel-update v1.0.0
 ```
+
+The absolute command path may also be used.
 
 Updates are Release-only, verify `SHA256SUMS`, preserve the database,
 configuration, secrets, Node identity, LKG, certificates, DNSMgr settings,
@@ -75,8 +79,8 @@ Reality backends.
 
 When using Proxy Protocol v1, enable the backend receive side first:
 
-1. Enable `acceptProxyProtocol` in the V2Board/v2node backend.
-2. Wait for its poll/reload and verify the running Xray inbound accepts it.
+1. Enable HAProxy PROXY protocol receive on the remote Reality/Xray backend.
+2. Wait for its reload and verify the running backend/Xray inbound accepts it.
 3. Enable Relay upstream Proxy Protocol sending last.
 
 Disable in the reverse order: stop Relay sending first, then disable backend

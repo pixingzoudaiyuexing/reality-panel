@@ -33,8 +33,9 @@ authentication. OpenList/camouflage is a separate fallback path.
 
 The control protocol remains version 8. Reality `xver=0` is independent of
 the optional Relay-to-backend HAProxy PROXY protocol. When PROXY is enabled,
-enable backend receive first, wait for v2node/Xray reload and verify runtime,
-then enable Relay send. Disable in the reverse order.
+enable receive on the remote Reality/Xray backend first, wait for its reload
+and verify runtime receive, then enable Relay send last. Disable in the reverse
+order.
 
 ## Lifecycle
 

@@ -21,7 +21,8 @@ one-time enrollment secrets.
 15. Verify DNS-01 challenge, certificate ACTIVE, and Nginx activation.
 16. Verify camouflage fallback on `:8443` and public HTTP response.
 17. Verify the Reality route is active and Relay remains L4 transparent.
-18. Enable backend Proxy Protocol receive and wait for v2node/Xray reload.
+18. Enable remote Reality/Xray backend Proxy Protocol receive and wait for its
+    backend/Xray reload.
 19. Verify runtime backend receive is enabled, then enable Relay send.
 20. Verify a real client connection and the real client IP at the backend.
 21. Verify diagnosis covers SNI, TCP, certificate, camouflage, and PROXY state.

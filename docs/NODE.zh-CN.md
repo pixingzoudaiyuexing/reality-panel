@@ -28,8 +28,9 @@ Reality 私钥。Nginx Stream 使用 `ssl_preread`；Reality 认证由后端控�
 OpenList/camouflage 是独立的 fallback 路径。
 
 控制协议保持版本 8。Reality `xver=0` 与可选的 Relay 到后端 HAProxy
-PROXY protocol 是两套机制。启用 PROXY 时，先启用后端接收，等待 v2node/Xray
-reload 并验证运行态，最后启用 Relay 发送；关闭时顺序相反。
+PROXY protocol 是两套机制。启用 PROXY 时，先在远端 Reality/Xray 后端启用
+接收，等待后端/Xray reload 并验证运行态接收已生效，最后启用 Relay 发送；
+关闭时顺序相反。
 
 ## 生命周期
 
