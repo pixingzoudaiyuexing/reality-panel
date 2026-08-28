@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## [1.0.0-rc.2] - 2026-08-28
+## [1.0.0-rc.3] - 2026-08-28
 
 First Reality Panel release candidate for the relay-node binary. Includes the
 validated Reality SNI, Proxy Protocol, lifecycle, reconciliation, recovery,

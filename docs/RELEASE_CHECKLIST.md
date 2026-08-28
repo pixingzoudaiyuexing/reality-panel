@@ -1,4 +1,4 @@
-# Reality Panel v1.0.0-rc.2 Acceptance
+# Reality Panel v1.0.0-rc.3 Acceptance
 
 Run this checklist on a new Debian 12 amd64 Panel VPS and a new Relay VPS.
 Record command output without recording credentials, tokens, private keys, or

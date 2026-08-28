@@ -21,8 +21,8 @@ Versioned GitHub Releases are the only supported production source. The first
 release candidate is installed explicitly:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.2/install.sh \
-  | bash -s -- install --version v1.0.0-rc.2 --public-panel-url http://203.0.113.10:18888
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.3/install.sh \
+  | bash -s -- install --version v1.0.0-rc.3 --public-panel-url http://203.0.113.10:18888
 ```
 
 The supported first-release host is Debian 12 amd64 with systemd. The
@@ -65,7 +65,7 @@ Default uninstall removes the local Panel service, installed binaries,
 frontend, and Node artifacts but retains local configuration and data:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.2/install.sh \
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.3/install.sh \
   | bash -s -- uninstall
 ```
 

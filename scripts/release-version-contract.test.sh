@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONTRACT="$ROOT/scripts/release-version-contract.sh"
-TAG="${1:-v1.0.0-rc.2}"
+TAG="${1:-v1.0.0-rc.3}"
 
 bash "$CONTRACT" "$TAG"
 
@@ -11,7 +11,7 @@ tmp="$(mktemp -d)"
 trap 'rm -rf -- "$tmp"' EXIT
 cp "$ROOT/crates/panel/Cargo.toml" "$tmp/panel.toml"
 cp "$ROOT/crates/node/Cargo.toml" "$tmp/node.toml"
-sed 's/^version = "1\.0\.0-rc\.2"$/version = "1.0.0-rc.1"/' \
+sed 's/^version = "1\.0\.0-rc\.3"$/version = "1.0.0-rc.2"/' \
     "$tmp/panel.toml" > "$tmp/panel-mismatch.toml"
 
 if PANEL_MANIFEST="$tmp/panel-mismatch.toml" NODE_MANIFEST="$tmp/node.toml" \
