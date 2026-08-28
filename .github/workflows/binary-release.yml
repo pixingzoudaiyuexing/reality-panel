@@ -20,6 +20,9 @@ jobs:
     name: Build and publish verified amd64 release
     runs-on: ubuntu-24.04
     container: rust:1.96-bookworm
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Check out the tagged source revision
         uses: actions/checkout@v4
@@ -39,12 +42,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Validate tag and package versions
-        run: |
-          TAG="$GITHUB_REF_NAME"
-          VERSION="${TAG#v}"
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
-          test "$(sed -n 's/^version = "\(.*\)"/\1/p' crates/panel/Cargo.toml | head -n1)" = "$VERSION"
-          test "$(sed -n 's/^version = "\(.*\)"/\1/p' crates/node/Cargo.toml | head -n1)" = "$VERSION"
+        run: bash scripts/release-version-contract.sh "$GITHUB_REF_NAME"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
