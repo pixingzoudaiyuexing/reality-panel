@@ -676,6 +676,23 @@ export interface DiagnoseResult {
   protocol: string;
   transport: string;
   results: DiagnoseTargetResult[];
+  reality?: RealityDiagnosis;
+}
+
+export interface RealityCheck {
+  state: 'pass' | 'warning' | 'fail' | 'not_tested' | string;
+  detail?: string | null;
+}
+
+export interface RealityDiagnosis {
+  config: { check: RealityCheck; listen_port: number; sni?: string | null; targets: string[]; send_proxy_protocol: boolean };
+  nginx: { check: RealityCheck; plan_contains_rule: boolean; mapping_matches: boolean; expected_fingerprint?: string | null; deployed_fingerprint?: string | null; managed_file_matches: boolean; config_valid: boolean; service_healthy: boolean };
+  runtime: { check: RealityCheck; listen_443: boolean; listen_8443: boolean };
+  backends: { address: string; check: RealityCheck; elapsed_ms?: number | null }[];
+  certificate: { check: RealityCheck; renewal?: RealityCheck; certificate_status: string; cert_path?: string | null; key_path?: string | null; san_match: boolean; cert_key_match: boolean; issuer?: string | null; valid_until?: string | null; remaining_days?: number | null; tls_handshake: RealityCheck };
+  camouflage: { check: RealityCheck; site_status: string; tls_listener_port: number; local_backend: string; http_status?: number | null };
+  fallback: { check: RealityCheck; http_status?: number | null; authenticated_reality_path: boolean };
+  vless_authentication: RealityCheck;
 }
 
 /** One node's diagnosis view. Mirrors the backend NodeDiagnoseStatus enum
@@ -700,6 +717,22 @@ export interface DiagnoseResponse {
   request_id: string;
   rule_id: number;
   nodes: NodeDiagnoseStatus[];
+}
+
+export interface ReapplyNodeStatus {
+  state: 'result' | 'unsupported' | 'control_channel_offline' | 'timeout';
+  node_id: string;
+  group_name: string;
+  public_ip?: string | null;
+  success?: boolean;
+  error?: string | null;
+  node_version?: string | null;
+}
+
+export interface ReapplyResponse {
+  rule_id: number;
+  applied: number;
+  nodes: ReapplyNodeStatus[];
 }
 
 /** v0.4.11 PR3: inbound groups owned by an admin that are available for

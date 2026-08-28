@@ -1,10 +1,10 @@
 import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Popover, Tag, Alert, Typography, Dropdown, Switch, Tabs, Spin, Tooltip } from 'antd';
 import type { MenuProps } from 'antd';
-import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, SearchOutlined, InfoCircleOutlined } from '@ant-design/icons';
+import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, SearchOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, NodeStatus, CamouflageSiteStatus, RuleDnsStatus } from '../api/types';
+import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, ReapplyResponse, NodeStatus, CamouflageSiteStatus, RuleDnsStatus, RealityDiagnosis } from '../api/types';
 import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
@@ -44,6 +44,25 @@ function payloadWithTargets<T extends Record<string, unknown>>(values: T & { tar
 function normalizeSni(value?: string | null): string | undefined {
   const s = value?.trim().toLowerCase();
   return s || undefined;
+}
+
+export function isRealityRule(rule: Pick<ForwardRule, 'public_transport' | 'node_transport'>): boolean {
+  return rule.public_transport === 'nginx_sni' || rule.node_transport === 'nginx_sni';
+}
+
+export function compactRealityStatus(
+  rule: Pick<ForwardRule, 'camouflage_enabled'>,
+  dns: RuleDnsStatus | undefined,
+  camouflage: CamouflageAggregateStatus,
+  t: (key: string) => string,
+) {
+  if (!rule.camouflage_enabled) return { dns: dns?.sync_state ?? '-', route: '-', certificate: '-' };
+  const dnsValue = !dns || !dns.eligible ? '-' : dns.sync_state === 'PROPAGATED' ? 'OK' : dns.sync_state;
+  const route = camouflage.state === 'active' ? 'OK' : camouflage.state === 'failed' ? 'FAIL' : camouflage.state.toUpperCase();
+  const certificate = camouflage.certificate?.certificate_status === 'active'
+    ? `OK${camouflage.certificate.valid_until ? ` ${Math.max(0, Math.floor((new Date(camouflage.certificate.valid_until).getTime() - Date.now()) / 86_400_000))}d` : ''}`
+    : (camouflage.certificate?.certificate_status ?? t('preparing')).toUpperCase();
+  return { dns: dnsValue, route, certificate };
 }
 
 export function deriveCamouflageStatus(
@@ -763,6 +782,26 @@ export default function Rules() {
     }
   };
 
+  const handleReapply = async (r: ForwardRule) => {
+    try {
+      const res = await api.post<unknown, ApiEnvelope<ReapplyResponse>>(`/rules/${r.id}/reapply`, {});
+      if (res.code !== 0 || !res.data) {
+        message.error(res.message || t('reapplyFailed'));
+        return;
+      }
+      const failed = res.data.nodes.filter(node => node.state !== 'result' || node.success !== true).length;
+      if (res.data.applied > 0 && failed === 0) {
+        message.success(t('reapplySuccess').replace('{count}', String(res.data.applied)));
+      } else if (res.data.applied > 0) {
+        message.warning(t('reapplyPartial').replace('{ok}', String(res.data.applied)).replace('{fail}', String(failed)));
+      } else {
+        message.error(t('reapplyFailed'));
+      }
+    } catch {
+      message.error(t('reapplyFailed'));
+    }
+  };
+
   /** v1.2.0: batch restart. Per-rule POST like batch pause/resume — there is no
    *  bulk endpoint. A rule can fail individually (paused → 400, or not owned →
    *  404), so tally ok/fail rather than assuming Promise.all means success. */
@@ -770,10 +809,15 @@ export default function Rules() {
     const ids = selectedRowKeys as number[];
     if (ids.length === 0) return;
     const results = await Promise.all(ids.map(async id => {
+      const rule = visibleRules.find(item => item.id === id);
+      const endpoint = rule && isRealityRule(rule) ? `/rules/${id}/reapply` : `/rules/${id}/restart`;
       try {
-        const res = await api.post<unknown, ApiEnvelope<RestartResponse>>(`/rules/${id}/restart`, {});
+        const res = await api.post<unknown, ApiEnvelope<RestartResponse | ReapplyResponse>>(endpoint, {});
         // Reaching zero nodes is not a success worth reporting as one.
-        return res.code === 0 && (res.data?.restarted ?? 0) > 0;
+        const count = rule && isRealityRule(rule)
+          ? (res.data as ReapplyResponse | undefined)?.applied ?? 0
+          : (res.data as RestartResponse | undefined)?.restarted ?? 0;
+        return res.code === 0 && count > 0;
       } catch { return false; }
     }));
     const ok = results.filter(Boolean).length;
@@ -928,89 +972,42 @@ export default function Rules() {
       },
     },
     {
-      title: 'DNS', key: 'dns', width: 300,
-      render: (_: unknown, r: ForwardRule) => (
-        <DnsStatusCell
-          status={dnsStatusByRule.get(r.id)}
-          retrying={dnsRetrying === r.id}
-          onRetry={() => handleDnsRetry(r.id)}
-          t={t}
-        />
-      ),
-    },
-    {
-      title: t('camouflage'), key: 'camouflage', width: 280,
+      title: t('status'), key: 'status', width: 180,
       render: (_: unknown, r: ForwardRule) => {
+        if (!isRealityRule(r)) return <Text type="secondary">{t('runtimeHealthy')}</Text>;
         const view = deriveCamouflageStatus(r, nodeStatuses);
-        if (view.state === 'disabled') return <Text type="secondary">-</Text>;
-        const status = view.certificate;
-        const routeAvailable = view.state === 'active' || view.state === 'partial';
-        const days = status?.valid_until
-          ? Math.max(0, Math.floor((new Date(status.valid_until).getTime() - Date.now()) / 86_400_000))
-          : null;
+        const dns = dnsStatusByRule.get(r.id);
+        const summary = compactRealityStatus(r, dns, view, t);
+        const dnsDetails = (
+          <DnsStatusCell status={dns} retrying={dnsRetrying === r.id} onRetry={() => handleDnsRetry(r.id)} t={t} />
+        );
         const details = (
-          <Space orientation="vertical" size={8} style={{ minWidth: 320, maxWidth: 440 }}>
-            {view.nodes.map(node => {
-              const standby = view.state === 'partial' && node.state !== 'active' && node.state !== 'offline';
-              const stateLabel = node.state === 'active' ? t('relayActive')
-                : standby ? t('relayStandby')
-                  : node.state === 'preparing' ? t('preparing')
-                    : node.state === 'failed' ? t('routeFailed')
-                      : node.state === 'offline' ? t('offline') : t('routeUnknown');
-              const stateColor = node.state === 'active' ? 'green'
-                : standby || node.state === 'preparing' ? 'gold'
-                  : node.state === 'failed' ? 'red' : 'default';
-              return (
-                <div key={`${node.relayIp ?? ''}:${node.nodeId ?? ''}`} style={{ borderBottom: '1px solid #f0f0f0', paddingBottom: 8 }}>
-                  <Space size={6} wrap>
-                    <Text strong className="rp-mono">{node.relayIp ?? node.nodeId ?? t('routeUnknown')}</Text>
-                    <Tag color={stateColor}>{stateLabel}</Tag>
-                  </Space>
-                  {node.nodeId && node.relayIp && <div><Text type="secondary" className="rp-mono">{node.nodeId}</Text></div>}
-                  <Space size={[4, 4]} wrap style={{ marginTop: 4 }}>
-                    <Tag>{t('listeners')}: {node.listenerState}</Tag>
-                    <Tag>{t('camouflage')}: {node.siteState}</Tag>
-                    <Tag>{t('certificate')}: {node.certificateState}</Tag>
-                  </Space>
-                  {node.lastError && (
-                    <div>
-                      <Text type={node.certificateState === 'active' ? 'warning' : view.state === 'failed' ? 'danger' : 'secondary'}>
-                        {camouflageCertificateMessage(node.certificateState, node.lastError, t)}
-                      </Text>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+          <Space orientation="vertical" size={8} style={{ minWidth: 320, maxWidth: 460 }}>
+            <Typography.Text strong>{t('dns')}</Typography.Text>
+            {dnsDetails}
+            <Typography.Text strong>{t('routeDetails')}</Typography.Text>
+            <Text>{t('activeRelays')}: {view.activeCount}/{view.totalCount}</Text>
+            {view.nodes.map(node => (
+              <Text key={`${node.relayIp ?? ''}:${node.nodeId ?? ''}`} type="secondary">
+                {node.relayIp ?? t('routeUnknown')} · {node.listenerState} · {node.siteState} · {node.certificateState}
+                {node.lastError ? ` · ${camouflageCertificateMessage(node.certificateState, node.lastError, t)}` : ''}
+              </Text>
+            ))}
+            <Typography.Text strong>{t('certificateDetails')}</Typography.Text>
+            {view.certificate?.issuer && <Text>{view.certificate.issuer}</Text>}
+            {view.certificate?.valid_until && <Text>{t('expires')}: {new Date(view.certificate.valid_until).toLocaleString()}</Text>}
+            {view.certificate?.last_success && <Text>{t('lastCertificateSuccess')}: {new Date(view.certificate.last_success).toLocaleString()}</Text>}
+            {view.certificate?.last_error && <Text type="warning">{camouflageCertificateMessage(view.certificate.certificate_status, view.certificate.last_error, t)}</Text>}
           </Space>
         );
+        const color = (value: string) => value === 'OK' || value.startsWith('OK ') ? 'green' : value === '-' ? 'default' : value === 'PREPARING' || value === 'PENDING' ? 'gold' : 'red';
         return (
-          <Space orientation="vertical" size={2}>
-            <Space size={4}>
-              <Tag color={routeAvailable ? 'green' : view.state === 'failed' ? 'red' : view.state === 'unknown' ? 'default' : 'gold'}>
-                {routeAvailable ? t('routeActive') : view.state === 'failed' ? t('routeFailed') : view.state === 'unknown' ? t('routeUnknown') : t('routeWaiting')}
-              </Tag>
-              <Tag color={status?.certificate_status === 'active' ? 'green' : status?.certificate_status === 'failed' ? 'red' : 'gold'}>
-                {t('certificate')}: {status?.certificate_status ?? t('preparing')}
-              </Tag>
-            </Space>
-            <Space size={4}>
-              <Text type="secondary">{t('activeRelays')}: {view.activeCount}/{view.totalCount}</Text>
-              {view.nodes.length > 0 && (
-                <Popover title={t('relayStatusDetails')} content={details} trigger="click">
-                  <Button type="text" size="small" icon={<InfoCircleOutlined />} aria-label={t('relayStatusDetails')}>{t('details')}</Button>
-                </Popover>
-              )}
-            </Space>
-            {status?.issuer && <Text type="secondary">{status.issuer}</Text>}
-            {status?.valid_until && <Text type="secondary">{t('expires')}: {new Date(status.valid_until).toLocaleDateString()} ({days}d)</Text>}
-            {status?.last_success && <Text type="secondary">{t('lastCertificateSuccess')}: {new Date(status.last_success).toLocaleString()}</Text>}
-            {status?.last_error && (
-              <Text type={status.certificate_status === 'active' ? 'warning' : 'danger'}>
-                {camouflageCertificateMessage(status.certificate_status, status.last_error, t)}
-              </Text>
-            )}
-          </Space>
+          <Popover title={t('statusDetails')} content={details} trigger="click">
+            <Button type="text" size="small" className="rp-compact-status" aria-label={t('statusDetails')}>
+              <span><Tag color={color(summary.dns)}>DNS {summary.dns === 'OK' ? '✓' : summary.dns === '-' ? '-' : '✕'}{summary.dns !== 'OK' && summary.dns !== '-' ? ` ${summary.dns}` : ''}</Tag><Tag color={color(summary.route)}>路由 {summary.route === 'OK' ? '✓' : '✕'}</Tag></span>
+              <span><Tag color={color(summary.certificate)}>证书 {summary.certificate === 'OK' ? '✓' : summary.certificate.startsWith('OK ') ? `✓ ${summary.certificate.slice(3)}` : `✕ ${summary.certificate}`}</Tag></span>
+            </Button>
+          </Popover>
         );
       },
     },
@@ -1040,26 +1037,30 @@ export default function Rules() {
           <Button size="small" type="text" icon={<CopyOutlined />} onClick={() => handleCopy(r)}>{t('copy')}</Button>
           {/* v0.4.9: diagnosis is TCP-only — disable for pure-UDP rules. */}
           <Button size="small" type="text" icon={<MedicineBoxOutlined />} disabled={r.protocol === 'udp'} onClick={() => handleDiagnose(r)} title={r.protocol === 'udp' ? t('diagnoseUdpUnsupported') : t('diagnose')}>{t('diagnose')}</Button>
-          {/* v1.2.0: restart drops every live connection on this rule, so it is
-              behind a confirm (diagnose is read-only and isn't). Disabled while
-              paused — there are no listeners to restart. */}
-          <Popconfirm
-            title={t('restartConfirmTitle')}
-            description={t('restartConfirmDesc')}
-            onConfirm={() => handleRestart(r)}
-            okButtonProps={{ danger: true }}
-            disabled={r.paused}
-          >
-            <Button
-              size="small"
-              type="text"
-              icon={<ThunderboltOutlined />}
+          {isRealityRule(r) ? (
+            <Popconfirm
+              title={t('reapplyConfirmTitle')}
+              description={t('reapplyConfirmDesc')}
+              onConfirm={() => handleReapply(r)}
               disabled={r.paused}
-              title={r.paused ? t('restartPausedHint') : t('restart')}
             >
-              {t('restart')}
-            </Button>
-          </Popconfirm>
+              <Button size="small" type="text" icon={<ReloadOutlined />} disabled={r.paused} title={t('reapply')}>
+                {t('reapply')}
+              </Button>
+            </Popconfirm>
+          ) : (
+            <Popconfirm
+              title={t('restartConfirmTitle')}
+              description={t('restartConfirmDesc')}
+              onConfirm={() => handleRestart(r)}
+              okButtonProps={{ danger: true }}
+              disabled={r.paused}
+            >
+              <Button size="small" type="text" icon={<ThunderboltOutlined />} disabled={r.paused} title={r.paused ? t('restartPausedHint') : t('restart')}>
+                {t('restart')}
+              </Button>
+            </Popconfirm>
+          )}
           <Popconfirm title={t('deleteRuleConfirm')} onConfirm={() => handleDelete(r.id)}>
             <Button danger size="small" type="text">{t('delete')}</Button>
           </Popconfirm>
@@ -1635,7 +1636,9 @@ function DiagnoseNodeRow({ node, t, isAdmin }: { node: NodeDiagnoseStatus; t: (k
           <Tag color="orange">{t('diagnoseTimeout')}</Tag>
         )}
       </Space>
-      {node.status === 'result' && node.results.length > 0 && (
+      {node.status === 'result' && node.reality ? (
+        <RealityDiagnosisView diagnosis={node.reality} t={t} />
+      ) : node.status === 'result' && node.results.length > 0 ? (
         <Table<DiagnoseTargetResult> size="small" pagination={false} style={{ marginTop: 8 }}
           dataSource={node.results} rowKey="address"
           columns={[
@@ -1643,8 +1646,39 @@ function DiagnoseNodeRow({ node, t, isAdmin }: { node: NodeDiagnoseStatus; t: (k
             { title: t('diagnoseOutcome'), key: 'outcome', render: (_: unknown, r: DiagnoseTargetResult) => <ProbeOutcomeTag o={r.outcome} t={t} /> },
           ]}
         />
-      )}
+      ) : null}
     </div>
+  );
+}
+
+function RealityDiagnosisView({ diagnosis, t }: { diagnosis: RealityDiagnosis; t: (key: string) => string }) {
+  const status = (check: { state: string; detail?: string | null }) => (
+    <Space size={6} wrap>
+      <Tag color={check.state === 'pass' ? 'green' : check.state === 'warning' ? 'gold' : check.state === 'not_tested' ? 'default' : 'red'}>
+        {check.state === 'pass' ? 'PASS' : check.state === 'warning' ? 'WARN' : check.state === 'not_tested' ? t('notTested') : 'FAIL'}
+      </Tag>
+      {check.detail && <Text type="secondary">{check.detail}</Text>}
+    </Space>
+  );
+  return (
+    <Space orientation="vertical" size={8} style={{ width: '100%', marginTop: 8 }}>
+      <Typography.Text strong>{t('realityConfigLayer')}</Typography.Text>{status(diagnosis.config.check)}
+      <Text type="secondary">SNI {diagnosis.config.sni ?? '-'} · :{diagnosis.config.listen_port} · PP {diagnosis.config.send_proxy_protocol ? 'ON' : 'OFF'}</Text>
+      <Typography.Text strong>{t('realityNginxLayer')}</Typography.Text>{status(diagnosis.nginx.check)}
+      <Text type="secondary">{diagnosis.nginx.config_valid ? 'nginx -t PASS' : 'nginx -t FAIL'} · {diagnosis.nginx.managed_file_matches ? t('configConsistent') : t('configDrifted')}</Text>
+      <Typography.Text strong>{t('realityRuntimeLayer')}</Typography.Text>{status(diagnosis.runtime.check)}
+      <Text type="secondary">:443 {diagnosis.runtime.listen_443 ? 'listening' : 'not listening'} · :8443 {diagnosis.runtime.listen_8443 ? 'listening' : 'not listening'}</Text>
+      <Typography.Text strong>{t('realityBackendLayer')}</Typography.Text>
+      {diagnosis.backends.map(backend => <Text key={backend.address} className="rp-mono">{backend.address} · {status(backend.check)}{backend.elapsed_ms != null ? ` · ${backend.elapsed_ms}ms` : ''}</Text>)}
+      <Typography.Text strong>{t('certificateDetails')}</Typography.Text>{status(diagnosis.certificate.check)}
+      <Text type="secondary">SAN {diagnosis.certificate.san_match ? 'PASS' : 'FAIL'} · cert/key {diagnosis.certificate.cert_key_match ? 'MATCH' : 'MISMATCH'} · {diagnosis.certificate.remaining_days ?? '-'}d</Text>
+      <Text type="secondary">TLS {status(diagnosis.certificate.tls_handshake)}</Text>
+      {diagnosis.certificate.renewal && <><Typography.Text strong>{t('certificateRenewal')}</Typography.Text>{status(diagnosis.certificate.renewal)}</>}
+      <Typography.Text strong>{t('camouflage')}</Typography.Text>{status(diagnosis.camouflage.check)}
+      <Text type="secondary">:8443 · {diagnosis.camouflage.local_backend}{diagnosis.camouflage.http_status ? ` · HTTP ${diagnosis.camouflage.http_status}` : ''}</Text>
+      <Typography.Text strong>{t('fallbackE2e')}</Typography.Text>{status(diagnosis.fallback.check)}
+      <Typography.Text strong>{t('vlessAuthentication')}</Typography.Text>{status(diagnosis.vless_authentication)}
+    </Space>
   );
 }
 

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { Form } from 'antd';
-import { CamouflageFormFields, camouflageCertificateMessage, deriveCamouflageStatus, DnsStatusCell, ProxyProtocolFormField } from './Rules';
+import { CamouflageFormFields, camouflageCertificateMessage, compactRealityStatus, deriveCamouflageStatus, DnsStatusCell, isRealityRule, ProxyProtocolFormField } from './Rules';
 import type { NodeStatus, RuleDnsStatus } from '../api/types';
 
 // ============================================================
@@ -252,6 +252,65 @@ describe('camouflage observed status', () => {
       siteState: 'active',
       certificateState: 'active',
     });
+  });
+});
+
+describe('Reality rule controls and compact status', () => {
+  const translate = (key: string) => key;
+  const activeCamouflage = {
+    state: 'active' as const,
+    activeCount: 1,
+    totalCount: 1,
+    nodes: [],
+    certificate: {
+      site_id: 'op1',
+      sni: 'op1.example.com',
+      site_status: 'active',
+      certificate_status: 'active',
+      valid_until: new Date(Date.now() + 89 * 86_400_000).toISOString(),
+    },
+  };
+  const propagatedDns: RuleDnsStatus = {
+    rule_id: 1,
+    eligible: true,
+    automation_enabled: true,
+    fqdn: 'op1.example.com',
+    record_type: 'A',
+    expected_value: '192.0.2.10',
+    ownership: 'PANEL_MANAGED',
+    sync_state: 'PROPAGATED',
+    last_observed_at: null,
+    mutation_verified_at: null,
+    propagated_at: null,
+    last_error_category: null,
+    warning_category: null,
+  };
+
+  it('routes nginx_sni rules to reapply and ordinary rules to restart', () => {
+    expect(isRealityRule({ public_transport: 'nginx_sni', node_transport: 'raw' })).toBe(true);
+    expect(isRealityRule({ public_transport: 'raw', node_transport: 'raw' })).toBe(false);
+  });
+
+  it('keeps normal Reality status to two compact summary rows', () => {
+    expect(compactRealityStatus(
+      { camouflage_enabled: true },
+      propagatedDns,
+      activeCamouflage,
+      translate,
+    )).toMatchObject({ dns: 'OK', route: 'OK', certificate: expect.stringMatching(/^OK (88|89)d$/) });
+  });
+
+  it('keeps renewal failures out of the compact certificate summary', () => {
+    const view = {
+      ...activeCamouflage,
+      certificate: { ...activeCamouflage.certificate, last_error: 'renewal failed' },
+    };
+    expect(compactRealityStatus(
+      { camouflage_enabled: true },
+      propagatedDns,
+      view,
+      translate,
+    ).certificate).toMatch(/^OK (88|89)d$/);
   });
 });
 
