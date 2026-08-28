@@ -31,7 +31,7 @@ jobs:
         run: |
           rustup show
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates file
+          apt-get install -y --no-install-recommends ca-certificates file openssl sqlite3
           rm -rf /var/lib/apt/lists/*
 
       - name: Install Node.js
@@ -70,6 +70,9 @@ jobs:
           npm test
           npm run typecheck
           npm run build
+
+      - name: Verify Linux node artifact permission contract
+        run: bash scripts/node-artifact-permissions.test.sh
 
       - name: Assemble release assets
         run: |
