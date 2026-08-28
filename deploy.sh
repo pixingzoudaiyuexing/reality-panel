@@ -117,6 +117,7 @@ node_sha="$(sha256sum "$staging/node-assets/amd64/relay-node" | awk '{print $1}'
 node_size="$(stat -c '%s' "$staging/node-assets/amd64/relay-node")"
 printf '{"version":"%s","sha256":"%s","size":%s}\n' "$version" "$node_sha" "$node_size" \
     > "$staging/node-assets/amd64/metadata.json"
+chmod 0644 "$staging/node-assets/amd64/metadata.json"
 
 if [ -L "$INSTALL_ROOT/current" ]; then old_current="$(readlink "$INSTALL_ROOT/current")"; fi
 if [ -e "$final" ]; then

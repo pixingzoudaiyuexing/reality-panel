@@ -379,15 +379,22 @@ fn elf_machine(architecture: &str) -> Option<u16> {
     }
 }
 
+fn artifact_metadata_read_error(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::NotFound => "artifact metadata missing",
+        std::io::ErrorKind::PermissionDenied => "artifact metadata not readable: permission denied",
+        _ => "artifact metadata could not be read",
+    }
+}
+
 fn load_artifact_from(root: &FsPath, architecture: &str) -> Result<LoadedArtifact, String> {
     let architecture = lifecycle_artifact_architecture(architecture)
         .ok_or_else(|| "unsupported artifact architecture".to_string())?;
     let directory = root.join(architecture);
-    let metadata: ArtifactMetadata = serde_json::from_slice(
-        &std::fs::read(directory.join("metadata.json"))
-            .map_err(|error| format!("artifact metadata missing: {error}"))?,
-    )
-    .map_err(|error| format!("invalid artifact metadata: {error}"))?;
+    let metadata_bytes = std::fs::read(directory.join("metadata.json"))
+        .map_err(|error| artifact_metadata_read_error(error.kind()).to_string())?;
+    let metadata: ArtifactMetadata = serde_json::from_slice(&metadata_bytes)
+        .map_err(|error| format!("invalid artifact metadata: {error}"))?;
     semver::Version::parse(&metadata.version).map_err(|_| "invalid artifact version")?;
     if metadata.sha256.len() != 64 || !metadata.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
@@ -1114,6 +1121,22 @@ mod tests {
         std::fs::write(dir.join("relay-node"), vec![0_u8; MIN_ARTIFACT_BYTES]).unwrap();
         assert!(load_artifact_from(&root, "amd64").is_err());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_metadata_read_errors_are_classified_without_paths() {
+        assert_eq!(
+            artifact_metadata_read_error(std::io::ErrorKind::NotFound),
+            "artifact metadata missing"
+        );
+        assert_eq!(
+            artifact_metadata_read_error(std::io::ErrorKind::PermissionDenied),
+            "artifact metadata not readable: permission denied"
+        );
+        assert_eq!(
+            artifact_metadata_read_error(std::io::ErrorKind::Interrupted),
+            "artifact metadata could not be read"
+        );
     }
 
     #[test]

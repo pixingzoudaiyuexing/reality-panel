@@ -1,6 +1,7 @@
 use relay_shared::protocol::ProvisioningCapabilities;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::ErrorKind;
 use std::path::Path;
 
 pub(crate) const INSTALL_SCRIPT: &str = include_str!("../../../../scripts/relay-node-bootstrap.sh");
@@ -101,6 +102,16 @@ pub(crate) fn load_artifact(architecture: &str) -> Result<ProvisioningArtifact, 
     load_artifact_from(Path::new(&root), architecture)
 }
 
+fn artifact_metadata_read_message(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::NotFound => "Panel relay-node artifact metadata is missing",
+        ErrorKind::PermissionDenied => {
+            "Panel relay-node artifact metadata is not readable: permission denied"
+        }
+        _ => "Panel relay-node artifact metadata could not be read",
+    }
+}
+
 fn load_artifact_from(
     root: &Path,
     architecture: &str,
@@ -110,16 +121,16 @@ fn load_artifact_from(
         message: "unsupported artifact architecture",
     })?;
     let directory = root.join(architecture);
-    let metadata: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(directory.join("metadata.json")).map_err(|_| ProvisioningError {
+    let metadata_bytes =
+        std::fs::read(directory.join("metadata.json")).map_err(|error| ProvisioningError {
             category: "ARTIFACT_FAILED",
-            message: "Panel relay-node artifact metadata is missing",
-        })?,
-    )
-    .map_err(|_| ProvisioningError {
-        category: "ARTIFACT_FAILED",
-        message: "Panel relay-node artifact metadata is invalid",
-    })?;
+            message: artifact_metadata_read_message(error.kind()),
+        })?;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&metadata_bytes).map_err(|_| ProvisioningError {
+            category: "ARTIFACT_FAILED",
+            message: "Panel relay-node artifact metadata is invalid",
+        })?;
     let version = metadata
         .get("version")
         .and_then(|v| v.as_str())
@@ -313,5 +324,21 @@ mod tests {
         .unwrap();
         assert!(load_artifact_from(&root, "amd64").is_err());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_metadata_read_errors_are_classified_without_paths() {
+        assert_eq!(
+            artifact_metadata_read_message(ErrorKind::NotFound),
+            "Panel relay-node artifact metadata is missing"
+        );
+        assert_eq!(
+            artifact_metadata_read_message(ErrorKind::PermissionDenied),
+            "Panel relay-node artifact metadata is not readable: permission denied"
+        );
+        assert_eq!(
+            artifact_metadata_read_message(ErrorKind::Interrupted),
+            "Panel relay-node artifact metadata could not be read"
+        );
     }
 }
