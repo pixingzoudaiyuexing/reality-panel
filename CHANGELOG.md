@@ -7,6 +7,11 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.0.0-rc.5] - 2026-08-28
+
+Release candidate update that repairs relay-node artifact metadata
+permissions during fresh installation and Panel upgrade.
+
 ## [1.0.0-rc.4] - 2026-08-28
 
 First Reality Panel release candidate. Panel and relay-node are built together

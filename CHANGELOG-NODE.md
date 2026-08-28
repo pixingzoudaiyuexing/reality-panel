@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.0.0-rc.5] - 2026-08-28
+
+Release candidate update for the Panel-side relay-node artifact metadata
+permission repair. The node binary and config protocol are unchanged.
+
 ## [1.0.0-rc.4] - 2026-08-28
 
 First Reality Panel release candidate for the relay-node binary. Includes the

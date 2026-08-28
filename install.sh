@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPOSITORY="pixingzoudaiyuexing/reality-panel"
-DEFAULT_RELEASE_TAG="v1.0.0-rc.4"
+DEFAULT_RELEASE_TAG="v1.0.0-rc.5"
 INSTALL_ROOT="/opt/relay-panel"
 CONFIG_ROOT="/etc/relay-panel"
 DATA_ROOT="/var/lib/relay-panel"
@@ -17,7 +17,7 @@ fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'EOF'
 Usage:
-  install.sh install --version v1.0.0-rc.4 --public-panel-url URL
+  install.sh install --version v1.0.0-rc.5 --public-panel-url URL
   install.sh update [VERSION]
   install.sh uninstall [--yes] [--purge]
 
