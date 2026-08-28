@@ -6,8 +6,8 @@
 # RelayPanel node installer - downloads and runs relay-node as a systemd service.
 #
 # Usage:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/scripts/relay-node-install.sh) \
-#     -t <NODE_TOKEN> -u <PANEL_URL>
+#   bash <(curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.1/relay-node-install.sh) \
+#     -t <NODE_TOKEN> -u <PANEL_URL> --version 1.0.0-rc.1
 #
 # Options:
 #   -t, --token         Node token (required, from the panel UI)
@@ -15,6 +15,7 @@
 #   -s, --service-name  systemd service name (default: relay-node)
 #   -p, --proxy         Proxy for downloads, e.g. socks5://127.0.0.1:10808
 #                       (or set RELAY_PROXY env var)
+#   --version X.Y.Z     Install an exact unified Release version.
 #   --nginx-sni         Enable Nginx Stream SNI mode.
 #   --nginx-docker      Run the Nginx SNI router as a Docker container.
 #   --openlist-port N   Use an existing local OpenList HTTP Docker site as the
@@ -26,8 +27,6 @@
 #
 # Environment:
 #   RELAY_PROXY           Same as -p (e.g. socks5://127.0.0.1:10808)
-#   RELAY_NODE_BASE_URL   Custom download mirror base, e.g. https://download.example.com/relay-panel
-#                         The script will fetch {BASE_URL}/relay-node-linux-{arch}
 #
 # Idempotent re-runs: downloading to a temp file and swapping atomically means
 # this script can be re-run to upgrade an already-running node. The running
@@ -45,8 +44,8 @@ cd / 2>/dev/null || true
 
 # Bump this when releasing a new version. The binary is downloaded from
 # GitHub Releases assets.
-SCRIPT_VERSION="1.2.2"
-REPO="pixingzoudaiyuexing/relay-panel"
+SCRIPT_VERSION="1.0.0-rc.1"
+REPO="pixingzoudaiyuexing/reality-panel"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -76,8 +75,7 @@ SNI_FALLBACK_CERTBOT_DOMAIN="${SNI_FALLBACK_CERTBOT_DOMAIN:-}"
 SNI_FALLBACK_CERTBOT_EMAIL="${SNI_FALLBACK_CERTBOT_EMAIL:-}"
 SNI_FALLBACK_CERTBOT_STAGING="${SNI_FALLBACK_CERTBOT_STAGING:-0}"
 # v1.2: explicit node version override (--version X.Y.Z). When empty, the
-# script queries GitHub for the latest node-v* tag and falls back to
-# SCRIPT_VERSION if the query fails (it NEVER guesses the panel version).
+# script resolves the latest stable unified Reality Panel release.
 TARGET_VERSION=""
 
 # ---------- Parse args ----------
@@ -111,7 +109,7 @@ while [[ $# -gt 0 ]]; do
             echo "  -u, --url           Panel URL, e.g. http://panel-ip:18888 (required)"
             echo "  -s, --service-name  systemd service name (default: relay-node)"
             echo "  -p, --proxy         Download proxy, e.g. socks5://127.0.0.1:10808"
-            echo "  --version X.Y.Z     Install a specific node version (default: latest node-v* from GitHub)"
+            echo "  --version X.Y.Z     Install a specific unified release (default: latest stable)"
             echo "  --nginx-sni         Configure Nginx Stream SNI routing"
             echo "  --nginx-docker      Run the Nginx SNI router as a Docker container"
             echo "  --nginx-mode MODE   Nginx runtime for --nginx-sni: host or docker (default: host)"
@@ -137,7 +135,6 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Environment:"
             echo "  RELAY_PROXY           Same as -p"
-            echo "  RELAY_NODE_BASE_URL   Custom mirror for binary downloads"
             echo "  NGINX_SNI=1           Same as --nginx-sni"
             echo "  NGINX_SNI_MODE=docker Same as --nginx-docker"
             echo "  NGINX_SNI_DOCKER_IMAGE / NGINX_SNI_DOCKER_NAME"
@@ -240,9 +237,8 @@ fi
 ARCH_RAW="$(uname -m)"
 case "$ARCH_RAW" in
     x86_64|amd64) ARCH="amd64" ;;
-    aarch64|arm64) ARCH="arm64" ;;
     *)
-        fail "Unsupported architecture: $ARCH_RAW. Only amd64 and arm64 are supported."
+        fail "Unsupported architecture: $ARCH_RAW. Reality Panel v1 releases Linux amd64 only."
         ;;
 esac
 info "Detected architecture: $ARCH ($ARCH_RAW)"
@@ -653,29 +649,20 @@ NGINX_SNI_CONF_PATH="/etc/nginx/stream.d/relay-panel-sni.conf"
 TMP_BINARY="${BINARY}.tmp"
 
 # ---------- Resolve the install version ----------
-# v1.2: nodes release on their own node-v* track. By default install the LATEST
-# node-v* tag from GitHub; --version pins a specific one. The script NEVER
-# falls back to the panel version — if the node-version query fails it uses
-# SCRIPT_VERSION (the version this script shipped with) and warns.
+# Reality Panel ships Panel and Node from the same v* GitHub Release. Default
+# installation resolves GitHub's latest stable release; --version permits an
+# explicit stable or prerelease tag. There is no branch, mirror, or local fallback.
 resolve_node_version() {
     # $1 = proxy arg ("" or "--proxy X"). Returns the bare version on stdout.
     local proxy_args="$1"
-    local api_url="https://api.github.com/repos/${REPO}/releases?per_page=30"
-    local raw
-    # Query the releases list, find the highest node-v* tag, strip "node-v".
-    # jq is not assumed; use grep+sed+sort. Tolerate a missing jq / API hiccup.
-    raw=$(curl -fsSL --connect-timeout 10 --max-time 20 $proxy_args \
-          -H 'User-Agent: relay-node-install' "$api_url" 2>/dev/null \
-        | grep -oE '"tag_name": "node-v[0-9]+\.[0-9]+\.[0-9]+[^"]*"' \
-        | sed -E 's/"tag_name": "node-v//; s/"$//' \
-        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' \
-        | sort -rV \
-        | head -n1 || true)
-    echo "$raw"
+    local latest_url
+    latest_url=$(curl -fsSL --connect-timeout 10 --max-time 20 $proxy_args \
+        -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest") || return 1
+    printf '%s\n' "${latest_url##*/v}"
 }
 
 if [ -z "$TARGET_VERSION" ]; then
-    info "Querying GitHub for the latest node-v* release…"
+    info "Querying GitHub for the latest stable Reality Panel release…"
     PROXY_ARG=""
     [ -n "$PROXY" ] && PROXY_ARG="--proxy $PROXY"
     LATEST_NODE=$(resolve_node_version "$PROXY_ARG")
@@ -683,10 +670,7 @@ if [ -z "$TARGET_VERSION" ]; then
         TARGET_VERSION="$LATEST_NODE"
         info "Latest node release: $TARGET_VERSION"
     else
-        # Query failed — do NOT guess the panel version. Fall back to the
-        # version this script shipped with and warn.
-        TARGET_VERSION="$SCRIPT_VERSION"
-        warn "Could not reach GitHub to find the latest node-v* release; falling back to bundled version $SCRIPT_VERSION. Use --version X.Y.Z to pin a specific version."
+        fail "Could not resolve the latest stable GitHub Release. Use --version $SCRIPT_VERSION to pin an existing release."
     fi
 else
     info "Installing node version: $TARGET_VERSION (pinned via --version)"
@@ -701,7 +685,7 @@ fi
 # download/swap is the only step skipped (gated by ALREADY_AT_VERSION).
 ALREADY_AT_VERSION=0
 if [ -x "$BINARY" ]; then
-    INSTALLED_VERSION="$("$BINARY" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    INSTALLED_VERSION="$("$BINARY" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?' | head -n1 || true)"
     if [ -n "$INSTALLED_VERSION" ] && [ "$INSTALLED_VERSION" = "$TARGET_VERSION" ]; then
         info "Already at node version $TARGET_VERSION — skipping binary download; refreshing panel/token/service config."
         ALREADY_AT_VERSION=1
@@ -716,34 +700,10 @@ fi
 if [ "$ALREADY_AT_VERSION" != "1" ]; then
 
 # ---------- Build download URL ----------
-# v1.2: node binaries live under node-v{version} from 1.1.1 onward. Versions
-# 1.1.0 and earlier were published under the joint v{version} tag, so fall back
-# to that path for the known legacy range (mirrors the node's self-updater).
-# Default: GitHub Releases. Override with RELAY_NODE_BASE_URL for mirrors.
-ASSET_NAME="relay-node-linux-${ARCH}"
-url_tag_prefix() {
-    # $1 = bare version. Echo "node-v" or "v" (legacy fallback for <= 1.1.0).
-    local v="$1"
-    # Compare major.minor.patch numerically against 1.1.1.
-    local major minor patch
-    IFS=. read -r major minor patch <<< "${v%%-*}"
-    major="${major:-0}"; minor="${minor:-0}"; patch="${patch:-0}"
-    if [ "$major" -lt 1 ] \
-        || { [ "$major" -eq 1 ] && [ "$minor" -lt 1 ]; } \
-        || { [ "$major" -eq 1 ] && [ "$minor" -eq 1 ] && [ "$patch" -lt 1 ]; }; then
-        echo "v"
-    else
-        echo "node-v"
-    fi
-}
-if [ -n "${RELAY_NODE_BASE_URL:-}" ]; then
-    DOWNLOAD_URL="${RELAY_NODE_BASE_URL}/${ASSET_NAME}"
-    info "Using custom mirror: ${RELAY_NODE_BASE_URL}"
-else
-    TAG_PREFIX=$(url_tag_prefix "$TARGET_VERSION")
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${TAG_PREFIX}${TARGET_VERSION}/${ASSET_NAME}"
-    info "Download URL: $DOWNLOAD_URL"
-fi
+# Node binaries are available only from the matching unified GitHub Release.
+ASSET_NAME="reality-node-linux-${ARCH}"
+DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${TARGET_VERSION}/${ASSET_NAME}"
+info "Download URL: $DOWNLOAD_URL"
 
 # ---------- Download binary to temp file ----------
 # curl flags: follow redirects, fail on HTTP error, show progress bar,
@@ -772,8 +732,7 @@ if ! curl "${CURL_OPTS[@]}" "$DOWNLOAD_URL" -o "$TMP_BINARY"; then
 
 Try one of:
   1. Use a proxy:     $0 -t <token> -u <url> -p socks5://127.0.0.1:10808
-  2. Use a mirror:    RELAY_NODE_BASE_URL=https://your-mirror.com $0 -t <token> -u <url>
-  3. Download manually:
+  2. Download manually:
      curl -fL -o relay-node '${DOWNLOAD_URL}'
      Then copy to ${BINARY}
 
@@ -781,36 +740,21 @@ Note: the existing binary (if any) was NOT touched by this failed download."
 fi
 
 # ---------- Verify SHA256 checksum (supply-chain integrity) ----------
-# v0.3.9: every GitHub Release publishes <asset>.sha256 alongside the binary.
-# We download it and run `sha256sum -c` so a tampered/truncated/replaced binary
+# Every unified GitHub Release publishes one SHA256SUMS manifest. We extract
+# the exact asset entry so a tampered/truncated/replaced binary
 # (MITM, compromised mirror, CDN cache poisoning) is caught BEFORE it replaces
 # the working binary. The existing binary is NOT touched on verification
 # failure (same guarantee as a failed download).
 #
-# Behavior:
-#   - GitHub Releases (default): checksum is REQUIRED. Missing file or mismatch
-#     is a hard FAIL — the release is expected to ship one (binary-release.yml
-#     generates it). Set SKIP_CHECKSUM=1 only if you accept the risk.
-#   - Custom mirror (RELAY_NODE_BASE_URL): we try the checksum but, if the
-#     mirror doesn't serve a .sha256, we WARN and continue (a mirror operator
-#     may legitimately not mirror it). A mismatch is still a hard FAIL.
-if [ "${SKIP_CHECKSUM:-0}" != "1" ]; then
-    CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
-    TMP_CHECKSUM="${TMP_BINARY}.sha256"
-    # v0.3.11: MUST use -L (follow redirects). GitHub Releases download URLs
-    # 302-redirect to objects.githubusercontent.com; without -L, curl returns
-    # exit 0 but downloads an EMPTY body (the 3xx response), so the checksum
-    # file ends up 0 bytes and we falsely report "empty or malformed". Reuse
-    # the same redirect/retry/proxy flags as the binary download for parity.
-    if curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
-        --retry-connrefused ${PROXY:+--proxy "$PROXY"} "$CHECKSUM_URL" -o "$TMP_CHECKSUM"; then
-        # v0.3.10: verify by DIRECT hash comparison rather than `sha256sum -c`.
-        # The `-c` mode re-parses the filename from the checksum file, whose
-        # behaviour varies across GNU coreutils / BusyBox / toybox (filename
-        # quoting, leading `*` for binary mode, path handling) and produced
-        # false FAILs on otherwise-correct downloads. Extracting the hash and
-        # comparing it as a plain string is robust across all of them.
-        EXPECTED=$(awk '{ print $1 }' "$TMP_CHECKSUM" | tr -d '[:space:]')
+# The matching GitHub Release checksum is required. Missing or mismatched
+# checksum data is a hard failure before the running binary is touched.
+CHECKSUM_URL="https://github.com/${REPO}/releases/download/v${TARGET_VERSION}/SHA256SUMS"
+TMP_CHECKSUM="${TMP_BINARY}.SHA256SUMS"
+    # Reuse the binary download's redirect, retry, timeout, and proxy options.
+    if curl "${CURL_OPTS[@]}" "$CHECKSUM_URL" -o "$TMP_CHECKSUM"; then
+        EXPECTED=$(awk -v name="$ASSET_NAME" \
+            '$2 == name || $2 == ("*" name) { print $1 }' "$TMP_CHECKSUM")
+        EXPECTED_COUNT=$(printf '%s\n' "$EXPECTED" | sed '/^$/d' | wc -l | tr -d ' ')
         # Compute the actual hash, trying the common tool variants in order.
         #   sha256sum <file> | awk '{print $1}'   (GNU coreutils, BusyBox)
         #   shasum -a 256 <file> | awk '{print $1}' (macOS, some BSD-based)
@@ -827,15 +771,14 @@ if [ "${SKIP_CHECKSUM:-0}" != "1" ]; then
         # false mismatch (some tools uppercase).
         EXPECTED_LC=$(printf '%s' "$EXPECTED" | tr '[:upper:]' '[:lower:]')
         ACTUAL_LC=$(printf '%s' "$ACTUAL" | tr '[:upper:]' '[:lower:]')
-        if [ -z "$EXPECTED" ]; then
+        if [ "$EXPECTED_COUNT" != "1" ] || ! [[ "$EXPECTED" =~ ^[0-9A-Fa-f]{64}$ ]]; then
             rm -f "$TMP_BINARY" "$TMP_CHECKSUM"
-            fail "Checksum file at ${CHECKSUM_URL} is empty or malformed.
-The download was discarded. To bypass (NOT recommended): SKIP_CHECKSUM=1"
+            fail "SHA256SUMS has no unique valid entry for ${ASSET_NAME}.
+The download was discarded."
         elif [ -z "$ACTUAL_LC" ]; then
             rm -f "$TMP_BINARY" "$TMP_CHECKSUM"
             fail "No sha256 tool found (tried sha256sum, shasum, sha256).
-Cannot verify the downloaded binary. Install one of these, or re-run with
-SKIP_CHECKSUM=1 (NOT recommended). The existing binary was NOT touched."
+Cannot verify the downloaded binary. Install one of these. The existing binary was NOT touched."
         elif [ "$ACTUAL_LC" = "$EXPECTED_LC" ]; then
             info "Checksum verified (sha256 OK)."
         else
@@ -845,21 +788,15 @@ Expected: $EXPECTED
 Actual:   $ACTUAL
 
 The downloaded binary does not match the published sha256. This indicates a
-truncated, corrupted, or tampered download. The existing binary was NOT touched.
-To bypass (NOT recommended), re-run with SKIP_CHECKSUM=1."
+truncated, corrupted, or tampered download. The existing binary was NOT touched."
         fi
         rm -f "$TMP_CHECKSUM"
-    elif [ -z "${RELAY_NODE_BASE_URL:-}" ]; then
-        # GitHub Releases is REQUIRED to ship a checksum. Missing = hard fail.
-        rm -f "$TMP_BINARY" "$TMP_CHECKSUM"
-        fail "Checksum file not found at ${CHECKSUM_URL}.
-Release v${TARGET_VERSION} is expected to publish a .sha256. The download was
-discarded. To bypass (NOT recommended): SKIP_CHECKSUM=1"
     else
-        warn "No checksum available at mirror (${CHECKSUM_URL}); skipping verification.
-Prefer a mirror that also serves .sha256, or set SKIP_CHECKSUM=1 to silence this."
+        # GitHub Releases is REQUIRED to ship the manifest. Missing = hard fail.
+        rm -f "$TMP_BINARY" "$TMP_CHECKSUM"
+        fail "Checksum manifest not found at ${CHECKSUM_URL}.
+Release v${TARGET_VERSION} is expected to publish SHA256SUMS. The download was discarded."
     fi
-fi
 
 # ---------- Validate downloaded temp file ----------
 # Check it is not an HTML error page. Use two methods:

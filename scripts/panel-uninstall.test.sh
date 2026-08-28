@@ -1,122 +1,126 @@
 #!/usr/bin/env bash
-# Offline uninstall harness. It substitutes only the fixed install root in a
-# temporary copy, then uses a fake Docker CLI to assert project-scoped cleanup.
+# Offline uninstall harness for the fixed bare-metal Panel layout.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 INSTALL_ROOT="$TMP/opt/relay-panel"
+CONFIG_ROOT="$TMP/etc/relay-panel"
+DATA_ROOT="$TMP/var/lib/relay-panel"
+SCRIPT_ROOT="$TMP/usr/local/lib/reality-panel"
+UPDATE_COMMAND="$TMP/usr/local/sbin/reality-panel-update"
+SERVICE_FILE="$TMP/etc/systemd/system/relay-panel.service"
 SCRIPT="$TMP/install-under-test.sh"
 FAKE="$TMP/fakebin"
-LOG="$TMP/docker.log"
-UNRELATED_CONTAINER="$TMP/unrelated-container"
-UNRELATED_VOLUME="$TMP/unrelated-volume"
+LOG="$TMP/system.log"
+UNRELATED="$TMP/unrelated"
 
-mkdir -p "$FAKE"
-sed \
-  -e "s#INSTALL_DIR=\"/opt/relay-panel\"#INSTALL_DIR=\"$INSTALL_ROOT\"#" \
-  -e "s#\[ \"\$INSTALL_DIR\" = \"/opt/relay-panel\" \]#[ \"\$INSTALL_DIR\" = \"$INSTALL_ROOT\" ]#" \
-  "$ROOT/install.sh" > "$SCRIPT"
-chmod +x "$SCRIPT"
-
-cat > "$FAKE/docker" <<'EOF'
+mkdir -p "$FAKE" "$UNRELATED"
+cat > "$FAKE/systemctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$*" >> "${HARNESS_LOG:?}"
-if [ "${1:-}" = "compose" ]; then
-  exit 0
-fi
-exit 1
-EOF
-chmod +x "$FAKE/docker"
-
-cat > "$FAKE/uname" <<'EOF'
-#!/usr/bin/env bash
-if [ "${1:-}" = "-s" ]; then
-  printf 'Linux\n'
-else
-  command /usr/bin/uname "$@"
-fi
-EOF
-chmod +x "$FAKE/uname"
-
-cat > "$FAKE/apt-get" <<'EOF'
-#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >> "${HARNESS_LOG:?}"
 exit 0
 EOF
-chmod +x "$FAKE/apt-get"
+chmod +x "$FAKE/systemctl"
+
+# Substitute only the fixed absolute paths in a temporary copy. The guard
+# checks remain in place with their expected test paths, so the harness cannot
+# accidentally exercise a broader deletion scope.
+sed \
+  -e "s#INSTALL_ROOT=\"/opt/relay-panel\"#INSTALL_ROOT=\"$INSTALL_ROOT\"#" \
+  -e "s#CONFIG_ROOT=\"/etc/relay-panel\"#CONFIG_ROOT=\"$CONFIG_ROOT\"#" \
+  -e "s#DATA_ROOT=\"/var/lib/relay-panel\"#DATA_ROOT=\"$DATA_ROOT\"#" \
+  -e "s#SCRIPT_ROOT=\"/usr/local/lib/reality-panel\"#SCRIPT_ROOT=\"$SCRIPT_ROOT\"#" \
+  -e "s#UPDATE_COMMAND=\"/usr/local/sbin/reality-panel-update\"#UPDATE_COMMAND=\"$UPDATE_COMMAND\"#" \
+  -e "s#/etc/systemd/system/relay-panel.service#$SERVICE_FILE#g" \
+  -e "s#\[ \"\$INSTALL_ROOT\" = \"/opt/relay-panel\" \]#[ \"\$INSTALL_ROOT\" = \"$INSTALL_ROOT\" ]#" \
+  -e "s#\[ \"\$CONFIG_ROOT\" = \"/etc/relay-panel\" \]#[ \"\$CONFIG_ROOT\" = \"$CONFIG_ROOT\" ]#" \
+  -e "s#\[ \"\$DATA_ROOT\" = \"/var/lib/relay-panel\" \]#[ \"\$DATA_ROOT\" = \"$DATA_ROOT\" ]#" \
+  "$ROOT/install.sh" > "$SCRIPT"
+chmod +x "$SCRIPT"
 
 fail() { echo "[FAIL] $*" >&2; exit 1; }
 ok() { echo "[OK] $*"; }
 run_uninstall() {
   HARNESS_LOG="$LOG" PATH="$FAKE:$PATH" bash "$SCRIPT" uninstall "$@"
 }
+run_confirmed() {
+  TEST_ANSWER="$1" TEST_SCRIPT="$SCRIPT" TEST_LOG="$LOG" TEST_PATH="$FAKE:$PATH" \
+    expect <<'EOF'
+set timeout 5
+log_user 0
+spawn env HARNESS_LOG=$env(TEST_LOG) PATH=$env(TEST_PATH) bash $env(TEST_SCRIPT) uninstall
+expect {
+  -re {Type [A-Z]+ to continue: } { send -- "$env(TEST_ANSWER)\r"; exp_continue }
+  eof {}
+  timeout { exit 2 }
+}
+catch wait result
+exit [lindex $result 3]
+EOF
+}
 make_install() {
-  mkdir -p "$INSTALL_ROOT"
-  cp "$ROOT/docker-compose.release.yaml" "$INSTALL_ROOT/"
-  cp "$ROOT/docker-compose.yaml" "$INSTALL_ROOT/"
-  printf 'JWT_SECRET=test\nPANEL_KEY=test\n' > "$INSTALL_ROOT/.env"
+  mkdir -p "$INSTALL_ROOT/releases" "$INSTALL_ROOT/public" \
+    "$INSTALL_ROOT/node-assets" "$CONFIG_ROOT" "$DATA_ROOT" \
+    "$SCRIPT_ROOT" "$(dirname "$UPDATE_COMMAND")" "$(dirname "$SERVICE_FILE")"
+  printf 'local runtime\n' > "$INSTALL_ROOT/current"
+  printf 'JWT_SECRET=fixture\nPANEL_KEY=fixture\n' > "$CONFIG_ROOT/relay-panel.env"
+  printf 'database\n' > "$DATA_ROOT/data.db"
+  printf 'update\n' > "$UPDATE_COMMAND"
+  printf 'unit\n' > "$SERVICE_FILE"
 }
 
-# Confirmation rejection must not call Docker or delete local files.
+# A cancelled confirmation leaves every owned and unrelated sentinel intact.
+make_install
+before="$(find "$TMP" -type f -print | sort | shasum)"
+run_confirmed NO
+[ -e "$INSTALL_ROOT/current" ] || fail "confirmation rejection deleted the install"
+[ "$(find "$TMP" -type f -print | sort | shasum)" = "$before" ] || \
+  fail "confirmation rejection changed local resources"
+ok "confirmation rejection leaves resources intact"
+
+# Explicit confirmation removes the runtime-owned paths but keeps config/data.
+: > "$LOG"
+run_confirmed UNINSTALL
+[ ! -e "$INSTALL_ROOT" ] || fail "confirmed uninstall retained runtime files"
+[ ! -e "$SCRIPT_ROOT" ] || fail "confirmed uninstall retained helper scripts"
+[ ! -e "$SERVICE_FILE" ] || fail "confirmed uninstall retained systemd unit"
+[ -e "$CONFIG_ROOT/relay-panel.env" ] || fail "default uninstall deleted config"
+[ -e "$DATA_ROOT/data.db" ] || fail "default uninstall deleted data"
+[ -e "$UNRELATED" ] || fail "unrelated path was removed"
+grep -q 'systemctl disable --now relay-panel.service' "$LOG" || \
+  fail "service stop was not attempted"
+ok "confirmed uninstall removes runtime and preserves config/data"
+
+# --yes is the explicit non-interactive path and purge removes only fixed data.
 make_install
 : > "$LOG"
-printf 'no\n' | HARNESS_LOG="$LOG" PATH="$FAKE:$PATH" bash "$SCRIPT" uninstall
-[ -d "$INSTALL_ROOT" ] || fail "rejected confirmation deleted the install root"
-[ ! -s "$LOG" ] || fail "rejected confirmation contacted Docker"
-ok "confirmation rejection leaves all resources intact"
+run_uninstall --yes --purge
+[ ! -e "$INSTALL_ROOT" ] || fail "--yes purge retained runtime files"
+[ ! -e "$CONFIG_ROOT" ] || fail "--yes purge retained config"
+[ ! -e "$DATA_ROOT" ] || fail "--yes purge retained data"
+[ -e "$UNRELATED" ] || fail "--yes purge removed unrelated path"
+ok "--yes purge removes only the local Panel deployment"
 
-# Interactive DELETE confirmation removes only the fixed project's declared
-# Compose resources and root.
-touch "$UNRELATED_CONTAINER" "$UNRELATED_VOLUME"
+# Missing and partial installations are safe and idempotent.
 : > "$LOG"
-printf 'DELETE\n' | HARNESS_LOG="$LOG" PATH="$FAKE:$PATH" bash "$SCRIPT" uninstall
-[ ! -e "$INSTALL_ROOT" ] || fail "accepted uninstall retained the install root"
-[ -e "$UNRELATED_CONTAINER" ] || fail "unrelated container sentinel was removed"
-[ -e "$UNRELATED_VOLUME" ] || fail "unrelated volume sentinel was removed"
-grep -q -- '--volumes --remove-orphans' "$LOG" || fail "Compose volume cleanup flags missing"
-grep -q -- "--project-directory $INSTALL_ROOT" "$LOG" || fail "Compose cleanup escaped fixed root"
-if grep -Eq 'rm |volume rm|container rm|system prune|network prune' "$LOG"; then
-  fail "uninstall issued a broad Docker deletion command"
+run_uninstall --yes
+if grep -Evq '^systemctl (disable --now relay-panel\.service|daemon-reload)$' "$LOG"; then
+  fail "already absent uninstall performed unexpected cleanup"
 fi
-ok "interactive confirmation removes only declared project resources and local root"
-
-# --yes is an explicit non-interactive equivalent, never the default.
-make_install
-: > "$LOG"
+mkdir -p "$INSTALL_ROOT/releases"
+printf 'partial\n' > "$INSTALL_ROOT/releases/partial.txt"
 run_uninstall --yes
-[ ! -e "$INSTALL_ROOT" ] || fail "--yes retained the install root"
-grep -q -- '--volumes --remove-orphans' "$LOG" || fail "--yes did not clean Compose volumes"
-ok "--yes removes the local deployment without a prompt"
+[ ! -e "$INSTALL_ROOT" ] || fail "partial install was not removed"
+ok "missing and partial installs are idempotent"
 
-# Missing and partial installs both succeed without widening cleanup scope.
-: > "$LOG"
-run_uninstall --yes
-[ ! -s "$LOG" ] || fail "already-uninstalled path contacted Docker"
-ok "already-uninstalled is idempotent"
-
-mkdir -p "$INSTALL_ROOT"
-printf 'partial\n' > "$INSTALL_ROOT/.env"
-: > "$LOG"
-run_uninstall --yes
-[ ! -e "$INSTALL_ROOT" ] || fail "partial install root was not removed"
-if grep -q ' down ' "$LOG"; then
-  fail "partial install without compose files ran Compose cleanup"
-fi
-ok "partial install cleanup is safe"
-
-# Uninstall leaves no sentinel or reservation under the known root, so the
-# normal fresh-install path can recreate it. Fresh deploy behavior itself is
-# covered by scripts/deploy-web-mode-check.sh without network or a live Docker.
-[ ! -e "$INSTALL_ROOT" ] || fail "uninstall left an install-root blocker"
-ok "clean install root is ready for fresh install"
-
-bash "$ROOT/deploy.sh" uninstall --help >/dev/null
-grep -q 'INSTALL_DIR="/opt/relay-panel"' "$ROOT/install.sh" || fail "install root is no longer fixed"
-if grep -Eq 'ssh |ssh\(' "$ROOT/install.sh"; then
+bash -n "$ROOT/install.sh" "$ROOT/deploy.sh" "$ROOT/update.sh"
+grep -Fq 'Remote Relay nodes were not contacted' "$ROOT/install.sh" || \
+  fail "remote safety message missing"
+if rg -n '(^|[[:space:]])ssh([[:space:]]|\()' "$ROOT/install.sh"; then
   fail "Panel uninstall must not contact Relay hosts"
 fi
-ok "deploy command dispatch and local-only boundary are intact"
-
+ok "shell syntax and local-only boundary are intact"
 echo "panel uninstall harness: PASS"

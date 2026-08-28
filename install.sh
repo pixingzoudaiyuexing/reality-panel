@@ -1,281 +1,196 @@
 #!/usr/bin/env bash
-#
-# RelayPanel one-line installer for Linux (Debian / Ubuntu).
-#
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/<release-ref>/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/<release-ref>/install.sh | bash -s -- uninstall
-#
-
-# Touch: trigger script-check CI on version-only PRs (paths filter otherwise skips it).
-# What it does:
-#   1. Verifies Linux + root
-#   2. Installs git, curl, ca-certificates, openssl (apt)
-#   3. Clones (or updates) the repo into /opt/relay-panel (quiet by default;
-#      set DEBUG=1 to see raw git output)
-#   4. Runs deploy.sh inside that directory
-#
-# NOTE: This is the one-line PANEL installer. It is distinct from
-# scripts/relay-node-install.sh, which installs only the relay-node binary on
-# a forwarding node. This script was accidentally emptied in commit b03ae7a
-# and shipped empty through v0.1.7; restored verbatim from f184fb8 in v0.1.8.
-#
+# Reality Panel release installer/updater/uninstaller for Debian 12 amd64.
 set -euo pipefail
 
-INSTALL_DIR="/opt/relay-panel"
-REPO_URL="https://github.com/pixingzoudaiyuexing/relay-panel.git"
-RELEASE_REF="${RELAYPANEL_RELEASE_REF:-RELEASE_REF_REQUIRED}"
-RELEASE_VERSION="${RELAYPANEL_RELEASE_VERSION:-RELEASE_VERSION_REQUIRED}"
+REPOSITORY="pixingzoudaiyuexing/reality-panel"
+DEFAULT_RELEASE_TAG="v1.0.0-rc.1"
+INSTALL_ROOT="/opt/relay-panel"
+CONFIG_ROOT="/etc/relay-panel"
+DATA_ROOT="/var/lib/relay-panel"
+SCRIPT_ROOT="/usr/local/lib/reality-panel"
+UPDATE_COMMAND="/usr/local/sbin/reality-panel-update"
 
-# DEBUG=1 shows full git output during clone/pull (default: quiet, clean status
-# lines only). Most users want a clean install log without a wall of git diff
-# stats, so quiet is the default.
-DEBUG="${DEBUG:-0}"
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-fail()  { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
+info() { printf '[INFO] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
+fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
 Usage:
-  install.sh                 Install or upgrade RelayPanel
-  install.sh uninstall       Remove this local RelayPanel deployment
-  install.sh uninstall --yes Remove without the interactive confirmation
+  install.sh install --version v1.0.0-rc.1 --public-panel-url URL
+  install.sh update [VERSION]
+  install.sh uninstall [--yes] [--purge]
+
+Install requires an explicit GitHub Release tag. Update without VERSION selects
+the latest non-prerelease GitHub Release. Uninstall preserves configuration and
+data unless --purge is explicitly supplied.
 EOF
 }
 
-confirm_uninstall() {
-    local answer=""
-    echo ""
-    warn "RelayPanel uninstall will permanently delete this Panel's local database, configuration, and secrets."
-    warn "Rule exports are NOT created automatically. Export important Rules before continuing."
-    warn "Remote Relay nodes, DNS records, and Reality backends will NOT be touched."
-    echo ""
-    printf "Type DELETE to remove the local RelayPanel deployment: "
+valid_release_tag() {
+    [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+}
+
+valid_public_panel_url() {
+    local url="$1" authority host port
+    [[ "$url" =~ ^https?://[^/@[:space:]?#]+/?$ ]] || return 1
+    authority="${url#*://}"
+    authority="${authority%/}"
+    if [[ "$authority" == \[*\]* ]]; then
+        host="${authority%%\]*}]"
+        host="${host#\[}"
+        port="${authority#*\]}"
+        [ -n "$host" ] && [[ "$host" == *:* ]] || return 1
+        if [ -n "$port" ]; then
+            [[ "$port" =~ ^:[0-9]{1,5}$ ]] || return 1
+            [ "${port#:}" -le 65535 ] || return 1
+        fi
+    else
+        [[ "$authority" =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || return 1
+        if [[ "$authority" == *:* ]]; then
+            port="${authority##*:}"
+            [ "$port" -le 65535 ] || return 1
+        fi
+    fi
+}
+
+confirm() {
+    local expected="$1" prompt="$2" answer=""
+    printf '%s\nType %s to continue: ' "$prompt" "$expected"
     if [ -t 0 ]; then
         read -r answer
     elif { read -r answer < /dev/tty; } 2>/dev/null; then
         :
-    elif ! read -r answer; then
-        fail "No interactive terminal is available. Re-run with uninstall --yes only after reviewing the warning."
+    else
+        fail "No interactive terminal is available; review the warning and use --yes if appropriate."
     fi
-    [ "$answer" = "DELETE" ] || {
-        info "Uninstall cancelled. Nothing was deleted."
-        exit 0
-    }
+    [ "$answer" = "$expected" ] || { info "Cancelled. Nothing was deleted."; exit 0; }
 }
 
-uninstall_panel() {
-    local yes=0
+local_uninstall() {
+    local yes=0 purge=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --yes) yes=1 ;;
+            --purge) purge=1 ;;
             -h|--help) usage; exit 0 ;;
             *) fail "Unknown uninstall option: $1" ;;
         esac
         shift
     done
-
-    # This script owns one fixed deployment root. Never permit a caller-supplied
-    # path or a glob here: uninstall is intentionally local-panel only.
-    [ "$INSTALL_DIR" = "/opt/relay-panel" ] || fail "Unexpected RelayPanel install root; refusing uninstall."
-
-    if [ ! -e "$INSTALL_DIR" ]; then
-        info "RelayPanel is already absent at ${INSTALL_DIR}. Nothing to uninstall."
-        exit 0
-    fi
+    [ "$INSTALL_ROOT" = "/opt/relay-panel" ] || fail "Unexpected install root"
+    [ "$CONFIG_ROOT" = "/etc/relay-panel" ] || fail "Unexpected config root"
+    [ "$DATA_ROOT" = "/var/lib/relay-panel" ] || fail "Unexpected data root"
 
     if [ "$yes" -ne 1 ]; then
-        confirm_uninstall
+        warn "This removes only the local Reality Panel service and installed release files."
+        warn "Remote Relay nodes, DNS records, and Reality backends are not contacted."
+        if [ "$purge" -eq 1 ]; then
+            warn "--purge permanently deletes the local database, configuration, and secrets."
+            confirm "PURGE" "Export important Rules before purging; exports are not created automatically."
+        else
+            confirm "UNINSTALL" "Panel data and configuration will be retained for a later reinstall."
+        fi
     fi
 
-    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-        # Both files describe the same fixed project root. Running down for each
-        # makes a partially completed source/release deployment recoverable while
-        # Compose limits deletion to project-scoped containers, networks, and the
-        # named volumes declared by that file.
-        for compose_file in docker-compose.release.yaml docker-compose.yaml; do
-            if [ -f "$INSTALL_DIR/$compose_file" ]; then
-                info "Removing RelayPanel Compose resources from ${compose_file} ..."
-                if ! docker compose --project-directory "$INSTALL_DIR" -f "$INSTALL_DIR/$compose_file" down --volumes --remove-orphans; then
-                    warn "Compose cleanup for ${compose_file} did not complete; continuing with local file cleanup."
-                fi
-            fi
-        done
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now relay-panel.service >/dev/null 2>&1 || true
+    fi
+    rm -f -- /etc/systemd/system/relay-panel.service "$UPDATE_COMMAND"
+    rm -rf -- "$INSTALL_ROOT/releases" "$INSTALL_ROOT/current" \
+        "$INSTALL_ROOT/public" "$INSTALL_ROOT/node-assets" "$SCRIPT_ROOT"
+    rmdir "$INSTALL_ROOT" 2>/dev/null || true
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true
+
+    if [ "$purge" -eq 1 ]; then
+        rm -rf -- "$CONFIG_ROOT" "$DATA_ROOT"
+        info "Reality Panel binaries, configuration, and local data removed."
     else
-        warn "Docker Compose is unavailable; no containers or volumes can be removed by this run."
+        info "Reality Panel removed; configuration remains in $CONFIG_ROOT and data in $DATA_ROOT."
     fi
-
-    # The path is fixed and checked above. This removes only the clone, .env,
-    # runtime files, and local node-assets belonging to this Panel installation.
-    rm -rf -- "$INSTALL_DIR"
-    info "Local RelayPanel deployment removed. Remote Relay nodes were not contacted."
+    info "Remote Relay nodes were not contacted."
 }
 
-# Uninstall is handled before platform/dependency installation or git cloning.
-# This keeps an already-absent or partial deployment idempotent and avoids any
-# unrelated package changes during removal.
-case "${1:-}" in
+command_name="${1:-install}"
+[ "$#" -eq 0 ] || shift
+case "$command_name" in
     uninstall)
-        shift
-        uninstall_panel "$@"
+        if [ -x "$SCRIPT_ROOT/deploy.sh" ]; then
+            exec "$SCRIPT_ROOT/deploy.sh" uninstall "$@"
+        fi
+        local_uninstall "$@"
         exit 0
         ;;
-    -h|--help)
-        usage
-        exit 0
-        ;;
-    "")
-        ;;
-    *)
-        fail "Unknown command: $1 (use uninstall or --help)"
-        ;;
+    install|update) ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) fail "Unknown command: $command_name" ;;
 esac
 
-# Quiet git flags: suppress the file-change stat dump (the `Foo | 123 +++`
-# block) that looks like an error to non-technical users. When DEBUG=1 we drop
-# --quiet so the full output is visible for troubleshooting.
-if [ "$DEBUG" = "1" ]; then
-    GIT_QUIET=""
-else
-    GIT_QUIET="--quiet"
+[ "$(id -u)" -eq 0 ] || fail "Run as root."
+[ "$(uname -s)" = "Linux" ] || fail "Only Linux is supported."
+[ "$(uname -m)" = "x86_64" ] || fail "Reality Panel v1 requires Linux amd64 (x86_64)."
+[ -r /etc/os-release ] || fail "Cannot identify the operating system."
+# shellcheck disable=SC1091
+. /etc/os-release
+[ "${ID:-}" = "debian" ] && [ "${VERSION_ID:-}" = "12" ] || \
+    fail "The supported v1 host is Debian 12 amd64."
+command -v systemctl >/dev/null 2>&1 || fail "systemd is required."
+
+version="${VERSION:-}"
+if [ "$command_name" = "install" ] && [ -z "$version" ]; then
+    version="$DEFAULT_RELEASE_TAG"
 fi
-
-# ---------- 1. Platform check ----------
-if [ "$(uname -s)" != "Linux" ]; then
-    fail "This installer only runs on Linux. Current OS: $(uname -s)"
-fi
-
-if [ "$(id -u)" -ne 0 ]; then
-    warn "Not running as root. Re-run with sudo if you hit permission errors."
-    warn "Install target is ${INSTALL_DIR} (needs root to write)."
-fi
-
-# ---------- 2. Install base deps ----------
-need_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-# Detect package manager
-PKG_MANAGER=""
-if need_cmd apt-get; then
-    PKG_MANAGER="apt"
-elif need_cmd dnf; then
-    PKG_MANAGER="dnf"
-elif need_cmd yum; then
-    PKG_MANAGER="yum"
-else
-    fail "No supported package manager found (apt/dnf/yum). Currently only Debian/Ubuntu is supported."
-fi
-
-if [ "$PKG_MANAGER" != "apt" ]; then
-    warn "Detected ${PKG_MANAGER}. This installer is tested on Debian/Ubuntu."
-    warn "Proceeding, but dependency names may differ."
-fi
-
-MISSING=""
-for cmd in git curl ca-certificates openssl; do
-    # ca-certificates is a package name, not a command - check differently
-    if [ "$cmd" = "ca-certificates" ] || [ "$cmd" = "openssl" ]; then
-        if [ "$cmd" = "ca-certificates" ] && [ ! -d /usr/share/ca-certificates ] && [ ! -d /etc/ssl/certs ]; then
-            MISSING="$MISSING $cmd"
-        elif [ "$cmd" = "openssl" ] && ! need_cmd openssl; then
-            MISSING="$MISSING $cmd"
-        fi
-    elif ! need_cmd "$cmd"; then
-        MISSING="$MISSING $cmd"
-    fi
+public_url="${PUBLIC_PANEL_URL:-}"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --version) [ "$#" -ge 2 ] || fail "--version requires a value"; version="$2"; shift 2 ;;
+        --public-panel-url) [ "$#" -ge 2 ] || fail "--public-panel-url requires a value"; public_url="$2"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        v*) [ "$command_name" = "update" ] && [ -z "$version" ] || fail "Unexpected argument: $1"; version="$1"; shift ;;
+        *) fail "Unknown option: $1" ;;
+    esac
 done
 
-if [ -n "$MISSING" ]; then
-    info "Installing missing dependencies:${MISSING}"
-    case "$PKG_MANAGER" in
-        apt)
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq
-            apt-get install -y -qq git curl ca-certificates openssl
-            ;;
-        dnf)
-            dnf install -y git curl ca-certificates openssl
-            ;;
-        yum)
-            yum install -y git curl ca-certificates openssl
-            ;;
-    esac
-    info "Dependencies installed."
-else
-    info "All base dependencies present."
-fi
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq ca-certificates curl file openssl sqlite3 tar >/dev/null
 
-# ---------- 3. Clone or update repo ----------
-# Git output is kept quiet by default (see GIT_QUIET above): the file-change
-# stat block that `git pull` prints looks like an error to most users, and the
-# one-line status below is all they need. Set DEBUG=1 to see raw git output.
-if [ -d "$INSTALL_DIR" ]; then
-    if [ -d "$INSTALL_DIR/.git" ]; then
-        info "Repository exists at ${INSTALL_DIR} - checking for updates ..."
-        cd "$INSTALL_DIR"
-        before=$(git rev-parse --short HEAD 2>/dev/null || echo '?')
-        # --ff-only: never create a merge commit during an automated update.
-        # Capture stderr so a failure (e.g. diverged history) prints the real
-        # git message instead of a generic "update failed".
-        if ! git pull --ff-only $GIT_QUIET 2>/tmp/relaypanel-git-err; then
-            echo -e "${RED}[FAIL]${NC} Repository update failed. git output:" >&2
-            cat /tmp/relaypanel-git-err >&2
-            rm -f /tmp/relaypanel-git-err
-            fail "git pull failed. If your local branch diverged, reset with: git -C $INSTALL_DIR reset --hard origin/main"
-        fi
-        rm -f /tmp/relaypanel-git-err
-        after=$(git rev-parse --short HEAD 2>/dev/null || echo '?')
-        if [ "$before" = "$after" ]; then
-            info "Repository already up to date. ($after)"
-        else
-            info "Repository updated: $before -> $after"
-        fi
-    else
-        fail "${INSTALL_DIR} exists but is not a git repository. \
-Back it up or remove it, then re-run this script. Refusing to overwrite."
-    fi
-else
-    if [ "$RELEASE_REF" = "RELEASE_REF_REQUIRED" ] || [ "$RELEASE_VERSION" = "RELEASE_VERSION_REQUIRED" ]; then
-        fail "Fresh installs require RELAYPANEL_RELEASE_REF and RELAYPANEL_RELEASE_VERSION for a compatible release. Set both explicitly; no unpinned main install is allowed."
-    fi
-    info "Cloning ${REPO_URL} into ${INSTALL_DIR} ..."
-    if ! git clone --depth 1 --branch "$RELEASE_REF" $GIT_QUIET "$REPO_URL" "$INSTALL_DIR" 2>/tmp/relaypanel-git-err; then
-        echo -e "${RED}[FAIL]${NC} Clone failed. git output:" >&2
-        cat /tmp/relaypanel-git-err >&2
-        rm -f /tmp/relaypanel-git-err
-        fail "git clone failed. Check your network and that the repo URL is reachable."
-    fi
-    rm -f /tmp/relaypanel-git-err
-    cd "$INSTALL_DIR"
-    info "Cloned at $(git rev-parse --short HEAD 2>/dev/null || echo '?')"
+if [ "$command_name" = "update" ] && [ -z "$version" ]; then
+    info "Resolving latest stable Reality Panel release..."
+    latest_url="$(curl --proto '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' \
+        "https://github.com/$REPOSITORY/releases/latest")"
+    version="${latest_url##*/}"
 fi
+[ -n "$version" ] || fail "Install requires --version vX.Y.Z (RC tags are allowed)."
+valid_release_tag "$version" || fail "Invalid release tag: $version"
 
-# Existing installations retain the release identity recorded by deploy.sh;
-# callers may explicitly provide a new pinned ref/version for an upgrade.
-if [ "$RELEASE_REF" = "RELEASE_REF_REQUIRED" ]; then
-    RELEASE_REF=$(grep -E '^RELAYPANEL_RELEASE_REF=' .env 2>/dev/null | tail -n1 | cut -d= -f2- || true)
-    RELEASE_REF="${RELEASE_REF:-RELEASE_REF_REQUIRED}"
+env_file="$CONFIG_ROOT/relay-panel.env"
+if [ -z "$public_url" ] && [ -r "$env_file" ]; then
+    public_url="$(sed -n 's/^PUBLIC_PANEL_URL=//p' "$env_file" | tail -n 1)"
 fi
-if [ "$RELEASE_VERSION" = "RELEASE_VERSION_REQUIRED" ]; then
-    RELEASE_VERSION=$(grep -E '^RELAYPANEL_RELEASE_VERSION=' .env 2>/dev/null | tail -n1 | cut -d= -f2- || true)
-    RELEASE_VERSION="${RELEASE_VERSION:-RELEASE_VERSION_REQUIRED}"
+if [ -z "$public_url" ] && [ -r /dev/tty ]; then
+    printf 'Public Panel URL (http://IP:PORT or https://hostname): ' > /dev/tty
+    read -r public_url < /dev/tty
 fi
+[ -n "$public_url" ] || fail "PUBLIC_PANEL_URL is required for remote Relay bootstrap."
+valid_public_panel_url "$public_url" || fail "PUBLIC_PANEL_URL must be a credential-free http:// or https:// origin with no path, query, or fragment."
 
-export RELAYPANEL_RELEASE_REF="$RELEASE_REF"
-export RELAYPANEL_RELEASE_VERSION="$RELEASE_VERSION"
+tmp="$(mktemp -d)"
+trap 'rm -rf -- "$tmp"' EXIT
+base="https://github.com/$REPOSITORY/releases/download/$version"
+info "Downloading verified assets for $version..."
+curl --proto '=https' --tlsv1.2 -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
+assets=(reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh update.sh deploy.sh)
+for asset in "${assets[@]}"; do
+    curl --proto '=https' --tlsv1.2 -fsSL "$base/$asset" -o "$tmp/$asset"
+    expected="$(awk -v name="$asset" '$2 == name || $2 == ("*" name) { print $1 }' "$tmp/SHA256SUMS")"
+    [ "$(printf '%s\n' "$expected" | wc -l | tr -d ' ')" = "1" ] && [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || \
+        fail "SHA256SUMS has no unique checksum for $asset"
+    actual="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
+    [ "$actual" = "$expected" ] || fail "SHA256 mismatch for $asset"
+done
+chmod +x "$tmp/install.sh" "$tmp/update.sh" "$tmp/deploy.sh" \
+    "$tmp/reality-panel-linux-amd64" "$tmp/reality-node-linux-amd64"
 
-# ---------- 4. Hand off to deploy.sh ----------
-if [ ! -f deploy.sh ]; then
-    fail "deploy.sh not found in ${INSTALL_DIR}. Repository may be incomplete."
-fi
-
-chmod +x deploy.sh
-info "Starting deploy.sh ..."
-exec ./deploy.sh "$INSTALL_DIR"
-# maintenance comment to retrigger script-check
+RELEASE_DIR="$tmp" RELEASE_VERSION="$version" PUBLIC_PANEL_URL="$public_url" \
+    exec "$tmp/deploy.sh" "$command_name"
