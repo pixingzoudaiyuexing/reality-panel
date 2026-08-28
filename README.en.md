@@ -1,107 +1,57 @@
-<p align="center">
-  <img src="frontend/public/favicon.svg" width="80" height="80" alt="RelayPanel Logo" />
-</p>
+# Reality Panel
 
-<h1 align="center">RelayPanel</h1>
+Reality Panel is the self-hosted control plane for transparent Reality SNI
+relays. It provides Relay node management, Nginx Stream forwarding, Proxy
+Protocol v1, DNSMgr A records, DNS-01 certificates, OpenList camouflage,
+last-known-good recovery, lifecycle operations, diagnostics, and reapply.
 
-<p align="center">
-  ⚡ Self-hosted TCP/UDP Forwarding Management Panel ⚡
-</p>
-
-<p align="center">
-  <strong>English</strong> | <a href="README.md">中文</a>
-</p>
-
-<p align="center">
-  <a href="https://github.com/pixingzoudaiyuexing/relay-panel/releases/latest"><img src="https://img.shields.io/github/v/release/pixingzoudaiyuexing/relay-panel?style=flat-square&label=Release&color=blue" alt="Release" /></a>
-  <a href="https://github.com/pixingzoudaiyuexing/relay-panel/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/pixingzoudaiyuexing/relay-panel/ci.yml?style=flat-square&label=CI" alt="CI" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/pixingzoudaiyuexing/relay-panel?style=flat-square&label=License&color=red" alt="License" /></a>
-</p>
-
-<p align="center">
-  Built with Rust. Manage forwarding rules, device groups, traffic quotas, and<br/>
-  live node status via web UI. Lightweight: Panel ~7 MB + Node ~4 MB.<br/>
-  Deploy: Docker Compose. Database: SQLite / PostgreSQL.
-</p>
-
----
-
-## ✨ Features
-
-- 🔀 **Forwarding rules** — TCP/UDP multi-target forwarding, failover / round-robin balancing, circuit breaker with auto-recovery, domain targets that follow DDNS
-- 🚦 **Connection control** — per-rule concurrent-connection cap; restart one rule, a batch, or on a schedule — dropping old connections and rebuilding listeners
-- 🛒 **Plans & billing** — self-service plan purchase and redeem-code top-ups; charged as `(upload + download) × line rate`; one plan per user, renewals stack and switching replaces
-- 📊 **Traffic visibility** — per-rule and per-user metering, with 1 / 7 / 30-day charts stacked by line so you can see which one is consuming the quota
-- 🖥️ **Node management** — live CPU / memory / connections, region detection, Telegram or email alerts on offline, one-click upgrade from the panel (no SSH)
-- 👤 **Users & groups** — manage any user's rules and plan, reset traffic or password, ban; device groups can be hidden, and removing a node doesn't affect rules
-- 🗄️ **Deployment-friendly** — SQLite (zero-config) or PostgreSQL; panel and node both support amd64 / arm64
-- 🔒 **Security** — first login forces password change; node auth via Bearer token
-
-Full feature reference and user docs: **[relaypanel.dev](https://relaypanel.dev)**
-
----
-
-## 🚀 Quick start
-
-**One command deploy:**
+Production installs use only versioned GitHub Release assets. The first RC can
+be installed with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/relay-panel/main/install.sh | bash
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.1/install.sh \
+  | bash -s -- install --version v1.0.0-rc.1 --public-panel-url http://203.0.113.10:18888
 ```
 
-> 🔑 **Default login `admin` / `admin123` — first login forces a password change.**
+The installer targets Debian 12 amd64 with systemd, verifies every asset with
+`SHA256SUMS`, and installs the Panel, frontend, and matching Node binary from
+one Release. `PUBLIC_PANEL_URL` accepts a credential-free `http://IP:PORT` or
+`https://hostname` origin with no path, query, or fragment. HTTP is supported
+intentionally.
 
-📖 Full guide: **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**
-
----
-
-## 🏗️ Architecture
-
-```
-  Browser (React UI)          relay-node (Tokio TCP/UDP)
-       │                          ▲
-       ▼                          │
-   relay-panel  ◄─── WebSocket config push + HTTP status report
-   (Axum API)                     │
-       │                          ▼
-   SQLite / PG              forwards traffic to targets
-```
-
----
-
-## 🔄 Update
-
-**Panel** (back up `.env` and your database first):
+Panel-managed Node deployment is the normal path. Manual Bootstrap is an
+advanced recovery path. The installed updater selects the latest stable
+Release or an explicit tag, verifies it, preserves all application/runtime
+state, and rolls back a failed health check:
 
 ```bash
-cd /opt/relay-panel && git pull --quiet && ./deploy.sh
+/usr/local/sbin/reality-panel-update
+/usr/local/sbin/reality-panel-update v1.0.0
 ```
 
-**Nodes**: Panel → Node Status → click "Upgrade". No SSH. systemd nodes only (Docker nodes update the image instead); upgrading drops that node's live forwarding connections. See the [node documentation](docs/NODE.md#update).
-
----
-
-## 🛠️ Local dev
+Default uninstall retains local data and requires typing `UNINSTALL`:
 
 ```bash
-cargo build && cargo run -p relay-panel &   # API on :18888
-cd frontend && npm install && npm run dev   # UI on :5173
-python3 tests/e2e_test.py                   # end-to-end test
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0-rc.1/install.sh \
+  | bash -s -- uninstall
 ```
 
----
+Use `--yes` only for deliberate automation and `--purge` only to delete local
+database/configuration/secrets. Remote Relays, DNSMgr, and Reality backends
+are never contacted.
 
-## 📦 Tech stack
+For Proxy Protocol v1, enable backend receive first, wait for the v2node/Xray
+reload and verify its runtime setting, then enable Relay sending. Disable in
+the reverse order. Reality `xver=0` remains `0` and is separate from PROXY.
 
-Rust · Axum · Tokio · sqlx · SQLite/PostgreSQL · JWT · React 19 · TypeScript · Ant Design · Docker Compose
+DNSMgr is Panel-only, ownership-aware, A-record-only automation. It fails
+closed on external conflicts, verifies mutations, never automatically manages
+AAAA or deletes DNS, and cannot change Relay runtime/LKG authority during an
+upstream outage. Public DNS remains the certificate authority.
 
----
+Diagnostics cover SNI, backend TCP, certificate, camouflage, and PROXY
+configuration. VLESS client authentication and full fallback E2E still need a
+real client connection.
 
-## 📄 License & Disclaimer
-
-AGPL-3.0 — see [LICENSE](LICENSE).
-
-Open-source traffic-forwarding tool for **personal study and research only**.
-Use lawfully and at your own risk.
-
-Full **[Disclaimer](docs/DISCLAIMER.md)**
+See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) for the RC
+acceptance sequence.
