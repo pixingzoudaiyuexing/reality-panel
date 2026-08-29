@@ -1153,7 +1153,22 @@ pub(crate) async fn derive_dns_desired(
     let sni = rule.sni.as_deref().unwrap_or_default().trim();
     let expected_value =
         match GroupRepository::find_by_id(db, rule.device_group_in, &ResourceScope::All).await? {
-            Some(group) if group.group_type == "in" => group.connect_host.trim().to_string(),
+            Some(group) if group.group_type == "in" => {
+                match crate::service::relay_preference::resolve_dns_target(db, rule.device_group_in)
+                    .await?
+                {
+                    crate::service::relay_preference::RelayDnsTarget::Resolved(ip) => ip,
+                    crate::service::relay_preference::RelayDnsTarget::NotSet => {
+                        group.connect_host.trim().to_string()
+                    }
+                    crate::service::relay_preference::RelayDnsTarget::Invalid(category) => {
+                        return Ok(DnsDesiredResolution::ConfigurationError {
+                            desired: None,
+                            category,
+                        })
+                    }
+                }
+            }
             Some(_) => {
                 return Ok(DnsDesiredResolution::ConfigurationError {
                     desired: None,
@@ -1404,6 +1419,45 @@ async fn refresh_all_desired(db: &dyn Repository) -> Result<(), crate::db::error
 pub async fn schedule_all_eligible(db: &dyn Repository) -> Result<(), crate::db::error::DbError> {
     for rule in db.list_rules(&ResourceScope::All).await? {
         schedule_rule(db, rule.id).await?;
+    }
+    Ok(())
+}
+
+fn rule_is_dns_eligible(rule: &relay_shared::models::ForwardRule) -> bool {
+    !rule.paused
+        && rule.camouflage_enabled
+        && rule.node_transport == "nginx_sni"
+        && normalize_fqdn(rule.sni.as_deref().unwrap_or_default().trim()).is_ok()
+}
+
+pub async fn eligible_rule_ids_for_group(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<Vec<i64>, crate::db::error::DbError> {
+    let mut ids: Vec<i64> = db
+        .list_rules(&ResourceScope::All)
+        .await?
+        .into_iter()
+        .filter(|rule| rule.device_group_in == group_id && rule_is_dns_eligible(rule))
+        .map(|rule| rule.id)
+        .collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// Schedule only the eligible Reality records belonging to one inbound group.
+/// `eligible_rule_ids` comes from the preflight performed under the preference
+/// mutation lock, so another group can never be pulled into this transaction.
+pub async fn schedule_group_eligible(
+    db: &dyn Repository,
+    group_id: i64,
+    eligible_rule_ids: &[i64],
+) -> Result<(), crate::db::error::DbError> {
+    let current_ids = eligible_rule_ids_for_group(db, group_id).await?;
+    for rule_id in eligible_rule_ids {
+        if current_ids.binary_search(rule_id).is_ok() {
+            schedule_rule(db, *rule_id).await?;
+        }
     }
     Ok(())
 }
@@ -1865,6 +1919,7 @@ async fn reconciliation_tick(state: &AppState) {
         if let Err(error) = disable_all_syncs(state.db.as_ref()).await {
             tracing::error!("dns reconciliation: disabling sync state failed: {}", error);
         }
+        crate::service::relay_preference::finalize_switching_preferences(state).await;
         return;
     }
     if let Err(error) = refresh_all_desired(state.db.as_ref()).await {
@@ -1875,9 +1930,13 @@ async fn reconciliation_tick(state: &AppState) {
     }
     let client = match load_client(state.db.as_ref()).await {
         Ok(Some(client)) => client,
-        Ok(None) => return,
+        Ok(None) => {
+            crate::service::relay_preference::finalize_switching_preferences(state).await;
+            return;
+        }
         Err(error) => {
             tracing::error!("dns reconciliation: client configuration failed: {}", error);
+            crate::service::relay_preference::finalize_switching_preferences(state).await;
             return;
         }
     };
@@ -1890,6 +1949,7 @@ async fn reconciliation_tick(state: &AppState) {
         Ok(due) => due,
         Err(error) => {
             tracing::error!("dns reconciliation: due-state query failed: {}", error);
+            crate::service::relay_preference::finalize_switching_preferences(state).await;
             return;
         }
     };
@@ -1900,6 +1960,7 @@ async fn reconciliation_tick(state: &AppState) {
             audit.record(state).await;
         }
     }
+    crate::service::relay_preference::finalize_switching_preferences(state).await;
 }
 
 /// Start the Panel-only DNS reconciliation worker. It never touches Relay
@@ -3063,6 +3124,94 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn desired_state_prefers_pending_then_preferred_then_legacy_connect_host() {
+        use crate::service::relay_preference::{
+            RelayPreferencePhase, RelayPreferenceState, RELAY_PREFERENCE_KEY_PREFIX,
+        };
+
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        let desired_value = |resolution: DnsDesiredResolution| match resolution {
+            DnsDesiredResolution::Eligible(desired) => desired.expected_value,
+            other => panic!("unexpected desired state: {other:?}"),
+        };
+        assert_eq!(
+            desired_value(derive_dns_desired(&db, 100).await.unwrap()),
+            "192.0.2.10"
+        );
+
+        db.set("node_status:10:node-a", r#"{"public_ipv4":"192.0.2.20"}"#)
+            .await
+            .unwrap();
+        db.set("node_status:10:node-b", r#"{"public_ipv4":"192.0.2.30"}"#)
+            .await
+            .unwrap();
+        let key = format!("{RELAY_PREFERENCE_KEY_PREFIX}10");
+        db.set(
+            &key,
+            &serde_json::to_string(&RelayPreferenceState {
+                preferred_node_id: Some("node-a".into()),
+                pending_node_id: None,
+                state: RelayPreferencePhase::Idle,
+                started_at: None,
+                last_error: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            desired_value(derive_dns_desired(&db, 100).await.unwrap()),
+            "192.0.2.20"
+        );
+
+        db.set(
+            &key,
+            &serde_json::to_string(&RelayPreferenceState {
+                preferred_node_id: Some("node-a".into()),
+                pending_node_id: Some("node-b".into()),
+                state: RelayPreferencePhase::Switching,
+                started_at: Some("2026-08-29T00:00:00Z".into()),
+                last_error: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            desired_value(derive_dns_desired(&db, 100).await.unwrap()),
+            "192.0.2.30"
+        );
+
+        db.set(
+            &key,
+            &serde_json::to_string(&RelayPreferenceState {
+                preferred_node_id: Some("node-a".into()),
+                pending_node_id: Some("node-b".into()),
+                state: RelayPreferencePhase::Failed,
+                started_at: Some("2026-08-29T00:00:00Z".into()),
+                last_error: Some("DNS_RECORD_CONFLICT".into()),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            desired_value(derive_dns_desired(&db, 100).await.unwrap()),
+            "192.0.2.20"
+        );
+
+        db.set("node_status:10:node-a", r#"{"public_ipv4":"192.0.2.21"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            desired_value(derive_dns_desired(&db, 100).await.unwrap()),
+            "192.0.2.21",
+            "preferred IP must be read from current node telemetry"
+        );
     }
 
     #[tokio::test]
