@@ -2055,7 +2055,7 @@ mod tests {
         }"#;
         let report: StatusReport = serde_json::from_str(legacy).unwrap();
         assert!(report.reconciliation.is_none());
-        assert_eq!(CONFIG_PROTOCOL_VERSION, 8);
+        assert_eq!(CONFIG_PROTOCOL_VERSION, 9);
 
         let status = ReconciliationStatus {
             state: ReconciliationStatusState::Converged,
@@ -2072,13 +2072,13 @@ mod tests {
     }
 
     #[test]
-    fn omitted_acme_challenge_method_remains_http01_on_protocol_v8() {
+    fn omitted_acme_challenge_method_remains_http01_on_protocol_v9() {
         let policy: CamouflageCertificatePolicy = serde_json::from_str(
             r#"{"domain":"site.example.com","expected_public_ip":"192.0.2.10","renew_before_days":30}"#,
         )
         .unwrap();
         assert_eq!(policy.challenge_method, AcmeChallengeMethod::Http01);
-        assert_eq!(CONFIG_PROTOCOL_VERSION, 8);
+        assert_eq!(CONFIG_PROTOCOL_VERSION, 9);
     }
 
     #[test]
