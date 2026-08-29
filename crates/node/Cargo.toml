@@ -2,7 +2,7 @@
 name = "relay-node"
 # Stage 2 lifecycle compatibility version. `--version` / `-V` read this via
 # env!("CARGO_PKG_VERSION"); Panel-managed artifacts declare the same value.
-version = "1.1.0-rc.1"
+version = "1.1.0-rc.2"
 edition = "2021"
 license.workspace = true
 
