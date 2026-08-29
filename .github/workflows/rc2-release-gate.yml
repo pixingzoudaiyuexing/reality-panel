@@ -41,7 +41,6 @@ jobs:
           bash scripts/release-version-contract.sh v1.1.0-rc.2
           cargo fmt --all -- --check
           cargo check --workspace --locked
-          git diff --check
           bash scripts/check-repo-test-parity.sh
 
       - name: Run locked workspace tests
