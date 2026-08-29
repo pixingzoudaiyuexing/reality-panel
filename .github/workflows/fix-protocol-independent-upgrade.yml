@@ -1,0 +1,284 @@
+name: Fix Protocol Independent Upgrade
+
+on:
+  push:
+    branches:
+      - fix/protocol-independent-node-upgrade
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/protocol-independent-node-upgrade
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Apply architecture fix
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, got {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          # 1) Lifecycle protocol is deliberately independent from config protocol.
+          Path('crates/shared/src/control_protocol.rs').write_text(r'''//! Node control/lifecycle protocol capabilities.
+//!
+//! 这个协议故意与 CONFIG_PROTOCOL_VERSION 分离：配置结构发生破坏性变化时，
+//! 旧 Node 可以停止接收新配置，但“一键升级”控制通道必须继续工作。只要认证
+//! 有效、节点具备 lifecycle v1，就允许进入 upgrade-only 控制通道。
+
+/// 生命周期控制协议版本。不要因为 ListenerConfig / NodeConfigResponse 变化而递增。
+/// 只有 NodeLifecycleCommand / NodeLifecycleEvent 本身出现不可向后兼容的变化时才考虑升级；
+/// 优先保持 v1 向后兼容，以保证已托管节点永远能够被 Panel 升级。
+pub const LIFECYCLE_PROTOCOL_VERSION: u32 = 1;
+
+pub fn lifecycle_protocol_versions_compatible(panel: u32, node: u32) -> bool {
+    panel == node
+}
+
+/// 兼容尚未发送 X-Lifecycle-Protocol-Version 的已发布 Node。
+///
+/// v1.1.0-rc.2/rc.3 已经实现完整 node_lifecycle 命令，但当时没有独立 capability
+/// header；这是 rc.4 升级死锁的桥接路径。未来 Node 应显式发送 lifecycle header，
+/// Panel 在 header 存在时不会再靠产品版本猜测能力。
+pub fn legacy_node_supports_lifecycle(version: Option<&str>) -> bool {
+    let Some(raw) = version else {
+        return false;
+    };
+    let version = raw.trim().trim_start_matches('v');
+    if version.is_empty() {
+        return false;
+    }
+
+    if let Some(rc) = version
+        .strip_prefix("1.0.0-rc.")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return rc >= 5;
+    }
+    if let Some(rc) = version
+        .strip_prefix("1.1.0-rc.")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return rc >= 2;
+    }
+
+    // 其它 prerelease：只把明显晚于当前 1.1 线的版本视为具备 lifecycle。
+    // 1.1.0-rc.1 已知不能作为跨协议桥接基线，因此上面会明确返回 false。
+    let base = version.split('-').next().unwrap_or("");
+    let mut parts = base.split('.');
+    let parsed = (
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+    );
+    let Some((major, minor, patch)) = match parsed {
+        (Some(major), Some(minor), Some(patch)) => Some((major, minor, patch)),
+        _ => None,
+    } else {
+        return false;
+    };
+
+    if version.contains('-') {
+        (major, minor, patch) > (1, 1, 0)
+    } else {
+        (major, minor, patch) >= (1, 0, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_protocol_is_independent_and_exact() {
+        assert!(lifecycle_protocol_versions_compatible(1, 1));
+        assert!(!lifecycle_protocol_versions_compatible(1, 2));
+    }
+
+    #[test]
+    fn legacy_bridge_recognizes_shipped_upgrade_capable_nodes() {
+        assert!(legacy_node_supports_lifecycle(Some("1.1.0-rc.2")));
+        assert!(legacy_node_supports_lifecycle(Some("v1.1.0-rc.3")));
+        assert!(legacy_node_supports_lifecycle(Some("1.0.0-rc.5")));
+        assert!(legacy_node_supports_lifecycle(Some("1.2.3")));
+        assert!(legacy_node_supports_lifecycle(Some("2.0.0-rc.1")));
+        assert!(!legacy_node_supports_lifecycle(Some("1.1.0-rc.1")));
+        assert!(!legacy_node_supports_lifecycle(Some("1.0.0-rc.4")));
+        assert!(!legacy_node_supports_lifecycle(Some("invalid")));
+        assert!(!legacy_node_supports_lifecycle(None));
+    }
+}
+''')
+
+          replace_once(
+              'crates/shared/src/lib.rs',
+              'pub mod models;\npub mod money;\npub mod protocol;\npub mod reconciliation;\n',
+              'pub mod control_protocol;\npub mod models;\npub mod money;\npub mod protocol;\npub mod reconciliation;\n',
+          )
+
+          # 2) New Nodes advertise lifecycle protocol separately from config protocol.
+          replace_once(
+              'crates/node/src/ws_client.rs',
+              '''    if let Ok(v) = relay_shared::protocol::CONFIG_PROTOCOL_VERSION\n        .to_string()\n        .parse()\n    {\n        request.headers_mut().insert("X-Config-Protocol-Version", v);\n    }\n''',
+              '''    if let Ok(v) = relay_shared::protocol::CONFIG_PROTOCOL_VERSION\n        .to_string()\n        .parse()\n    {\n        request.headers_mut().insert("X-Config-Protocol-Version", v);\n    }\n    // Lifecycle protocol is intentionally independent from config protocol. A\n    // future config bump may put this connection into upgrade-only mode, but\n    // the Panel must still be able to deliver a signed/validated Node upgrade.\n    if let Ok(v) = relay_shared::control_protocol::LIFECYCLE_PROTOCOL_VERSION\n        .to_string()\n        .parse()\n    {\n        request\n            .headers_mut()\n            .insert("X-Lifecycle-Protocol-Version", v);\n    }\n''',
+          )
+
+          # 3) Panel WS registry knows normal vs upgrade-only connections.
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              'use relay_shared::protocol::NodeConfigResponse;\n',
+              '''use relay_shared::control_protocol::{\n    legacy_node_supports_lifecycle, lifecycle_protocol_versions_compatible,\n    LIFECYCLE_PROTOCOL_VERSION,\n};\nuse relay_shared::protocol::NodeConfigResponse;\n''',
+          )
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              '''struct ConnEntry {\n    tx: mpsc::UnboundedSender<String>,\n    node_id: Option<String>,\n}\n''',
+              '''struct ConnEntry {\n    tx: mpsc::UnboundedSender<String>,\n    node_id: Option<String>,\n    /// false = upgrade-only: never receive config snapshots/config_changed or\n    /// ordinary control commands from a newer Panel.\n    config_compatible: bool,\n    /// Independent lifecycle capability. An upgrade-only connection must have\n    /// this true or it is rejected during the WS handshake.\n    lifecycle_capable: bool,\n}\n''',
+          )
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              '''    pub async fn register(\n        &self,\n        group_id: i64,\n        node_id: Option<String>,\n    ) -> (u64, mpsc::UnboundedReceiver<String>) {\n        let conn_id = self.next_id.fetch_add(1, Ordering::Relaxed);\n        let (tx, rx) = mpsc::unbounded_channel();\n        self.inner\n            .write()\n            .await\n            .entry(group_id)\n            .or_default()\n            .insert(conn_id, ConnEntry { tx, node_id });\n        (conn_id, rx)\n    }\n''',
+              '''    pub async fn register(\n        &self,\n        group_id: i64,\n        node_id: Option<String>,\n    ) -> (u64, mpsc::UnboundedReceiver<String>) {\n        self.register_with_capabilities(group_id, node_id, true, true)\n            .await\n    }\n\n    async fn register_with_capabilities(\n        &self,\n        group_id: i64,\n        node_id: Option<String>,\n        config_compatible: bool,\n        lifecycle_capable: bool,\n    ) -> (u64, mpsc::UnboundedReceiver<String>) {\n        let conn_id = self.next_id.fetch_add(1, Ordering::Relaxed);\n        let (tx, rx) = mpsc::unbounded_channel();\n        self.inner.write().await.entry(group_id).or_default().insert(\n            conn_id,\n            ConnEntry {\n                tx,\n                node_id,\n                config_compatible,\n                lifecycle_capable,\n            },\n        );\n        (conn_id, rx)\n    }\n''',
+          )
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              '''    pub async fn broadcast_all(&self, msg: &str) {\n        let mut map = self.inner.write().await;\n        for conns in map.values_mut() {\n            conns.retain(|_, e| e.tx.send(msg.to_string()).is_ok());\n        }\n    }\n''',
+              '''    pub async fn broadcast_all(&self, msg: &str) {\n        let mut map = self.inner.write().await;\n        for conns in map.values_mut() {\n            conns.retain(|_, e| {\n                // Upgrade-only nodes intentionally keep their LKG and must not\n                // even be told that a newer config exists.\n                !e.config_compatible || e.tx.send(msg.to_string()).is_ok()\n            });\n        }\n    }\n''',
+          )
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              '''        conns.retain(|_, e| {\n            if e.node_id.as_deref() != Some(node_id) {\n                return true; // not the target node — leave untouched\n            }\n            if e.tx.send(msg.to_string()).is_ok() {\n                sent += 1;\n                true\n            } else {\n                false // target but dead — prune\n            }\n        });\n''',
+              '''        conns.retain(|_, e| {\n            if e.node_id.as_deref() != Some(node_id) || !e.config_compatible {\n                return true; // not target or upgrade-only — leave untouched\n            }\n            if e.tx.send(msg.to_string()).is_ok() {\n                sent += 1;\n                true\n            } else {\n                false // target but dead — prune\n            }\n        });\n''',
+          )
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              '''        sent\n    }\n\n    /// v0.4.14: the set of node_ids in a group that currently have a live WS\n''',
+              '''        sent\n    }\n\n    /// Deliver the one operation that must survive config-protocol skew.\n    /// Upgrade-only connections are eligible, but only when the node advertised\n    /// (or is a known legacy implementation of) the stable lifecycle protocol.\n    pub async fn send_upgrade_node(&self, group_id: i64, node_id: &str, msg: &str) -> usize {\n        let mut map = self.inner.write().await;\n        let Some(conns) = map.get_mut(&group_id) else {\n            return 0;\n        };\n        let mut sent = 0usize;\n        conns.retain(|_, e| {\n            if e.node_id.as_deref() != Some(node_id) || !e.lifecycle_capable {\n                return true;\n            }\n            if e.tx.send(msg.to_string()).is_ok() {\n                sent += 1;\n                true\n            } else {\n                false\n            }\n        });\n        if conns.is_empty() {\n            map.remove(&group_id);\n        }\n        sent\n    }\n\n    /// v0.4.14: the set of node_ids in a group that currently have a live WS\n''',
+          )
+
+          # Remove the old config gate before authentication. Config mismatch is
+          # now handled after authentication/capability detection.
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              '''\n    // v0.4.0: config-protocol gate. A node whose X-Config-Protocol-Version\n    // header is absent or doesn't match the panel's is refused at upgrade time\n    // (426 Upgrade Required) with a structured JSON body so the node can log\n    // the exact mismatch. NOT a transient error — the node must back off.\n    if !crate::api::node::config_protocol_compatible(&headers) {\n        let received = crate::api::node::extract_config_protocol_version(&headers);\n        return (\n            axum::http::StatusCode::UPGRADE_REQUIRED,\n            axum::Json(serde_json::json!({\n                "code": "CONFIG_PROTOCOL_MISMATCH",\n                "required": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,\n                "received": received,\n                "message": "relay-node configuration protocol is incompatible; \\\n                            upgrade relay-node to match the panel"\n            })),\n        )\n            .into_response();\n    }\n''',
+              '\n',
+          )
+
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              '''    let node_architecture = headers\n        .get("X-Node-Architecture")\n        .and_then(|value| value.to_str().ok())\n        .map(str::trim)\n        .filter(|value| !value.is_empty())\n        .map(str::to_string);\n    // Clone the Arc<dyn Repository> so the WS task can keep using it after the\n''',
+              '''    let node_architecture = headers\n        .get("X-Node-Architecture")\n        .and_then(|value| value.to_str().ok())\n        .map(str::trim)\n        .filter(|value| !value.is_empty())\n        .map(str::to_string);\n\n    let config_compatible = crate::api::node::config_protocol_compatible(&headers);\n    let lifecycle_protocol = headers\n        .get("X-Lifecycle-Protocol-Version")\n        .and_then(|value| value.to_str().ok())\n        .and_then(|value| value.trim().parse::<u32>().ok());\n    let lifecycle_capable = match lifecycle_protocol {\n        Some(version) => lifecycle_protocol_versions_compatible(\n            LIFECYCLE_PROTOCOL_VERSION,\n            version,\n        ),\n        None => legacy_node_supports_lifecycle(node_version.as_deref()),\n    };\n\n    // Config mismatch is no longer allowed to kill the upgrade path. A known\n    // lifecycle-capable node with a stable node_id is accepted as upgrade-only:\n    // no config snapshot, no config_changed, no diagnose/restart/uninstall.\n    if !config_compatible && (node_id.is_none() || !lifecycle_capable) {\n        let received = crate::api::node::extract_config_protocol_version(&headers);\n        return (\n            axum::http::StatusCode::UPGRADE_REQUIRED,\n            axum::Json(serde_json::json!({\n                "code": "CONFIG_PROTOCOL_MISMATCH",\n                "required": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,\n                "received": received,\n                "message": "relay-node configuration protocol is incompatible and this node has no compatible lifecycle upgrade channel"\n            })),\n        )\n            .into_response();\n    }\n    if !config_compatible {\n        tracing::warn!(\n            node_id = ?node_id,\n            node_version = ?node_version,\n            config_protocol = ?crate::api::node::extract_config_protocol_version(&headers),\n            lifecycle_protocol = ?lifecycle_protocol,\n            "websocket accepted in upgrade-only mode due to config protocol mismatch"\n        );\n    }\n    // Clone the Arc<dyn Repository> so the WS task can keep using it after the\n''',
+          )
+
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              '''            node_architecture,\n            state,\n''',
+              '''            node_architecture,\n            config_compatible,\n            lifecycle_capable,\n            state,\n''',
+          )
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              '''    node_architecture: Option<String>,\n    state: AppState,\n''',
+              '''    node_architecture: Option<String>,\n    config_compatible: bool,\n    lifecycle_capable: bool,\n    state: AppState,\n''',
+          )
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              '''    let lifecycle_node_id = node_id.clone();\n    let (conn_id, mut push_rx) = node_connections.register(group_id, node_id).await;\n''',
+              '''    let lifecycle_node_id = node_id.clone();\n    let (conn_id, mut push_rx) = node_connections\n        .register_with_capabilities(\n            group_id,\n            node_id,\n            config_compatible,\n            lifecycle_capable,\n        )\n        .await;\n''',
+          )
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              '''    if let Some(config) = build_config_snapshot(db.as_ref(), group_id).await {\n        if let Ok(config_json) = serde_json::to_string(&config) {\n            let _ = sender.send(Message::Text(config_json.into())).await;\n        }\n    }\n''',
+              '''    if config_compatible {\n        if let Some(config) = build_config_snapshot(db.as_ref(), group_id).await {\n            if let Ok(config_json) = serde_json::to_string(&config) {\n                let _ = sender.send(Message::Text(config_json.into())).await;\n            }\n        }\n    }\n''',
+          )
+
+          # Add regression test: mismatched connection receives only upgrade.
+          replace_once(
+              'crates/panel/src/api/ws.rs',
+              '''    /// online_node_ids returns the node_ids with a live connection; older nodes\n''',
+              '''    #[tokio::test]\n    async fn upgrade_only_connection_receives_upgrade_but_no_config_control() {\n        let conns = NodeConnections::new();\n        let (_, mut old_rx) = conns\n            .register_with_capabilities(1, Some("old-node".into()), false, true)\n            .await;\n        let (_, mut current_rx) = conns\n            .register_with_capabilities(1, Some("current-node".into()), true, true)\n            .await;\n\n        conns.broadcast_all(r#"{"type":"config_changed"}"#).await;\n        assert!(old_rx.try_recv().is_err(), "upgrade-only node must not receive config_changed");\n        assert_eq!(current_rx.recv().await.as_deref(), Some(r#"{"type":"config_changed"}"#));\n\n        assert_eq!(conns.send_node(1, "old-node", "diagnose").await, 0);\n        assert!(old_rx.try_recv().is_err(), "ordinary control must be blocked");\n\n        assert_eq!(conns.send_upgrade_node(1, "old-node", "upgrade").await, 1);\n        assert_eq!(old_rx.recv().await.as_deref(), Some("upgrade"));\n\n        // It remains an authenticated online node so the UI can offer Upgrade.\n        assert!(conns.online_node_ids(1).await.contains("old-node"));\n    }\n\n    /// online_node_ids returns the node_ids with a live connection; older nodes\n''',
+          )
+
+          # 4) Lifecycle eligibility must not depend on current config protocol.
+          replace_once(
+              'crates/panel/src/api/node_ops.rs',
+              '''fn status_supports_lifecycle(\n    status: Option<&serde_json::Value>,\n    current_version: Option<&str>,\n) -> bool {\n    // Historical nodes with an explicitly known lifecycle wire capability\n    // remain supported. All modern Reality Panel releases use the stable\n    // semver floor plus the reported config protocol instead of adding a\n    // new product-version exception for every future release line.\n    if relay_shared::protocol::node_supports_lifecycle(current_version) {\n        return true;\n    }\n    if !is_modern_reality_panel_release(current_version) {\n        return false;\n    }\n    status\n        .and_then(|value| value.get("config_protocol_version"))\n        .and_then(|value| value.as_u64())\n        == Some(CONFIG_PROTOCOL_VERSION as u64)\n}\n''',
+              '''fn status_supports_lifecycle(\n    status: Option<&serde_json::Value>,\n    current_version: Option<&str>,\n) -> bool {\n    // Cross-config-protocol upgrades MUST stay possible. Known shipped nodes\n    // with lifecycle support therefore pass independently of the config gate.\n    if relay_shared::control_protocol::legacy_node_supports_lifecycle(current_version)\n        || relay_shared::protocol::node_supports_lifecycle(current_version)\n    {\n        return true;\n    }\n    // Preserve the historical current-protocol path for older modern builds.\n    if !is_modern_reality_panel_release(current_version) {\n        return false;\n    }\n    status\n        .and_then(|value| value.get("config_protocol_version"))\n        .and_then(|value| value.as_u64())\n        == Some(CONFIG_PROTOCOL_VERSION as u64)\n}\n''',
+          )
+
+          replace_once(
+              'crates/panel/src/api/node_ops.rs',
+              '''    if !status_supports_lifecycle(status.as_ref(), current_version.as_deref()) {\n        return Err(response::<()>(\n            StatusCode::CONFLICT,\n            409,\n            "NODE_LIFECYCLE_UNSUPPORTED",\n        ));\n    }\n    let mut target_version = None;\n''',
+              '''    if !status_supports_lifecycle(status.as_ref(), current_version.as_deref()) {\n        return Err(response::<()>(\n            StatusCode::CONFLICT,\n            409,\n            "NODE_LIFECYCLE_UNSUPPORTED",\n        ));\n    }\n    let config_compatible = status\n        .as_ref()\n        .and_then(|value| value.get("config_protocol_version"))\n        .and_then(|value| value.as_u64())\n        == Some(CONFIG_PROTOCOL_VERSION as u64);\n    if action != NodeLifecycleAction::Upgrade && !config_compatible {\n        return Err(response::<()>(\n            StatusCode::CONFLICT,\n            409,\n            "NODE_CONFIG_PROTOCOL_MISMATCH",\n        ));\n    }\n    let mut target_version = None;\n''',
+          )
+
+          replace_once(
+              'crates/panel/src/api/node_ops.rs',
+              '''    if state\n        .node_connections\n        .send_node(group_id, &node_id, &encoded)\n        .await\n        == 0\n    {\n''',
+              '''    let delivered = if action == NodeLifecycleAction::Upgrade {\n        state\n            .node_connections\n            .send_upgrade_node(group_id, &node_id, &encoded)\n            .await\n    } else {\n        state\n            .node_connections\n            .send_node(group_id, &node_id, &encoded)\n            .await\n    };\n    if delivered == 0 {\n''',
+          )
+
+          # Pin the exact rc.3 -> future config bump regression.
+          replace_once(
+              'crates/panel/src/api/node_ops.rs',
+              '''        assert!(!status_supports_lifecycle(\n            Some(&legacy_protocol),\n            Some("1.1.0-rc.1")\n        ));\n        assert!(!status_supports_lifecycle(None, Some("1.1.0-rc.1")));\n\n        // Explicitly-known historical lifecycle versions keep their\n''',
+              '''        assert!(!status_supports_lifecycle(\n            Some(&legacy_protocol),\n            Some("1.1.0-rc.1")\n        ));\n        assert!(!status_supports_lifecycle(None, Some("1.1.0-rc.1")));\n        // rc.2/rc.3 already shipped node_lifecycle. A config protocol bump must\n        // never make their one-click upgrade path disappear.\n        assert!(status_supports_lifecycle(\n            Some(&legacy_protocol),\n            Some("1.1.0-rc.3")\n        ));\n\n        // Explicitly-known historical lifecycle versions keep their\n''',
+          )
+
+          # 5) UI: protocol mismatch disables normal lifecycle actions but NOT Upgrade.
+          replace_once(
+              'frontend/src/components/nodes/NodeDesktopTable.tsx',
+              '''        const target = artifactVersions[arch];\n        const lifecycleReady = !!r.node_id && !!r.online && r.install_method === 'systemd';\n        const canUpgrade = lifecycleReady && !!target && target !== r.node_version;\n''',
+              '''        const target = artifactVersions[arch];\n        const lifecycleReady = !!r.node_id && !!r.online && r.install_method === 'systemd';\n        const protocolCompatible = r.config_protocol_version == null || panelProtocol <= 0 || r.config_protocol_version === panelProtocol;\n        // Config protocol skew deliberately leaves Upgrade enabled. All other\n        // lifecycle controls remain disabled until the Node reconnects on the\n        // current config protocol.\n        const normalLifecycleReady = lifecycleReady && protocolCompatible;\n        const canUpgrade = lifecycleReady && !!target && target !== r.node_version;\n''',
+          )
+          replace_once(
+              'frontend/src/components/nodes/NodeDesktopTable.tsx',
+              '''            <Tooltip title={t('nodeLogs')}><Button size="small" type="text" icon={<FileTextOutlined />} disabled={!r.node_id || !r.online} aria-label={t('nodeLogs')} onClick={() => onLifecycle(r, 'logs')} /></Tooltip>\n            <Tooltip title={t('nodeRestart')}><Button size="small" type="text" icon={<ReloadOutlined />} disabled={!lifecycleReady} aria-label={t('nodeRestart')} onClick={() => onLifecycle(r, 'restart')} /></Tooltip>\n            <Tooltip title={target ? t('nodeUpgradeTip').replace('{v}', target) : t('nodeArtifactMissing')}><Button size="small" type="text" icon={<CloudDownloadOutlined />} disabled={!canUpgrade} aria-label={t('nodeUpgrade')} onClick={() => onLifecycle(r, 'upgrade')} /></Tooltip>\n            <Tooltip title={t('nodeUninstall')}><Button size="small" type="text" danger icon={<StopOutlined />} disabled={!lifecycleReady} aria-label={t('nodeUninstall')} onClick={() => onLifecycle(r, 'uninstall')} /></Tooltip>\n''',
+              '''            <Tooltip title={t('nodeLogs')}><Button size="small" type="text" icon={<FileTextOutlined />} disabled={!normalLifecycleReady} aria-label={t('nodeLogs')} onClick={() => onLifecycle(r, 'logs')} /></Tooltip>\n            <Tooltip title={t('nodeRestart')}><Button size="small" type="text" icon={<ReloadOutlined />} disabled={!normalLifecycleReady} aria-label={t('nodeRestart')} onClick={() => onLifecycle(r, 'restart')} /></Tooltip>\n            <Tooltip title={target ? t('nodeUpgradeTip').replace('{v}', target) : t('nodeArtifactMissing')}><Button size="small" type="text" icon={<CloudDownloadOutlined />} disabled={!canUpgrade} aria-label={t('nodeUpgrade')} onClick={() => onLifecycle(r, 'upgrade')} /></Tooltip>\n            <Tooltip title={t('nodeUninstall')}><Button size="small" type="text" danger icon={<StopOutlined />} disabled={!normalLifecycleReady} aria-label={t('nodeUninstall')} onClick={() => onLifecycle(r, 'uninstall')} /></Tooltip>\n''',
+          )
+
+          # 6) Chinese maintenance docs record the invariant.
+          replace_once(
+              'docs/NODE.zh-CN.md',
+              '''控制协议保持版本 8。Reality `xver=0` 与可选的 Relay 到后端 HAProxy\nPROXY protocol 是两套机制。启用 PROXY 时，先在远端 Reality/Xray 后端启用\n''',
+              '''配置协议当前为 v9；节点生命周期/一键升级使用独立的 Lifecycle Protocol v1，\n两者不得绑定升级。配置协议不兼容时，已具备 lifecycle 能力的托管 Node 仍可建立\n**upgrade-only** 控制通道：继续使用本地 LKG，不接收新配置、诊断、重启或卸载命令，\n但 Panel 必须仍能向它下发经过版本、架构和 SHA-256 校验的一键升级。这样未来配置协议\n从 v9 升到 v10/v20 时，不会再次出现“因为需要升级，所以反而无法升级”的死锁。\n\nReality `xver=0` 与可选的 Relay 到后端 HAProxy PROXY protocol 是两套机制。启用 PROXY 时，先在远端 Reality/Xray 后端启用\n''',
+          )
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Targeted Rust tests
+        run: |
+          cargo test -p relay-shared control_protocol -- --nocapture
+          cargo test -p relay-panel upgrade_only_connection_receives_upgrade_but_no_config_control -- --nocapture
+          cargo test -p relay-panel modern_reality_panel_lifecycle_uses_semver_and_current_protocol -- --nocapture
+          cargo check --workspace
+
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run typecheck
+
+      - name: Commit validated fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/shared/src/control_protocol.rs crates/shared/src/lib.rs crates/node/src/ws_client.rs crates/panel/src/api/ws.rs crates/panel/src/api/node_ops.rs frontend/src/components/nodes/NodeDesktopTable.tsx docs/NODE.zh-CN.md
+          git diff --cached --check
+          git commit -m 'fix: 配置协议升级时保留节点一键升级通道 [skip ci]'
+          git push origin HEAD:fix/protocol-independent-node-upgrade
