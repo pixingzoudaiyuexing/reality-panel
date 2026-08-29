@@ -7,6 +7,7 @@ permissions:
   contents: write
 jobs:
   apply:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,14 +21,15 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          import textwrap
           path = Path('.github/workflows/fix-protocol-independent-upgrade.yml')
           lines = path.read_text().splitlines(True)
           marker = '      - name: Apply architecture fix\n'
           start_name = lines.index(marker)
           start = next(i for i in range(start_name + 1, len(lines)) if lines[i].strip() == 'run: |')
           end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith('      - name: Format'))
-          script = textwrap.dedent(''.join(lines[start + 1:end]))
+          prefix = '          '
+          block = lines[start + 1:end]
+          script = ''.join(line[len(prefix):] if line.startswith(prefix) else line for line in block)
           Path('/tmp/apply-upgrade-fix.py').write_text(script)
           PY
           python3 /tmp/apply-upgrade-fix.py
