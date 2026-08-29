@@ -1,0 +1,53 @@
+name: Apply Upgrade Fix Driver
+on:
+  push:
+    branches:
+      - fix/protocol-independent-node-upgrade
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/protocol-independent-node-upgrade
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Extract and apply patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+          path = Path('.github/workflows/fix-protocol-independent-upgrade.yml')
+          lines = path.read_text().splitlines(True)
+          marker = '      - name: Apply architecture fix\n'
+          start_name = lines.index(marker)
+          start = next(i for i in range(start_name + 1, len(lines)) if lines[i].strip() == 'run: |')
+          end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith('      - name: Format'))
+          script = textwrap.dedent(''.join(lines[start + 1:end]))
+          Path('/tmp/apply-upgrade-fix.py').write_text(script)
+          PY
+          python3 /tmp/apply-upgrade-fix.py
+      - name: Format and targeted tests
+        run: |
+          cargo fmt --all
+          cargo test -p relay-shared control_protocol -- --nocapture
+          cargo test -p relay-panel upgrade_only_connection_receives_upgrade_but_no_config_control -- --nocapture
+          cargo test -p relay-panel modern_reality_panel_lifecycle_uses_semver_and_current_protocol -- --nocapture
+          cargo check --workspace
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run typecheck
+      - name: Commit fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/shared/src/control_protocol.rs crates/shared/src/lib.rs crates/node/src/ws_client.rs crates/panel/src/api/ws.rs crates/panel/src/api/node_ops.rs frontend/src/components/nodes/NodeDesktopTable.tsx docs/NODE.zh-CN.md
+          git diff --cached --check
+          git commit -m 'fix: 配置协议升级时保留节点一键升级通道 [skip ci]'
+          git push origin HEAD:fix/protocol-independent-node-upgrade
