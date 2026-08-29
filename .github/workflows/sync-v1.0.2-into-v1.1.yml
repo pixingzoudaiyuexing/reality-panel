@@ -2,7 +2,8 @@ name: Sync v1.0.2 into v1.1 RC
 
 on:
   push:
-    branches: ["feature/v1.1-relay-preference"]
+    branches:
+      - feature/v1.1-relay-preference
 
 permissions:
   contents: write
@@ -13,7 +14,6 @@ concurrency:
 
 jobs:
   merge-and-verify:
-    if: github.event.head_commit.message == 'chore: temporary v1.0.2 sync runner'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +25,7 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: Merge current main and resolve known overlap
+      - name: Merge main and resolve known overlap
         shell: bash
         run: |
           set -euo pipefail
@@ -35,71 +35,14 @@ jobs:
           merge_rc=$?
           set -e
           if [[ $merge_rc -ne 0 && ! -f .git/MERGE_HEAD ]]; then
-            echo "main merge failed before a merge state was created" >&2
             exit "$merge_rc"
           fi
-
-          for path in \
-            crates/panel/src/api/admin/mod.rs \
-            frontend/src/api/types.ts \
-            frontend/src/i18n/en-US.ts \
-            frontend/src/i18n/zh-CN.ts; do
+          for path in crates/panel/src/api/admin/mod.rs frontend/src/api/types.ts frontend/src/i18n/en-US.ts frontend/src/i18n/zh-CN.ts; do
             if git ls-files -u -- "$path" | grep -q .; then
               git checkout --ours -- "$path"
             fi
           done
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          def replace_once(path: str, old: str, new: str) -> None:
-              p = Path(path)
-              text = p.read_text()
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{path}: expected exactly one anchor, found {count}: {old!r}")
-              p.write_text(text.replace(old, new, 1))
-
-          # Keep v1.1 admin test changes while carrying the v1.0.2 SiteConfig field.
-          admin = Path("crates/panel/src/api/admin/mod.rs")
-          text = admin.read_text()
-          if "public_panel_url: String::new()," not in text:
-              replace_once(
-                  str(admin),
-                  '                contact: "tg:@someone".into(),\n',
-                  '                contact: "tg:@someone".into(),\n                public_panel_url: String::new(),\n',
-              )
-
-          # Keep Relay Preference API types and add the v1.0.2 admin-only setting field.
-          types = Path("frontend/src/api/types.ts")
-          text = types.read_text()
-          if "public_panel_url: string;" not in text:
-              replace_once(
-                  str(types),
-                  "export interface SiteConfig extends PublicSite, SiteNotice {}\n",
-                  "export interface SiteConfig extends PublicSite, SiteNotice {\n  /** 管理员配置的节点 Bootstrap / Enrollment 公网根地址。 */\n  public_panel_url: string;\n}\n",
-              )
-
-          en = Path("frontend/src/i18n/en-US.ts")
-          text = en.read_text()
-          if "panelPublicUrl: 'Panel public URL'" not in text:
-              replace_once(
-                  str(en),
-                  "  siteNameHint: 'Shown on the login page, in the sidebar, and as the browser tab title. Empty falls back to RealityPanel.',\n",
-                  "  siteNameHint: 'Shown on the login page, in the sidebar, and as the browser tab title. Empty falls back to RealityPanel.',\n  panelPublicUrl: 'Panel public URL',\n  panelPublicUrlHint: 'Used for Node Bootstrap, Enrollment, and generated public links. Example: https://panel.example.com. Leave empty to keep using PUBLIC_PANEL_URL from the deployment environment.',\n  panelPublicUrlInvalid: 'Enter a valid http:// or https:// root URL without a path, query, credentials, or fragment.',\n",
-              )
-
-          zh = Path("frontend/src/i18n/zh-CN.ts")
-          text = zh.read_text()
-          if "panelPublicUrl: '面板公网地址'" not in text:
-              replace_once(
-                  str(zh),
-                  "  siteNameHint: '显示在登录页、左侧边栏和浏览器标签标题。留空则使用 RealityPanel。',\n",
-                  "  siteNameHint: '显示在登录页、左侧边栏和浏览器标签标题。留空则使用 RealityPanel。',\n  panelPublicUrl: '面板公网地址',\n  panelPublicUrlHint: '用于节点 Bootstrap、Enrollment 及面板生成的对外访问链接。例如：https://panel.example.com。留空时继续使用部署环境中的 PUBLIC_PANEL_URL。',\n  panelPublicUrlInvalid: '请输入有效的 http:// 或 https:// 根地址，不能包含路径、查询参数或账号密码。',\n",
-              )
-          PY
-
-          # Verify the hotfix really exists after conflict resolution.
+          python3 .github/scripts/sync-v1.0.2-into-v1.1.py
           grep -q 'pub public_panel_url: String' crates/panel/src/service/site.rs
           grep -q 'effective_public_panel_url' crates/panel/src/api/provisioning.rs
           grep -q 'public_panel_url: string;' frontend/src/api/types.ts
@@ -108,21 +51,9 @@ jobs:
           grep -q 'name="public_panel_url"' frontend/src/pages/SiteSettings.tsx
           grep -q 'version = "1.1.0-rc.1"' crates/panel/Cargo.toml
           grep -q 'version = "1.1.0-rc.1"' crates/node/Cargo.toml
-
-          git rm .github/workflows/sync-v1.0.2-into-v1.1.yml
-          git add \
-            crates/panel/src/api/admin/mod.rs \
-            crates/panel/src/api/node_deploy.rs \
-            crates/panel/src/api/node_enrollment.rs \
-            crates/panel/src/api/provisioning.rs \
-            crates/panel/src/api/site.rs \
-            crates/panel/src/service/site.rs \
-            frontend/src/api/types.ts \
-            frontend/src/i18n/en-US.ts \
-            frontend/src/i18n/zh-CN.ts \
-            frontend/src/pages/SiteSettings.tsx
+          git rm .github/scripts/sync-v1.0.2-into-v1.1.py .github/workflows/sync-v1.0.2-into-v1.1.yml
+          git add crates/panel/src/api/admin/mod.rs crates/panel/src/api/node_deploy.rs crates/panel/src/api/node_enrollment.rs crates/panel/src/api/provisioning.rs crates/panel/src/api/site.rs crates/panel/src/service/site.rs frontend/src/api/types.ts frontend/src/i18n/en-US.ts frontend/src/i18n/zh-CN.ts frontend/src/pages/SiteSettings.tsx
           git diff --cached --check
-
       - name: Rust verification
         run: |
           cargo fmt --all -- --check
@@ -132,7 +63,6 @@ jobs:
           bash scripts/check-repo-test-parity.sh
           bash scripts/release-check.sh
           git diff --check
-
       - name: Frontend verification
         working-directory: frontend
         run: |
@@ -140,7 +70,6 @@ jobs:
           npm run typecheck
           npm test
           npm run build
-
       - name: Commit merge and push
         shell: bash
         run: |
