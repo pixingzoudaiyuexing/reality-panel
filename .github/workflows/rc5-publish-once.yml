@@ -49,7 +49,8 @@ jobs:
 
       - name: Validate release source and versions
         run: |
-          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)" = "$RELEASE_SHA"
           bash scripts/release-version-contract.sh "$RELEASE_TAG"
           cargo fmt --all -- --check
           cargo check --workspace --locked
