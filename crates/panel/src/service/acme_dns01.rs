@@ -15,7 +15,7 @@ use hickory_resolver::TokioAsyncResolver;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -26,7 +26,11 @@ const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(120);
 const PROPAGATION_INTERVAL: Duration = Duration::from_secs(5);
 const PAGE_LIMIT: u16 = 100;
 
-static SNI_OPERATIONS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+// 同一个 SNI 的 TXT read-modify-write 必须串行，避免两个 Relay 同时读取旧值后
+// 相互覆盖；但锁只覆盖 DNS 提交/清理的临界区，绝不能覆盖传播等待和 CA 验证。
+// Weak 避免长期运行的 Panel 因历史 SNI 不断累积锁对象。
+static SNI_OPERATIONS: Lazy<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AcmeDns01Request {
@@ -81,24 +85,17 @@ impl AcmeDns01Error {
     }
 }
 
-struct SniOperationLease(String);
-
-impl Drop for SniOperationLease {
-    fn drop(&mut self) {
-        if let Ok(mut operations) = SNI_OPERATIONS.lock() {
-            operations.remove(&self.0);
-        }
-    }
-}
-
-fn acquire_sni(sni: &str) -> Result<SniOperationLease, AcmeDns01Error> {
+fn sni_operation(sni: &str) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>, AcmeDns01Error> {
     let mut operations = SNI_OPERATIONS
         .lock()
         .map_err(|_| AcmeDns01Error::Conflict)?;
-    if !operations.insert(sni.to_string()) {
-        return Err(AcmeDns01Error::Conflict);
+    if let Some(operation) = operations.get(sni).and_then(std::sync::Weak::upgrade) {
+        return Ok(operation);
     }
-    Ok(SniOperationLease(sni.to_string()))
+    operations.retain(|_, operation| operation.strong_count() > 0);
+    let operation = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    operations.insert(sni.to_string(), std::sync::Arc::downgrade(&operation));
+    Ok(operation)
 }
 
 pub async fn present(
@@ -116,12 +113,10 @@ async fn present_with_observer(
     propagation: &dyn TxtPropagationObserver,
 ) -> Result<AcmeDns01Response, AcmeDns01Error> {
     let sni = validate_request(request)?;
-    let _lease = acquire_sni(&sni)?;
     let client = load_client(db)
         .await
         .map_err(|_| AcmeDns01Error::Provider)?
         .ok_or(AcmeDns01Error::Unavailable)?;
-    cleanup_expired_for_sni(db, &client, &sni).await;
 
     let challenge_id = challenge_id(&request.node_id, &sni, &request.value);
     let key = state_key(&challenge_id);
@@ -139,7 +134,6 @@ async fn present_with_observer(
         }
     }
 
-    reject_other_active_challenge(db, &sni, &challenge_id).await?;
     let txt_fqdn = format!("_acme-challenge.{sni}");
     let sni_fqdn = normalize_fqdn(&sni).map_err(|_| AcmeDns01Error::InvalidRequest)?;
     let zone = match resolve_zone(&client, &sni_fqdn).await {
@@ -177,24 +171,30 @@ async fn present_with_observer(
     };
     persist_state(db, &state).await?;
 
-    let result = present_provider_value(&client, &state, &request.value, ttl).await;
-    let record_id = match result {
-        Ok(record_id) => record_id,
-        Err(error) => {
-            state.cleanup_state = "CLEANUP_PENDING".into();
-            let _ = persist_state(db, &state).await;
-            return Err(error);
-        }
-    };
-    state.provider_record_id = Some(record_id);
-    state.cleanup_state = "PROPAGATING".into();
-    persist_state(db, &state).await?;
+    let operation = sni_operation(&sni)?;
+    {
+        let _guard = operation.lock().await;
+        cleanup_expired_for_sni(db, &client, &sni).await;
+        let result = present_provider_value(&client, &state, &request.value, ttl).await;
+        let record_id = match result {
+            Ok(record_id) => record_id,
+            Err(error) => {
+                state.cleanup_state = "CLEANUP_PENDING".into();
+                let _ = persist_state(db, &state).await;
+                return Err(error);
+            }
+        };
+        state.provider_record_id = Some(record_id);
+        state.cleanup_state = "PROPAGATING".into();
+        persist_state(db, &state).await?;
+    }
 
     if propagation
         .wait_for_value(&txt_fqdn, &zone.zone_name, &request.value)
         .await
         .is_err()
     {
+        let _guard = operation.lock().await;
         let _ = cleanup_state(db, &client, &mut state).await;
         return Err(AcmeDns01Error::PropagationTimeout);
     }
@@ -226,7 +226,6 @@ pub async fn cleanup(
     request: &AcmeDns01Request,
 ) -> Result<AcmeDns01Response, AcmeDns01Error> {
     let sni = validate_request(request)?;
-    let _lease = acquire_sni(&sni)?;
     let challenge_id = challenge_id(&request.node_id, &sni, &request.value);
     let key = state_key(&challenge_id);
     let Some(raw) = db.get(&key).await.map_err(|_| AcmeDns01Error::Database)? else {
@@ -254,6 +253,8 @@ pub async fn cleanup(
         .await
         .map_err(|_| AcmeDns01Error::Provider)?
         .ok_or(AcmeDns01Error::Unavailable)?;
+    let operation = sni_operation(&sni)?;
+    let _guard = operation.lock().await;
     cleanup_state(db, &client, &mut state).await?;
     Ok(AcmeDns01Response {
         challenge_id,
@@ -273,14 +274,17 @@ pub async fn cleanup_expired(db: &dyn Repository) {
             continue;
         };
         if state.cleanup_state != "CLEANED" && state.expires_at <= Utc::now() {
-            let Ok(_lease) = acquire_sni(&state.sni) else {
+            let Ok(operation) = sni_operation(&state.sni) else {
                 continue;
             };
+            let _guard = operation.lock().await;
             let _ = cleanup_state(db, &client, &mut state).await;
         }
     }
 }
 
+// 调用者必须持有对应 SNI 的 operation lock；这样过期清理和新的 present
+// 共用同一段 TXT read-modify-write 临界区，不会误删其他 Relay 的 value。
 async fn cleanup_expired_for_sni(db: &dyn Repository, client: &DnsMgrClient, sni: &str) {
     let Ok(rows) = db.scan_prefix(STATE_PREFIX).await else {
         return;
@@ -293,29 +297,6 @@ async fn cleanup_expired_for_sni(db: &dyn Repository, client: &DnsMgrClient, sni
             let _ = cleanup_state(db, client, &mut state).await;
         }
     }
-}
-
-async fn reject_other_active_challenge(
-    db: &dyn Repository,
-    sni: &str,
-    challenge_id: &str,
-) -> Result<(), AcmeDns01Error> {
-    for (_, raw) in db
-        .scan_prefix(STATE_PREFIX)
-        .await
-        .map_err(|_| AcmeDns01Error::Database)?
-    {
-        let state: ChallengeState =
-            serde_json::from_str(&raw).map_err(|_| AcmeDns01Error::Database)?;
-        if state.sni == sni
-            && state.challenge_id != challenge_id
-            && state.cleanup_state != "CLEANED"
-            && state.expires_at > Utc::now()
-        {
-            return Err(AcmeDns01Error::Conflict);
-        }
-    }
-    Ok(())
 }
 
 async fn present_provider_value(
@@ -793,12 +774,16 @@ mod tests {
         (base_url, state, handle)
     }
 
-    fn request(sni: &str, value: &str) -> AcmeDns01Request {
+    fn request_for(node_id: &str, sni: &str, value: &str) -> AcmeDns01Request {
         AcmeDns01Request {
-            node_id: "node-a".into(),
+            node_id: node_id.into(),
             sni: sni.into(),
             value: value.into(),
         }
+    }
+
+    fn request(sni: &str, value: &str) -> AcmeDns01Request {
+        request_for("node-a", sni, value)
     }
 
     #[test]
@@ -830,16 +815,64 @@ mod tests {
         assert!(!first.contains("challenge-token"));
     }
 
-    #[test]
-    fn same_sni_operations_are_serialized_and_the_lease_is_released() {
-        let first = acquire_sni("serialized.example.com").unwrap();
-        assert!(matches!(
-            acquire_sni("serialized.example.com"),
-            Err(AcmeDns01Error::Conflict)
-        ));
-        assert!(acquire_sni("other.example.com").is_ok());
-        drop(first);
-        assert!(acquire_sni("serialized.example.com").is_ok());
+    #[tokio::test]
+    async fn same_sni_operations_share_a_mutex_without_blocking_other_snis() {
+        let first = sni_operation("serialized.example.com").unwrap();
+        let same = sni_operation("serialized.example.com").unwrap();
+        let other = sni_operation("other.example.com").unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &other));
+
+        let guard = first.lock().await;
+        let waiter_lock = Arc::clone(&same);
+        let waiter = tokio::spawn(async move {
+            let _guard = waiter_lock.lock().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(guard);
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_sni_challenges_share_txt_and_cleanup_independently() {
+        let first_value = "challenge-token-relay-a";
+        let second_value = "challenge-token-relay-b";
+        let sni = "concurrent.example.com";
+        let (base_url, provider, handle) =
+            mock_provider("_acme-challenge.concurrent", Vec::new()).await;
+        let db = test_db(&base_url).await;
+        let first = request_for("node-a", sni, first_value);
+        let second = request_for("node-b", sni, second_value);
+        let propagation = FixedPropagation(true);
+
+        let (first_result, second_result) = tokio::join!(
+            present_with_observer(&db, 10, &first, &propagation),
+            present_with_observer(&db, 10, &second, &propagation),
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+
+        {
+            let state = provider.lock().await;
+            let mut actual = state.values.clone();
+            actual.sort();
+            let mut expected = vec![first_value.to_string(), second_value.to_string()];
+            expected.sort();
+            assert_eq!(actual, expected);
+            assert_eq!((state.creates, state.updates, state.deletes), (1, 1, 0));
+        }
+
+        cleanup(&db, 10, &first).await.unwrap();
+        {
+            let state = provider.lock().await;
+            assert_eq!(state.values, [second_value]);
+        }
+        cleanup(&db, 10, &second).await.unwrap();
+        let state = provider.lock().await;
+        assert!(state.values.is_empty());
+        assert_eq!((state.creates, state.updates, state.deletes), (1, 2, 1));
+        handle.abort();
     }
 
     #[tokio::test]

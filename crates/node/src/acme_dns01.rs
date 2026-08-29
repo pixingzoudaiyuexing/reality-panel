@@ -68,9 +68,16 @@ pub(crate) fn run_hook(args: &[String]) -> Result<(), String> {
         if response.status() == StatusCode::OK {
             Ok(())
         } else {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let code = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| value.get("code")?.as_str().map(str::to_string))
+                .unwrap_or_else(|| "UNKNOWN".to_string());
             Err(format!(
-                "Panel challenge request returned HTTP {}",
-                response.status().as_u16()
+                "Panel challenge request returned HTTP {} code {}",
+                status.as_u16(),
+                code
             ))
         }
     })
