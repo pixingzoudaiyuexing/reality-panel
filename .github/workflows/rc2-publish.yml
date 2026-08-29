@@ -33,6 +33,7 @@ jobs:
 
       - name: Verify immutable tag target
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git rev-parse 'v1.1.0-rc.2^{commit}')" = '15b95beb23617cd3d1fce429d7c4b653d0b5f786'
           test "$(git rev-parse HEAD)" = '15b95beb23617cd3d1fce429d7c4b653d0b5f786'
 
