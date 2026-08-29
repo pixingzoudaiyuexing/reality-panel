@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.0.1] - 2026-08-29
+
+Unified hotfix release. The relay-node runtime behavior and config protocol 8
+remain unchanged; the Node package version is aligned with the Panel release.
+
 ## [1.0.0] - 2026-08-29
 
 First stable relay-node release. This promotes the accepted rc.6 code line
