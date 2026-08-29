@@ -593,7 +593,7 @@ fn validate_policy(
     policy: &CertificateLifecyclePolicy,
 ) -> Result<(), String> {
     if !is_valid_certificate_domain(&policy.domain)
-        || !certificate_name_matches_host(&policy.domain, &site.sni)
+        || !relay_shared::reconciliation::certificate_domain_covers_sni(&policy.domain, &site.sni)
     {
         return Err("certificate domain must cover camouflage SNI".into());
     }
@@ -772,7 +772,7 @@ fn validate_certificate_validity(
         .value
         .general_names
         .iter()
-        .any(|name| matches!(name, GeneralName::DNSName(value) if certificate_name_matches_host(value, domain)))
+        .any(|name| matches!(name, GeneralName::DNSName(value) if relay_shared::reconciliation::certificate_domain_covers_sni(value, domain)))
     {
         return Err("certificate SAN does not match camouflage SNI".into());
     }
@@ -986,20 +986,6 @@ fn is_valid_certificate_domain(value: &str) -> bool {
     }
 }
 
-pub(crate) fn certificate_name_matches_host(certificate_name: &str, host: &str) -> bool {
-    if certificate_name.eq_ignore_ascii_case(host) {
-        return true;
-    }
-    let Some(base) = certificate_name.strip_prefix("*.") else {
-        return false;
-    };
-    let suffix = format!(".{base}");
-    let Some(label) = host.strip_suffix(&suffix) else {
-        return false;
-    };
-    !label.is_empty() && !label.contains('.')
-}
-
 fn certbot_certificate_name(domain: &str) -> Result<String, String> {
     if !is_valid_certificate_domain(domain) {
         return Err("invalid certificate domain".into());
@@ -1163,18 +1149,22 @@ mod tests {
 
     #[test]
     fn wildcard_certificate_scope_covers_exactly_one_label() {
-        assert!(certificate_name_matches_host(
+        assert!(relay_shared::reconciliation::certificate_domain_covers_sni(
             "*.example.com",
             "op1.example.com"
         ));
-        assert!(!certificate_name_matches_host(
-            "*.example.com",
-            "a.b.example.com"
-        ));
-        assert!(!certificate_name_matches_host(
-            "*.example.com",
-            "example.com"
-        ));
+        assert!(
+            !relay_shared::reconciliation::certificate_domain_covers_sni(
+                "*.example.com",
+                "a.b.example.com"
+            )
+        );
+        assert!(
+            !relay_shared::reconciliation::certificate_domain_covers_sni(
+                "*.example.com",
+                "example.com"
+            )
+        );
         assert!(is_valid_certificate_domain("*.example.com"));
         assert!(!is_valid_certificate_domain("*.com"));
     }

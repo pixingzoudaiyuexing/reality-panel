@@ -688,7 +688,7 @@ pub(crate) fn validate_config(config: &NodeConfigResponse) -> Result<(), String>
             || site.tls_listener_port != 8443
             // wildcard 证书只要能覆盖当前 SNI 就是合法配置；这里必须和证书生命周期
             // 共用同一套匹配规则，避免“证书已签发但 desired 被拒绝”的分裂状态。
-            || !crate::forwarder::certificate_lifecycle::certificate_name_matches_host(
+            || !relay_shared::reconciliation::certificate_domain_covers_sni(
                 &site.certificate.domain,
                 &site.sni,
             )

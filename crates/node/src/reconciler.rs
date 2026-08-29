@@ -212,6 +212,7 @@ impl ReconciliationResult {
 
 #[derive(Debug, Default)]
 pub struct Reconciler {
+    latest_panel_snapshot: Option<TrustedSnapshot>,
     last_panel_desired: Option<ConfigFingerprint>,
     last_applied: Option<ConfigFingerprint>,
     pending: Option<PendingApply>,
@@ -304,6 +305,46 @@ impl Reconciler {
             .await;
         self.record_status(&result);
         result
+    }
+
+    /// 证书依赖完成或到达重试时间后，重放最近一次已验证的 Panel desired。
+    /// 该路径仍经过唯一 reconciler mutation path，不创建第二套配置应用逻辑。
+    pub async fn reconcile_latest_panel_desired(
+        &mut self,
+        manager: &Arc<Mutex<ForwarderManager>>,
+        camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    ) -> Option<ReconciliationResult> {
+        let snapshot = self.latest_panel_snapshot.clone()?;
+        let result = self
+            .reconcile_with_paths(
+                manager,
+                camouflage,
+                ReconciliationInput::Trusted(snapshot),
+                poller::current_cache_paths(),
+            )
+            .await;
+        self.record_status(&result);
+        Some(result)
+    }
+
+    #[cfg(test)]
+    async fn reconcile_latest_panel_desired_with_test_paths(
+        &mut self,
+        manager: &Arc<Mutex<ForwarderManager>>,
+        camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+        paths: poller::CachePaths,
+    ) -> Option<ReconciliationResult> {
+        let snapshot = self.latest_panel_snapshot.clone()?;
+        let result = self
+            .reconcile_with_paths(
+                manager,
+                camouflage,
+                ReconciliationInput::Trusted(snapshot),
+                paths,
+            )
+            .await;
+        self.record_status(&result);
+        Some(result)
     }
 
     #[cfg(test)]
@@ -409,6 +450,9 @@ impl Reconciler {
             }
             ReconciliationInput::Untrusted(_) => return ReconciliationResult::untrusted(),
         };
+        if snapshot.source() == AuthoritySource::ValidatedPanel {
+            self.latest_panel_snapshot = Some(snapshot.clone());
+        }
 
         // A failed durable finalization still owns the runtime that was
         // successfully applied from a validated Panel snapshot. If the Panel
@@ -507,7 +551,13 @@ impl Reconciler {
             let withheld_dependency_ready = panel_unchanged
                 && effective_fingerprint != *snapshot.fingerprint()
                 && poller::camouflage_dependencies_ready(camouflage, snapshot.config()).await;
-            if (panel_unchanged || local_recovery) && !withheld_dependency_ready {
+            let withheld_retry_due = panel_unchanged
+                && effective_fingerprint != *snapshot.fingerprint()
+                && crate::forwarder::camouflage_site::desired_retry_due(camouflage).await;
+            if (panel_unchanged || local_recovery)
+                && !withheld_dependency_ready
+                && !withheld_retry_due
+            {
                 let inspection = poller::inspect_runtime(manager, camouflage, &effective).await;
                 if inspection.healthy {
                     return ReconciliationResult {
@@ -579,6 +629,10 @@ impl Reconciler {
             if withheld_dependency_ready {
                 tracing::info!(
                     "previously withheld camouflage dependency is ready; applying desired config"
+                );
+            } else if withheld_retry_due {
+                tracing::info!(
+                    "camouflage dependency retry is due; replaying desired certificate work"
                 );
             }
         }
@@ -1242,7 +1296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_background_camouflage_dependency_reapplies_withheld_listener() {
+    async fn periodic_replay_converges_completed_certificate_without_notify() {
         let dir = std::env::temp_dir().join(format!(
             "relaypanel-reconciler-background-ready-{}-{}",
             std::process::id(),
@@ -1826,7 +1880,7 @@ mod tests {
                 &manager,
                 &camouflage,
                 ReconciliationInput::validated_panel(next).unwrap(),
-                paths,
+                paths.clone(),
             )
             .await;
         assert_eq!(withheld.state, ReconciliationState::DependencyWithheld);
@@ -1850,6 +1904,49 @@ mod tests {
             .await
             .active_snis()
             .contains("op1.example.com"));
+
+        // 模拟后台证书任务已完成但 Notify 没有被消费：不再注入新的
+        // config_changed，后续周期 tick 只重放最近一次已验证 desired，仍必须
+        // 主动完成 listener 与 LKG 收敛。
+        let p1 = modern_camouflage_manifest(&dir).sites.remove(0);
+        let mut q1 = p1.clone();
+        q1.id = "op2_example_com".into();
+        q1.sni = "op2.example.com".into();
+        assert!(camouflage
+            .lock()
+            .await
+            .apply_candidate(CamouflageSitesManifest {
+                sites: vec![p1, q1],
+            }));
+        let converged = reconciler
+            .reconcile_latest_panel_desired_with_test_paths(&manager, &camouflage, paths)
+            .await
+            .expect("validated Panel desired must be retained for dependency wakeup");
+        assert_eq!(converged.state, ReconciliationState::Converged);
+        assert_eq!(
+            manager
+                .lock()
+                .await
+                .nginx_sni_rule_id_for(443, "op1.example.com"),
+            None
+        );
+        assert_eq!(
+            manager
+                .lock()
+                .await
+                .nginx_sni_rule_id_for(443, "op2.example.com"),
+            Some(1)
+        );
+        assert_eq!(
+            camouflage.lock().await.active_snis(),
+            std::collections::HashSet::from(["op2.example.com".to_string()])
+        );
+        let lkg: CamouflageSitesManifest = serde_json::from_slice(
+            &std::fs::read(dir.join("camouflage-state/site-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(lkg.sites.len(), 1);
+        assert_eq!(lkg.sites[0].id, "op2_example_com");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -113,11 +113,14 @@ export function deriveCamouflageStatus(
       const fullyActive = node.online !== false
         && listenerState === 'active'
         && certificate?.site_status === 'active'
-        && certificate.certificate_status === 'active';
+        && ['active', 'renewal_warning'].includes(certificate.certificate_status);
       let state: CamouflageNodeStatusView['state'];
       if (node.online === false) state = 'offline';
       else if (fullyActive) state = 'active';
-      else if (certificate?.site_status === 'failed' || certificate?.certificate_status === 'failed') state = 'failed';
+      else if (
+        ['failed', 'failed_retrying'].includes(certificate?.site_status ?? '')
+        || ['failed', 'failed_retrying'].includes(certificate?.certificate_status ?? '')
+      ) state = 'failed';
       else if (certificate || listenerState === 'withheld') state = 'preparing';
       else state = 'unknown';
       return {
@@ -177,7 +180,7 @@ export function camouflageCertificateMessage(
   translate: (key: string) => string,
 ): string | undefined {
   if (!error) return undefined;
-  if (certificateState === 'active') return translate('certificateRenewalWarning');
+  if (certificateState === 'active' || certificateState === 'renewal_warning') return translate('certificateRenewalWarning');
   if (error.toLowerCase().includes('dns')) return translate('camouflageDnsMismatch');
   return error;
 }

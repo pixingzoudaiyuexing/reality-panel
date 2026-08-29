@@ -362,8 +362,10 @@ fn certificate_and_camouflage(
         remaining_days,
         cert_error,
     ) = inspect_certificate(site.as_ref(), sni.unwrap_or_default());
-    let cert_ok = status.certificate_status == "active"
-        && san_match
+    let cert_ok = matches!(
+        status.certificate_status.as_str(),
+        "active" | "renewal_warning"
+    ) && san_match
         && cert_key_match
         && cert_error.is_none();
     let renewal = renewal_diagnosis(&status);
@@ -407,11 +409,11 @@ fn certificate_and_camouflage(
 
 fn renewal_diagnosis(status: &relay_shared::protocol::CamouflageSiteStatus) -> RealityCheck {
     match status.certificate_status.as_str() {
-        "active" => match status.last_error.as_deref() {
+        "active" | "renewal_warning" => match status.last_error.as_deref() {
             Some(error) => check("warning", error),
             None => check("pass", "no renewal warning reported"),
         },
-        "failed" => check(
+        "failed" | "failed_retrying" => check(
             "fail",
             status
                 .last_error
@@ -590,6 +592,99 @@ async fn report(config: &NodeConfig, result: DiagnoseResult) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forwarder::camouflage_site::{
+        CamouflageSiteConfig, CamouflageSitesManifest, CertificateReference, OPENLIST_BACKEND,
+    };
+    use crate::forwarder::certificate_lifecycle::CertificateLifecycleConfig;
+    use crate::forwarder::nginx_sni::NginxSniConfig;
+    use relay_shared::protocol::{
+        AcmeChallengeMethod, CamouflageCertificatePolicy, CamouflageLocalBackend,
+        CamouflageSiteDesired,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    fn diagnosis_test_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "relay-node-diagnosis-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn diagnosis_certificate(
+        dir: &std::path::Path,
+        name: &str,
+        san: &str,
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> CertificateReference {
+        use rcgen::{CertificateParams, KeyPair};
+        std::fs::create_dir_all(dir).unwrap();
+        let mut params = CertificateParams::new(vec![san.to_string()]).unwrap();
+        params.not_before = not_before;
+        params.not_after = not_after;
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        let cert_path = dir.join(format!("{name}.crt"));
+        let key_path = dir.join(format!("{name}.key"));
+        std::fs::write(&cert_path, certificate.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        CertificateReference {
+            cert_path,
+            key_path,
+            lifecycle: None,
+        }
+    }
+
+    fn diagnosis_manager(
+        dir: &std::path::Path,
+        certificate: CertificateReference,
+    ) -> (CamouflageSiteManager, CamouflageSiteDesired) {
+        let mut manager = CamouflageSiteManager::new(CamouflageSiteConfig {
+            enabled: false,
+            manifest_path: dir.join("source.json"),
+            state_dir: dir.join("state"),
+            nginx: NginxSniConfig {
+                enabled: false,
+                conf_path: dir.join("camouflage.conf"),
+                test_cmd: "true".into(),
+                reload_cmd: "true".into(),
+                default_backend: "127.0.0.1:9".into(),
+                access_log_path: dir.join("camouflage.log").display().to_string(),
+            },
+            certificate_lifecycle: CertificateLifecycleConfig::disabled_for_test(dir),
+        });
+        assert!(manager.apply_candidate(CamouflageSitesManifest {
+            sites: vec![CamouflageSite {
+                id: "q1".into(),
+                sni: "q1.example.com".into(),
+                tls_listener_port: 8443,
+                local_backend: OPENLIST_BACKEND.into(),
+                certificate,
+            }],
+        }));
+        let desired = CamouflageSiteDesired {
+            site_id: "q1".into(),
+            sni: "q1.example.com".into(),
+            tls_listener_port: 8443,
+            local_backend: CamouflageLocalBackend::OpenList,
+            certificate: CamouflageCertificatePolicy {
+                domain: "q1.example.com".into(),
+                expected_public_ip: "192.0.2.10".into(),
+                renew_before_days: 30,
+                challenge_method: AcmeChallengeMethod::Dns01,
+            },
+            enabled: true,
+        };
+        manager.prepare_desired(std::slice::from_ref(&desired), true);
+        manager.record_renewal_warning_for_test("q1", "renewal failed");
+        (manager, desired)
+    }
 
     #[test]
     fn target_probe_outcome_serializes_snake_case() {
@@ -651,7 +746,7 @@ mod tests {
             site_id: "op1".into(),
             sni: "op1.example.com".into(),
             site_status: "active".into(),
-            certificate_status: "active".into(),
+            certificate_status: "renewal_warning".into(),
             issuer: None,
             valid_from: None,
             valid_until: None,
@@ -666,6 +761,67 @@ mod tests {
             renewal.detail.as_deref(),
             Some("renewal failed; will retry")
         );
+    }
+
+    #[test]
+    fn renewal_warning_diagnosis_rejects_invalid_certificate_counterexamples() {
+        use time::{Duration as TimeDuration, OffsetDateTime};
+
+        let dir = diagnosis_test_dir("renewal-warning-strict");
+        let now = OffsetDateTime::now_utc();
+        let valid = diagnosis_certificate(
+            &dir,
+            "valid",
+            "q1.example.com",
+            now - TimeDuration::days(1),
+            now + TimeDuration::days(90),
+        );
+        let mut key_mismatch = diagnosis_certificate(
+            &dir,
+            "key-mismatch",
+            "q1.example.com",
+            now - TimeDuration::days(1),
+            now + TimeDuration::days(90),
+        );
+        key_mismatch.key_path = valid.key_path;
+        let cases = vec![
+            diagnosis_certificate(
+                &dir,
+                "expired",
+                "q1.example.com",
+                now - TimeDuration::days(10),
+                now - TimeDuration::days(1),
+            ),
+            diagnosis_certificate(
+                &dir,
+                "san-mismatch",
+                "other.example.com",
+                now - TimeDuration::days(1),
+                now + TimeDuration::days(90),
+            ),
+            key_mismatch,
+            diagnosis_certificate(
+                &dir,
+                "not-yet-valid",
+                "q1.example.com",
+                now + TimeDuration::days(1),
+                now + TimeDuration::days(90),
+            ),
+        ];
+
+        for certificate in cases {
+            let case_dir = diagnosis_test_dir("renewal-warning-case");
+            let (manager, desired) = diagnosis_manager(&case_dir, certificate);
+            assert_eq!(
+                manager.status_snapshot()[0].certificate_status,
+                "renewal_warning"
+            );
+            let (certificate, _) =
+                certificate_and_camouflage(&manager, Some("q1.example.com"), Some(&desired));
+            assert_eq!(certificate.check.state, "fail");
+            std::fs::remove_dir_all(case_dir).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

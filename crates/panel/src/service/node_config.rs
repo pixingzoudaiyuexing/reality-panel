@@ -24,6 +24,7 @@ use relay_shared::protocol::{
     validate_proxy_protocol_invariants, AcmeChallengeMethod, CamouflageCertificatePolicy,
     CamouflageLocalBackend, CamouflageSiteDesired, NodeConfigResponse,
 };
+use relay_shared::reconciliation::certificate_domain_covers_sni;
 use std::collections::BTreeMap;
 
 #[derive(Debug)]
@@ -182,6 +183,14 @@ pub async fn build_node_config(
     }
 
     validate_proxy_protocol_invariants(&listeners).map_err(NodeConfigBuildError::InvalidConfig)?;
+    for site in camouflage_by_sni.values() {
+        if !certificate_domain_covers_sni(&site.certificate.domain, &site.sni) {
+            return Err(NodeConfigBuildError::InvalidConfig(format!(
+                "certificate domain {} does not cover camouflage SNI {}",
+                site.certificate.domain, site.sni
+            )));
+        }
+    }
 
     Ok(NodeConfigResponse {
         listeners,

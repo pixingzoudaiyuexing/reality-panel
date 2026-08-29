@@ -295,7 +295,12 @@ fn evaluate_node(
         if matching_site.map(|site| site.site_status.as_str()) != Some("active") {
             reasons.push(format!("CAMOUFLAGE_SITE_NOT_ACTIVE:{0}", rule.id));
         }
-        if matching_site.map(|site| site.certificate_status.as_str()) != Some("active") {
+        if !matching_site.is_some_and(|site| {
+            matches!(
+                site.certificate_status.as_str(),
+                "active" | "renewal_warning"
+            )
+        }) {
             reasons.push(format!("CERTIFICATE_NOT_ACTIVE:{0}", rule.id));
         }
     }
@@ -1037,6 +1042,44 @@ mod tests {
                 "site_status": "preparing",
                 "certificate_status": "pending",
                 "line_type": "default"
+            }]
+        }));
+        let node = evaluate(&raw, &[rule(1, true)], true);
+        assert!(!node.ready);
+        assert!(node
+            .ready_reasons
+            .contains(&"CAMOUFLAGE_SITE_NOT_ACTIVE:1".into()));
+        assert!(node
+            .ready_reasons
+            .contains(&"CERTIFICATE_NOT_ACTIVE:1".into()));
+    }
+
+    #[test]
+    fn renewal_warning_certificate_remains_ready() {
+        let raw = status(serde_json::json!({
+            "camouflage_sites": [{
+                "site_id": "site-1",
+                "sni": "op1.example.com",
+                "site_status": "active",
+                "certificate_status": "renewal_warning",
+                "last_error": "renewal will retry"
+            }]
+        }));
+        let node = evaluate(&raw, &[rule(1, true)], true);
+        assert!(node.ready);
+        assert!(!node
+            .ready_reasons
+            .contains(&"CERTIFICATE_NOT_ACTIVE:1".into()));
+    }
+
+    #[test]
+    fn unknown_camouflage_status_values_fail_safe_as_not_ready() {
+        let raw = status(serde_json::json!({
+            "camouflage_sites": [{
+                "site_id": "site-1",
+                "sni": "op1.example.com",
+                "site_status": "future_site_state",
+                "certificate_status": "future_certificate_state"
             }]
         }));
         let node = evaluate(&raw, &[rule(1, true)], true);

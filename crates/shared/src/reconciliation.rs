@@ -3,6 +3,25 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fmt;
 
+/// 判断证书域名是否覆盖具体 SNI。通配符只覆盖紧邻基域的一层标签。
+pub fn certificate_domain_covers_sni(certificate_domain: &str, sni: &str) -> bool {
+    let certificate_domain = certificate_domain
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let sni = sni.trim_end_matches('.').to_ascii_lowercase();
+    if certificate_domain == sni {
+        return true;
+    }
+    let Some(base) = certificate_domain.strip_prefix("*.") else {
+        return false;
+    };
+    let suffix = format!(".{base}");
+    let Some(label) = sni.strip_suffix(&suffix) else {
+        return false;
+    };
+    !label.is_empty() && !label.contains('.')
+}
+
 /// Deterministic SHA-256 over a canonical typed Node configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ConfigFingerprint(String);
@@ -245,5 +264,29 @@ mod tests {
         dns01.camouflage_sites[0].certificate.challenge_method = AcmeChallengeMethod::Dns01;
 
         assert_ne!(config_fingerprint(&http01), config_fingerprint(&dns01));
+    }
+
+    #[test]
+    fn certificate_domain_matching_has_one_shared_wildcard_semantics() {
+        assert!(certificate_domain_covers_sni(
+            "site.example.com",
+            "SITE.EXAMPLE.COM."
+        ));
+        assert!(certificate_domain_covers_sni(
+            "*.Example.com",
+            "site.example.com"
+        ));
+        assert!(!certificate_domain_covers_sni(
+            "*.example.com",
+            "nested.site.example.com"
+        ));
+        assert!(!certificate_domain_covers_sni(
+            "*.example.com",
+            "example.com"
+        ));
+        assert!(!certificate_domain_covers_sni(
+            "*.example.com",
+            "site.example.net"
+        ));
     }
 }

@@ -153,6 +153,32 @@ describe('camouflage observed status', () => {
       .toBe('hard certificate failure');
   });
 
+  it('keeps renewal warning usable and distinguishes failed retrying', () => {
+    const warning = deriveCamouflageStatus(rule, [node({
+      certificate_status: 'renewal_warning',
+      last_error: 'renewal will retry',
+    })]);
+    expect(warning.state).toBe('active');
+    expect(warning.activeCount).toBe(1);
+
+    const retrying = deriveCamouflageStatus(rule, [node({
+      site_status: 'failed_retrying',
+      certificate_status: 'failed_retrying',
+      last_error: 'issuance will retry',
+    }, { active_listener_rule_ids: [] })]);
+    expect(retrying.state).toBe('failed');
+    expect(retrying.activeCount).toBe(0);
+  });
+
+  it('treats unknown camouflage status strings as not active', () => {
+    const result = deriveCamouflageStatus(rule, [node({
+      site_status: 'future_site_state',
+      certificate_status: 'future_certificate_state',
+    })]);
+    expect(result.state).not.toBe('active');
+    expect(result.activeCount).toBe(0);
+  });
+
   it('returns unknown when no Relay has useful observed state', () => {
     const result = deriveCamouflageStatus(rule, []);
     expect(result.state).toBe('unknown');

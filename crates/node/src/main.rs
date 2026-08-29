@@ -289,16 +289,50 @@ async fn run() {
         );
     }
     if config.camouflage_sites_enabled && config.certificate_lifecycle_enabled {
-        let camouflage_sites = camouflage_sites.clone();
+        let active_camouflage_sites = camouflage_sites.clone();
         let interval_secs = config.certificate_lifecycle_check_interval_secs;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
             interval.tick().await;
             loop {
                 interval.tick().await;
-                if !forwarder::camouflage_site::reconcile_active_shared(&camouflage_sites).await {
+                if !forwarder::camouflage_site::reconcile_active_shared(&active_camouflage_sites)
+                    .await
+                {
                     tracing::warn!(
                         "camouflage certificate lifecycle check failed; keeping active runtime"
+                    );
+                }
+            }
+        });
+
+        let camouflage_sites = camouflage_sites.clone();
+        let manager = manager.clone();
+        let reconciler = reconciler.clone();
+        let dependency_notify =
+            forwarder::camouflage_site::desired_dependency_notify(&camouflage_sites).await;
+        tokio::spawn(async move {
+            loop {
+                // Notify 只用于降低证书完成后的收敛延迟；即使通知丢失，低频
+                // 周期检查仍会重放最近一次可信 Panel desired，保证最终收敛。
+                let delay = forwarder::camouflage_site::desired_retry_delay(&camouflage_sites)
+                    .await
+                    .unwrap_or(Duration::from_secs(60));
+                tokio::select! {
+                    _ = dependency_notify.notified() => {}
+                    _ = tokio::time::sleep(delay) => {}
+                }
+
+                let result = reconciler
+                    .lock()
+                    .await
+                    .reconcile_latest_panel_desired(&manager, &camouflage_sites)
+                    .await;
+                if result.as_ref().is_some_and(|value| {
+                    value.state == reconciler::ReconciliationState::ApplyFailed
+                }) {
+                    tracing::warn!(
+                        "certificate dependency wakeup could not converge desired config; preserving LKG"
                     );
                 }
             }

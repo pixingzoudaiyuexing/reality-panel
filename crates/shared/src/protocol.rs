@@ -778,9 +778,9 @@ impl ProvisioningCapabilities {
 pub struct CamouflageSiteStatus {
     pub site_id: String,
     pub sni: String,
-    /// "preparing" | "active" | "failed"
+    /// "preparing" | "failed_retrying" | "active"
     pub site_status: String,
-    /// "pending" | "active" | "failed"
+    /// "pending" | "failed_retrying" | "active" | "renewal_warning"
     pub certificate_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issuer: Option<String>,
@@ -2078,6 +2078,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(policy.challenge_method, AcmeChallengeMethod::Http01);
+        assert_eq!(CONFIG_PROTOCOL_VERSION, 9);
+    }
+
+    #[test]
+    fn unknown_camouflage_status_strings_remain_protocol_compatible() {
+        let status: CamouflageSiteStatus = serde_json::from_str(
+            r#"{
+                "site_id":"site-1",
+                "sni":"site.example.com",
+                "site_status":"future_site_state",
+                "certificate_status":"future_certificate_state"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(status.site_status, "future_site_state");
+        assert_eq!(status.certificate_status, "future_certificate_state");
         assert_eq!(CONFIG_PROTOCOL_VERSION, 9);
     }
 
