@@ -1,0 +1,43 @@
+name: Release Prep rc5
+
+on:
+  push:
+    branches:
+      - fix/protocol-independent-node-upgrade
+
+permissions:
+  contents: write
+
+jobs:
+  prep:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/protocol-independent-node-upgrade
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Refresh lockfile
+        run: cargo generate-lockfile
+      - name: Validate release contract
+        run: |
+          bash scripts/release-version-contract.sh v1.1.0-rc.5
+          cargo fmt --all -- --check
+          cargo check --workspace --locked
+          cargo test -p relay-shared control_protocol --locked -- --nocapture
+          cargo test -p relay-panel api::ws::tests --locked -- --nocapture
+          git diff --check
+      - name: Commit lockfile
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.lock
+          if git diff --cached --quiet; then
+            echo 'Cargo.lock already current'
+            exit 0
+          fi
+          git commit -m 'release: 更新 v1.1.0-rc.5 锁文件 [skip ci]'
+          git push origin HEAD:fix/protocol-independent-node-upgrade
