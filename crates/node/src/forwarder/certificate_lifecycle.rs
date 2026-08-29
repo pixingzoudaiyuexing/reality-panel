@@ -986,7 +986,7 @@ fn is_valid_certificate_domain(value: &str) -> bool {
     }
 }
 
-fn certificate_name_matches_host(certificate_name: &str, host: &str) -> bool {
+pub(crate) fn certificate_name_matches_host(certificate_name: &str, host: &str) -> bool {
     if certificate_name.eq_ignore_ascii_case(host) {
         return true;
     }

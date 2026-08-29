@@ -686,7 +686,12 @@ pub(crate) fn validate_config(config: &NodeConfigResponse) -> Result<(), String>
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
             || !valid_domain(&site.sni)
             || site.tls_listener_port != 8443
-            || site.certificate.domain != site.sni
+            // wildcard 证书只要能覆盖当前 SNI 就是合法配置；这里必须和证书生命周期
+            // 共用同一套匹配规则，避免“证书已签发但 desired 被拒绝”的分裂状态。
+            || !crate::forwarder::certificate_lifecycle::certificate_name_matches_host(
+                &site.certificate.domain,
+                &site.sni,
+            )
             || site
                 .certificate
                 .expected_public_ip
@@ -1265,6 +1270,33 @@ mod tests {
             },
             enabled: true,
         }
+    }
+
+    #[test]
+    fn wildcard_certificate_domain_covering_sni_is_valid_config() {
+        let mut site = camouflage_site("p1.13886.xyz");
+        site.certificate.domain = "*.13886.xyz".into();
+        let config = NodeConfigResponse {
+            camouflage_sites: vec![site],
+            listeners: vec![],
+        };
+
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn wildcard_certificate_domain_does_not_cover_nested_sni() {
+        let mut site = camouflage_site("deep.p1.13886.xyz");
+        site.certificate.domain = "*.13886.xyz".into();
+        let config = NodeConfigResponse {
+            camouflage_sites: vec![site],
+            listeners: vec![],
+        };
+
+        assert_eq!(
+            validate_config(&config).unwrap_err(),
+            "invalid camouflage desired state"
+        );
     }
 
     fn dependent_listener(
