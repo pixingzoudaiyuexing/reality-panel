@@ -891,7 +891,9 @@ apt-get update -y -qq
 # images without treating a freshly-installed Nginx listener as pre-existing.
 apt-get install -y -qq ca-certificates curl iproute2
 preflight_managed_ports
-apt-get install -y -qq docker.io nginx libnginx-mod-stream openssl certbot
+# Docker 在启用 AppArmor 的精简系统上不会总是自动补齐解析器；显式安装，
+# 避免 daemon 正常但容器启动时报 docker-default profile 无法加载。
+apt-get install -y -qq docker.io nginx libnginx-mod-stream openssl certbot apparmor
 step_ok
 
 step transaction-snapshot
@@ -904,6 +906,11 @@ install -d -m 0755 "$CERTIFICATE_HTTP01_WEBROOT/.well-known/acme-challenge"
 step_ok
 
 step docker
+if [ -r /sys/module/apparmor/parameters/enabled ] \
+  && grep -qi '^Y' /sys/module/apparmor/parameters/enabled; then
+  command -v apparmor_parser >/dev/null 2>&1 \
+    || fail "Docker AppArmor is enabled but apparmor_parser is unavailable"
+fi
 systemctl is-enabled --quiet docker || systemctl enable docker
 systemctl is-active --quiet docker || systemctl start docker
 docker info >/dev/null
