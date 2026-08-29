@@ -1,0 +1,37 @@
+name: RC2 Tag
+
+on:
+  push:
+    branches:
+      - hotfix/v1.1.0-rc.2
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create immutable v1.1.0-rc.2 tag on audited main
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET='15b95beb23617cd3d1fce429d7c4b653d0b5f786'
+          TAG='v1.1.0-rc.2'
+          git fetch origin main --tags
+          test "$(git rev-parse origin/main)" = "$TARGET"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "$TAG already exists; refusing to move or recreate it" >&2
+            exit 1
+          fi
+          bash scripts/release-version-contract.sh "$TAG"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$TAG" "$TARGET" -m "Reality Panel $TAG"
+          test "$(git rev-parse "$TAG^{commit}")" = "$TARGET"
+          git push origin "refs/tags/$TAG"
