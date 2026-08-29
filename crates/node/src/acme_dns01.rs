@@ -16,6 +16,15 @@ pub(crate) fn is_hook_command(args: &[String]) -> bool {
     args.first().is_some_and(|arg| arg == COMMAND)
 }
 
+fn challenge_domain(domain: &str) -> Result<String, String> {
+    let domain = domain.trim().trim_end_matches('.');
+    let domain = domain.strip_prefix("*.").unwrap_or(domain);
+    if domain.is_empty() || domain.contains('*') {
+        return Err("challenge domain is invalid".into());
+    }
+    Ok(domain.to_ascii_lowercase())
+}
+
 pub(crate) fn run_hook(args: &[String]) -> Result<(), String> {
     let action = match args.get(1).map(String::as_str) {
         Some("auth") => "present",
@@ -30,7 +39,9 @@ pub(crate) fn run_hook(args: &[String]) -> Result<(), String> {
     if token.trim().is_empty() || token == "default-token" {
         return Err("Node credential is unavailable".into());
     }
-    let sni = std::env::var("CERTBOT_DOMAIN").map_err(|_| "challenge domain is unavailable")?;
+    let certbot_domain =
+        std::env::var("CERTBOT_DOMAIN").map_err(|_| "challenge domain is unavailable")?;
+    let sni = challenge_domain(&certbot_domain)?;
     let value =
         std::env::var("CERTBOT_VALIDATION").map_err(|_| "challenge value is unavailable")?;
     let node_id = crate::poller::get_or_create_node_id();
@@ -91,6 +102,16 @@ mod tests {
     fn hook_detection_is_exact() {
         assert!(is_hook_command(&[COMMAND.into(), "auth".into()]));
         assert!(!is_hook_command(&["--version".into()]));
+    }
+
+    #[test]
+    fn wildcard_certbot_domain_maps_to_dns_challenge_base() {
+        assert_eq!(challenge_domain("*.Example.COM.").unwrap(), "example.com");
+        assert_eq!(
+            challenge_domain("op1.example.com").unwrap(),
+            "op1.example.com"
+        );
+        assert!(challenge_domain("foo.*.example.com").is_err());
     }
 
     #[test]

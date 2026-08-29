@@ -45,6 +45,20 @@ pub struct AcmeDns01Response {
     pub state: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TxtMutationMode {
+    SeparateRecords,
+    HuaweiRecordSet,
+}
+
+fn txt_mutation_mode(provider_type: Option<&str>) -> TxtMutationMode {
+    match provider_type.map(str::to_ascii_lowercase).as_deref() {
+        Some("huawei") => TxtMutationMode::HuaweiRecordSet,
+        _ => TxtMutationMode::SeparateRecords,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChallengeState {
     challenge_id: String,
@@ -56,6 +70,10 @@ struct ChallengeState {
     host: String,
     line: String,
     provider_record_id: Option<String>,
+    /// rc.4 起持久化 Provider 的 TXT mutation 语义。旧 rc.3 状态没有此字段，
+    /// cleanup 时会从 DNSMgr domain detail 重新推导，避免升级时误删 RRset。
+    #[serde(default)]
+    txt_mode: Option<TxtMutationMode>,
     value_sha256: String,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
@@ -148,6 +166,7 @@ async fn present_with_observer(
     let line =
         resolve_mutation_line(&ProviderLine::default(), &detail).ok_or(AcmeDns01Error::Provider)?;
     let ttl = write_ttl(&detail).ok_or(AcmeDns01Error::Provider)?;
+    let txt_mode = txt_mutation_mode(detail.domain.provider_type.as_deref());
     let challenge_host = if zone.host == "@" {
         "_acme-challenge".to_string()
     } else {
@@ -164,6 +183,7 @@ async fn present_with_observer(
         host: challenge_host,
         line: line.raw_id.clone(),
         provider_record_id: None,
+        txt_mode: Some(txt_mode),
         value_sha256: value_fingerprint(&request.value),
         created_at: now,
         expires_at: now + ChronoDuration::seconds(CHALLENGE_TTL_SECS),
@@ -313,38 +333,53 @@ async fn present_provider_value(
         return Ok(record.record_id.clone());
     }
 
-    let mutation = if records.is_empty() {
-        DnsMgrRecordMutation {
-            host: state.host.clone(),
-            record_type: "TXT".into(),
-            value: value.to_string(),
-            line: state.line.clone(),
-            ttl,
+    let mode = state.txt_mode.ok_or(AcmeDns01Error::Provider)?;
+    match mode {
+        TxtMutationMode::SeparateRecords => {
+            // Cloudflare 等 Provider 的 TXT value 是单条 record 内容；并发 challenge
+            // 必须创建多个同名 TXT，而不是把多个值拼成一个字符串。
+            let mutation = DnsMgrRecordMutation {
+                host: state.host.clone(),
+                record_type: "TXT".into(),
+                value: value.to_string(),
+                line: state.line.clone(),
+                ttl,
+            };
+            client
+                .create_record(state.zone_id, &mutation)
+                .await
+                .map_err(map_provider_error)?;
         }
-    } else if records.len() == 1 {
-        let mut values = records[0].values.clone();
-        values.push(value.to_string());
-        DnsMgrRecordMutation {
-            host: state.host.clone(),
-            record_type: "TXT".into(),
-            value: encode_provider_values(&values)?,
-            line: state.line.clone(),
-            ttl,
+        TxtMutationMode::HuaweiRecordSet => {
+            // DNSMgr Huawei wrapper 把一个 mutation value 用逗号拆成 records[]。
+            // 每个成员必须自行带引号；`A,B` 会被错误变成 `"A` 与 `B"`。
+            if records.len() > 1 {
+                return Err(AcmeDns01Error::Conflict);
+            }
+            let mut values = records
+                .first()
+                .map(|record| record.values.clone())
+                .unwrap_or_default();
+            values.push(value.to_string());
+            let mutation = DnsMgrRecordMutation {
+                host: state.host.clone(),
+                record_type: "TXT".into(),
+                value: encode_huawei_recordset_values(&values)?,
+                line: state.line.clone(),
+                ttl,
+            };
+            if let Some(record) = records.first() {
+                client
+                    .update_record(state.zone_id, &record.record_id, &mutation)
+                    .await
+                    .map_err(map_provider_error)?;
+            } else {
+                client
+                    .create_record(state.zone_id, &mutation)
+                    .await
+                    .map_err(map_provider_error)?;
+            }
         }
-    } else {
-        return Err(AcmeDns01Error::Conflict);
-    };
-
-    if records.is_empty() {
-        client
-            .create_record(state.zone_id, &mutation)
-            .await
-            .map_err(map_provider_error)?;
-    } else {
-        client
-            .update_record(state.zone_id, &records[0].record_id, &mutation)
-            .await
-            .map_err(map_provider_error)?;
     }
 
     let matching = list_txt_records(client, state)
@@ -364,6 +399,13 @@ async fn cleanup_state(
     state: &mut ChallengeState,
 ) -> Result<(), AcmeDns01Error> {
     state.cleanup_state = "CLEANUP_PENDING".into();
+    if state.txt_mode.is_none() {
+        let detail = client
+            .get_domain(state.zone_id)
+            .await
+            .map_err(map_provider_error)?;
+        state.txt_mode = Some(txt_mutation_mode(detail.domain.provider_type.as_deref()));
+    }
     persist_state(db, state).await?;
     let matching = list_txt_records(client, state)
         .await?
@@ -381,29 +423,42 @@ async fn cleanup_state(
         {
             return Err(AcmeDns01Error::Conflict);
         }
-        let remaining = record
-            .values
-            .iter()
-            .filter(|value| value_fingerprint(&normalize_txt_value(value)) != state.value_sha256)
-            .cloned()
-            .collect::<Vec<_>>();
-        if remaining.is_empty() {
-            client
-                .delete_record(state.zone_id, &record.record_id)
-                .await
-                .map_err(map_provider_error)?;
-        } else {
-            let mutation = DnsMgrRecordMutation {
-                host: state.host.clone(),
-                record_type: "TXT".into(),
-                value: encode_provider_values(&remaining)?,
-                line: state.line.clone(),
-                ttl: u32::try_from(record.ttl).map_err(|_| AcmeDns01Error::Provider)?,
-            };
-            client
-                .update_record(state.zone_id, &record.record_id, &mutation)
-                .await
-                .map_err(map_provider_error)?;
+        match state.txt_mode.ok_or(AcmeDns01Error::Provider)? {
+            TxtMutationMode::SeparateRecords => {
+                // 每个 challenge 自己占一条 TXT，cleanup 只删除自己的 record。
+                client
+                    .delete_record(state.zone_id, &record.record_id)
+                    .await
+                    .map_err(map_provider_error)?;
+            }
+            TxtMutationMode::HuaweiRecordSet => {
+                let remaining = record
+                    .values
+                    .iter()
+                    .filter(|value| {
+                        value_fingerprint(&normalize_txt_value(value)) != state.value_sha256
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if remaining.is_empty() {
+                    client
+                        .delete_record(state.zone_id, &record.record_id)
+                        .await
+                        .map_err(map_provider_error)?;
+                } else {
+                    let mutation = DnsMgrRecordMutation {
+                        host: state.host.clone(),
+                        record_type: "TXT".into(),
+                        value: encode_huawei_recordset_values(&remaining)?,
+                        line: state.line.clone(),
+                        ttl: u32::try_from(record.ttl).map_err(|_| AcmeDns01Error::Provider)?,
+                    };
+                    client
+                        .update_record(state.zone_id, &record.record_id, &mutation)
+                        .await
+                        .map_err(map_provider_error)?;
+                }
+            }
         }
     }
     if list_txt_records(client, state)
@@ -579,11 +634,26 @@ fn normalize_txt_value(value: &str) -> String {
         .to_string()
 }
 
-fn encode_provider_values(values: &[String]) -> Result<String, AcmeDns01Error> {
-    if values.is_empty() || values.iter().any(|value| value.contains(',')) {
+fn encode_huawei_recordset_values(values: &[String]) -> Result<String, AcmeDns01Error> {
+    if values.is_empty() {
         return Err(AcmeDns01Error::Conflict);
     }
-    Ok(values.join(","))
+    values
+        .iter()
+        .map(|value| normalize_txt_value(value))
+        .map(|value| {
+            if value.is_empty()
+                || value.contains(',')
+                || value.contains('"')
+                || value.contains('\\')
+            {
+                Err(AcmeDns01Error::Conflict)
+            } else {
+                Ok(format!("\"{value}\""))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|values| values.join(","))
 }
 
 fn state_key(challenge_id: &str) -> String {
@@ -733,7 +803,7 @@ mod tests {
                     async move {
                         let mut state = state.lock().await;
                         state.creates += 1;
-                        state.values = form["value"].split(',').map(str::to_string).collect();
+                        state.values = decode_huawei_mutation(&form["value"]);
                         Json(json!({"code": 0}))
                     }
                 }),
@@ -750,7 +820,7 @@ mod tests {
                         );
                         let mut state = state.lock().await;
                         state.updates += 1;
-                        state.values = form["value"].split(',').map(str::to_string).collect();
+                        state.values = decode_huawei_mutation(&form["value"]);
                         Json(json!({"code": 0}))
                     }
                 }),
@@ -774,6 +844,18 @@ mod tests {
         (base_url, state, handle)
     }
 
+    fn decode_huawei_mutation(value: &str) -> Vec<String> {
+        let wrapped = if value.starts_with('"') {
+            value.to_string()
+        } else {
+            format!("\"{value}\"")
+        };
+        wrapped
+            .split(',')
+            .map(normalize_txt_value)
+            .collect::<Vec<_>>()
+    }
+
     fn request_for(node_id: &str, sni: &str, value: &str) -> AcmeDns01Request {
         AcmeDns01Request {
             node_id: node_id.into(),
@@ -787,14 +869,22 @@ mod tests {
     }
 
     #[test]
-    fn provider_values_preserve_every_entry_and_fail_closed_on_commas() {
+    fn huawei_recordset_values_quote_each_member_and_fail_closed() {
         assert_eq!(
-            encode_provider_values(&["old".into(), "challenge".into()]).unwrap(),
-            "old,challenge"
+            encode_huawei_recordset_values(&["old".into(), "challenge".into()]).unwrap(),
+            "\"old\",\"challenge\""
         );
         assert_eq!(
-            encode_provider_values(&["unrelated,content".into(), "challenge".into()]),
+            encode_huawei_recordset_values(&["unrelated,content".into(), "challenge".into()]),
             Err(AcmeDns01Error::Conflict)
+        );
+        assert_eq!(
+            txt_mutation_mode(Some("huawei")),
+            TxtMutationMode::HuaweiRecordSet
+        );
+        assert_eq!(
+            txt_mutation_mode(Some("cloudflare")),
+            TxtMutationMode::SeparateRecords
         );
     }
 

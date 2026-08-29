@@ -39,7 +39,10 @@ use serde::{Deserialize, Serialize};
 /// prevents an older node from silently ignoring the new data-plane semantic.
 /// v8 = Panel-selected ACME DNS-01. The gate prevents a v7 node from silently
 /// ignoring DNS-01 hooks and the Panel-backed challenge lifecycle.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 8;
+/// v9 = camouflage certificate `domain` may be a DNS-01 wildcard that covers
+/// the concrete SNI. A v8 node rejects that semantic as an exact-domain
+/// mismatch, so Panel and Node must upgrade together.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 9;
 
 pub fn config_protocol_versions_compatible(panel: u32, node: u32) -> bool {
     panel == node

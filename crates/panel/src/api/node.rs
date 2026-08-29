@@ -144,11 +144,15 @@ async fn acme_dns01_operation(
             Ok(config) => config,
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
+    let requested_domain = request.sni.trim_end_matches('.');
     let authorized = config.camouflage_sites.iter().any(|site| {
+        let certificate_domain = site.certificate.domain.trim_end_matches('.');
+        let certificate_authorized = certificate_domain.eq_ignore_ascii_case(requested_domain)
+            || certificate_domain
+                .strip_prefix("*.")
+                .is_some_and(|base| base.eq_ignore_ascii_case(requested_domain));
         site.enabled
-            && site
-                .sni
-                .eq_ignore_ascii_case(request.sni.trim_end_matches('.'))
+            && certificate_authorized
             && site.certificate.challenge_method == AcmeChallengeMethod::Dns01
     });
     if !authorized {
@@ -167,7 +171,15 @@ async fn acme_dns01_operation(
     match result {
         Ok(response) => Json(response).into_response(),
         Err(error) => {
-            let status = match error {
+            let code = error.code();
+            tracing::warn!(
+                operation = if present { "present" } else { "cleanup" },
+                node_id = %request.node_id,
+                domain = %request.sni,
+                code,
+                "ACME DNS-01 operation failed"
+            );
+            let status = match &error {
                 crate::service::acme_dns01::AcmeDns01Error::InvalidRequest => {
                     StatusCode::BAD_REQUEST
                 }
@@ -181,7 +193,7 @@ async fn acme_dns01_operation(
                     StatusCode::SERVICE_UNAVAILABLE
                 }
             };
-            (status, Json(serde_json::json!({"code": error.code()}))).into_response()
+            (status, Json(serde_json::json!({"code": code}))).into_response()
         }
     }
 }

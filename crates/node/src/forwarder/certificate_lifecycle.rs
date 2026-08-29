@@ -24,7 +24,7 @@ const DEFAULT_RENEW_BEFORE_DAYS: u32 = 30;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CertificateLifecyclePolicy {
-    /// Must exactly match the local TLS camouflage SNI.
+    /// Exact SNI or a one-label DNS-01 wildcard that covers the local SNI.
     pub domain: String,
     #[serde(default)]
     pub email: Option<String>,
@@ -514,7 +514,7 @@ fn certbot_args(
         "--non-interactive".into(),
         "--agree-tos".into(),
         "--cert-name".into(),
-        policy.domain.clone(),
+        certbot_certificate_name(&policy.domain)?,
         "-d".into(),
         policy.domain.clone(),
     ];
@@ -592,8 +592,10 @@ fn validate_policy(
     site: &CamouflageSite,
     policy: &CertificateLifecyclePolicy,
 ) -> Result<(), String> {
-    if policy.domain != site.sni || !is_valid_domain(&policy.domain) {
-        return Err("certificate domain must exactly match camouflage SNI".into());
+    if !is_valid_certificate_domain(&policy.domain)
+        || !certificate_name_matches_host(&policy.domain, &site.sni)
+    {
+        return Err("certificate domain must cover camouflage SNI".into());
     }
     if let Some(email) = &policy.email {
         if !email.contains('@') || email.len() > 254 {
@@ -770,7 +772,7 @@ fn validate_certificate_validity(
         .value
         .general_names
         .iter()
-        .any(|name| matches!(name, GeneralName::DNSName(value) if *value == domain))
+        .any(|name| matches!(name, GeneralName::DNSName(value) if certificate_name_matches_host(value, domain)))
     {
         return Err("certificate SAN does not match camouflage SNI".into());
     }
@@ -977,6 +979,37 @@ fn is_safe_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
+fn is_valid_certificate_domain(value: &str) -> bool {
+    match value.strip_prefix("*.") {
+        Some(base) => is_valid_domain(base) && base.split('.').count() >= 2,
+        None => is_valid_domain(value),
+    }
+}
+
+fn certificate_name_matches_host(certificate_name: &str, host: &str) -> bool {
+    if certificate_name.eq_ignore_ascii_case(host) {
+        return true;
+    }
+    let Some(base) = certificate_name.strip_prefix("*.") else {
+        return false;
+    };
+    let suffix = format!(".{base}");
+    let Some(label) = host.strip_suffix(&suffix) else {
+        return false;
+    };
+    !label.is_empty() && !label.contains('.')
+}
+
+fn certbot_certificate_name(domain: &str) -> Result<String, String> {
+    if !is_valid_certificate_domain(domain) {
+        return Err("invalid certificate domain".into());
+    }
+    Ok(match domain.strip_prefix("*.") {
+        Some(base) => format!("wildcard-{base}"),
+        None => domain.to_string(),
+    })
+}
+
 fn is_valid_domain(value: &str) -> bool {
     value.len() <= 253
         && value.split('.').count() >= 2
@@ -1126,6 +1159,42 @@ mod tests {
             local_backend: "127.0.0.1:5244".into(),
             certificate: reference,
         }
+    }
+
+    #[test]
+    fn wildcard_certificate_scope_covers_exactly_one_label() {
+        assert!(certificate_name_matches_host(
+            "*.example.com",
+            "op1.example.com"
+        ));
+        assert!(!certificate_name_matches_host(
+            "*.example.com",
+            "a.b.example.com"
+        ));
+        assert!(!certificate_name_matches_host(
+            "*.example.com",
+            "example.com"
+        ));
+        assert!(is_valid_certificate_domain("*.example.com"));
+        assert!(!is_valid_certificate_domain("*.com"));
+    }
+
+    #[test]
+    fn wildcard_certbot_args_keep_wildcard_but_use_safe_cert_name() {
+        let mut policy = policy("site.example.com");
+        policy.domain = "*.example.com".into();
+        policy.challenge_method = AcmeChallengeMethod::Dns01;
+        let args = certbot_args(
+            &policy,
+            false,
+            Path::new("/unused"),
+            Path::new("/opt/relay-node/relay-node"),
+        )
+        .unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["-d", "*.example.com"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--cert-name", "wildcard-example.com"]));
     }
 
     #[test]

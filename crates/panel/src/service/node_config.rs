@@ -17,7 +17,10 @@
 //! errors so they can never tear down a node by masquerading as an empty plan.
 
 use crate::db::error::DbError;
-use crate::db::repo::{GroupRepository, ProfileScope, ResourceScope, TunnelProfileRepository};
+use crate::db::repo::{
+    DnsRecordBindingRepository, DnsRecordSyncRepository, GroupRepository, ProfileScope,
+    ResourceScope, TunnelProfileRepository,
+};
 use crate::db::Repository;
 use relay_shared::models::{DeviceGroup, ForwardRule};
 use relay_shared::protocol::{
@@ -158,6 +161,8 @@ pub async fn build_node_config(
             .map(str::to_ascii_lowercase);
         if effective_rule.camouflage_enabled && effective_rule.node_transport == "nginx_sni" {
             if let Some(sni) = camouflage_sni {
+                let certificate_domain =
+                    certificate_domain_for_rule(db, effective_rule.id, &sni).await?;
                 camouflage_by_sni
                     .entry(sni.clone())
                     .or_insert_with(|| CamouflageSiteDesired {
@@ -166,7 +171,7 @@ pub async fn build_node_config(
                         tls_listener_port: 8443,
                         local_backend: CamouflageLocalBackend::OpenList,
                         certificate: CamouflageCertificatePolicy {
-                            domain: sni,
+                            domain: certificate_domain,
                             expected_public_ip: group.connect_host.trim().to_string(),
                             renew_before_days: 30,
                             // Reality Panel 的证书权威路径固定使用 Panel DNS-01。
@@ -185,6 +190,47 @@ pub async fn build_node_config(
         listeners,
         camouflage_sites: camouflage_by_sni.into_values().collect(),
     })
+}
+
+/// 根据已经验证过的 Panel DNS ownership 计算证书作用域。
+/// 没有 ownership binding 时保持单域名证书；绝不靠“最后两段域名”猜 zone。
+async fn certificate_domain_for_rule(
+    db: &dyn Repository,
+    rule_id: i64,
+    sni: &str,
+) -> Result<String, DbError> {
+    let exact = sni.trim_end_matches('.').to_ascii_lowercase();
+    let Some(sync) = db.find_dns_record_sync(rule_id).await? else {
+        return Ok(exact);
+    };
+    if !sync.fqdn.trim_end_matches('.').eq_ignore_ascii_case(&exact) {
+        return Ok(exact);
+    }
+    let Some(binding) = db
+        .find_dns_record_binding_for_rule(rule_id, &sync.fqdn, &sync.record_type, &sync.line_key)
+        .await?
+    else {
+        return Ok(exact);
+    };
+    Ok(wildcard_domain_for_managed_sni(&exact, &binding.zone_name).unwrap_or(exact))
+}
+
+fn wildcard_domain_for_managed_sni(sni: &str, zone_name: &str) -> Option<String> {
+    let sni = sni.trim_end_matches('.').to_ascii_lowercase();
+    let zone = zone_name.trim_end_matches('.').to_ascii_lowercase();
+    if sni == zone || zone.is_empty() {
+        return None;
+    }
+    let zone_suffix = format!(".{zone}");
+    if !sni.ends_with(&zone_suffix) {
+        return None;
+    }
+    let (_, parent) = sni.split_once('.')?;
+    if parent == zone || parent.ends_with(&zone_suffix) {
+        Some(format!("*.{parent}"))
+    } else {
+        None
+    }
 }
 
 /// Resolve a rule's target address list.
@@ -306,6 +352,26 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn wildcard_scope_uses_direct_parent_inside_managed_zone() {
+        assert_eq!(
+            wildcard_domain_for_managed_sni("o1.13886.xyz", "13886.xyz").as_deref(),
+            Some("*.13886.xyz")
+        );
+        assert_eq!(
+            wildcard_domain_for_managed_sni("a.b.example.com", "example.com").as_deref(),
+            Some("*.b.example.com")
+        );
+        assert_eq!(
+            wildcard_domain_for_managed_sni("example.com", "example.com"),
+            None
+        );
+        assert_eq!(
+            wildcard_domain_for_managed_sni("evil-example.com", "example.com"),
+            None
+        );
     }
 
     /// A normal active user's rule on an `in` group must produce one listener.
