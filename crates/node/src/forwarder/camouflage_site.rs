@@ -5,8 +5,9 @@
 //! used by dedicated REALITY servers as their fallback target.
 
 use super::certificate_lifecycle::{
-    inspect_certificate, CertificateLifecycle, CertificateLifecycleConfig,
-    CertificateLifecyclePolicy, LifecycleAction, RenewalGate,
+    certificate_scope_key, inspect_certificate, CertificateLifecycle, CertificateLifecycleConfig,
+    CertificateLifecyclePolicy, LifecycleAction, LifecycleReconcileReport, RenewalGate,
+    ACME_RETRY_DEFERRED,
 };
 use super::nginx_sni::{self, NginxSniConfig};
 use relay_shared::protocol::{
@@ -90,12 +91,12 @@ pub struct CamouflageSiteManager {
     renewal_warnings: HashMap<String, (String, String)>,
     panel_authority_established: bool,
     desired_worker_in_flight: bool,
+    desired_reconcile_pending: bool,
     reconcile_retry_attempt: usize,
     reconcile_retry_at: Option<Instant>,
     reconcile_retry_backoff: Vec<Duration>,
-    acme_retry_attempt: usize,
-    acme_retry_at_unix_ms: Option<i64>,
-    acme_retry_scope_fingerprint: Option<String>,
+    acme_retries: HashMap<String, PersistedScopeAcmeRetry>,
+    legacy_acme_retry: Option<PersistedDesiredAcmeRetry>,
     acme_retry_backoff: Vec<Duration>,
     acme_jitter_seed: u64,
     acme_jitter_percent: u32,
@@ -115,6 +116,7 @@ struct CertificateReconcileSnapshot {
     apply_gate: Arc<AsyncMutex<()>>,
     desired_request: bool,
     prepared_site_ids: HashSet<String>,
+    allowed_acme_scope_keys: HashSet<String>,
 }
 
 struct CertificateReconcileResult {
@@ -127,13 +129,35 @@ struct CertificateReconcileOutcome {
     actions: HashMap<String, LifecycleAction>,
     successful_site_ids: HashSet<String>,
     failed_site_errors: HashMap<String, String>,
+    attempted_scope_keys: HashSet<String>,
+    successful_scope_keys: HashSet<String>,
+    failed_scope_keys: HashSet<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedDesiredAcmeRetry {
     attempt: usize,
     next_retry_unix_ms: i64,
     scope_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedScopeAcmeRetry {
+    attempt: usize,
+    next_retry_unix_ms: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedDesiredAcmeRetries {
+    version: u8,
+    scopes: HashMap<String, PersistedScopeAcmeRetry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PersistedDesiredAcmeRetryFile {
+    Scoped(PersistedDesiredAcmeRetries),
+    Legacy(PersistedDesiredAcmeRetry),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,8 +170,7 @@ enum ReconcileCommit {
 
 impl CamouflageSiteManager {
     pub fn new(config: CamouflageSiteConfig) -> Self {
-        let (acme_retry_attempt, acme_retry_at_unix_ms, acme_retry_scope_fingerprint) =
-            load_desired_acme_retry(&config.state_dir);
+        let (acme_retries, legacy_acme_retry) = load_desired_acme_retry(&config.state_dir);
         let acme_jitter_seed = desired_acme_jitter_seed(&config.state_dir);
         Self {
             config,
@@ -164,6 +187,7 @@ impl CamouflageSiteManager {
             renewal_warnings: HashMap::new(),
             panel_authority_established: false,
             desired_worker_in_flight: false,
+            desired_reconcile_pending: false,
             reconcile_retry_attempt: 0,
             reconcile_retry_at: None,
             reconcile_retry_backoff: vec![
@@ -172,9 +196,8 @@ impl CamouflageSiteManager {
                 Duration::from_secs(30),
                 Duration::from_secs(60),
             ],
-            acme_retry_attempt,
-            acme_retry_at_unix_ms,
-            acme_retry_scope_fingerprint,
+            acme_retries,
+            legacy_acme_retry,
             acme_retry_backoff: vec![
                 Duration::from_secs(30),
                 Duration::from_secs(2 * 60),
@@ -196,21 +219,37 @@ impl CamouflageSiteManager {
             .cloned()
             .collect();
         let next_fingerprint = camouflage_desired_fingerprint(&next);
-        let next_acme_scope = desired_acme_scope_fingerprint(&next);
-        if self.acme_retry_at_unix_ms.is_some() {
-            match self.acme_retry_scope_fingerprint.as_deref() {
-                Some(current) if current != next_acme_scope => self.clear_acme_retry(),
-                // 无 identity 的损坏/旧状态保守绑定到首次可信 desired，避免重启风暴。
-                None => self.acme_retry_scope_fingerprint = Some(next_acme_scope.clone()),
-                _ => {}
+        let next_scope_fingerprint = desired_acme_scope_fingerprint(&next);
+        let next_scope_keys = next
+            .iter()
+            .filter_map(|site| desired_certificate_scope_key(site).ok())
+            .collect::<HashSet<_>>();
+        let retry_count = self.acme_retries.len();
+        self.acme_retries
+            .retain(|scope_key, _| next_scope_keys.contains(scope_key));
+        let retry_set_changed = self.acme_retries.len() != retry_count;
+        if let Some(legacy) = self.legacy_acme_retry.take() {
+            if legacy.scope_fingerprint.is_empty()
+                || legacy.scope_fingerprint == next_scope_fingerprint
+            {
+                for scope_key in next_scope_keys {
+                    self.acme_retries
+                        .entry(scope_key)
+                        .or_insert(PersistedScopeAcmeRetry {
+                            attempt: legacy.attempt,
+                            next_retry_unix_ms: legacy.next_retry_unix_ms,
+                        });
+                }
             }
+            self.persist_acme_retries();
+        } else if retry_set_changed {
+            self.persist_acme_retries();
         }
-        if self.acme_retry_scope_fingerprint.is_none() {
-            self.acme_retry_scope_fingerprint = Some(next_acme_scope);
-        }
-        if next_fingerprint != self.desired_fingerprint {
+        let changed = next_fingerprint != self.desired_fingerprint;
+        if changed {
             self.desired_generation = self.desired_generation.wrapping_add(1);
             self.desired_fingerprint = next_fingerprint;
+            self.desired_reconcile_pending = true;
             self.reconcile_retry_attempt = 0;
             self.reconcile_retry_at = None;
         }
@@ -386,6 +425,7 @@ impl CamouflageSiteManager {
             apply_gate: Arc::clone(&self.apply_gate),
             desired_request: false,
             prepared_site_ids: HashSet::new(),
+            allowed_acme_scope_keys: HashSet::new(),
         })
     }
 
@@ -396,13 +436,14 @@ impl CamouflageSiteManager {
     ) -> Option<CertificateReconcileSnapshot> {
         self.update_desired(desired, panel_authoritative);
         if !panel_authoritative || self.desired.is_empty() {
+            if panel_authoritative {
+                self.desired_reconcile_pending = false;
+            }
             return None;
         }
-        if self.desired_worker_in_flight || !self.desired_control_work_is_due() {
-            return None;
-        }
-        if !self.acme_retry_is_due() {
-            self.schedule_reconcile_retry();
+        if self.desired_worker_in_flight
+            || (!self.desired_reconcile_pending && !self.desired_control_work_is_due())
+        {
             return None;
         }
         let mut candidate = self
@@ -462,6 +503,7 @@ impl CamouflageSiteManager {
         }
 
         if prepared_site_ids.is_empty() {
+            self.desired_reconcile_pending = false;
             return None;
         }
         let attempted_at = chrono::Utc::now().to_rfc3339();
@@ -470,6 +512,7 @@ impl CamouflageSiteManager {
                 .insert(site_id.clone(), attempted_at.clone());
         }
         self.desired_worker_in_flight = true;
+        self.desired_reconcile_pending = false;
         self.reconcile_retry_at = None;
 
         Some(CertificateReconcileSnapshot {
@@ -484,19 +527,34 @@ impl CamouflageSiteManager {
             apply_gate: Arc::clone(&self.apply_gate),
             desired_request: true,
             prepared_site_ids,
+            allowed_acme_scope_keys: self
+                .desired
+                .iter()
+                .filter_map(|site| desired_certificate_scope_key(site).ok())
+                .filter(|scope_key| self.acme_scope_is_due(scope_key))
+                .collect(),
         })
     }
 
     fn reconcile_retry_is_due(&self) -> bool {
         self.reconcile_retry_at
             .map(|deadline| Instant::now() >= deadline)
+            .unwrap_or(false)
+    }
+
+    fn acme_scope_is_due(&self, scope_key: &str) -> bool {
+        self.acme_retries
+            .get(scope_key)
+            .map(|retry| unix_time_millis() >= retry.next_retry_unix_ms)
             .unwrap_or(true)
     }
 
     fn acme_retry_is_due(&self) -> bool {
-        self.acme_retry_at_unix_ms
-            .map(|deadline| unix_time_millis() >= deadline)
-            .unwrap_or(true)
+        self.acme_retries.iter().any(|(scope_key, retry)| {
+            self.desired.iter().any(|site| {
+                desired_certificate_scope_key(site).as_deref() == Ok(scope_key.as_str())
+            }) && unix_time_millis() >= retry.next_retry_unix_ms
+        })
     }
 
     fn desired_control_work_is_due(&self) -> bool {
@@ -516,10 +574,13 @@ impl CamouflageSiteManager {
         self.reconcile_retry_at = Some(Instant::now() + delay);
     }
 
-    fn schedule_acme_retry(&mut self) {
-        let index = self
-            .acme_retry_attempt
-            .min(self.acme_retry_backoff.len().saturating_sub(1));
+    fn schedule_acme_retry(&mut self, scope_key: &str) {
+        let attempt = self
+            .acme_retries
+            .get(scope_key)
+            .map(|retry| retry.attempt)
+            .unwrap_or_default();
+        let index = attempt.min(self.acme_retry_backoff.len().saturating_sub(1));
         let base = self
             .acme_retry_backoff
             .get(index)
@@ -532,45 +593,66 @@ impl CamouflageSiteManager {
         let jitter_ms = if jitter_limit == 0 {
             0
         } else {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            scope_key.hash(&mut hasher);
             (self
                 .acme_jitter_seed
-                .wrapping_add(self.acme_retry_attempt as u64)
+                .wrapping_add(hasher.finish())
+                .wrapping_add(attempt as u64)
                 % (jitter_limit as u64 + 1)) as u128
         };
         let delay_ms = base.as_millis().saturating_add(jitter_ms);
-        self.acme_retry_attempt = self.acme_retry_attempt.saturating_add(1);
-        self.acme_retry_at_unix_ms =
-            Some(unix_time_millis().saturating_add(delay_ms.min(i64::MAX as u128) as i64));
-        if let Err(error) = persist_desired_acme_retry(
-            &self.config.state_dir,
-            self.acme_retry_attempt,
-            self.acme_retry_at_unix_ms.unwrap_or_default(),
-            self.acme_retry_scope_fingerprint
-                .as_deref()
-                .unwrap_or_default(),
-        ) {
-            tracing::warn!("could not persist desired ACME retry protection: {error}");
+        self.acme_retries.insert(
+            scope_key.to_string(),
+            PersistedScopeAcmeRetry {
+                attempt: attempt.saturating_add(1),
+                next_retry_unix_ms: unix_time_millis()
+                    .saturating_add(delay_ms.min(i64::MAX as u128) as i64),
+            },
+        );
+        self.persist_acme_retries();
+    }
+
+    fn clear_acme_retry(&mut self, scope_key: &str) {
+        if self.acme_retries.remove(scope_key).is_some() {
+            self.persist_acme_retries();
         }
     }
 
-    fn clear_acme_retry(&mut self) {
-        self.acme_retry_attempt = 0;
-        self.acme_retry_at_unix_ms = None;
-        self.acme_retry_scope_fingerprint = None;
-        remove_desired_acme_retry(&self.config.state_dir);
+    fn persist_acme_retries(&self) {
+        if let Err(error) = persist_desired_acme_retries(&self.config.state_dir, &self.acme_retries)
+        {
+            tracing::warn!("could not persist desired ACME retry protection: {error}");
+        }
     }
 
     fn finish_desired_worker(&mut self, retry: bool) {
         self.desired_worker_in_flight = false;
         if retry {
             self.schedule_reconcile_retry();
-            self.schedule_acme_retry();
         } else {
             self.reconcile_retry_attempt = 0;
             self.reconcile_retry_at = None;
-            self.clear_acme_retry();
         }
         self.dependency_notify.notify_one();
+    }
+
+    fn finish_desired_worker_with_scopes(
+        &mut self,
+        retry: bool,
+        attempted_scope_keys: &HashSet<String>,
+        successful_scope_keys: &HashSet<String>,
+        failed_scope_keys: &HashSet<String>,
+    ) {
+        for scope_key in successful_scope_keys {
+            self.clear_acme_retry(scope_key);
+        }
+        for scope_key in failed_scope_keys {
+            if attempted_scope_keys.contains(scope_key) {
+                self.schedule_acme_retry(scope_key);
+            }
+        }
+        self.finish_desired_worker(retry);
     }
 
     fn desired_retry_delay(&self) -> Option<Duration> {
@@ -580,9 +662,18 @@ impl CamouflageSiteManager {
         let reconcile = self
             .reconcile_retry_at
             .map(|deadline| deadline.saturating_duration_since(Instant::now()));
-        let acme = self.acme_retry_at_unix_ms.map(|deadline| {
-            Duration::from_millis(deadline.saturating_sub(unix_time_millis()).max(0) as u64)
-        });
+        let acme = self
+            .acme_retries
+            .values()
+            .map(|retry| {
+                Duration::from_millis(
+                    retry
+                        .next_retry_unix_ms
+                        .saturating_sub(unix_time_millis())
+                        .max(0) as u64,
+                )
+            })
+            .min();
         match (reconcile, acme) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (Some(delay), None) | (None, Some(delay)) => Some(delay),
@@ -800,13 +891,29 @@ impl CamouflageSiteManager {
         &mut self,
         manifest: CamouflageSitesManifest,
     ) -> Result<(), String> {
-        let (candidate, actions) = run_certificate_reconcile(
+        let report = run_certificate_reconcile(
             &self.config,
             &self.renewal_gate,
             &self.acme_gate,
             manifest,
             self.active.as_ref(),
+            None,
         )?;
+        if let Some(error) = report.failed_site_errors.values().next() {
+            return Err(error.clone());
+        }
+        let candidate = report.manifest;
+        let actions = candidate
+            .sites
+            .iter()
+            .map(|site| {
+                report
+                    .actions
+                    .get(&site.id)
+                    .copied()
+                    .unwrap_or(LifecycleAction::Unchanged)
+            })
+            .collect::<Vec<_>>();
         for (site, action) in candidate.sites.iter().zip(actions.iter()) {
             if *action == LifecycleAction::RenewalWarning {
                 self.renewal_warnings.insert(
@@ -1025,6 +1132,16 @@ fn desired_acme_scope_fingerprint(desired: &[CamouflageSiteDesired]) -> String {
         .to_string()
 }
 
+fn desired_certificate_scope_key(site: &CamouflageSiteDesired) -> Result<String, String> {
+    certificate_scope_key(&CertificateLifecyclePolicy {
+        domain: site.certificate.domain.clone(),
+        email: None,
+        expected_public_ip: site.certificate.expected_public_ip.clone(),
+        renew_before_days: site.certificate.renew_before_days,
+        challenge_method: site.certificate.challenge_method,
+    })
+}
+
 fn desired_acme_jitter_seed(state_dir: &Path) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     state_dir.hash(&mut hasher);
@@ -1037,46 +1154,83 @@ fn desired_acme_jitter_seed(state_dir: &Path) -> u64 {
     hasher.finish()
 }
 
-fn load_desired_acme_retry(state_dir: &Path) -> (usize, Option<i64>, Option<String>) {
+fn load_desired_acme_retry(
+    state_dir: &Path,
+) -> (
+    HashMap<String, PersistedScopeAcmeRetry>,
+    Option<PersistedDesiredAcmeRetry>,
+) {
     let path = desired_acme_retry_path(state_dir);
     match fs::read(&path) {
-        Ok(bytes) => match serde_json::from_slice::<PersistedDesiredAcmeRetry>(&bytes) {
-            Ok(state) => {
+        Ok(bytes) => match serde_json::from_slice::<PersistedDesiredAcmeRetryFile>(&bytes) {
+            Ok(PersistedDesiredAcmeRetryFile::Scoped(mut state)) if state.version == 2 => {
                 let now = unix_time_millis();
                 let maximum = now.saturating_add(66 * 60 * 1000);
+                for retry in state.scopes.values_mut() {
+                    retry.next_retry_unix_ms = retry.next_retry_unix_ms.min(maximum);
+                }
+                (state.scopes, None)
+            }
+            Ok(PersistedDesiredAcmeRetryFile::Legacy(mut state)) => {
+                let maximum = unix_time_millis().saturating_add(66 * 60 * 1000);
+                state.next_retry_unix_ms = state.next_retry_unix_ms.min(maximum);
+                (HashMap::new(), Some(state))
+            }
+            Ok(PersistedDesiredAcmeRetryFile::Scoped(_)) => {
+                tracing::warn!(
+                    "desired ACME retry state version is unsupported; applying conservative restart backoff"
+                );
                 (
-                    state.attempt,
-                    Some(state.next_retry_unix_ms.min(maximum)),
-                    Some(state.scope_fingerprint),
+                    HashMap::new(),
+                    Some(PersistedDesiredAcmeRetry {
+                        attempt: usize::MAX,
+                        next_retry_unix_ms: unix_time_millis() + 60 * 60 * 1000,
+                        scope_fingerprint: String::new(),
+                    }),
                 )
             }
             Err(error) => {
                 tracing::warn!(
                     "desired ACME retry state is invalid; applying conservative restart backoff: {error}"
                 );
-                (usize::MAX, Some(unix_time_millis() + 60 * 60 * 1000), None)
+                (
+                    HashMap::new(),
+                    Some(PersistedDesiredAcmeRetry {
+                        attempt: usize::MAX,
+                        next_retry_unix_ms: unix_time_millis() + 60 * 60 * 1000,
+                        scope_fingerprint: String::new(),
+                    }),
+                )
             }
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (0, None, None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), None),
         Err(error) => {
             tracing::warn!(
                 "desired ACME retry state is unreadable; applying conservative restart backoff: {error}"
             );
-            (usize::MAX, Some(unix_time_millis() + 60 * 60 * 1000), None)
+            (
+                HashMap::new(),
+                Some(PersistedDesiredAcmeRetry {
+                    attempt: usize::MAX,
+                    next_retry_unix_ms: unix_time_millis() + 60 * 60 * 1000,
+                    scope_fingerprint: String::new(),
+                }),
+            )
         }
     }
 }
 
-fn persist_desired_acme_retry(
+fn persist_desired_acme_retries(
     state_dir: &Path,
-    attempt: usize,
-    next_retry_unix_ms: i64,
-    scope_fingerprint: &str,
+    scopes: &HashMap<String, PersistedScopeAcmeRetry>,
 ) -> Result<(), String> {
-    let state = PersistedDesiredAcmeRetry {
-        attempt,
-        next_retry_unix_ms,
-        scope_fingerprint: scope_fingerprint.to_string(),
+    if scopes.is_empty() {
+        remove_desired_acme_retry(state_dir);
+        return Ok(());
+    }
+    let state = PersistedDesiredAcmeRetries {
+        version: 2,
+        scopes: scopes.clone(),
     };
     let bytes = serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?;
     write_private_file(&desired_acme_retry_path(state_dir), &bytes)
@@ -1109,19 +1263,22 @@ fn run_certificate_reconcile(
     acme_gate: &Arc<std::sync::Mutex<()>>,
     mut manifest: CamouflageSitesManifest,
     active: Option<&CamouflageSitesManifest>,
-) -> Result<(CamouflageSitesManifest, Vec<LifecycleAction>), String> {
+    allowed_acme_scopes: Option<&HashSet<String>>,
+) -> Result<LifecycleReconcileReport, String> {
     // Certbot uses its default shared config/work/log roots. Keep that tool
     // serialized independently from the state mutex; status reads remain free.
     let _acme_lease = acme_gate
         .lock()
         .map_err(|_| "certificate lifecycle gate is unavailable".to_string())?;
-    let site_ids = manifest
+    let mut scope_keys = manifest
         .sites
         .iter()
-        .filter(|site| site.certificate.lifecycle.is_some())
-        .map(|site| site.id.clone())
-        .collect();
-    let Some(_renewal_lease) = renewal_gate.try_acquire(site_ids) else {
+        .filter_map(|site| site.certificate.lifecycle.as_ref())
+        .filter_map(|policy| certificate_scope_key(policy).ok())
+        .collect::<Vec<_>>();
+    scope_keys.sort();
+    scope_keys.dedup();
+    let Some(_renewal_lease) = renewal_gate.try_acquire(scope_keys) else {
         return Err(RECONCILE_IN_FLIGHT.into());
     };
 
@@ -1140,7 +1297,8 @@ fn run_certificate_reconcile(
         }
     }
 
-    CertificateLifecycle::new(config.certificate_lifecycle.clone()).reconcile(&manifest)
+    CertificateLifecycle::new(config.certificate_lifecycle.clone())
+        .reconcile_scoped(&manifest, allowed_acme_scopes)
 }
 
 fn run_snapshot(snapshot: CertificateReconcileSnapshot) -> CertificateReconcileResult {
@@ -1159,21 +1317,16 @@ fn run_snapshot(snapshot: CertificateReconcileSnapshot) -> CertificateReconcileR
             &snapshot.acme_gate,
             snapshot.manifest.clone(),
             snapshot.active.as_ref(),
+            None,
         )
-        .map(|(candidate, actions)| {
-            let actions = candidate
-                .sites
-                .iter()
-                .zip(actions)
-                .map(|(site, action)| (site.id.clone(), action))
-                .collect();
-            let successful_site_ids = candidate.sites.iter().map(|site| site.id.clone()).collect();
-            CertificateReconcileOutcome {
-                candidate,
-                actions,
-                successful_site_ids,
-                failed_site_errors: HashMap::new(),
-            }
+        .map(|report| CertificateReconcileOutcome {
+            candidate: report.manifest,
+            actions: report.actions,
+            successful_site_ids: report.successful_site_ids,
+            failed_site_errors: report.failed_site_errors,
+            attempted_scope_keys: report.attempted_scope_keys,
+            successful_scope_keys: report.successful_scope_keys,
+            failed_scope_keys: report.failed_scope_keys,
         })
     };
     tracing::info!(
@@ -1192,70 +1345,60 @@ fn run_desired_certificate_reconcile(
         .active
         .clone()
         .unwrap_or(CamouflageSitesManifest { sites: Vec::new() });
-    let mut actions = HashMap::new();
-    let mut successful_site_ids = HashSet::new();
-    let mut failed_site_errors = HashMap::new();
-
-    let mut prepared_site_ids: Vec<_> = snapshot.prepared_site_ids.iter().cloned().collect();
-    prepared_site_ids.sort();
-    for site_id in &prepared_site_ids {
-        let Some(desired_site) = snapshot
+    let desired_manifest = CamouflageSitesManifest {
+        sites: snapshot
             .manifest
             .sites
             .iter()
-            .find(|site| &site.id == site_id)
+            .filter(|site| snapshot.prepared_site_ids.contains(&site.id))
             .cloned()
-        else {
-            failed_site_errors.insert(site_id.clone(), "desired site is unavailable".into());
-            continue;
-        };
-        let previous = snapshot.active.as_ref().and_then(|active| {
-            active
-                .sites
-                .iter()
-                .find(|site| site.id == desired_site.id || site.sni == desired_site.sni)
-                .cloned()
-        });
-        let active = previous.map(|site| CamouflageSitesManifest { sites: vec![site] });
-        match run_certificate_reconcile(
-            &snapshot.config,
-            &snapshot.renewal_gate,
-            &snapshot.acme_gate,
-            CamouflageSitesManifest {
-                sites: vec![desired_site.clone()],
-            },
-            active.as_ref(),
-        ) {
-            Ok((reconciled, site_actions)) => {
-                let Some(reconciled_site) = reconciled.sites.into_iter().next() else {
-                    failed_site_errors
-                        .insert(site_id.clone(), "prepared site is unavailable".into());
-                    continue;
-                };
-                candidate.sites.retain(|site| {
-                    site.id != reconciled_site.id && site.sni != reconciled_site.sni
-                });
-                candidate.sites.push(reconciled_site);
-                actions.insert(
-                    site_id.clone(),
-                    site_actions
-                        .into_iter()
-                        .next()
-                        .unwrap_or(LifecycleAction::Unchanged),
-                );
-                successful_site_ids.insert(site_id.clone());
-            }
-            Err(error) => {
-                failed_site_errors.insert(site_id.clone(), sanitize_error(&error));
-            }
+            .collect(),
+    };
+    let report = run_certificate_reconcile(
+        &snapshot.config,
+        &snapshot.renewal_gate,
+        &snapshot.acme_gate,
+        desired_manifest,
+        snapshot.active.as_ref(),
+        Some(&snapshot.allowed_acme_scope_keys),
+    );
+
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            return CertificateReconcileOutcome {
+                candidate,
+                actions: HashMap::new(),
+                successful_site_ids: HashSet::new(),
+                failed_site_errors: snapshot
+                    .prepared_site_ids
+                    .iter()
+                    .map(|site_id| (site_id.clone(), sanitize_error(&error)))
+                    .collect(),
+                attempted_scope_keys: HashSet::new(),
+                successful_scope_keys: HashSet::new(),
+                failed_scope_keys: HashSet::new(),
+            };
         }
+    };
+    for reconciled_site in &report.manifest.sites {
+        if !report.successful_site_ids.contains(&reconciled_site.id) {
+            continue;
+        }
+        candidate
+            .sites
+            .retain(|site| site.id != reconciled_site.id && site.sni != reconciled_site.sni);
+        candidate.sites.push(reconciled_site.clone());
     }
 
     CertificateReconcileOutcome {
         candidate,
-        actions,
-        successful_site_ids,
-        failed_site_errors,
+        actions: report.actions,
+        successful_site_ids: report.successful_site_ids,
+        failed_site_errors: report.failed_site_errors,
+        attempted_scope_keys: report.attempted_scope_keys,
+        successful_scope_keys: report.successful_scope_keys,
+        failed_scope_keys: report.failed_scope_keys,
     }
 }
 
@@ -1307,6 +1450,9 @@ async fn commit_snapshot(
         actions,
         successful_site_ids,
         failed_site_errors,
+        attempted_scope_keys,
+        successful_scope_keys,
+        failed_scope_keys,
     } = match outcome {
         Ok(value) => value,
         Err(error) if error == RECONCILE_IN_FLIGHT => {
@@ -1340,7 +1486,12 @@ async fn commit_snapshot(
                             .insert(site.site_id.clone(), sanitize_error(&error));
                     }
                 }
-                current.finish_desired_worker(true);
+                current.finish_desired_worker_with_scopes(
+                    true,
+                    &snapshot.allowed_acme_scope_keys,
+                    &HashSet::new(),
+                    &snapshot.allowed_acme_scope_keys,
+                );
             }
             return ReconcileCommit::Failed;
         }
@@ -1390,7 +1541,12 @@ async fn commit_snapshot(
                     );
                 }
             }
-            current.finish_desired_worker(true);
+            current.finish_desired_worker_with_scopes(
+                true,
+                &attempted_scope_keys,
+                &successful_scope_keys,
+                &failed_scope_keys,
+            );
         }
         return ReconcileCommit::Failed;
     }
@@ -1417,7 +1573,9 @@ async fn commit_snapshot(
             current.last_errors.remove(site_id);
         }
         for (site_id, error) in &failed_site_errors {
-            current.last_errors.insert(site_id.clone(), error.clone());
+            if error != ACME_RETRY_DEFERRED || !current.last_errors.contains_key(site_id) {
+                current.last_errors.insert(site_id.clone(), error.clone());
+            }
         }
     }
     if current.active.as_ref() != Some(&candidate) {
@@ -1425,7 +1583,12 @@ async fn commit_snapshot(
     }
     current.active = Some(candidate);
     if snapshot.desired_request {
-        current.finish_desired_worker(!failed_site_errors.is_empty());
+        current.finish_desired_worker_with_scopes(
+            !failed_site_errors.is_empty(),
+            &attempted_scope_keys,
+            &successful_scope_keys,
+            &failed_scope_keys,
+        );
     }
     tracing::info!(
         generation = snapshot.generation,
@@ -2513,6 +2676,12 @@ mod tests {
             .map(|site| (site.id.clone(), LifecycleAction::Unchanged))
             .collect();
         let successful_site_ids = snapshot.prepared_site_ids.clone();
+        let successful_scope_keys = candidate
+            .sites
+            .iter()
+            .filter_map(|site| site.certificate.lifecycle.as_ref())
+            .filter_map(|policy| certificate_scope_key(policy).ok())
+            .collect();
         CertificateReconcileResult {
             snapshot,
             outcome: Ok(CertificateReconcileOutcome {
@@ -2520,8 +2689,20 @@ mod tests {
                 actions,
                 successful_site_ids,
                 failed_site_errors: HashMap::new(),
+                attempted_scope_keys: HashSet::new(),
+                successful_scope_keys,
+                failed_scope_keys: HashSet::new(),
             }),
         }
+    }
+
+    fn retry_for_desired<'a>(
+        state: &'a CamouflageSiteManager,
+        desired: &CamouflageSiteDesired,
+    ) -> Option<&'a PersistedScopeAcmeRetry> {
+        state
+            .acme_retries
+            .get(&desired_certificate_scope_key(desired).unwrap())
     }
 
     async fn wait_for_desired_worker(shared: &Arc<AsyncMutex<CamouflageSiteManager>>) {
@@ -2618,19 +2799,18 @@ mod tests {
             prepare_desired_shared(&shared, std::slice::from_ref(&desired), true).await;
         }
         assert_eq!(certbot_invocation_count(&counter), 1);
-        assert_eq!(shared.lock().await.acme_retry_attempt, 1);
+        {
+            let state = shared.lock().await;
+            assert_eq!(retry_for_desired(&state, &desired).unwrap().attempt, 1);
+        }
         assert!(desired_acme_retry_path(&config.state_dir).exists());
 
         let mut restarted = CamouflageSiteManager::new(config);
         restarted.reconcile_retry_backoff = vec![Duration::ZERO];
         restarted.acme_retry_backoff = vec![Duration::from_secs(1)];
         restarted.acme_jitter_percent = 0;
-        assert_eq!(restarted.acme_retry_attempt, 1);
-        assert_eq!(
-            restarted.acme_retry_scope_fingerprint.as_deref(),
-            Some(desired_acme_scope_fingerprint(std::slice::from_ref(&desired)).as_str())
-        );
-        assert!(!restarted.acme_retry_is_due());
+        assert_eq!(retry_for_desired(&restarted, &desired).unwrap().attempt, 1);
+        assert!(!restarted.acme_scope_is_due(&desired_certificate_scope_key(&desired).unwrap()));
         let restarted = Arc::new(AsyncMutex::new(restarted));
         prepare_desired_shared(&restarted, std::slice::from_ref(&desired), true).await;
         assert_eq!(certbot_invocation_count(&counter), 1);
@@ -2698,17 +2878,16 @@ mod tests {
         assert!(!state.last_errors.contains_key("q1"));
         assert!(state.last_errors.contains_key("q2"));
         assert!(!state.last_errors.contains_key("q3"));
-        assert_eq!(state.acme_retry_attempt, 1);
-        assert!(state.acme_retry_at_unix_ms.is_some());
-        let persisted: PersistedDesiredAcmeRetry = serde_json::from_slice(
+        let failed_scope = desired_certificate_scope_key(&desired[1]).unwrap();
+        assert_eq!(state.acme_retries[&failed_scope].attempt, 1);
+        assert!(state.acme_retries[&failed_scope].next_retry_unix_ms > unix_time_millis());
+        let persisted: PersistedDesiredAcmeRetries = serde_json::from_slice(
             &fs::read(desired_acme_retry_path(&state.config.state_dir)).unwrap(),
         )
         .unwrap();
-        assert_eq!(persisted.attempt, 1);
-        assert_eq!(
-            persisted.scope_fingerprint,
-            desired_acme_scope_fingerprint(&desired)
-        );
+        assert_eq!(persisted.version, 2);
+        assert_eq!(persisted.scopes.len(), 1);
+        assert_eq!(persisted.scopes[&failed_scope].attempt, 1);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2737,7 +2916,7 @@ mod tests {
         let config = shared.lock().await.config.clone();
         let mut restarted = CamouflageSiteManager::new(config);
         restarted.set_desired_retry_backoff_for_test(vec![Duration::from_secs(60)]);
-        assert_eq!(restarted.acme_retry_attempt, 1);
+        assert_eq!(retry_for_desired(&restarted, &scope_a).unwrap().attempt, 1);
         let mut scope_b = desired_site("q2", "q2.b.example.com");
         scope_b.certificate.domain = "*.b.example.com".into();
         let next = restarted.desired_reconcile_snapshot(std::slice::from_ref(&scope_b), true);
@@ -2745,11 +2924,7 @@ mod tests {
             next.is_some(),
             "new certificate scope must not inherit old backoff"
         );
-        assert_eq!(restarted.acme_retry_attempt, 0);
-        assert_eq!(
-            restarted.acme_retry_scope_fingerprint.as_deref(),
-            Some(desired_acme_scope_fingerprint(&[scope_b]).as_str())
-        );
+        assert!(restarted.acme_retries.is_empty());
         assert!(!desired_acme_retry_path(&restarted.config.state_dir).exists());
 
         let mut state = manager(&dir.join("same-scope"), "true", "true");
@@ -2774,17 +2949,13 @@ mod tests {
         let config = shared.lock().await.config.clone();
         let mut restarted = CamouflageSiteManager::new(config);
         restarted.set_desired_retry_backoff_for_test(vec![Duration::from_secs(60)]);
-        assert_eq!(restarted.acme_retry_attempt, 1);
+        assert_eq!(retry_for_desired(&restarted, &q1).unwrap().attempt, 1);
         let mut q2 = desired_site("q2", "q2.example.com");
         q2.certificate.domain = "*.example.com".into();
         let next = restarted.desired_reconcile_snapshot(std::slice::from_ref(&q2), true);
-        assert!(next.is_none(), "same certificate scope must retain backoff");
-        assert_eq!(restarted.acme_retry_attempt, 1);
-        assert!(restarted.acme_retry_at_unix_ms.is_some());
-        assert_eq!(
-            restarted.acme_retry_scope_fingerprint.as_deref(),
-            Some(desired_acme_scope_fingerprint(&[q1]).as_str())
-        );
+        let next = next.expect("cheap reconciliation must continue during ACME backoff");
+        assert!(next.allowed_acme_scope_keys.is_empty());
+        assert_eq!(retry_for_desired(&restarted, &q2).unwrap().attempt, 1);
         assert!(desired_acme_retry_path(&restarted.config.state_dir).exists());
         let _ = fs::remove_dir_all(dir);
     }
@@ -3122,9 +3293,11 @@ mod tests {
         assert!(prepare_desired_shared(&shared, &[desired.clone()], true)
             .await
             .is_empty());
-        assert!(prepare_desired_shared(&shared, &[desired], true)
-            .await
-            .is_empty());
+        assert!(
+            prepare_desired_shared(&shared, std::slice::from_ref(&desired), true)
+                .await
+                .is_empty()
+        );
         {
             let state = shared.lock().await;
             assert!(state.desired_worker_in_flight);
@@ -3139,7 +3312,7 @@ mod tests {
                 if state.last_errors.contains_key("same_site") {
                     assert!(!state.desired_worker_in_flight);
                     assert_eq!(state.reconcile_retry_attempt, 1);
-                    assert_eq!(state.acme_retry_attempt, 1);
+                    assert_eq!(retry_for_desired(&state, &desired).unwrap().attempt, 1);
                     break;
                 }
                 drop(state);
@@ -3215,7 +3388,7 @@ mod tests {
             assert!(state.active_snis().contains("q1.example.com"));
             assert!(state.last_errors.get("q1").is_none());
             assert_eq!(state.reconcile_retry_attempt, 0);
-            assert_eq!(state.acme_retry_attempt, 0);
+            assert!(state.acme_retries.is_empty());
             assert!(!desired_acme_retry_path(&state.config.state_dir).exists());
             assert!(
                 state.finalize_for_listener_snis(&HashSet::from(["q1.example.com".to_string()]))

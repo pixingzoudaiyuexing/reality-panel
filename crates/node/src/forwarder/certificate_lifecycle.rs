@@ -8,7 +8,7 @@ use super::camouflage_site::{CamouflageSite, CamouflageSitesManifest, Certificat
 use super::nginx_sni::{self, NginxSniConfig};
 use relay_shared::protocol::AcmeChallengeMethod;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, ToSocketAddrs};
@@ -21,6 +21,7 @@ use x509_parser::pem::parse_x509_pem;
 use x509_parser::prelude::*;
 
 const DEFAULT_RENEW_BEFORE_DAYS: u32 = 30;
+pub(crate) const ACME_RETRY_DEFERRED: &str = "certificate scope ACME retry backoff active";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CertificateLifecyclePolicy {
@@ -80,6 +81,16 @@ pub enum LifecycleAction {
     RenewalWarning,
 }
 
+pub(crate) struct LifecycleReconcileReport {
+    pub manifest: CamouflageSitesManifest,
+    pub actions: HashMap<String, LifecycleAction>,
+    pub successful_site_ids: HashSet<String>,
+    pub failed_site_errors: HashMap<String, String>,
+    pub attempted_scope_keys: HashSet<String>,
+    pub successful_scope_keys: HashSet<String>,
+    pub failed_scope_keys: HashSet<String>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CertificateMetadata {
     pub issuer: String,
@@ -107,9 +118,8 @@ pub(crate) fn inspect_certificate(path: &Path) -> Result<CertificateMetadata, St
     })
 }
 
-/// Local-only guard for scheduler work. A failed renewal drops its lease, so a
-/// later tick can retry; concurrent work for the same camouflage site cannot
-/// invoke Certbot twice.
+/// Local-only guard for scheduler work. Keys are canonical certificate domains,
+/// so many sites sharing one wildcard cannot invoke Certbot concurrently.
 #[derive(Debug, Default)]
 pub(crate) struct RenewalGate {
     running: Mutex<HashSet<String>>,
@@ -117,21 +127,24 @@ pub(crate) struct RenewalGate {
 
 pub(crate) struct RenewalLease<'a> {
     gate: &'a RenewalGate,
-    site_ids: Vec<String>,
+    scope_keys: Vec<String>,
 }
 
 impl RenewalGate {
-    pub(crate) fn try_acquire(&self, site_ids: Vec<String>) -> Option<RenewalLease<'_>> {
+    pub(crate) fn try_acquire(&self, scope_keys: Vec<String>) -> Option<RenewalLease<'_>> {
         let mut running = self.running.lock().ok()?;
-        if site_ids.iter().any(|site_id| running.contains(site_id)) {
+        if scope_keys
+            .iter()
+            .any(|scope_key| running.contains(scope_key))
+        {
             return None;
         }
-        for site_id in &site_ids {
-            running.insert(site_id.clone());
+        for scope_key in &scope_keys {
+            running.insert(scope_key.clone());
         }
         Some(RenewalLease {
             gate: self,
-            site_ids,
+            scope_keys,
         })
     }
 }
@@ -139,8 +152,8 @@ impl RenewalGate {
 impl Drop for RenewalLease<'_> {
     fn drop(&mut self) {
         if let Ok(mut running) = self.gate.running.lock() {
-            for site_id in &self.site_ids {
-                running.remove(site_id);
+            for scope_key in &self.scope_keys {
+                running.remove(scope_key);
             }
         }
     }
@@ -193,7 +206,29 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
         &self,
         source: &CamouflageSitesManifest,
     ) -> Result<(CamouflageSitesManifest, Vec<LifecycleAction>), String> {
-        self.reconcile_prepared_with_dns(source, validate_dns)
+        let report = self.reconcile_scoped(source, None)?;
+        if !report.failed_site_errors.is_empty() {
+            let mut failures = report.failed_site_errors.into_iter().collect::<Vec<_>>();
+            failures.sort_by(|left, right| left.0.cmp(&right.0));
+            return Err(failures
+                .into_iter()
+                .next()
+                .map(|(_, error)| error)
+                .unwrap_or_else(|| "certificate scope reconciliation failed".into()));
+        }
+        let actions = report
+            .manifest
+            .sites
+            .iter()
+            .map(|site| {
+                report
+                    .actions
+                    .get(&site.id)
+                    .copied()
+                    .unwrap_or(LifecycleAction::Unchanged)
+            })
+            .collect();
+        Ok((report.manifest, actions))
     }
 
     #[cfg(test)]
@@ -320,6 +355,297 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
             (Ok(result), Ok(())) => Ok(result),
+        }
+    }
+
+    pub(crate) fn reconcile_scoped(
+        &self,
+        source: &CamouflageSitesManifest,
+        allowed_acme_scopes: Option<&HashSet<String>>,
+    ) -> Result<LifecycleReconcileReport, String> {
+        self.reconcile_scoped_with_dns(source, validate_dns, allowed_acme_scopes)
+    }
+
+    fn reconcile_scoped_with_dns<F>(
+        &self,
+        source: &CamouflageSitesManifest,
+        dns_validator: F,
+        allowed_acme_scopes: Option<&HashSet<String>>,
+    ) -> Result<LifecycleReconcileReport, String>
+    where
+        F: Fn(&str, &str) -> Result<(), String>,
+    {
+        let mut report = LifecycleReconcileReport {
+            manifest: source.clone(),
+            actions: HashMap::new(),
+            successful_site_ids: HashSet::new(),
+            failed_site_errors: HashMap::new(),
+            attempted_scope_keys: HashSet::new(),
+            successful_scope_keys: HashSet::new(),
+            failed_scope_keys: HashSet::new(),
+        };
+        if !self.config.enabled {
+            for site in &source.sites {
+                report
+                    .actions
+                    .insert(site.id.clone(), LifecycleAction::Unchanged);
+                report.successful_site_ids.insert(site.id.clone());
+            }
+            return Ok(report);
+        }
+
+        self.ensure_https_redirect()?;
+        ensure_private_dir(&self.config.state_dir)?;
+        let mut scopes = BTreeMap::<String, Vec<usize>>::new();
+        for (index, site) in source.sites.iter().enumerate() {
+            let Some(policy) = site.certificate.lifecycle.as_ref() else {
+                report
+                    .actions
+                    .insert(site.id.clone(), LifecycleAction::Unchanged);
+                report.successful_site_ids.insert(site.id.clone());
+                continue;
+            };
+            match certificate_scope_key(policy) {
+                Ok(scope_key) => scopes.entry(scope_key).or_default().push(index),
+                Err(error) => {
+                    report.failed_site_errors.insert(site.id.clone(), error);
+                }
+            }
+        }
+
+        let mut prepared_http01 = None;
+        for (scope_key, indexes) in scopes {
+            self.reconcile_certificate_scope(
+                &scope_key,
+                &indexes,
+                &mut report,
+                &dns_validator,
+                allowed_acme_scopes,
+                &mut prepared_http01,
+            );
+        }
+
+        let redirect = self.ensure_https_redirect();
+        match redirect {
+            Ok(()) => Ok(report),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn reconcile_certificate_scope<F>(
+        &self,
+        scope_key: &str,
+        indexes: &[usize],
+        report: &mut LifecycleReconcileReport,
+        dns_validator: &F,
+        allowed_acme_scopes: Option<&HashSet<String>>,
+        prepared_http01: &mut Option<String>,
+    ) where
+        F: Fn(&str, &str) -> Result<(), String>,
+    {
+        let mut policy = None::<CertificateLifecyclePolicy>;
+        let mut usable = Vec::<(usize, ExistingCertificate)>::new();
+        let mut eligible = Vec::<usize>::new();
+
+        for &index in indexes {
+            let site = &report.manifest.sites[index];
+            let Some(mut site_policy) = site.certificate.lifecycle.clone() else {
+                continue;
+            };
+            site_policy.domain = scope_key.to_string();
+            if let Err(error) = validate_policy(site, &site_policy) {
+                report.failed_site_errors.insert(site.id.clone(), error);
+                continue;
+            }
+            if policy
+                .as_ref()
+                .is_some_and(|current| current != &site_policy)
+            {
+                report.failed_site_errors.insert(
+                    site.id.clone(),
+                    "certificate scope has conflicting lifecycle policies".into(),
+                );
+                continue;
+            }
+            policy.get_or_insert(site_policy.clone());
+            eligible.push(index);
+            match self.discover_existing(site, &site_policy) {
+                Ok(Some(existing)) => usable.push((index, existing)),
+                Ok(None) => {}
+                Err(error) => {
+                    report.failed_site_errors.insert(site.id.clone(), error);
+                }
+            }
+        }
+
+        let Some(policy) = policy else {
+            return;
+        };
+        let shared_existing = usable
+            .iter()
+            .filter_map(|(_, existing)| {
+                certificate_not_after(&existing.reference.cert_path)
+                    .ok()
+                    .map(|expires| (expires, existing.clone()))
+            })
+            .max_by_key(|(expires, _)| *expires)
+            .map(|(_, existing)| existing);
+
+        let mut existing_by_index = usable.into_iter().collect::<HashMap<_, _>>();
+        if let Some(existing) = shared_existing.as_ref() {
+            for &index in &eligible {
+                if existing_by_index.contains_key(&index) {
+                    continue;
+                }
+                let site = &report.manifest.sites[index];
+                match install_candidate(
+                    &existing.reference,
+                    &self.config.state_dir,
+                    &site.id,
+                    &policy,
+                ) {
+                    Ok(reference) => {
+                        existing_by_index.insert(
+                            index,
+                            ExistingCertificate {
+                                reference,
+                                renewal_due: existing.renewal_due,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        report.failed_site_errors.insert(site.id.clone(), error);
+                    }
+                }
+            }
+        }
+        for (&index, existing) in &existing_by_index {
+            report.manifest.sites[index].certificate = existing.reference.clone();
+        }
+
+        let renewal_due = existing_by_index.is_empty()
+            || existing_by_index
+                .values()
+                .any(|existing| existing.renewal_due);
+        if !renewal_due {
+            for index in existing_by_index.keys() {
+                let site_id = report.manifest.sites[*index].id.clone();
+                report
+                    .actions
+                    .insert(site_id.clone(), LifecycleAction::Unchanged);
+                report.successful_site_ids.insert(site_id);
+            }
+            report.successful_scope_keys.insert(scope_key.to_string());
+            return;
+        }
+
+        let acme_allowed = allowed_acme_scopes
+            .map(|allowed| allowed.contains(scope_key))
+            .unwrap_or(true);
+        if !acme_allowed {
+            for index in existing_by_index.keys() {
+                let site_id = report.manifest.sites[*index].id.clone();
+                report
+                    .actions
+                    .insert(site_id.clone(), LifecycleAction::Unchanged);
+                report.successful_site_ids.insert(site_id);
+            }
+            for index in eligible {
+                if !existing_by_index.contains_key(&index) {
+                    report.failed_site_errors.insert(
+                        report.manifest.sites[index].id.clone(),
+                        ACME_RETRY_DEFERRED.into(),
+                    );
+                }
+            }
+            return;
+        }
+        report.attempted_scope_keys.insert(scope_key.to_string());
+
+        let attempt: Result<(CertificateReference, bool), String> = (|| {
+            if policy.challenge_method == AcmeChallengeMethod::Http01 {
+                if !self.config.http01_nginx.enabled {
+                    return Err("certificate lifecycle requires managed Nginx for HTTP-01".into());
+                }
+                dns_validator(&policy.domain, &policy.expected_public_ip)?;
+                let scope_manifest = CamouflageSitesManifest {
+                    sites: eligible
+                        .iter()
+                        .map(|index| report.manifest.sites[*index].clone())
+                        .collect(),
+                };
+                self.prepare_http01_once(&scope_manifest, prepared_http01)?;
+            }
+            let renew = !existing_by_index.is_empty();
+            self.invoke_certbot(&policy, renew)?;
+            let candidate = self
+                .best_certbot_candidate(&policy)?
+                .ok_or_else(|| "ACME did not produce a usable certificate".to_string())?;
+            if validate_candidate(
+                &candidate,
+                &policy.domain,
+                policy.renew_before_days,
+                &self.runner,
+                true,
+            )
+            .is_err()
+                || shared_existing.as_ref().is_some_and(|existing| {
+                    same_certificate(&candidate, &existing.reference).unwrap_or(true)
+                })
+            {
+                return Err("ACME did not produce a new usable certificate".into());
+            }
+            Ok((candidate, renew))
+        })();
+
+        match attempt {
+            Ok((candidate, renew)) => {
+                report.successful_scope_keys.insert(scope_key.to_string());
+                for index in eligible {
+                    let site_id = report.manifest.sites[index].id.clone();
+                    match install_candidate(&candidate, &self.config.state_dir, &site_id, &policy) {
+                        Ok(reference) => {
+                            report.manifest.sites[index].certificate = reference;
+                            report.actions.insert(
+                                site_id.clone(),
+                                if renew {
+                                    LifecycleAction::Renewed
+                                } else {
+                                    LifecycleAction::Issued
+                                },
+                            );
+                            report.successful_site_ids.insert(site_id);
+                        }
+                        Err(error) if existing_by_index.contains_key(&index) => {
+                            report
+                                .actions
+                                .insert(site_id.clone(), LifecycleAction::RenewalWarning);
+                            report.successful_site_ids.insert(site_id);
+                            tracing::warn!(
+                                site_id = %report.manifest.sites[index].id,
+                                "new certificate generation install failed; retaining usable generation: {error}"
+                            );
+                        }
+                        Err(error) => {
+                            report.failed_site_errors.insert(site_id, error);
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                report.failed_scope_keys.insert(scope_key.to_string());
+                for index in eligible {
+                    let site_id = report.manifest.sites[index].id.clone();
+                    if existing_by_index.contains_key(&index) {
+                        report
+                            .actions
+                            .insert(site_id.clone(), LifecycleAction::RenewalWarning);
+                        report.successful_site_ids.insert(site_id);
+                    } else {
+                        report.failed_site_errors.insert(site_id, error.clone());
+                    }
+                }
+            }
         }
     }
 
@@ -586,6 +912,18 @@ fn certificate_not_after(path: &Path) -> Result<i64, String> {
     let (_, certificate) =
         X509Certificate::from_der(&pem.contents).map_err(|_| "invalid certificate DER")?;
     Ok(certificate.validity().not_after.timestamp())
+}
+
+pub(crate) fn certificate_scope_key(policy: &CertificateLifecyclePolicy) -> Result<String, String> {
+    let domain = policy
+        .domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if !is_valid_certificate_domain(&domain) {
+        return Err("invalid certificate domain".into());
+    }
+    Ok(domain)
 }
 
 fn validate_policy(
@@ -1015,7 +1353,10 @@ mod tests {
     use super::*;
     use ::time::{Duration as TimeDuration, OffsetDateTime};
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     struct FakeRunner(Mutex<VecDeque<Output>>);
 
@@ -1045,6 +1386,37 @@ mod tests {
             } else {
                 Ok(output(true, b"same"))
             }
+        }
+    }
+
+    struct ScopeRunner {
+        live_root: PathBuf,
+        replacements: HashMap<String, (Vec<u8>, Vec<u8>)>,
+        failed_domains: HashSet<String>,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl CommandRunner for ScopeRunner {
+        fn run(&self, program: &Path, args: &[String]) -> Result<Output, String> {
+            if program != Path::new("/bin/true") {
+                return Ok(output(true, b"same"));
+            }
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            let domain = args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "-d").then_some(pair[1].as_str()))
+                .ok_or_else(|| "missing Certbot domain".to_string())?;
+            if self.failed_domains.contains(domain) {
+                return Ok(output(false, b""));
+            }
+            let (cert, key) = self
+                .replacements
+                .get(domain)
+                .ok_or_else(|| format!("missing replacement certificate for {domain}"))?;
+            let live = self.live_root.join(certbot_certificate_name(domain)?);
+            write_private_file(&live.join("fullchain.pem"), cert)?;
+            write_private_file(&live.join("privkey.pem"), key)?;
+            Ok(output(true, b""))
         }
     }
 
@@ -1145,6 +1517,43 @@ mod tests {
             local_backend: "127.0.0.1:5244".into(),
             certificate: reference,
         }
+    }
+
+    fn scoped_site(dir: &Path, id: &str, sni: &str, domain: &str) -> CamouflageSite {
+        let mut lifecycle_policy = policy(domain);
+        lifecycle_policy.challenge_method = AcmeChallengeMethod::Dns01;
+        CamouflageSite {
+            id: id.into(),
+            sni: sni.into(),
+            tls_listener_port: 8443,
+            local_backend: "127.0.0.1:5244".into(),
+            certificate: CertificateReference {
+                cert_path: dir.join(format!("missing/{id}/fullchain.pem")),
+                key_path: dir.join(format!("missing/{id}/privkey.pem")),
+                lifecycle: Some(lifecycle_policy),
+            },
+        }
+    }
+
+    fn scope_runner(
+        dir: &Path,
+        replacements: HashMap<String, (Vec<u8>, Vec<u8>)>,
+        failed_domains: HashSet<String>,
+        invocations: Arc<AtomicUsize>,
+    ) -> (CertificateLifecycleConfig, ScopeRunner) {
+        ensure_private_dir(&dir.join("letsencrypt/archive")).unwrap();
+        let hook = dir.join("acme-dns01-hook");
+        write_private_file(&hook, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config = enabled_config(dir);
+        config.dns01_hook_binary = hook;
+        let runner = ScopeRunner {
+            live_root: config.certbot_live_dir.clone(),
+            replacements,
+            failed_domains,
+            invocations,
+        };
+        (config, runner)
     }
 
     #[test]
@@ -1770,6 +2179,137 @@ mod tests {
             .unwrap();
         assert_eq!(actions, vec![LifecycleAction::RenewalWarning]);
         assert_eq!(candidate.sites[0].certificate.cert_path, old_cert);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn forty_sites_sharing_one_wildcard_invoke_certbot_once() {
+        let dir = unique_dir("scope-dedup");
+        let replacement =
+            write_test_certificate(&dir.join("replacement"), vec!["*.example.com".into()]);
+        let replacements = HashMap::from([(
+            "*.example.com".to_string(),
+            (
+                fs::read(replacement.0).unwrap(),
+                fs::read(replacement.1).unwrap(),
+            ),
+        )]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let (config, runner) =
+            scope_runner(&dir, replacements, HashSet::new(), Arc::clone(&invocations));
+        let manifest = CamouflageSitesManifest {
+            sites: (1..=40)
+                .map(|index| {
+                    scoped_site(
+                        &dir,
+                        &format!("q{index}"),
+                        &format!("q{index}.example.com"),
+                        "*.example.com",
+                    )
+                })
+                .collect(),
+        };
+
+        let report = CertificateLifecycle::with_runner(config, runner)
+            .reconcile_scoped(&manifest, None)
+            .unwrap();
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(report.successful_site_ids.len(), 40);
+        assert!(report.failed_site_errors.is_empty());
+        assert_eq!(
+            report.attempted_scope_keys,
+            HashSet::from(["*.example.com".into()])
+        );
+        assert_eq!(
+            report.successful_scope_keys,
+            HashSet::from(["*.example.com".into()])
+        );
+        assert!(report.failed_scope_keys.is_empty());
+        assert!(report
+            .actions
+            .values()
+            .all(|action| *action == LifecycleAction::Issued));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_certificate_scope_does_not_block_or_clear_successful_scope() {
+        let dir = unique_dir("scope-isolation");
+        let replacement =
+            write_test_certificate(&dir.join("replacement-b"), vec!["*.b.example.com".into()]);
+        let replacements = HashMap::from([(
+            "*.b.example.com".to_string(),
+            (
+                fs::read(replacement.0).unwrap(),
+                fs::read(replacement.1).unwrap(),
+            ),
+        )]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let (config, runner) = scope_runner(
+            &dir,
+            replacements,
+            HashSet::from(["*.a.example.com".into()]),
+            Arc::clone(&invocations),
+        );
+        let manifest = CamouflageSitesManifest {
+            sites: vec![
+                scoped_site(&dir, "q1", "q1.a.example.com", "*.a.example.com"),
+                scoped_site(&dir, "q2", "q2.b.example.com", "*.b.example.com"),
+            ],
+        };
+
+        let report = CertificateLifecycle::with_runner(config, runner)
+            .reconcile_scoped(&manifest, None)
+            .unwrap();
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        assert!(report.failed_site_errors.contains_key("q1"));
+        assert!(report.successful_site_ids.contains("q2"));
+        assert_eq!(
+            report.failed_scope_keys,
+            HashSet::from(["*.a.example.com".into()])
+        );
+        assert_eq!(
+            report.successful_scope_keys,
+            HashSet::from(["*.b.example.com".into()])
+        );
+        assert_eq!(report.actions.get("q2"), Some(&LifecycleAction::Issued));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn site_install_failure_does_not_block_sibling_in_same_scope() {
+        let dir = unique_dir("scope-install-isolation");
+        let replacement =
+            write_test_certificate(&dir.join("replacement"), vec!["*.example.com".into()]);
+        let replacements = HashMap::from([(
+            "*.example.com".to_string(),
+            (
+                fs::read(replacement.0).unwrap(),
+                fs::read(replacement.1).unwrap(),
+            ),
+        )]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let (config, runner) =
+            scope_runner(&dir, replacements, HashSet::new(), Arc::clone(&invocations));
+        let manifest = CamouflageSitesManifest {
+            sites: vec![
+                scoped_site(&dir, "good", "q1.example.com", "*.example.com"),
+                scoped_site(&dir, "bad/site", "q2.example.com", "*.example.com"),
+            ],
+        };
+
+        let report = CertificateLifecycle::with_runner(config, runner)
+            .reconcile_scoped(&manifest, None)
+            .unwrap();
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(report.successful_site_ids.contains("good"));
+        assert!(report.failed_site_errors.contains_key("bad/site"));
+        assert_eq!(report.actions.get("good"), Some(&LifecycleAction::Issued));
+        assert!(report.successful_scope_keys.contains("*.example.com"));
+        assert!(report.failed_scope_keys.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 
