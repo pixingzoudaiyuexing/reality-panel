@@ -7,6 +7,19 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.0.1] - 2026-08-29
+
+Production hotfix for fresh Node deployment and stable lifecycle detection.
+
+### Fixed
+
+- Node bootstrap installs the AppArmor userspace package and verifies
+  `apparmor_parser` when AppArmor is enabled, preventing Docker/OpenList startup
+  failures on minimal Debian images.
+- Stable Reality Panel `1.0.x` Nodes using config protocol 8 are accepted by the
+  lifecycle capability gate, so log/restart operations are no longer rejected as
+  `NODE_LIFECYCLE_UNSUPPORTED`; older or ambiguous Nodes remain restricted.
+
 ## [1.0.0] - 2026-08-29
 
 First stable Reality Panel release. This promotes the accepted rc.6 code line
