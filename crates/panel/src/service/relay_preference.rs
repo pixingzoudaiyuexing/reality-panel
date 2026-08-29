@@ -114,6 +114,7 @@ pub enum RelayPreferenceError {
 pub enum RelayDnsTarget {
     NotSet,
     Resolved(String),
+    Frozen,
     Invalid(&'static str),
 }
 
@@ -409,6 +410,9 @@ pub async fn resolve_dns_target(
         Ok(preference) => preference,
         Err(_) => return Ok(RelayDnsTarget::Invalid("RELAY_PREFERENCE_INVALID")),
     };
+    if preference.state == RelayPreferencePhase::Failed && preference.pending_node_id.is_some() {
+        return Ok(RelayDnsTarget::Frozen);
+    }
     let selected_node_id = if preference.state == RelayPreferencePhase::Switching {
         preference.pending_node_id.as_deref()
     } else {
@@ -635,6 +639,23 @@ fn terminal_dns_error(sync: &crate::db::repo::DnsRecordSync) -> Option<String> {
     })
 }
 
+async fn fail_switch(
+    db: &dyn Repository,
+    group_id: i64,
+    mut preference: RelayPreferenceState,
+    target_node_id: String,
+    error: &str,
+) -> Result<FinalizeOutcome, RelayPreferenceError> {
+    preference.state = RelayPreferencePhase::Failed;
+    preference.last_error = Some(error.to_string());
+    store_preference(db, group_id, &preference).await?;
+    Ok(FinalizeOutcome::Failed {
+        from_node_id: preference.preferred_node_id,
+        to_node_id: target_node_id,
+        error: error.to_string(),
+    })
+}
+
 async fn finalize_switching_group(
     db: &dyn Repository,
     node_connections: &NodeConnections,
@@ -655,12 +676,28 @@ async fn finalize_switching_group(
             error: "PENDING_NODE_MISSING".into(),
         });
     };
-    let RelayDnsTarget::Resolved(target_ipv4) =
-        stored_node_public_ipv4(db, group_id, &target_node_id).await?
-    else {
-        // The target was Ready when the transaction started. A transient status
-        // gap must not select another Relay or commit a stale IP.
-        return Ok(FinalizeOutcome::Pending);
+    let target_ipv4 = match stored_node_public_ipv4(db, group_id, &target_node_id).await? {
+        RelayDnsTarget::Resolved(target_ipv4) => target_ipv4,
+        RelayDnsTarget::Invalid("RELAY_NODE_STATUS_MISSING" | "RELAY_NODE_STATUS_INVALID") => {
+            return fail_switch(
+                db,
+                group_id,
+                preference,
+                target_node_id,
+                "TARGET_STATUS_UNAVAILABLE",
+            )
+            .await;
+        }
+        RelayDnsTarget::Invalid(_) | RelayDnsTarget::NotSet | RelayDnsTarget::Frozen => {
+            return fail_switch(
+                db,
+                group_id,
+                preference,
+                target_node_id,
+                "TARGET_PUBLIC_IPV4_UNAVAILABLE",
+            )
+            .await;
+        }
     };
 
     let rule_ids = crate::service::dnsmgr::eligible_rule_ids_for_group(db, group_id).await?;
@@ -714,7 +751,14 @@ async fn finalize_switching_group(
         .iter()
         .any(|node| node.info.node_id == target_node_id && node.info.ready)
     {
-        return Ok(FinalizeOutcome::Pending);
+        return fail_switch(
+            db,
+            group_id,
+            preference,
+            target_node_id,
+            "TARGET_NOT_READY_AFTER_DNS",
+        )
+        .await;
     }
 
     let from_node_id = preference.preferred_node_id.clone();
@@ -1487,8 +1531,16 @@ mod tests {
             failed.last_error.as_deref(),
             Some("PUBLIC_DNS_MULTIPLE_ANSWERS")
         );
+        let frozen_multiple = repo.find_dns_record_sync(1).await.unwrap().unwrap();
+        crate::service::dnsmgr::refresh_all_desired(&repo)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.find_dns_record_sync(1).await.unwrap().unwrap(),
+            frozen_multiple
+        );
 
-        let retry = start_relay_switch(&repo, &connections, 7, "node-c")
+        let retry = start_relay_switch(&repo, &connections, 7, "node-b")
             .await
             .unwrap();
         assert!(matches!(retry, StartRelaySwitchOutcome::Started { .. }));
@@ -1501,12 +1553,29 @@ mod tests {
         ));
         let terminal = load_preference(&repo, 7).await.unwrap();
         assert_eq!(terminal.preferred_node_id.as_deref(), Some("node-a"));
-        assert_eq!(terminal.pending_node_id.as_deref(), Some("node-c"));
+        assert_eq!(terminal.pending_node_id.as_deref(), Some("node-b"));
         assert_eq!(terminal.last_error.as_deref(), Some("DNS_RECORD_CONFLICT"));
+        let frozen_conflict = repo.find_dns_record_sync(1).await.unwrap().unwrap();
+        crate::service::dnsmgr::refresh_all_desired(&repo)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.find_dns_record_sync(1).await.unwrap().unwrap(),
+            frozen_conflict
+        );
+
+        let choose_c = start_relay_switch(&repo, &connections, 7, "node-c")
+            .await
+            .unwrap();
+        assert!(matches!(choose_c, StartRelaySwitchOutcome::Started { .. }));
+        let switching_c = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(switching_c.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(switching_c.pending_node_id.as_deref(), Some("node-c"));
+        assert_eq!(switching_c.state, RelayPreferencePhase::Switching);
     }
 
     #[tokio::test]
-    async fn requesting_current_preferred_is_idempotent_and_target_drop_cannot_commit() {
+    async fn failed_switch_requires_explicit_post_to_restore_the_old_preferred() {
         let (repo, connections, _) = switch_fixture().await;
         assert_eq!(
             start_relay_switch(&repo, &connections, 7, "node-a")
@@ -1520,6 +1589,7 @@ mod tests {
             .await
             .unwrap();
         set_sync_state(&repo, 1, "PROPAGATED", None, None).await;
+        set_sync_state(&repo, 3, "PROPAGATED", None, None).await;
         repo.set(
             "node_status:7:node-b",
             &status(serde_json::json!({
@@ -1536,10 +1606,97 @@ mod tests {
             finalize_switching_group(&repo, &connections, 7)
                 .await
                 .unwrap(),
-            FinalizeOutcome::Pending
+            FinalizeOutcome::Failed { .. }
         ));
-        let preference = load_preference(&repo, 7).await.unwrap();
-        assert_eq!(preference.preferred_node_id.as_deref(), Some("node-a"));
-        assert_eq!(preference.pending_node_id.as_deref(), Some("node-b"));
+        let failed = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(failed.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(failed.pending_node_id.as_deref(), Some("node-b"));
+        assert_eq!(failed.state, RelayPreferencePhase::Failed);
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some("TARGET_NOT_READY_AFTER_DNS")
+        );
+        let frozen_b = repo.find_dns_record_sync(1).await.unwrap().unwrap();
+        crate::service::dnsmgr::refresh_all_desired(&repo)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.find_dns_record_sync(1).await.unwrap().unwrap(),
+            frozen_b
+        );
+
+        let rollback = start_relay_switch(&repo, &connections, 7, "node-a")
+            .await
+            .unwrap();
+        assert!(matches!(rollback, StartRelaySwitchOutcome::Started { .. }));
+        let switching_a = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(switching_a.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(switching_a.pending_node_id.as_deref(), Some("node-a"));
+        assert_eq!(switching_a.state, RelayPreferencePhase::Switching);
+        assert_eq!(
+            repo.find_dns_record_sync(1)
+                .await
+                .unwrap()
+                .unwrap()
+                .expected_value,
+            "203.0.113.5"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_target_status_or_ip_fails_instead_of_staying_switching() {
+        let (repo, connections, _) = switch_fixture().await;
+        start_relay_switch(&repo, &connections, 7, "node-b")
+            .await
+            .unwrap();
+        repo.delete("node_status:7:node-b").await.unwrap();
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::Failed { .. }
+        ));
+        let missing_status = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(missing_status.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(missing_status.pending_node_id.as_deref(), Some("node-b"));
+        assert_eq!(missing_status.state, RelayPreferencePhase::Failed);
+        assert_eq!(
+            missing_status.last_error.as_deref(),
+            Some("TARGET_STATUS_UNAVAILABLE")
+        );
+        let frozen = repo.find_dns_record_sync(1).await.unwrap().unwrap();
+        crate::service::dnsmgr::refresh_all_desired(&repo)
+            .await
+            .unwrap();
+        assert_eq!(repo.find_dns_record_sync(1).await.unwrap().unwrap(), frozen);
+
+        let (repo, connections, _) = switch_fixture().await;
+        start_relay_switch(&repo, &connections, 7, "node-b")
+            .await
+            .unwrap();
+        repo.set(
+            "node_status:7:node-b",
+            &status(serde_json::json!({
+                "public_ipv4": null,
+                "public_ip": null,
+                "active_listener_rule_ids": [1, 3]
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::Failed { .. }
+        ));
+        let missing_ip = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(missing_ip.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(missing_ip.pending_node_id.as_deref(), Some("node-b"));
+        assert_eq!(missing_ip.state, RelayPreferencePhase::Failed);
+        assert_eq!(
+            missing_ip.last_error.as_deref(),
+            Some("TARGET_PUBLIC_IPV4_UNAVAILABLE")
+        );
     }
 }

@@ -311,6 +311,52 @@ fn status_from_sync(
     }
 }
 
+fn status_from_frozen_sync(
+    rule_id: i64,
+    automation_enabled: bool,
+    sync: Option<crate::db::repo::DnsRecordSync>,
+) -> RuleDnsStatus {
+    let ownership = sync
+        .as_ref()
+        .map(|sync| match sync.ownership.as_str() {
+            "PANEL" => "PANEL_MANAGED",
+            "EXTERNAL" => "EXTERNAL",
+            _ => "NONE",
+        })
+        .unwrap_or("NONE")
+        .to_string();
+    let warning_category = sync
+        .as_ref()
+        .and_then(|sync| sync.last_error_category.as_deref())
+        .filter(|category| *category == "PUBLIC_DNS_MULTIPLE_ANSWERS")
+        .map(str::to_string);
+    let last_error_category = sync
+        .as_ref()
+        .and_then(|sync| sync.last_error_category.clone())
+        .filter(|category| category != "PUBLIC_DNS_MULTIPLE_ANSWERS");
+
+    RuleDnsStatus {
+        rule_id,
+        eligible: true,
+        automation_enabled,
+        fqdn: sync.as_ref().map(|sync| sync.fqdn.clone()),
+        record_type: sync.as_ref().map(|sync| sync.record_type.clone()),
+        expected_value: sync.as_ref().map(|sync| sync.expected_value.clone()),
+        ownership,
+        sync_state: sync
+            .as_ref()
+            .map(|sync| sync.state.clone())
+            .unwrap_or_else(|| "FROZEN".into()),
+        last_observed_at: sync.as_ref().and_then(|sync| sync.last_observed_at.clone()),
+        mutation_verified_at: sync
+            .as_ref()
+            .and_then(|sync| sync.mutation_verified_at.clone()),
+        propagated_at: sync.as_ref().and_then(|sync| sync.propagated_at.clone()),
+        last_error_category,
+        warning_category,
+    }
+}
+
 pub(crate) async fn project_rule_dns_status(
     state: &AppState,
     settings: &DnsMgrSettings,
@@ -333,6 +379,10 @@ pub(crate) async fn project_rule_dns_status(
             last_error_category: None,
             warning_category: None,
         }),
+        crate::service::dnsmgr::DnsDesiredResolution::Frozen => {
+            let sync = state.db.find_dns_record_sync(rule_id).await?;
+            Ok(status_from_frozen_sync(rule_id, automation_enabled, sync))
+        }
         crate::service::dnsmgr::DnsDesiredResolution::Eligible(desired) => {
             let sync = state.db.find_dns_record_sync(rule_id).await?;
             Ok(status_from_sync(
@@ -418,6 +468,12 @@ pub async fn retry_rule_dns_sync(
         Ok(crate::service::dnsmgr::DnsDesiredResolution::Eligible(_)) => {}
         Ok(crate::service::dnsmgr::DnsDesiredResolution::NotEligible) => {
             return Json(err(409, "规则不符合 DNS 自动化条件"));
+        }
+        Ok(crate::service::dnsmgr::DnsDesiredResolution::Frozen) => {
+            return Json(err(
+                409,
+                "Relay 切换失败状态已冻结，请通过 Relay Preference 重试",
+            ));
         }
         Ok(crate::service::dnsmgr::DnsDesiredResolution::ConfigurationError { .. }) => {
             return Json(err(409, "规则 DNS 配置无效"));
