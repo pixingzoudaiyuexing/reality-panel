@@ -5,17 +5,25 @@ relays. It provides Relay node management, Nginx Stream forwarding, Proxy
 Protocol v1, DNSMgr A records, DNS-01 certificates, OpenList camouflage,
 last-known-good recovery, lifecycle operations, diagnostics, and reapply.
 
-Production installs use only versioned GitHub Release assets. The current
-stable release can be installed with:
+The bootstrap entrypoint follows `main` and installs the latest stable GitHub
+Release by default:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0/install.sh \
-  | bash -s -- install --version v1.0.0 --public-panel-url http://203.0.113.10:18888
+curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh | bash
 ```
 
 The installer targets Debian 12 amd64 with systemd, verifies every asset with
 `SHA256SUMS`, and installs the Panel, frontend, and matching Node binary from
-one Release. `PUBLIC_PANEL_URL` accepts a credential-free `http://IP:PORT` or
+one versioned GitHub Release. The default local port is `18888`, and the public
+IPv4 is obtained from `api.ipify.org`. To select an exact stable/prerelease
+Release and override installation parameters:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh \
+  | bash -s -- v1.1.0-rc.1 --port 28888 --public-panel-url https://panel.example.com
+```
+
+`PUBLIC_PANEL_URL` accepts a credential-free `http://IP:PORT` or
 `https://hostname` origin with no path, query, or fragment. HTTP is supported
 intentionally.
 After a genuinely fresh install, the success output shows the seeded admin

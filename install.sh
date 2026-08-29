@@ -3,7 +3,6 @@
 set -euo pipefail
 
 REPOSITORY="pixingzoudaiyuexing/reality-panel"
-DEFAULT_RELEASE_TAG="v1.0.0"
 INSTALL_ROOT="/opt/relay-panel"
 CONFIG_ROOT="/etc/relay-panel"
 DATA_ROOT="/var/lib/relay-panel"
@@ -18,18 +17,39 @@ success() { printf '\033[32m\342\234\223 %s\033[0m\n' "$*"; }
 usage() {
     cat <<'EOF'
 Usage:
-  install.sh install --version v1.0.0 --public-panel-url URL
+  install.sh [VERSION] [--port PORT] [--public-panel-url URL]
+  install.sh install [--version VERSION] [--port PORT] [--public-panel-url URL]
   install.sh update [VERSION]
   install.sh uninstall [--yes] [--purge]
 
-Install requires an explicit GitHub Release tag. Update without VERSION selects
-the latest non-prerelease GitHub Release. Uninstall preserves configuration and
-data unless --purge is explicitly supplied.
+Install and update without VERSION select the latest stable GitHub Release.
+VERSION may be a stable or prerelease tag such as v1.0.0 or v1.1.0-rc.1.
+New installations listen on port 18888 by default. Uninstall preserves
+configuration and data unless --purge is explicitly supplied.
 EOF
 }
 
 valid_release_tag() {
     [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+}
+
+valid_stable_release_tag() {
+    [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+valid_ipv4() {
+    local ip="$1" octet
+    local -a octets
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r -a octets <<< "$ip"
+    [ "${#octets[@]}" -eq 4 ] || return 1
+    for octet in "${octets[@]}"; do
+        [ "$((10#$octet))" -le 255 ] || return 1
+    done
 }
 
 valid_public_panel_url() {
@@ -114,8 +134,29 @@ local_uninstall() {
     success "卸载成功"
 }
 
-command_name="${1:-install}"
-[ "$#" -eq 0 ] || shift
+command_name=install
+target_version="${TARGET_VERSION:-}"
+panel_port="${PANEL_PORT:-18888}"
+public_url="${PUBLIC_PANEL_URL:-}"
+
+case "${1:-}" in
+    install|update|uninstall)
+        command_name="$1"
+        shift
+        ;;
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    ""|--*) ;;
+    v*)
+        valid_release_tag "$1" || fail "Invalid release tag: $1"
+        target_version="$1"
+        shift
+        ;;
+    *) fail "Unknown command or release tag: $1" ;;
+esac
+
 case "$command_name" in
     uninstall)
         if [ -x "$SCRIPT_ROOT/deploy.sh" ]; then
@@ -125,7 +166,6 @@ case "$command_name" in
         exit 0
         ;;
     install|update) ;;
-    -h|--help|help) usage; exit 0 ;;
     *) fail "Unknown command: $command_name" ;;
 esac
 
@@ -141,55 +181,65 @@ os_version_id="$(. "$os_release_file"; printf '%s' "${VERSION_ID:-}")"
     fail "The supported v1 host is Debian 12 amd64."
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required."
 
-target_version="${TARGET_VERSION:-}"
-if [ "$command_name" = "install" ] && [ -z "$target_version" ]; then
-    target_version="$DEFAULT_RELEASE_TAG"
-fi
-public_url="${PUBLIC_PANEL_URL:-}"
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --version) [ "$#" -ge 2 ] || fail "--version requires a value"; target_version="$2"; shift 2 ;;
+        --port) [ "$#" -ge 2 ] || fail "--port requires a value"; panel_port="$2"; shift 2 ;;
         --public-panel-url) [ "$#" -ge 2 ] || fail "--public-panel-url requires a value"; public_url="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
-        v*) [ "$command_name" = "update" ] && [ -z "$target_version" ] || fail "Unexpected argument: $1"; target_version="$1"; shift ;;
+        v*) [ -z "$target_version" ] || fail "Multiple release versions were provided"; target_version="$1"; shift ;;
         *) fail "Unknown option: $1" ;;
     esac
 done
-
-if [ "${REALITY_PANEL_TEST_PARSE_ONLY:-0}" = 1 ]; then
-    printf 'command=%s\ntarget_version=%s\npublic_url=%s\n' "$command_name" "$target_version" "$public_url"
-    exit 0
-fi
-
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq ca-certificates curl file openssl sqlite3 tar >/dev/null
-
-if [ "$command_name" = "update" ] && [ -z "$target_version" ]; then
-    info "Resolving latest stable Reality Panel release..."
-    latest_url="$(curl --proto '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' \
-        "https://github.com/$REPOSITORY/releases/latest")"
-    target_version="${latest_url##*/}"
-fi
-[ -n "$target_version" ] || fail "Install requires --version vX.Y.Z (RC tags are allowed)."
-valid_release_tag "$target_version" || fail "Invalid release tag: $target_version"
+valid_port "$panel_port" || fail "Panel port must be an integer from 1 to 65535."
 
 env_file="$CONFIG_ROOT/relay-panel.env"
+
+if [ "${REALITY_PANEL_TEST_PARSE_ONLY:-0}" != 1 ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq ca-certificates curl file iproute2 openssl sqlite3 tar >/dev/null
+fi
+
+if [ ! -e "$env_file" ] && ss -H -ltn "sport = :$panel_port" 2>/dev/null | grep -q .; then
+    fail "Panel port $panel_port is already in use. Re-run with --port <PORT>."
+fi
+
+if [ -z "$target_version" ]; then
+    info "Resolving latest stable Reality Panel release..."
+    latest_url="$(curl --proto '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' \
+        "https://github.com/$REPOSITORY/releases/latest")" || \
+        fail "Unable to resolve the latest stable Reality Panel release."
+    target_version="${latest_url##*/}"
+    valid_stable_release_tag "$target_version" || \
+        fail "The latest Release endpoint did not resolve to a stable vX.Y.Z tag."
+fi
+valid_release_tag "$target_version" || fail "Invalid release tag: $target_version"
+
 if [ -z "$public_url" ] && [ -r "$env_file" ]; then
     public_url="$(sed -n 's/^PUBLIC_PANEL_URL=//p' "$env_file" | tail -n 1)"
 fi
-if [ -z "$public_url" ] && [ -r /dev/tty ]; then
-    printf 'Public Panel URL (http://IP:PORT or https://hostname): ' > /dev/tty
-    read -r public_url < /dev/tty
+if [ -z "$public_url" ]; then
+    public_ip="$(curl -4 -fsSL https://api.ipify.org)" || \
+        fail "Unable to automatically obtain the public IPv4. Re-run with --public-panel-url http://YOUR_IP:$panel_port or your HTTPS domain."
+    valid_ipv4 "$public_ip" || \
+        fail "Unable to automatically obtain a valid public IPv4. Re-run with --public-panel-url http://YOUR_IP:$panel_port or your HTTPS domain."
+    public_url="http://$public_ip:$panel_port"
 fi
-[ -n "$public_url" ] || fail "PUBLIC_PANEL_URL is required for remote Relay bootstrap."
 valid_public_panel_url "$public_url" || fail "PUBLIC_PANEL_URL must be a credential-free http:// or https:// origin with no path, query, or fragment."
+
+if [ "${REALITY_PANEL_TEST_PARSE_ONLY:-0}" = 1 ]; then
+    printf 'command=%s\ntarget_version=%s\npanel_port=%s\npublic_url=%s\n' \
+        "$command_name" "$target_version" "$panel_port" "$public_url"
+    exit 0
+fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf -- "$tmp"' EXIT
 base="https://github.com/$REPOSITORY/releases/download/$target_version"
 info "Downloading verified assets for $target_version..."
-curl --proto '=https' --tlsv1.2 -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
+curl --proto '=https' --tlsv1.2 -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" || \
+    fail "Unable to download SHA256SUMS for exact release $target_version."
 assets=(reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh update.sh deploy.sh)
 for asset in "${assets[@]}"; do
     curl --proto '=https' --tlsv1.2 -fsSL "$base/$asset" -o "$tmp/$asset"
@@ -202,5 +252,5 @@ done
 chmod +x "$tmp/install.sh" "$tmp/update.sh" "$tmp/deploy.sh" \
     "$tmp/reality-panel-linux-amd64" "$tmp/reality-node-linux-amd64"
 
-RELEASE_DIR="$tmp" RELEASE_VERSION="$target_version" PUBLIC_PANEL_URL="$public_url" \
+RELEASE_DIR="$tmp" RELEASE_VERSION="$target_version" PUBLIC_PANEL_URL="$public_url" PANEL_PORT="$panel_port" \
     exec "$tmp/deploy.sh" "$command_name"

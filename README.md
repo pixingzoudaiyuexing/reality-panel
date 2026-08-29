@@ -17,18 +17,27 @@ store Reality private material. The control protocol is version 8.
 
 ## Install
 
-Versioned GitHub Releases are the only supported production source. The
-current stable release is installed explicitly:
+The bootstrap entrypoint follows `main` and installs the latest stable GitHub
+Release by default:
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0/install.sh \
-  | bash -s -- install --version v1.0.0 --public-panel-url http://203.0.113.10:18888
+curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh | bash
 ```
 
 The supported first-release host is Debian 12 amd64 with systemd. The
 installer downloads the Panel binary, frontend, matching Node binary, and
-`SHA256SUMS` from the same Release. It validates every download before an
-atomic installation. `PUBLIC_PANEL_URL` accepts a credential-free
+deployment scripts only from that versioned Release. It validates every
+download against the Release's `SHA256SUMS` before an atomic installation.
+The default local port is `18888`, and the public IPv4 is obtained from
+`api.ipify.org`. Select an exact stable/prerelease tag or override the port and
+public URL with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh \
+  | bash -s -- v1.1.0-rc.1 --port 28888 --public-panel-url https://panel.example.com
+```
+
+`PUBLIC_PANEL_URL` accepts a credential-free
 `http://IP:PORT` or `https://hostname` origin with no path, query, or fragment.
 HTTP is supported intentionally; HTTPS is recommended where available.
 After a genuinely fresh install, the success output shows the seeded admin
