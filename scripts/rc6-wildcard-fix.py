@@ -60,3 +60,20 @@ tests = """    #[test]
 if anchor not in text:
     raise SystemExit("poller test anchor not found")
 poller.write_text(text.replace(anchor, tests + anchor, 1))
+
+for cargo_toml in [Path("crates/node/Cargo.toml"), Path("crates/panel/Cargo.toml")]:
+    text = cargo_toml.read_text()
+    old = 'version = "1.1.0-rc.5"'
+    if text.count(old) != 1:
+        raise SystemExit(f"unexpected rc5 package version count in {cargo_toml}")
+    cargo_toml.write_text(text.replace(old, 'version = "1.1.0-rc.6"', 1))
+
+lock = Path("Cargo.lock")
+text = lock.read_text()
+for package in ["relay-node", "relay-panel"]:
+    old = f'name = "{package}"\nversion = "1.1.0-rc.5"'
+    new = f'name = "{package}"\nversion = "1.1.0-rc.6"'
+    if text.count(old) != 1:
+        raise SystemExit(f"unexpected rc5 lock version for {package}")
+    text = text.replace(old, new, 1)
+lock.write_text(text)
