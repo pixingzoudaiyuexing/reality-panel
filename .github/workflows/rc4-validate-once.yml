@@ -1,5 +1,6 @@
 name: RC4 Full Validation Once
 
+# protocol v9 assertion refreshed; rerun the complete release gate.
 on:
   push:
     branches:
