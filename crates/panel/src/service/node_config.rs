@@ -17,10 +17,7 @@
 //! errors so they can never tear down a node by masquerading as an empty plan.
 
 use crate::db::error::DbError;
-use crate::db::repo::{
-    DnsRecordBindingRepository, DnsRecordSyncRepository, GroupRepository, ProfileScope,
-    ResourceScope, TunnelProfileRepository,
-};
+use crate::db::repo::{GroupRepository, ProfileScope, ResourceScope, TunnelProfileRepository};
 use crate::db::Repository;
 use relay_shared::models::{DeviceGroup, ForwardRule};
 use relay_shared::protocol::{

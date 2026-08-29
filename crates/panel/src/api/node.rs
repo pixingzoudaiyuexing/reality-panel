@@ -637,14 +637,14 @@ mod tests {
     }
 
     #[test]
-    fn config_protocol_v7_is_rejected_and_v8_is_accepted() {
-        let mut v7 = HeaderMap::new();
-        v7.insert("X-Config-Protocol-Version", "7".parse().unwrap());
-        assert!(!config_protocol_compatible(&v7));
-
+    fn config_protocol_v8_is_rejected_and_v9_is_accepted() {
         let mut v8 = HeaderMap::new();
         v8.insert("X-Config-Protocol-Version", "8".parse().unwrap());
-        assert!(config_protocol_compatible(&v8));
+        assert!(!config_protocol_compatible(&v8));
+
+        let mut v9 = HeaderMap::new();
+        v9.insert("X-Config-Protocol-Version", "9".parse().unwrap());
+        assert!(config_protocol_compatible(&v9));
         assert!(!config_protocol_compatible(&HeaderMap::new()));
     }
 
