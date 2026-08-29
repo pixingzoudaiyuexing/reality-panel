@@ -32,18 +32,16 @@ jobs:
                   raise SystemExit(f"{path}: expected exactly one match, got {count}")
               p.write_text(text.replace(old, new, 1))
 
-          # The primary bootstrap owns the systemd service contract. RuntimeDirectory
-          # guarantees /run/relay-node is recreated whenever relay-node starts after
-          # reboot. The node binary also self-heals before nginx -t, so upgraded old
-          # units that do not yet contain this directive remain recoverable.
+          # Primary bootstrap: systemd recreates the volatile /run/relay-node
+          # directory whenever relay-node starts. The binary-level repair path
+          # remains the compatibility fallback for already-installed older units.
           replace_once(
               "scripts/relay-node-bootstrap.sh",
-              '''[Service]\nType=simple\nEnvironmentFile=$install_dir/relay-node.env\nWorkingDirectory=$install_dir\nExecStart=$install_dir/relay-node\nRestart=always\nRestartSec=3\nLimitNOFILE=65536\n''',
-              '''[Service]\nType=simple\nRuntimeDirectory=relay-node\nRuntimeDirectoryMode=0755\nEnvironmentFile=$install_dir/relay-node.env\nWorkingDirectory=$install_dir\nExecStart=$install_dir/relay-node\nRestart=always\nRestartSec=3\nLimitNOFILE=65536\n''')
+              '''[Service]\nType=simple\nEnvironmentFile=/etc/relay-node/relay-node.env\nWorkingDirectory=/opt/relay-node\nExecStart=/opt/relay-node/relay-node\nRestart=always\nRestartSec=3\nLimitNOFILE=65536\n''',
+              '''[Service]\nType=simple\nRuntimeDirectory=relay-node\nRuntimeDirectoryMode=0755\nEnvironmentFile=/etc/relay-node/relay-node.env\nWorkingDirectory=/opt/relay-node\nExecStart=/opt/relay-node/relay-node\nRestart=always\nRestartSec=3\nLimitNOFILE=65536\n''')
 
-          # Keep the deprecated compatibility installer safe for operators that still
-          # use it, and fix its rc.2 usage example while touching only release-local
-          # documentation/runtime contract lines.
+          # Deprecated compatibility installer: keep the same reboot contract
+          # and ensure the release-local usage example points to rc.2.
           replace_once(
               "scripts/relay-node-install.sh",
               '''[Service]\nType=simple\nWorkingDirectory=${INSTALL_DIR}\nExecStart=/bin/bash ${START_SH}\nRestart=always\nRestartSec=3\nLimitNOFILE=65536\n''',
