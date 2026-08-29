@@ -29,6 +29,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin main
           set +e
           git merge --no-ff --no-commit origin/main
@@ -74,7 +76,5 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "merge: carry v1.0.2 hotfix into v1.1 rc"
           git push origin HEAD:feature/v1.1-relay-preference
