@@ -1,0 +1,47 @@
+name: Tag Reality Panel v1.1.0-rc.1
+
+on:
+  push:
+    branches:
+      - ops/publish-v1.1.0-rc.1
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-reality-panel-v1.1.0-rc.1
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: v1.1.0-rc.1
+  RELEASE_SHA: 1e3540e461e655721f0df5948f7c77b549d6aeb8
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 1e3540e461e655721f0df5948f7c77b549d6aeb8
+          fetch-depth: 0
+      - name: Verify immutable release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main --tags
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          test "$(git rev-parse origin/main)" = "$RELEASE_SHA"
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Tag $RELEASE_TAG already exists; refusing to move or recreate it." >&2
+            exit 1
+          fi
+          bash scripts/release-version-contract.sh "$RELEASE_TAG"
+          test "$(sed -n 's/^SCRIPT_VERSION="\(.*\)"/\1/p' scripts/relay-node-install.sh | head -n1)" = "1.1.0-rc.1"
+      - name: Create annotated release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$RELEASE_TAG" "$RELEASE_SHA" -m "Reality Panel $RELEASE_TAG"
+          git push origin "refs/tags/$RELEASE_TAG"
