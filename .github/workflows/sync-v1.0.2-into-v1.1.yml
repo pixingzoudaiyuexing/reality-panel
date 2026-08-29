@@ -63,7 +63,7 @@ jobs:
           cargo test -p relay-panel --locked public_panel_url
           bash scripts/release-version-contract.sh v1.1.0-rc.1
           bash scripts/check-repo-test-parity.sh
-          bash scripts/release-check.sh
+          bash scripts/release-check.sh 1.1.0-rc.1
           git diff --check
       - name: Frontend verification
         working-directory: frontend
