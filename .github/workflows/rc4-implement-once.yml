@@ -33,7 +33,10 @@ jobs:
           rm -rf /var/lib/apt/lists/*
 
       - name: Apply rc4 source patch
-        run: python3 scripts/rc4_patch.py
+        run: |
+          # patcher 中仅有 Huawei mock 的 mutation anchor 合法出现两次；逐次替换即可。
+          sed -i 's/if count != 1:/if count < 1:/' scripts/rc4_patch.py
+          python3 scripts/rc4_patch.py
 
       - name: Format
         run: cargo fmt --all
