@@ -138,6 +138,7 @@ command_name=install
 target_version="${TARGET_VERSION:-}"
 panel_port="${PANEL_PORT:-18888}"
 public_url="${PUBLIC_PANEL_URL:-}"
+port_was_explicit=0
 
 case "${1:-}" in
     install|update|uninstall)
@@ -184,7 +185,7 @@ command -v systemctl >/dev/null 2>&1 || fail "systemd is required."
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --version) [ "$#" -ge 2 ] || fail "--version requires a value"; target_version="$2"; shift 2 ;;
-        --port) [ "$#" -ge 2 ] || fail "--port requires a value"; panel_port="$2"; shift 2 ;;
+        --port) [ "$#" -ge 2 ] || fail "--port requires a value"; panel_port="$2"; port_was_explicit=1; shift 2 ;;
         --public-panel-url) [ "$#" -ge 2 ] || fail "--public-panel-url requires a value"; public_url="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         v*) [ -z "$target_version" ] || fail "Multiple release versions were provided"; target_version="$1"; shift ;;
@@ -249,6 +250,12 @@ for asset in "${assets[@]}"; do
     actual="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
     [ "$actual" = "$expected" ] || fail "SHA256 mismatch for $asset"
 done
+
+if [ "$port_was_explicit" -eq 1 ] && [ "$panel_port" != "18888" ] && \
+   ! grep -Fq 'PANEL_PORT' "$tmp/deploy.sh"; then
+    fail "Release $target_version does not support --port. Use the default port 18888 or install a newer Release that supports custom Panel ports."
+fi
+
 chmod +x "$tmp/install.sh" "$tmp/update.sh" "$tmp/deploy.sh" \
     "$tmp/reality-panel-linux-amd64" "$tmp/reality-node-linux-amd64"
 
