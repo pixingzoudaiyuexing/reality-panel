@@ -30,6 +30,10 @@ jobs:
           prefix = '          '
           block = lines[start + 1:end]
           script = ''.join(line[len(prefix):] if line.startswith(prefix) else line for line in block)
+          script = script.replace(
+              '''    let Some((major, minor, patch)) = match parsed {\n        (Some(major), Some(minor), Some(patch)) => Some((major, minor, patch)),\n        _ => None,\n    } else {\n''',
+              '''    let Some((major, minor, patch)) = (match parsed {\n        (Some(major), Some(minor), Some(patch)) => Some((major, minor, patch)),\n        _ => None,\n    }) else {\n''',
+          )
           Path('/tmp/apply-upgrade-fix.py').write_text(script)
           PY
           python3 /tmp/apply-upgrade-fix.py
