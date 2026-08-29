@@ -1,0 +1,10 @@
+name: Test Branch Workflow
+on:
+  push:
+    branches:
+      - fix/protocol-independent-node-upgrade
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
