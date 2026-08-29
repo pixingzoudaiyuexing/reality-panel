@@ -8,6 +8,10 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
+use relay_shared::control_protocol::{
+    legacy_node_supports_lifecycle, lifecycle_protocol_versions_compatible,
+    LIFECYCLE_PROTOCOL_VERSION,
+};
 use relay_shared::protocol::NodeConfigResponse;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +25,12 @@ use tokio::sync::{mpsc, RwLock};
 struct ConnEntry {
     tx: mpsc::UnboundedSender<String>,
     node_id: Option<String>,
+    /// false = upgrade-only: never receive config snapshots/config_changed or
+    /// ordinary control commands from a newer Panel.
+    config_compatible: bool,
+    /// Independent lifecycle capability. An upgrade-only connection must have
+    /// this true or it is rejected during the WS handshake.
+    lifecycle_capable: bool,
 }
 /// Per-group map of live connection senders.
 type GroupConns = HashMap<u64, ConnEntry>;
@@ -52,6 +62,17 @@ impl NodeConnections {
         group_id: i64,
         node_id: Option<String>,
     ) -> (u64, mpsc::UnboundedReceiver<String>) {
+        self.register_with_capabilities(group_id, node_id, true, true)
+            .await
+    }
+
+    async fn register_with_capabilities(
+        &self,
+        group_id: i64,
+        node_id: Option<String>,
+        config_compatible: bool,
+        lifecycle_capable: bool,
+    ) -> (u64, mpsc::UnboundedReceiver<String>) {
         let conn_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         self.inner
@@ -59,7 +80,15 @@ impl NodeConnections {
             .await
             .entry(group_id)
             .or_default()
-            .insert(conn_id, ConnEntry { tx, node_id });
+            .insert(
+                conn_id,
+                ConnEntry {
+                    tx,
+                    node_id,
+                    config_compatible,
+                    lifecycle_capable,
+                },
+            );
         (conn_id, rx)
     }
 
@@ -79,7 +108,11 @@ impl NodeConnections {
     pub async fn broadcast_all(&self, msg: &str) {
         let mut map = self.inner.write().await;
         for conns in map.values_mut() {
-            conns.retain(|_, e| e.tx.send(msg.to_string()).is_ok());
+            conns.retain(|_, e| {
+                // Upgrade-only nodes intentionally keep their LKG and must not
+                // even be told that a newer config exists.
+                !e.config_compatible || e.tx.send(msg.to_string()).is_ok()
+            });
         }
     }
 
@@ -122,14 +155,40 @@ impl NodeConnections {
         };
         let mut sent = 0usize;
         conns.retain(|_, e| {
-            if e.node_id.as_deref() != Some(node_id) {
-                return true; // not the target node — leave untouched
+            if e.node_id.as_deref() != Some(node_id) || !e.config_compatible {
+                return true; // not target or upgrade-only — leave untouched
             }
             if e.tx.send(msg.to_string()).is_ok() {
                 sent += 1;
                 true
             } else {
                 false // target but dead — prune
+            }
+        });
+        if conns.is_empty() {
+            map.remove(&group_id);
+        }
+        sent
+    }
+
+    /// Deliver the one operation that must survive config-protocol skew.
+    /// Upgrade-only connections are eligible, but only when the node advertised
+    /// (or is a known legacy implementation of) the stable lifecycle protocol.
+    pub async fn send_upgrade_node(&self, group_id: i64, node_id: &str, msg: &str) -> usize {
+        let mut map = self.inner.write().await;
+        let Some(conns) = map.get_mut(&group_id) else {
+            return 0;
+        };
+        let mut sent = 0usize;
+        conns.retain(|_, e| {
+            if e.node_id.as_deref() != Some(node_id) || !e.lifecycle_capable {
+                return true;
+            }
+            if e.tx.send(msg.to_string()).is_ok() {
+                sent += 1;
+                true
+            } else {
+                false
             }
         });
         if conns.is_empty() {
@@ -218,25 +277,6 @@ pub async fn node_ws_handler(
         None => return axum::http::StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    // v0.4.0: config-protocol gate. A node whose X-Config-Protocol-Version
-    // header is absent or doesn't match the panel's is refused at upgrade time
-    // (426 Upgrade Required) with a structured JSON body so the node can log
-    // the exact mismatch. NOT a transient error — the node must back off.
-    if !crate::api::node::config_protocol_compatible(&headers) {
-        let received = crate::api::node::extract_config_protocol_version(&headers);
-        return (
-            axum::http::StatusCode::UPGRADE_REQUIRED,
-            axum::Json(serde_json::json!({
-                "code": "CONFIG_PROTOCOL_MISMATCH",
-                "required": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
-                "received": received,
-                "message": "relay-node configuration protocol is incompatible; \
-                            upgrade relay-node to match the panel"
-            })),
-        )
-            .into_response();
-    }
-
     use relay_shared::models::DeviceGroup;
     let group: DeviceGroup = match state.db.find_by_token(&token).await {
         Ok(Some(g)) => g,
@@ -271,6 +311,44 @@ pub async fn node_ws_handler(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+
+    let config_compatible = crate::api::node::config_protocol_compatible(&headers);
+    let lifecycle_protocol = headers
+        .get("X-Lifecycle-Protocol-Version")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u32>().ok());
+    let lifecycle_capable = match lifecycle_protocol {
+        Some(version) => {
+            lifecycle_protocol_versions_compatible(LIFECYCLE_PROTOCOL_VERSION, version)
+        }
+        None => legacy_node_supports_lifecycle(node_version.as_deref()),
+    };
+
+    // Config mismatch is no longer allowed to kill the upgrade path. A known
+    // lifecycle-capable node with a stable node_id is accepted as upgrade-only:
+    // no config snapshot, no config_changed, no diagnose/restart/uninstall.
+    if !config_compatible && (node_id.is_none() || !lifecycle_capable) {
+        let received = crate::api::node::extract_config_protocol_version(&headers);
+        return (
+            axum::http::StatusCode::UPGRADE_REQUIRED,
+            axum::Json(serde_json::json!({
+                "code": "CONFIG_PROTOCOL_MISMATCH",
+                "required": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+                "received": received,
+                "message": "relay-node configuration protocol is incompatible and this node has no compatible lifecycle upgrade channel"
+            })),
+        )
+            .into_response();
+    }
+    if !config_compatible {
+        tracing::warn!(
+            node_id = ?node_id,
+            node_version = ?node_version,
+            config_protocol = ?crate::api::node::extract_config_protocol_version(&headers),
+            lifecycle_protocol = ?lifecycle_protocol,
+            "websocket accepted in upgrade-only mode due to config protocol mismatch"
+        );
+    }
     // Clone the Arc<dyn Repository> so the WS task can keep using it after the
     // upgrade handler returns. The pool snapshot is shared read-only.
     let db = state.db.clone();
@@ -284,6 +362,8 @@ pub async fn node_ws_handler(
             node_id,
             node_version,
             node_architecture,
+            config_compatible,
+            lifecycle_capable,
             state,
             db,
             node_connections,
@@ -298,6 +378,8 @@ async fn handle_node_ws(
     node_id: Option<String>,
     node_version: Option<String>,
     node_architecture: Option<String>,
+    config_compatible: bool,
+    lifecycle_capable: bool,
     state: AppState,
     db: std::sync::Arc<dyn crate::db::Repository>,
     node_connections: NodeConnections,
@@ -313,7 +395,9 @@ async fn handle_node_ws(
     // broadcast pushes from the channel. Both halves borrow independent state.
     let (mut sender, mut receiver) = socket.split();
     let lifecycle_node_id = node_id.clone();
-    let (conn_id, mut push_rx) = node_connections.register(group_id, node_id).await;
+    let (conn_id, mut push_rx) = node_connections
+        .register_with_capabilities(group_id, node_id, config_compatible, lifecycle_capable)
+        .await;
     if let Some(node_id) = lifecycle_node_id.as_deref() {
         for operation in node_operations.connected(
             group_id,
@@ -328,9 +412,11 @@ async fn handle_node_ws(
     // Send initial config snapshot so a freshly-connected node has its config
     // immediately, without waiting for the first HTTP poll. None (DB error) →
     // skip the push; the node will get its config on the next HTTP poll.
-    if let Some(config) = build_config_snapshot(db.as_ref(), group_id).await {
-        if let Ok(config_json) = serde_json::to_string(&config) {
-            let _ = sender.send(Message::Text(config_json.into())).await;
+    if config_compatible {
+        if let Some(config) = build_config_snapshot(db.as_ref(), group_id).await {
+            if let Ok(config_json) = serde_json::to_string(&config) {
+                let _ = sender.send(Message::Text(config_json.into())).await;
+            }
         }
     }
 
@@ -580,6 +666,39 @@ mod tests {
         let (_, _rx) = conns.register(1, Some("node-a".into())).await;
         assert_eq!(conns.send_node(1, "ghost", "probe").await, 0);
         assert_eq!(conns.send_node(999, "node-a", "probe").await, 0);
+    }
+
+    #[tokio::test]
+    async fn upgrade_only_connection_receives_upgrade_but_no_config_control() {
+        let conns = NodeConnections::new();
+        let (_, mut old_rx) = conns
+            .register_with_capabilities(1, Some("old-node".into()), false, true)
+            .await;
+        let (_, mut current_rx) = conns
+            .register_with_capabilities(1, Some("current-node".into()), true, true)
+            .await;
+
+        conns.broadcast_all(r#"{"type":"config_changed"}"#).await;
+        assert!(
+            old_rx.try_recv().is_err(),
+            "upgrade-only node must not receive config_changed"
+        );
+        assert_eq!(
+            current_rx.recv().await.as_deref(),
+            Some(r#"{"type":"config_changed"}"#)
+        );
+
+        assert_eq!(conns.send_node(1, "old-node", "diagnose").await, 0);
+        assert!(
+            old_rx.try_recv().is_err(),
+            "ordinary control must be blocked"
+        );
+
+        assert_eq!(conns.send_upgrade_node(1, "old-node", "upgrade").await, 1);
+        assert_eq!(old_rx.recv().await.as_deref(), Some("upgrade"));
+
+        // It remains an authenticated online node so the UI can offer Upgrade.
+        assert!(conns.online_node_ids(1).await.contains("old-node"));
     }
 
     /// online_node_ids returns the node_ids with a live connection; older nodes

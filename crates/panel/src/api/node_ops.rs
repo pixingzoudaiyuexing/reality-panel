@@ -500,13 +500,14 @@ fn status_supports_lifecycle(
     status: Option<&serde_json::Value>,
     current_version: Option<&str>,
 ) -> bool {
-    // Historical nodes with an explicitly known lifecycle wire capability
-    // remain supported. All modern Reality Panel releases use the stable
-    // semver floor plus the reported config protocol instead of adding a
-    // new product-version exception for every future release line.
-    if relay_shared::protocol::node_supports_lifecycle(current_version) {
+    // Cross-config-protocol upgrades MUST stay possible. Known shipped nodes
+    // with lifecycle support therefore pass independently of the config gate.
+    if relay_shared::control_protocol::legacy_node_supports_lifecycle(current_version)
+        || relay_shared::protocol::node_supports_lifecycle(current_version)
+    {
         return true;
     }
+    // Preserve the historical current-protocol path for older modern builds.
     if !is_modern_reality_panel_release(current_version) {
         return false;
     }
@@ -548,6 +549,18 @@ async fn create_operation(
             StatusCode::CONFLICT,
             409,
             "NODE_LIFECYCLE_UNSUPPORTED",
+        ));
+    }
+    let config_compatible = status
+        .as_ref()
+        .and_then(|value| value.get("config_protocol_version"))
+        .and_then(|value| value.as_u64())
+        == Some(CONFIG_PROTOCOL_VERSION as u64);
+    if action != NodeLifecycleAction::Upgrade && !config_compatible {
+        return Err(response::<()>(
+            StatusCode::CONFLICT,
+            409,
+            "NODE_CONFIG_PROTOCOL_MISMATCH",
         ));
     }
     let mut target_version = None;
@@ -632,12 +645,18 @@ async fn create_operation(
             "serialize lifecycle command failed",
         )
     })?;
-    if state
-        .node_connections
-        .send_node(group_id, &node_id, &encoded)
-        .await
-        == 0
-    {
+    let delivered = if action == NodeLifecycleAction::Upgrade {
+        state
+            .node_connections
+            .send_upgrade_node(group_id, &node_id, &encoded)
+            .await
+    } else {
+        state
+            .node_connections
+            .send_node(group_id, &node_id, &encoded)
+            .await
+    };
+    if delivered == 0 {
         state.node_operations.update(
             &operation.id,
             OperationStatus::Failed,
@@ -948,6 +967,12 @@ mod tests {
             Some("1.1.0-rc.1")
         ));
         assert!(!status_supports_lifecycle(None, Some("1.1.0-rc.1")));
+        // rc.2/rc.3 already shipped node_lifecycle. A config protocol bump must
+        // never make their one-click upgrade path disappear.
+        assert!(status_supports_lifecycle(
+            Some(&legacy_protocol),
+            Some("1.1.0-rc.3")
+        ));
 
         // Explicitly-known historical lifecycle versions keep their
         // compatibility path independently from config snapshot gates.
