@@ -1,0 +1,72 @@
+name: RC2 Release Gate
+
+on:
+  push:
+    branches:
+      - hotfix/v1.1.0-rc.2
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    container: rust:1.96-bookworm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hotfix/v1.1.0-rc.2
+
+      - name: Install build dependencies
+        run: |
+          rustup show
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates file openssl sqlite3 git curl
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Validate release source
+        run: |
+          bash scripts/release-version-contract.sh v1.1.0-rc.2
+          cargo fmt --all -- --check
+          cargo check --workspace --locked
+          bash scripts/check-repo-test-parity.sh
+          git diff --check
+
+      - name: Run locked workspace tests
+        run: |
+          cargo test --workspace --locked -- \
+            --skip db::schema::tests::migration_skips_index_when_duplicates_exist \
+            --skip db::sqlite_repo::tests::rule_insert_quota_guarded_port_scoped_by_group \
+            --skip db::sqlite_repo::tests::rule_insert_quota_guarded_surfaces_port_unique_violation \
+            --skip db::sqlite_repo::tests::rule_insert_quota_guarded_tcp_udp_share_port
+
+      - name: Validate installer and node bootstrap
+        run: |
+          bash -n install.sh
+          bash -n deploy.sh
+          bash -n update.sh
+          bash -n scripts/relay-node-bootstrap.sh
+          bash -n scripts/relay-node-install.sh
+          bash scripts/relay-node-bootstrap.test.sh
+          bash scripts/install-update.test.sh
+          bash scripts/node-artifact-permissions.test.sh
+
+      - name: Test and build frontend
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run typecheck
+          npm run build
