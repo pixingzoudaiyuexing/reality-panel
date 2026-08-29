@@ -1,0 +1,362 @@
+name: RC2 Hotfix Prepare
+
+on:
+  push:
+    branches:
+      - hotfix/v1.1.0-rc.2
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hotfix/v1.1.0-rc.2
+          fetch-depth: 0
+
+      - name: Apply audited rc.2 fixes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, got {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          # Long-lived lifecycle gate: keep explicit historical capability support,
+          # otherwise accept modern Reality Panel semver only when the node reports
+          # the current config protocol. This avoids per-minor-version exceptions.
+          replace_once(
+              "crates/panel/src/api/node_ops.rs",
+              '''fn is_reality_panel_1_0_stable(version: Option<&str>) -> bool {
+              let Some(version) = version else {
+                  return false;
+              };
+              let normalized = version.trim().trim_start_matches('v');
+              let mut parts = normalized.split('.');
+              let parsed = (
+                  parts.next().and_then(|part| part.parse::<u64>().ok()),
+                  parts.next().and_then(|part| part.parse::<u64>().ok()),
+                  parts.next().and_then(|part| part.parse::<u64>().ok()),
+                  parts.next(),
+              );
+              matches!(parsed, (Some(1), Some(0), Some(_), None))
+          }
+
+          fn status_supports_lifecycle(
+              status: Option<&serde_json::Value>,
+              current_version: Option<&str>,
+          ) -> bool {
+              if relay_shared::protocol::node_supports_lifecycle(current_version) {
+                  return true;
+              }
+              if !is_reality_panel_1_0_stable(current_version) {
+                  return false;
+              }
+              status
+                  .and_then(|value| value.get("config_protocol_version"))
+                  .and_then(|value| value.as_u64())
+                  == Some(CONFIG_PROTOCOL_VERSION as u64)
+          }
+          ''',
+              '''fn is_modern_reality_panel_release(version: Option<&str>) -> bool {
+              let Some(version) = version else {
+                  return false;
+              };
+              let normalized = version.trim().trim_start_matches('v');
+              semver::Version::parse(normalized)
+                  .is_ok_and(|version| version >= semver::Version::new(1, 0, 0))
+          }
+
+          fn status_supports_lifecycle(
+              status: Option<&serde_json::Value>,
+              current_version: Option<&str>,
+          ) -> bool {
+              // Historical nodes with an explicitly known lifecycle wire capability
+              // remain supported. All modern Reality Panel releases use the stable
+              // semver floor plus the reported config protocol instead of adding a
+              // new product-version exception for every future release line.
+              if relay_shared::protocol::node_supports_lifecycle(current_version) {
+                  return true;
+              }
+              if !is_modern_reality_panel_release(current_version) {
+                  return false;
+              }
+              status
+                  .and_then(|value| value.get("config_protocol_version"))
+                  .and_then(|value| value.as_u64())
+                  == Some(CONFIG_PROTOCOL_VERSION as u64)
+          }
+          ''')
+
+          replace_once(
+              "crates/panel/src/api/node_ops.rs",
+              '''    #[test]
+              fn stable_reality_panel_1_0_lifecycle_requires_current_protocol() {
+                  let compatible = serde_json::json!({
+                      "config_protocol_version": CONFIG_PROTOCOL_VERSION
+                  });
+                  assert!(status_supports_lifecycle(Some(&compatible), Some("v1.0.0")));
+                  assert!(status_supports_lifecycle(Some(&compatible), Some("1.0.1")));
+                  assert!(!status_supports_lifecycle(
+                      Some(&compatible),
+                      Some("1.0.0-rc.4")
+                  ));
+
+                  let legacy_protocol = serde_json::json!({
+                      "config_protocol_version": CONFIG_PROTOCOL_VERSION - 1
+                  });
+                  assert!(!status_supports_lifecycle(
+                      Some(&legacy_protocol),
+                      Some("1.0.0")
+                  ));
+                  assert!(!status_supports_lifecycle(None, Some("1.0.0")));
+                  assert!(status_supports_lifecycle(None, Some("1.2.3")));
+              }
+          ''',
+              '''    #[test]
+              fn modern_reality_panel_lifecycle_uses_semver_and_current_protocol() {
+                  let compatible = serde_json::json!({
+                      "config_protocol_version": CONFIG_PROTOCOL_VERSION
+                  });
+                  for version in [
+                      "v1.0.0",
+                      "1.0.1",
+                      "1.1.0-rc.1",
+                      "1.1.0",
+                      "2.0.0-rc.1",
+                  ] {
+                      assert!(
+                          status_supports_lifecycle(Some(&compatible), Some(version)),
+                          "expected {version} with current protocol to support lifecycle"
+                      );
+                  }
+                  assert!(!status_supports_lifecycle(
+                      Some(&compatible),
+                      Some("1.0.0-rc.4")
+                  ));
+                  assert!(!status_supports_lifecycle(Some(&compatible), Some("invalid")));
+
+                  let legacy_protocol = serde_json::json!({
+                      "config_protocol_version": CONFIG_PROTOCOL_VERSION - 1
+                  });
+                  assert!(!status_supports_lifecycle(
+                      Some(&legacy_protocol),
+                      Some("1.0.0")
+                  ));
+                  assert!(!status_supports_lifecycle(
+                      Some(&legacy_protocol),
+                      Some("1.1.0-rc.1")
+                  ));
+                  assert!(!status_supports_lifecycle(None, Some("1.1.0-rc.1")));
+
+                  // Explicitly-known historical lifecycle versions keep their
+                  // compatibility path independently from config snapshot gates.
+                  assert!(status_supports_lifecycle(None, Some("1.2.3")));
+                  assert!(status_supports_lifecycle(None, Some("1.0.0-rc.5")));
+              }
+          ''')
+
+          # Reboot/runtime recovery: production nginx tests always recreate the
+          # volatile PP socket directory before nginx -t. If the managed reload
+          # finds nginx inactive, recover with a restart instead of retrying
+          # `reload` forever. Synthetic test commands are left untouched.
+          replace_once(
+              "crates/node/src/forwarder/nginx_sni.rs",
+              '''    let actual = fs::read(&cfg.conf_path).ok();
+              let managed_file_exists = actual.is_some();
+              let file_matches = actual.as_deref() == Some(expected);
+              let config_valid = run_shell(&cfg.test_cmd).is_ok();
+              let service_healthy = nginx_service_healthy(cfg);
+          ''',
+              '''    let actual = fs::read(&cfg.conf_path).ok();
+              let managed_file_exists = actual.is_some();
+              let file_matches = actual.as_deref() == Some(expected);
+              let runtime_dir_ready = ensure_managed_runtime_dir(cfg).is_ok();
+              let config_valid = runtime_dir_ready && run_shell(&cfg.test_cmd).is_ok();
+              let service_healthy = nginx_service_healthy(cfg);
+          ''')
+
+          replace_once(
+              "crates/node/src/forwarder/nginx_sni.rs",
+              '''    if !cfg.enabled {
+                  return Ok(());
+              }
+
+              if let Some(parent) = cfg.conf_path.parent() {
+          ''',
+              '''    if !cfg.enabled {
+                  return Ok(());
+              }
+
+              ensure_managed_runtime_dir(cfg)?;
+              if let Some(parent) = cfg.conf_path.parent() {
+          ''')
+
+          replace_once(
+              "crates/node/src/forwarder/nginx_sni.rs",
+              '''    if let Err(e) = run_shell(&cfg.reload_cmd) {
+                  restore_previous(&cfg.conf_path, previous.as_deref())?;
+                  // The previous config is only a real rollback once Nginx has accepted
+                  // and reloaded it again. Preserve the original apply failure either way.
+                  if let Err(restore_err) = run_shell(&cfg.test_cmd).and_then(|_| run_shell(&cfg.reload_cmd))
+                  {
+          ''',
+              '''    if let Err(e) = reload_nginx(cfg) {
+                  restore_previous(&cfg.conf_path, previous.as_deref())?;
+                  // The previous config is only a real rollback once Nginx has accepted
+                  // and reloaded it again. Preserve the original apply failure either way.
+                  if let Err(restore_err) = run_shell(&cfg.test_cmd).and_then(|_| reload_nginx(cfg)) {
+          ''')
+
+          replace_once(
+              "crates/node/src/forwarder/nginx_sni.rs",
+              '''    if !cfg.enabled {
+                  return Ok(());
+              }
+              restore_previous(&cfg.conf_path, previous)?;
+              run_shell(&cfg.test_cmd)?;
+              run_shell(&cfg.reload_cmd)
+          }
+
+          fn temp_path''',
+              '''    if !cfg.enabled {
+                  return Ok(());
+              }
+              ensure_managed_runtime_dir(cfg)?;
+              restore_previous(&cfg.conf_path, previous)?;
+              run_shell(&cfg.test_cmd)?;
+              reload_nginx(cfg)
+          }
+
+          fn temp_path''')
+
+          replace_once(
+              "crates/node/src/forwarder/nginx_sni.rs",
+              '''fn nginx_service_healthy(cfg: &NginxSniConfig) -> bool {
+          ''',
+              '''fn ensure_managed_runtime_dir(cfg: &NginxSniConfig) -> Result<(), ApplyError> {
+              // Production `nginx -t` validates the whole Nginx configuration,
+              // including an already-deployed Proxy Protocol Unix listener. /run
+              // is volatile across reboot, so every managed validation recreates
+              // the directory before Nginx can reject the otherwise-valid config.
+              if cfg.test_cmd.trim() == "nginx -t" {
+                  ensure_proxy_protocol_strip_dir()?;
+              }
+              Ok(())
+          }
+
+          fn uses_default_systemd_reload(cfg: &NginxSniConfig) -> bool {
+              cfg.reload_cmd.trim() == "systemctl reload nginx"
+          }
+
+          fn reload_nginx(cfg: &NginxSniConfig) -> Result<(), ApplyError> {
+              match run_shell(&cfg.reload_cmd) {
+                  Ok(()) => Ok(()),
+                  Err(original) if uses_default_systemd_reload(cfg) => {
+                      if run_shell("systemctl is-active --quiet nginx").is_ok() {
+                          return Err(original);
+                      }
+                      tracing::warn!(
+                          "managed Nginx is inactive after reload failure; attempting restart"
+                      );
+                      run_shell("systemctl restart nginx")
+                  }
+                  Err(error) => Err(error),
+              }
+          }
+
+          fn nginx_service_healthy(cfg: &NginxSniConfig) -> bool {
+          ''')
+
+          replace_once(
+              "crates/node/src/forwarder/nginx_sni.rs",
+              '''    fn cleanup(path: &PathBuf) {
+                  let _ = std::fs::remove_file(path);
+                  let _ = std::fs::remove_file(temp_path(path));
+                  let _ = std::fs::remove_dir_all(path.parent().unwrap());
+              }
+
+              #[test]
+              fn nginx_test_failure_restores_old_config()''',
+              '''    fn cleanup(path: &PathBuf) {
+                  let _ = std::fs::remove_file(path);
+                  let _ = std::fs::remove_file(temp_path(path));
+                  let _ = std::fs::remove_dir_all(path.parent().unwrap());
+              }
+
+              #[test]
+              fn only_default_systemd_reload_enables_inactive_service_recovery() {
+                  let production = test_config(
+                      unique_path("production-reload").join("relay.conf"),
+                      "nginx -t",
+                      "systemctl reload nginx",
+                  );
+                  assert!(uses_default_systemd_reload(&production));
+
+                  let custom = test_config(
+                      unique_path("custom-reload").join("relay.conf"),
+                      "true",
+                      "custom-reload-command",
+                  );
+                  assert!(!uses_default_systemd_reload(&custom));
+              }
+
+              #[test]
+              fn nginx_test_failure_restores_old_config()''')
+
+          # Release version preparation. No protocol bump.
+          for path in ["crates/panel/Cargo.toml", "crates/node/Cargo.toml"]:
+              p = Path(path)
+              text = p.read_text()
+              if text.count('version = "1.1.0-rc.1"') != 1:
+                  raise SystemExit(f"{path}: package version contract changed")
+              p.write_text(text.replace('version = "1.1.0-rc.1"', 'version = "1.1.0-rc.2"', 1))
+
+          p = Path("Cargo.lock")
+          text = p.read_text()
+          count = text.count('version = "1.1.0-rc.1"')
+          if count != 2:
+              raise SystemExit(f"Cargo.lock: expected two workspace rc.1 versions, got {count}")
+          p.write_text(text.replace('version = "1.1.0-rc.1"', 'version = "1.1.0-rc.2"'))
+
+          p = Path("scripts/relay-node-install.sh")
+          text = p.read_text()
+          if 'SCRIPT_VERSION="1.1.0-rc.1"' not in text:
+              raise SystemExit("relay-node-install SCRIPT_VERSION contract changed")
+          text = text.replace('v1.1.0-rc.1', 'v1.1.0-rc.2')
+          text = text.replace('SCRIPT_VERSION="1.1.0-rc.1"', 'SCRIPT_VERSION="1.1.0-rc.2"')
+          p.write_text(text)
+          PY
+
+          cargo fmt --all
+          git diff --check
+
+      - name: Validate Rust and release contracts
+        shell: bash
+        run: |
+          cargo check --workspace --locked
+          cargo test -p relay-panel node_ops --locked
+          cargo test -p relay-node nginx_sni --locked
+          bash scripts/release-version-contract.sh v1.1.0-rc.2
+          bash scripts/check-repo-test-parity.sh
+
+      - name: Commit prepared hotfix
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock crates/panel/Cargo.toml crates/node/Cargo.toml \
+            crates/panel/src/api/node_ops.rs crates/node/src/forwarder/nginx_sni.rs \
+            scripts/relay-node-install.sh
+          git commit -m "fix: harden lifecycle and nginx recovery for rc.2"
+          git push origin HEAD:hotfix/v1.1.0-rc.2
