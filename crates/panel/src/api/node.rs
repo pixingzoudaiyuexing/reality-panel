@@ -366,11 +366,28 @@ pub async fn report_status(
         });
         // Status persistence is best-effort: the original used .ok() to swallow
         // any DB error so a transient failure never broke the report cycle.
-        let _ = state
-            .db
-            .set(&status_key, &status.to_string())
+        let status_persisted = match state.db.set(&status_key, &status.to_string()).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!("report_status: kvs set failed: {}", error);
+                false
+            }
+        };
+        if status_persisted && g.group_type == "in" {
+            if let Err(error) = crate::service::relay_preference::ensure_preference_initialized(
+                state.db.as_ref(),
+                &state.node_connections,
+                g.id,
+            )
             .await
-            .map_err(|e| tracing::warn!("report_status: kvs set failed: {}", e));
+            {
+                tracing::warn!(
+                    "report_status: relay preference initialization failed for group {}: {}",
+                    g.id,
+                    error
+                );
+            }
+        }
 
         // v1.2.4: fold this report into the node's hourly metrics bucket. The
         // status written above is a snapshot each report overwrites; this is the
@@ -539,6 +556,57 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("Authorization", format!("Bearer {token}").parse().unwrap());
         h
+    }
+
+    fn ready_status(node_id: &str) -> StatusReport {
+        StatusReport {
+            cpu_usage: 0.0,
+            mem_usage: 0.0,
+            active_connections: 0,
+            uptime_secs: 60,
+            public_ip: Some("203.0.113.10".into()),
+            public_ipv4: Some("203.0.113.10".into()),
+            public_ipv6: None,
+            disk_total: None,
+            disk_used: None,
+            disk_usage_percent: None,
+            disk_mount: None,
+            upload_bps: None,
+            download_bps: None,
+            boot_upload_bytes: None,
+            boot_download_bytes: None,
+            network_interface: None,
+            node_id: Some(node_id.into()),
+            process_uptime_secs: Some(60),
+            node_version: Some("1.0.0".into()),
+            config_protocol_version: Some(CONFIG_PROTOCOL_VERSION),
+            listener_errors: Some(Vec::new()),
+            install_method: Some("systemd".into()),
+            architecture: Some("linux-amd64".into()),
+            camouflage_sites: Some(Vec::new()),
+            active_listener_rule_ids: Some(vec![100]),
+            provisioning_capabilities: None,
+            reconciliation: Some(ReconciliationStatus {
+                state: ReconciliationStatusState::Converged,
+                desired_fingerprint: None,
+                applied_fingerprint: None,
+                observed_fingerprint: None,
+                last_success_at: Some(chrono::Utc::now().to_rfc3339()),
+                last_error: None,
+                recovery_source: ReconciliationRecoverySource::Panel,
+            }),
+        }
+    }
+
+    async fn stored_preference(state: &AppState, group_id: i64) -> Option<String> {
+        let raw = state
+            .db
+            .get(&format!("relay_preference:{group_id}"))
+            .await
+            .unwrap()?;
+        serde_json::from_str::<crate::service::relay_preference::RelayPreferenceState>(&raw)
+            .unwrap()
+            .preferred_node_id
     }
 
     fn config_headers(token: Option<&str>) -> HeaderMap {
@@ -1128,5 +1196,141 @@ mod tests {
             Some("systemd"),
             "install_method must be persisted so the upgrade UI can offer a self-upgrade"
         );
+    }
+
+    #[tokio::test]
+    async fn report_status_initializes_preference_without_get_request() {
+        let (state, _pool) = seeded_state().await;
+        let (_connection, _rx) = state
+            .node_connections
+            .register(10, Some("node-a".into()))
+            .await;
+
+        let Json(response) = report_status(
+            State(state.clone()),
+            auth_headers("tok-A"),
+            Json(ready_status("node-a")),
+        )
+        .await;
+        assert_eq!(response.code, 0);
+        assert_eq!(
+            stored_preference(&state, 10).await.as_deref(),
+            Some("node-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn new_ready_node_report_does_not_replace_existing_preference() {
+        let (state, _pool) = seeded_state().await;
+        let (_a_connection, _a_rx) = state
+            .node_connections
+            .register(10, Some("node-a".into()))
+            .await;
+        let Json(a_response) = report_status(
+            State(state.clone()),
+            auth_headers("tok-A"),
+            Json(ready_status("node-a")),
+        )
+        .await;
+        assert_eq!(a_response.code, 0);
+
+        let (_b_connection, _b_rx) = state
+            .node_connections
+            .register(10, Some("node-b".into()))
+            .await;
+        let Json(b_response) = report_status(
+            State(state.clone()),
+            auth_headers("tok-A"),
+            Json(ready_status("node-b")),
+        )
+        .await;
+        assert_eq!(b_response.code, 0);
+
+        assert_eq!(
+            stored_preference(&state, 10).await.as_deref(),
+            Some("node-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_preferred_node_is_not_replaced_by_ready_reporter() {
+        let (state, _pool) = seeded_state().await;
+        let preference = crate::service::relay_preference::RelayPreferenceState {
+            preferred_node_id: Some("node-a".into()),
+            ..Default::default()
+        };
+        state
+            .db
+            .set(
+                "relay_preference:10",
+                &serde_json::to_string(&preference).unwrap(),
+            )
+            .await
+            .unwrap();
+        let (_b_connection, _b_rx) = state
+            .node_connections
+            .register(10, Some("node-b".into()))
+            .await;
+
+        let Json(response) = report_status(
+            State(state.clone()),
+            auth_headers("tok-A"),
+            Json(ready_status("node-b")),
+        )
+        .await;
+        assert_eq!(response.code, 0);
+
+        assert_eq!(
+            stored_preference(&state, 10).await.as_deref(),
+            Some("node-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn near_simultaneous_node_reports_never_rewrite_initialized_preference() {
+        let (state, _pool) = seeded_state().await;
+        let (_a_connection, _a_rx) = state
+            .node_connections
+            .register(10, Some("node-a".into()))
+            .await;
+        let (_b_connection, _b_rx) = state
+            .node_connections
+            .register(10, Some("node-b".into()))
+            .await;
+
+        let a = report_status(
+            State(state.clone()),
+            auth_headers("tok-A"),
+            Json(ready_status("node-a")),
+        );
+        let b = report_status(
+            State(state.clone()),
+            auth_headers("tok-A"),
+            Json(ready_status("node-b")),
+        );
+        let (a_response, b_response) = tokio::join!(a, b);
+        assert_eq!(a_response.0.code, 0);
+        assert_eq!(b_response.0.code, 0);
+
+        let first = stored_preference(&state, 10).await;
+        assert!(matches!(
+            first.as_deref(),
+            None | Some("node-a") | Some("node-b")
+        ));
+        let Json(a_again) = report_status(
+            State(state.clone()),
+            auth_headers("tok-A"),
+            Json(ready_status("node-a")),
+        )
+        .await;
+        let Json(b_again) = report_status(
+            State(state.clone()),
+            auth_headers("tok-A"),
+            Json(ready_status("node-b")),
+        )
+        .await;
+        assert_eq!(a_again.code, 0);
+        assert_eq!(b_again.code, 0);
+        assert_eq!(stored_preference(&state, 10).await, first);
     }
 }

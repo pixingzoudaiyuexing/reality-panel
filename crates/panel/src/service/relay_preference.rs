@@ -7,8 +7,9 @@
 use crate::api::stats::{parse_status_key, NODE_ONLINE_WINDOW_SECS};
 use crate::api::ws::NodeConnections;
 use crate::db::error::DbError;
-use crate::db::repo::Repository;
+use crate::db::repo::{GroupRepository, Repository, ResourceScope};
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
 use relay_shared::models::ForwardRule;
 use relay_shared::protocol::{
     CamouflageSiteStatus, ListenerError, ReconciliationStatus, ReconciliationStatusState,
@@ -19,6 +20,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::Ipv4Addr;
 
 pub const RELAY_PREFERENCE_KEY_PREFIX: &str = "relay_preference:";
+
+/// The Panel is a single process. Serializing only the short initialization
+/// transaction prevents concurrent status reports from choosing different
+/// first preferences without adding database or distributed lock machinery.
+static INITIALIZATION_LOCK: Lazy<tokio::sync::Mutex<()>> =
+    Lazy::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -286,16 +293,11 @@ fn status_identity(key: &str) -> Option<(i64, String)> {
     Some((group_id, node_id.unwrap_or("__legacy__").to_string()))
 }
 
-pub async fn get_relay_preference(
+async fn evaluate_group_nodes(
     db: &dyn Repository,
     node_connections: &NodeConnections,
     group_id: i64,
-) -> Result<RelayPreferenceView, RelayPreferenceError> {
-    let raw_preference = db.get(&preference_key(group_id)).await?;
-    let mut preference = match raw_preference {
-        Some(raw) => serde_json::from_str(&raw).map_err(RelayPreferenceError::InvalidPreference)?,
-        None => RelayPreferenceState::default(),
-    };
+) -> Result<Vec<EvaluatedNode>, RelayPreferenceError> {
     let rules = db.list_active_for_config(group_id).await?;
     let rows = db.scan_prefix("node_status:").await?;
     let live_node_ids = node_connections.online_node_ids(group_id).await;
@@ -314,13 +316,38 @@ pub async fn get_relay_preference(
     for node_id in &live_node_ids {
         statuses.entry(node_id.clone()).or_default();
     }
-    let evaluated = statuses
+    Ok(statuses
         .into_iter()
         .map(|(node_id, raw_status)| {
             let raw_status = (!raw_status.is_empty()).then_some(raw_status.as_str());
             evaluate_node(node_id, raw_status, now, &live_node_ids, &rules)
         })
-        .collect::<Vec<_>>();
+        .collect())
+}
+
+/// Ensure an inbound group's preference has its one-time initial value.
+/// Existing preferences are returned unchanged; this function never performs
+/// failover or replaces an operator-selected/current preferred node.
+pub async fn ensure_preference_initialized(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+) -> Result<RelayPreferenceState, RelayPreferenceError> {
+    let _guard = INITIALIZATION_LOCK.lock().await;
+    let group = GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await?;
+    if group.as_ref().map(|group| group.group_type.as_str()) != Some("in") {
+        return Ok(RelayPreferenceState::default());
+    }
+    let raw_preference = db.get(&preference_key(group_id)).await?;
+    let mut preference = match raw_preference {
+        Some(raw) => serde_json::from_str(&raw).map_err(RelayPreferenceError::InvalidPreference)?,
+        None => RelayPreferenceState::default(),
+    };
+    if preference.preferred_node_id.is_some() {
+        return Ok(preference);
+    }
+
+    let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
 
     let ready_node_ids: Vec<String> = evaluated
         .iter()
@@ -334,6 +361,23 @@ pub async fn get_relay_preference(
         )
         .await?;
     }
+
+    Ok(preference)
+}
+
+pub async fn delete_relay_preference(db: &dyn Repository, group_id: i64) -> Result<(), DbError> {
+    let _guard = INITIALIZATION_LOCK.lock().await;
+    db.delete(&preference_key(group_id)).await?;
+    Ok(())
+}
+
+pub async fn get_relay_preference(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+) -> Result<RelayPreferenceView, RelayPreferenceError> {
+    let preference = ensure_preference_initialized(db, node_connections, group_id).await?;
+    let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
 
     let preferred_node_id = preference.preferred_node_id.clone();
     let preferred_ip = evaluated

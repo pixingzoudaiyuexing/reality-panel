@@ -234,6 +234,16 @@ pub async fn delete_group(
     match crate::service::groups::delete_group(state.db.as_ref(), id).await {
         Ok(false) => Json(err(404, "分组不存在")),
         Ok(true) => {
+            if let Err(error) =
+                crate::service::relay_preference::delete_relay_preference(state.db.as_ref(), id)
+                    .await
+            {
+                tracing::warn!(
+                    "delete_group {}: relay preference cleanup failed: {}",
+                    id,
+                    error
+                );
+            }
             tracing::warn!(
                 action = "delete_group",
                 group_id = id,
