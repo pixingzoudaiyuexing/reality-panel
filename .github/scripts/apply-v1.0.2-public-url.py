@@ -36,15 +36,32 @@ replace_once(
     "            contact: clamp(&self.contact, MAX_CONTACT),\n",
     "            contact: clamp(&self.contact, MAX_CONTACT),\n            public_panel_url: clamp(&self.public_panel_url, MAX_PUBLIC_PANEL_URL),\n",
 )
-replace_once(
+regex_once(
     "crates/panel/src/service/site.rs",
-    "        let cfg = SiteConfig::from_json(Some(r#\"{\\\"site_name\\\":\\\"我的中转\\\",\\\"contact\\\":\\\"tg\\\"}\"#));\n        assert_eq!(cfg.site_name, \"我的中转\");\n        assert_eq!(cfg.contact, \"tg\");\n",
-    "        let cfg = SiteConfig::from_json(Some(\n            r#\"{\\\"site_name\\\":\\\"我的中转\\\",\\\"contact\\\":\\\"tg\\\",\\\"public_panel_url\\\":\\\"https://panel.example.com\\\"}\"#,\n        ));\n        assert_eq!(cfg.site_name, \"我的中转\");\n        assert_eq!(cfg.contact, \"tg\");\n        assert_eq!(cfg.public_panel_url, \"https://panel.example.com\");\n",
+    r'''    fn from_json_keeps_a_configured_name\(\) \{.*?    \}\n\n''',
+    '''    fn from_json_keeps_a_configured_name() {
+        let cfg = SiteConfig::from_json(Some(
+            r#"{"site_name":"我的中转","contact":"tg","public_panel_url":"https://panel.example.com"}"#,
+        ));
+        assert_eq!(cfg.site_name, "我的中转");
+        assert_eq!(cfg.contact, "tg");
+        assert_eq!(cfg.public_panel_url, "https://panel.example.com");
+    }
+
+''',
 )
 replace_once(
     "crates/panel/src/service/site.rs",
     "    /// Truncation counts characters, not bytes. A byte slice at MAX_NAME would\n",
-    "    #[test]\n    fn old_site_json_without_public_panel_url_remains_compatible() {\n        let cfg = SiteConfig::from_json(Some(r#\"{\\\"site_name\\\":\\\"旧站点\\\"}\"#));\n        assert_eq!(cfg.site_name, \"旧站点\");\n        assert!(cfg.public_panel_url.is_empty());\n    }\n\n    /// Truncation counts characters, not bytes. A byte slice at MAX_NAME would\n",
+    '''    #[test]
+    fn old_site_json_without_public_panel_url_remains_compatible() {
+        let cfg = SiteConfig::from_json(Some(r#"{"site_name":"旧站点"}"#));
+        assert_eq!(cfg.site_name, "旧站点");
+        assert!(cfg.public_panel_url.is_empty());
+    }
+
+    /// Truncation counts characters, not bytes. A byte slice at MAX_NAME would
+''',
 )
 
 # 2) 站点设置 API 保存时做严格 origin 校验并规范化末尾斜杠。
@@ -141,8 +158,45 @@ replace_once(
     "const MAX_CONTACT = 256;\n",
     "const MAX_CONTACT = 256;\nconst MAX_PUBLIC_PANEL_URL = 2048;\n",
 )
-site_name_block = '''        <Form.Item\n          name="site_name"\n          label={t('siteName')}\n          extra={t('siteNameHint')}\n          rules={[{ max: MAX_NAME, message: t('siteFieldTooLong') }]}\n        >\n          <Input placeholder="RealityPanel" showCount maxLength={MAX_NAME} />\n        </Form.Item>\n'''
-public_url_block = site_name_block + '''        <Form.Item\n          name="public_panel_url"\n          label={t('panelPublicUrl')}\n          extra={t('panelPublicUrlHint')}\n          rules={[\n            { max: MAX_PUBLIC_PANEL_URL, message: t('siteFieldTooLong') },\n            {\n              // 与后端 valid_public_panel_url 保持同样的“仅根 origin”语义。\n              validator: async (_rule, value: string | undefined) => {\n                const raw = (value ?? '').trim();\n                if (!raw) return;\n                try {\n                  const parsed = new URL(raw);\n                  const valid = (parsed.protocol === 'http:' || parsed.protocol === 'https:')\n                    && !parsed.username\n                    && !parsed.password\n                    && !parsed.search\n                    && !parsed.hash\n                    && parsed.pathname === '/';\n                  if (!valid) throw new Error('invalid');\n                } catch {\n                  throw new Error(t('panelPublicUrlInvalid'));\n                }\n              },\n            },\n          ]}\n        >\n          <Input placeholder="https://panel.example.com" showCount maxLength={MAX_PUBLIC_PANEL_URL} />\n        </Form.Item>\n'''
+site_name_block = '''        <Form.Item
+          name="site_name"
+          label={t('siteName')}
+          extra={t('siteNameHint')}
+          rules={[{ max: MAX_NAME, message: t('siteFieldTooLong') }]}
+        >
+          <Input placeholder="RealityPanel" showCount maxLength={MAX_NAME} />
+        </Form.Item>
+'''
+public_url_block = site_name_block + '''        <Form.Item
+          name="public_panel_url"
+          label={t('panelPublicUrl')}
+          extra={t('panelPublicUrlHint')}
+          rules={[
+            { max: MAX_PUBLIC_PANEL_URL, message: t('siteFieldTooLong') },
+            {
+              // 与后端 valid_public_panel_url 保持同样的“仅根 origin”语义。
+              validator: async (_rule, value: string | undefined) => {
+                const raw = (value ?? '').trim();
+                if (!raw) return;
+                try {
+                  const parsed = new URL(raw);
+                  const valid = (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+                    && !parsed.username
+                    && !parsed.password
+                    && !parsed.search
+                    && !parsed.hash
+                    && parsed.pathname === '/';
+                  if (!valid) throw new Error('invalid');
+                } catch {
+                  throw new Error(t('panelPublicUrlInvalid'));
+                }
+              },
+            },
+          ]}
+        >
+          <Input placeholder="https://panel.example.com" showCount maxLength={MAX_PUBLIC_PANEL_URL} />
+        </Form.Item>
+'''
 replace_once("frontend/src/pages/SiteSettings.tsx", site_name_block, public_url_block)
 replace_once(
     "frontend/src/i18n/zh-CN.ts",
