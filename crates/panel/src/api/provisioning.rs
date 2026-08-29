@@ -1,3 +1,5 @@
+use super::AppState;
+use crate::service::site::{SiteConfig, SITE_CONFIG_KEY};
 use relay_shared::protocol::ProvisioningCapabilities;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -95,6 +97,23 @@ pub(crate) fn valid_public_panel_url(url: &str) -> bool {
         && parsed.query().is_none()
         && parsed.fragment().is_none()
         && (parsed.path().is_empty() || parsed.path() == "/")
+}
+
+fn normalize_public_panel_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    valid_public_panel_url(url).then(|| url.trim_end_matches('/').to_string())
+}
+
+/// 运行时公网地址优先使用管理员在站点设置中保存的值；留空或损坏时才回退
+/// 到部署环境的 PUBLIC_PANEL_URL。这样反代域名上线后无需重写容器环境变量。
+pub(crate) fn select_public_panel_url(site_url: &str, env_url: &str) -> Option<String> {
+    normalize_public_panel_url(site_url).or_else(|| normalize_public_panel_url(env_url))
+}
+
+pub(crate) async fn effective_public_panel_url(state: &AppState) -> Option<String> {
+    let raw = state.db.get(SITE_CONFIG_KEY).await.ok().flatten();
+    let site = SiteConfig::from_json(raw.as_deref());
+    select_public_panel_url(&site.public_panel_url, &state.config.public_panel_url)
 }
 
 pub(crate) fn load_artifact(architecture: &str) -> Result<ProvisioningArtifact, ProvisioningError> {
@@ -273,6 +292,28 @@ mod tests {
         ));
         assert!(!valid_public_panel_url("http://panel.example.com/path"));
         assert!(!valid_public_panel_url("ftp://panel.example.com"));
+    }
+
+    #[test]
+    fn public_panel_url_prefers_site_setting_and_falls_back_to_environment() {
+        assert_eq!(
+            select_public_panel_url(" https://panel.example.com/ ", "http://203.0.113.10:18888",)
+                .as_deref(),
+            Some("https://panel.example.com")
+        );
+        assert_eq!(
+            select_public_panel_url("", "http://203.0.113.10:18888/").as_deref(),
+            Some("http://203.0.113.10:18888")
+        );
+        assert_eq!(
+            select_public_panel_url(
+                "https://panel.example.com/path",
+                "https://fallback.example.com"
+            )
+            .as_deref(),
+            Some("https://fallback.example.com")
+        );
+        assert!(select_public_panel_url("not-a-url", "").is_none());
     }
 
     #[test]

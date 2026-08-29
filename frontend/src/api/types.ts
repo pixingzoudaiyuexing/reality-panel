@@ -285,7 +285,10 @@ export interface SiteNotice {
 }
 
 /** v1.2.4: the full site config, as the admin form reads and writes it. */
-export interface SiteConfig extends PublicSite, SiteNotice {}
+export interface SiteConfig extends PublicSite, SiteNotice {
+  /** 管理员配置的节点 Bootstrap / Enrollment 公网根地址。 */
+  public_panel_url: string;
+}
 
 /** v1.2.4: one recorded admin action. */
 export interface AuditEntry {

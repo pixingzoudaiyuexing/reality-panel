@@ -6,8 +6,9 @@
 
 use crate::api::middleware::AdminOnly;
 use crate::api::provisioning::{
-    bootstrap_session_lifetime_secs, capabilities_satisfy, load_artifact, normalize_architecture,
-    valid_public_panel_url, ProvisioningBundle, ProvisioningProfile, ENROLLMENT_CLAIM_WINDOW_SECS,
+    bootstrap_session_lifetime_secs, capabilities_satisfy, effective_public_panel_url,
+    load_artifact, normalize_architecture, ProvisioningBundle, ProvisioningProfile,
+    ENROLLMENT_CLAIM_WINDOW_SECS,
 };
 use crate::api::stats::{status_last_seen, NODE_ONLINE_WINDOW_SECS};
 use crate::api::AppState;
@@ -217,12 +218,12 @@ pub async fn create_enrollment(
                 return api_error(500, "database error");
             }
         };
-    if !valid_public_panel_url(&state.config.public_panel_url) {
+    let Some(panel_url) = effective_public_panel_url(&state).await else {
         return api_error(
             409,
-            "PUBLIC_PANEL_URL must be a valid public http:// or https:// origin",
+            "请先在站点设置中配置有效的面板公网地址，或设置 PUBLIC_PANEL_URL",
         );
-    }
+    };
 
     let id = uuid::Uuid::new_v4().to_string();
     let secret = random_token();
@@ -262,7 +263,7 @@ pub async fn create_enrollment(
     Json(ApiResponse::success(CreatedEnrollment {
         enrollment: enrollment_view(&enrollment),
         enrollment_secret: secret,
-        launcher_command: launcher_command(&state.config.public_panel_url, &id),
+        launcher_command: launcher_command(&panel_url, &id),
     }))
 }
 
@@ -317,7 +318,13 @@ pub async fn enrollment_bundle(
         Ok(artifact) => artifact,
         Err(error) => return bundle_error(503, error.message),
     };
-    let bundle = ProvisioningBundle::new(&state.config.public_panel_url, &group.token, artifact);
+    let Some(panel_url) = effective_public_panel_url(&state).await else {
+        return bundle_error(
+            409,
+            "请先在站点设置中配置有效的面板公网地址，或设置 PUBLIC_PANEL_URL",
+        );
+    };
+    let bundle = ProvisioningBundle::new(&panel_url, &group.token, artifact);
     match render_bundle(
         &id,
         enrollment.group_id,
