@@ -13,7 +13,7 @@ env:
 
 jobs:
   implement:
-    if: ${{ github.event.head_commit.message == 'ci: start rc4 implementation' }}
+    if: "${{ github.event.head_commit.message == 'ci: start rc4 implementation' }}"
     runs-on: ubuntu-24.04
     container: rust:1.96-bookworm
     defaults:
