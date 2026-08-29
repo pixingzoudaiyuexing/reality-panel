@@ -14,6 +14,7 @@ const { Text } = Typography;
 const MAX_NAME = 64;
 const MAX_SUBTITLE = 128;
 const MAX_CONTACT = 256;
+const MAX_PUBLIC_PANEL_URL = 2048;
 
 
 /**
@@ -106,6 +107,35 @@ export default function SiteSettings() {
           rules={[{ max: MAX_NAME, message: t('siteFieldTooLong') }]}
         >
           <Input placeholder="RealityPanel" showCount maxLength={MAX_NAME} />
+        </Form.Item>
+        <Form.Item
+          name="public_panel_url"
+          label={t('panelPublicUrl')}
+          extra={t('panelPublicUrlHint')}
+          rules={[
+            { max: MAX_PUBLIC_PANEL_URL, message: t('siteFieldTooLong') },
+            {
+              // 与后端 valid_public_panel_url 保持同样的“仅根 origin”语义。
+              validator: async (_rule, value: string | undefined) => {
+                const raw = (value ?? '').trim();
+                if (!raw) return;
+                try {
+                  const parsed = new URL(raw);
+                  const valid = (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+                    && !parsed.username
+                    && !parsed.password
+                    && !parsed.search
+                    && !parsed.hash
+                    && parsed.pathname === '/';
+                  if (!valid) throw new Error('invalid');
+                } catch {
+                  throw new Error(t('panelPublicUrlInvalid'));
+                }
+              },
+            },
+          ]}
+        >
+          <Input placeholder="https://panel.example.com" showCount maxLength={MAX_PUBLIC_PANEL_URL} />
         </Form.Item>
         <Form.Item
           name="subtitle"

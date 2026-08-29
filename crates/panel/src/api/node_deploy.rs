@@ -6,8 +6,8 @@
 
 use crate::api::middleware::AdminOnly;
 use crate::api::provisioning::{
-    capabilities_satisfy, load_artifact, normalize_architecture, reported_capabilities,
-    valid_public_panel_url, ProvisioningArtifact, ProvisioningBundle, ProvisioningProfile,
+    capabilities_satisfy, effective_public_panel_url, load_artifact, normalize_architecture,
+    reported_capabilities, ProvisioningArtifact, ProvisioningBundle, ProvisioningProfile,
 };
 use crate::api::AppState;
 use crate::db::repo::{GroupRepository, ResourceScope};
@@ -563,13 +563,12 @@ pub async fn start_deployment(
                 return error(500, "database error");
             }
         };
-    let panel_url = state.config.public_panel_url.trim().to_string();
-    if !valid_public_panel_url(&panel_url) {
+    let Some(panel_url) = effective_public_panel_url(&state).await else {
         return error(
             409,
-            "PUBLIC_PANEL_URL must be a valid public http:// or https:// origin before node bootstrap",
+            "请先在站点设置中配置有效的面板公网地址，或设置 PUBLIC_PANEL_URL",
         );
-    }
+    };
     let status = state
         .deployments
         .insert(group.id, ssh.host.clone(), req.profile)

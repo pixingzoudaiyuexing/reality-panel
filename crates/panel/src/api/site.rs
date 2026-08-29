@@ -15,8 +15,9 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use super::middleware::{AdminOnly, AuthUser};
+use super::provisioning::valid_public_panel_url;
 use super::AppState;
-use crate::service::site::{SiteConfig, SITE_CONFIG_KEY};
+use crate::service::site::{SiteConfig, MAX_PUBLIC_PANEL_URL, SITE_CONFIG_KEY};
 use relay_shared::protocol::ApiResponse;
 
 async fn load(state: &AppState) -> SiteConfig {
@@ -83,6 +84,8 @@ pub struct UpdateSiteRequest {
     pub announcement_type: String,
     #[serde(default)]
     pub contact: String,
+    #[serde(default)]
+    pub public_panel_url: String,
 }
 
 /// PUT /api/v1/admin/settings/site
@@ -91,6 +94,19 @@ pub async fn update_site_settings(
     State(state): State<AppState>,
     Json(req): Json<UpdateSiteRequest>,
 ) -> Json<ApiResponse<SiteConfig>> {
+    // 公网地址是连接配置，不能像普通展示文案一样静默截断；写入前必须完整校验。
+    let public_panel_url = req.public_panel_url.trim();
+    if public_panel_url.chars().count() > MAX_PUBLIC_PANEL_URL
+        || (!public_panel_url.is_empty() && !valid_public_panel_url(public_panel_url))
+    {
+        return Json(ApiResponse {
+            code: 400,
+            message: "面板公网地址必须是有效的 http:// 或 https:// 根地址，且不能包含路径、查询参数或账号密码".into(),
+            data: None,
+        });
+    }
+    let public_panel_url = public_panel_url.trim_end_matches('/').to_string();
+
     // Trim + clamp before storing, so every reader (including the public
     // endpoint hit on every login page load) gets a bounded value.
     let cfg = SiteConfig {
@@ -99,6 +115,7 @@ pub async fn update_site_settings(
         announcement: req.announcement,
         announcement_type: req.announcement_type,
         contact: req.contact,
+        public_panel_url,
     }
     .sanitized();
 
@@ -136,7 +153,7 @@ pub async fn update_site_settings(
         "settings",
         "site",
         &format!(
-            "站点名称 {} / 公告 {} / 客服 {}",
+            "站点名称 {} / 公告 {} / 客服 {} / 公网地址 {}",
             cfg.site_name,
             if cfg.announcement.is_empty() {
                 "已清空"
@@ -144,6 +161,11 @@ pub async fn update_site_settings(
                 "已设置"
             },
             if cfg.contact.is_empty() {
+                "已清空"
+            } else {
+                "已设置"
+            },
+            if cfg.public_panel_url.is_empty() {
                 "已清空"
             } else {
                 "已设置"
