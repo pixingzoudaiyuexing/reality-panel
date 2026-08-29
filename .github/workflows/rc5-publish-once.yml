@@ -31,12 +31,13 @@ jobs:
           ref: fix/wildcard-config-validation-rc6
           fetch-depth: 0
 
-      - name: Apply patch
+      - name: Apply patch and rc6 version
         run: |
           python3 scripts/rc6-wildcard-fix.py
           rm -f .github/workflows/rc6-wildcard-fix-once.yml
           cargo fmt --all
           cargo fmt --all -- --check
+          bash scripts/release-version-contract.sh v1.1.0-rc.6
 
       - name: Run targeted wildcard regression tests
         run: |
@@ -46,11 +47,12 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace --locked
 
-      - name: Commit verified fix branch
+      - name: Commit verified rc6 branch
         run: |
           rm -f scripts/rc6-wildcard-fix.py
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "fix: 接受覆盖 SNI 的通配符证书配置"
-          git push origin HEAD:fix/wildcard-config-validation-rc6
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" config user.name "github-actions[bot]"
+          git -C "$GITHUB_WORKSPACE" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$GITHUB_WORKSPACE" add -A
+          git -C "$GITHUB_WORKSPACE" commit -m "fix: 接受覆盖 SNI 的通配符证书配置"
+          git -C "$GITHUB_WORKSPACE" push origin HEAD:fix/wildcard-config-validation-rc6
