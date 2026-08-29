@@ -22,36 +22,36 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Fix protocol test and imports
+      - name: Fix shared protocol v9 assertions
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           python3 - <<'PY'
           from pathlib import Path
 
-          p = Path('crates/panel/src/api/node.rs')
+          p = Path('crates/shared/src/protocol.rs')
           s = p.read_text()
-          old = '''    #[test]\n    fn config_protocol_v7_is_rejected_and_v8_is_accepted() {\n        let mut v7 = HeaderMap::new();\n        v7.insert("X-Config-Protocol-Version", "7".parse().unwrap());\n        assert!(!config_protocol_compatible(&v7));\n\n        let mut v8 = HeaderMap::new();\n        v8.insert("X-Config-Protocol-Version", "8".parse().unwrap());\n        assert!(config_protocol_compatible(&v8));\n        assert!(!config_protocol_compatible(&HeaderMap::new()));\n    }'''
-          new = '''    #[test]\n    fn config_protocol_v8_is_rejected_and_v9_is_accepted() {\n        let mut v8 = HeaderMap::new();\n        v8.insert("X-Config-Protocol-Version", "8".parse().unwrap());\n        assert!(!config_protocol_compatible(&v8));\n\n        let mut v9 = HeaderMap::new();\n        v9.insert("X-Config-Protocol-Version", "9".parse().unwrap());\n        assert!(config_protocol_compatible(&v9));\n        assert!(!config_protocol_compatible(&HeaderMap::new()));\n    }'''
-          if s.count(old) != 1:
-              raise SystemExit('protocol test anchor mismatch')
-          p.write_text(s.replace(old, new, 1))
 
-          p = Path('crates/panel/src/service/node_config.rs')
-          s = p.read_text()
-          old = '''use crate::db::repo::{\n    DnsRecordBindingRepository, DnsRecordSyncRepository, GroupRepository, ProfileScope,\n    ResourceScope, TunnelProfileRepository,\n};'''
-          new = '''use crate::db::repo::{GroupRepository, ProfileScope, ResourceScope, TunnelProfileRepository};'''
-          if s.count(old) != 1:
-              raise SystemExit('import anchor mismatch')
-          p.write_text(s.replace(old, new, 1))
+          old = '        assert_eq!(CONFIG_PROTOCOL_VERSION, 8);'
+          if s.count(old) != 2:
+              raise SystemExit(f'expected exactly two stale v8 assertions, found {s.count(old)}')
+          s = s.replace(old, '        assert_eq!(CONFIG_PROTOCOL_VERSION, 9);')
+
+          old_name = 'fn omitted_acme_challenge_method_remains_http01_on_protocol_v8()'
+          new_name = 'fn omitted_acme_challenge_method_remains_http01_on_protocol_v9()'
+          if s.count(old_name) != 1:
+              raise SystemExit('ACME protocol test name anchor mismatch')
+          s = s.replace(old_name, new_name, 1)
+
+          p.write_text(s)
           PY
           cargo fmt --all
-          cargo test -p relay-panel config_protocol_v8_is_rejected_and_v9_is_accepted -- --nocapture
+          cargo test -p relay-shared --lib --locked
 
       - name: Commit fix
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add crates/panel/src/api/node.rs crates/panel/src/service/node_config.rs
+          git add crates/shared/src/protocol.rs
           git diff --cached --check
-          git commit -m 'test: 更新配置协议 v9 兼容性断言'
+          git commit -m 'test: 修正配置协议 v9 共享断言'
           git push origin HEAD:fix/rc4-wildcard-acme
