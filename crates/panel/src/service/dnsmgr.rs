@@ -2025,11 +2025,7 @@ async fn reconciliation_tick(state: &AppState) {
         }
     };
     let now = utc_now();
-    let due = match state
-        .db
-        .list_due_dns_record_syncs(&now, DNS_SYNC_MAX_BATCH)
-        .await
-    {
+    let due = match list_executable_due_syncs(state.db.as_ref(), &now).await {
         Ok(due) => due,
         Err(error) => {
             tracing::error!("dns reconciliation: due-state query failed: {}", error);
@@ -2040,17 +2036,40 @@ async fn reconciliation_tick(state: &AppState) {
     // A single worker serializes provider writes. This is intentionally a
     // bounded concurrency of one because DNSMgr has no idempotency key.
     for sync in due {
-        if matches!(
-            derive_dns_desired(state.db.as_ref(), sync.rule_id).await,
-            Ok(DnsDesiredResolution::Frozen)
-        ) {
-            continue;
-        }
         for audit in reconcile_one(state.db.as_ref(), sync, &client).await {
             audit.record(state).await;
         }
     }
     crate::service::relay_preference::finalize_switching_preferences(state).await;
+}
+
+async fn list_executable_due_syncs(
+    db: &dyn Repository,
+    now: &str,
+) -> Result<Vec<DnsRecordSync>, crate::db::error::DbError> {
+    // There is at most one DNS sync per rule. Reading up to the rule count
+    // ensures frozen transactions cannot consume the executable batch slots.
+    let rule_count = db.list_rules(&ResourceScope::All).await?.len();
+    let due_limit = i64::try_from(rule_count)
+        .unwrap_or(i64::MAX)
+        .max(DNS_SYNC_MAX_BATCH);
+    let due = db.list_due_dns_record_syncs(now, due_limit).await?;
+    let mut executable = Vec::with_capacity(DNS_SYNC_MAX_BATCH as usize);
+
+    for sync in due {
+        if matches!(
+            derive_dns_desired(db, sync.rule_id).await,
+            Ok(DnsDesiredResolution::Frozen)
+        ) {
+            continue;
+        }
+        executable.push(sync);
+        if executable.len() == DNS_SYNC_MAX_BATCH as usize {
+            break;
+        }
+    }
+
+    Ok(executable)
 }
 
 /// Start the Panel-only DNS reconciliation worker. It never touches Relay
@@ -3325,6 +3344,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frozen_due_syncs_do_not_starve_executable_work() {
+        let db = due_queue_db(DNS_SYNC_MAX_BATCH, 1).await;
+        let frozen_before = frozen_sync_rows(&db, DNS_SYNC_MAX_BATCH).await;
+
+        let executable = list_executable_due_syncs(&db, "2026-08-30 00:00:00")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            executable
+                .iter()
+                .map(|sync| sync.rule_id)
+                .collect::<Vec<_>>(),
+            vec![1000],
+            "a full leading batch of frozen rows must not starve later work"
+        );
+        assert_eq!(
+            frozen_sync_rows(&db, DNS_SYNC_MAX_BATCH).await,
+            frozen_before,
+            "filtering frozen rows must not change their state or diagnostics"
+        );
+    }
+
+    #[tokio::test]
+    async fn executable_due_syncs_remain_bounded_after_frozen_filtering() {
+        let db = due_queue_db(DNS_SYNC_MAX_BATCH - 1, DNS_SYNC_MAX_BATCH + 1).await;
+
+        let executable = list_executable_due_syncs(&db, "2026-08-30 00:00:00")
+            .await
+            .unwrap();
+
+        assert_eq!(executable.len(), DNS_SYNC_MAX_BATCH as usize);
+        assert_eq!(executable.first().unwrap().rule_id, 1000);
+        assert_eq!(executable.last().unwrap().rule_id, 1015);
+        assert!(executable.iter().all(|sync| sync.rule_id >= 1000));
+    }
+
+    #[tokio::test]
     async fn scheduling_is_persisted_and_rule_edit_replaces_only_desired_state() {
         let db = ensure_db().await;
         db.set(
@@ -3861,6 +3918,118 @@ mod tests {
 
     async fn sync_row(db: &SqliteRepository) -> DnsRecordSync {
         db.find_dns_record_sync(100).await.unwrap().unwrap()
+    }
+
+    async fn due_queue_db(frozen_count: i64, executable_count: i64) -> SqliteRepository {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (10, 'frozen-group', 'in', 'frozen-token', 1, '192.0.2.10'), \
+                    (20, 'active-group', 'in', 'active-token', 1, '192.0.2.40')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for offset in 0..frozen_count {
+            sqlx::query(
+                "INSERT INTO forward_rules \
+                 (id, name, uid, listen_port, device_group_in, target_addr, target_port, \
+                  public_transport, node_transport, protocol, sni, camouflage_enabled) \
+                 VALUES (?, ?, 1, ?, 10, '127.0.0.1', 80, \
+                         'nginx_sni', 'nginx_sni', 'tcp', ?, 1)",
+            )
+            .bind(100 + offset)
+            .bind(format!("frozen-rule-{offset}"))
+            .bind(21000 + offset)
+            .bind(format!("frozen-{offset}.example.com"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for offset in 0..executable_count {
+            sqlx::query(
+                "INSERT INTO forward_rules \
+                 (id, name, uid, listen_port, device_group_in, target_addr, target_port, \
+                  public_transport, node_transport, protocol, sni, camouflage_enabled) \
+                 VALUES (?, ?, 1, ?, 20, '127.0.0.1', 80, \
+                         'nginx_sni', 'nginx_sni', 'tcp', ?, 1)",
+            )
+            .bind(1000 + offset)
+            .bind(format!("active-rule-{offset}"))
+            .bind(22000 + offset)
+            .bind(format!("active-{offset}.example.com"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let db = SqliteRepository::new(pool);
+        db.set(
+            "relay_preference:10",
+            r#"{"preferred_node_id":"node-a","pending_node_id":"node-b","state":"failed","started_at":"2026-08-29T00:00:00Z","last_error":"DNS_RECORD_CONFLICT"}"#,
+        )
+        .await
+        .unwrap();
+        for offset in 0..frozen_count {
+            db.insert_dns_record_sync(&NewDnsRecordSync {
+                rule_id: 100 + offset,
+                fqdn: format!("frozen-{offset}.example.com"),
+                record_type: "A".into(),
+                expected_value: "192.0.2.30".into(),
+                line: "default".into(),
+                line_key: "default".into(),
+                state: "FAILED".into(),
+                ownership: "PANEL".into(),
+                last_error_category: Some("DNS_RECORD_CONFLICT".into()),
+                next_attempt_at: Some("2026-08-29 00:00:00".into()),
+                created_at: "2026-08-29 00:00:00".into(),
+                updated_at: "2026-08-29 00:00:00".into(),
+            })
+            .await
+            .unwrap();
+        }
+        for offset in 0..executable_count {
+            db.insert_dns_record_sync(&NewDnsRecordSync {
+                rule_id: 1000 + offset,
+                fqdn: format!("active-{offset}.example.com"),
+                record_type: "A".into(),
+                expected_value: "192.0.2.40".into(),
+                line: "default".into(),
+                line_key: "default".into(),
+                state: "PENDING".into(),
+                ownership: "UNKNOWN".into(),
+                last_error_category: None,
+                next_attempt_at: Some("2026-08-29 00:00:00".into()),
+                created_at: "2026-08-29 00:00:00".into(),
+                updated_at: "2026-08-29 00:00:00".into(),
+            })
+            .await
+            .unwrap();
+        }
+        db
+    }
+
+    async fn frozen_sync_rows(db: &SqliteRepository, count: i64) -> Vec<DnsRecordSync> {
+        let mut rows = Vec::new();
+        for offset in 0..count {
+            rows.push(
+                db.find_dns_record_sync(100 + offset)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        rows
     }
 
     async fn ensure_db() -> SqliteRepository {
