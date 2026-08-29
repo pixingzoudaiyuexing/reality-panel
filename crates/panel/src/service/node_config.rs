@@ -22,10 +22,21 @@ use crate::db::Repository;
 use relay_shared::models::{DeviceGroup, ForwardRule};
 use relay_shared::protocol::{
     validate_proxy_protocol_invariants, AcmeChallengeMethod, CamouflageCertificatePolicy,
-    CamouflageLocalBackend, CamouflageSiteDesired, NodeConfigResponse,
+    CamouflageLocalBackend, CamouflageSiteDesired, NodeConfigResponse, NodeConfigSnapshot,
 };
 use relay_shared::reconciliation::certificate_domain_covers_sni;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
+
+const REVISION_PREFIX: &str = "node_config_revision:";
+static CONFIG_BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedConfigRevision {
+    revision: u64,
+    fingerprint: String,
+}
 
 #[derive(Debug)]
 pub enum NodeConfigBuildError {
@@ -195,6 +206,48 @@ pub async fn build_node_config(
     Ok(NodeConfigResponse {
         listeners,
         camouflage_sites: camouflage_by_sni.into_values().collect(),
+    })
+}
+
+/// Build the Panel-authoritative snapshot shared by HTTP and WS delivery.
+/// Revision state is stored in KVS so process restarts cannot reuse an older
+/// revision or race two transports into different ordering metadata.
+pub async fn build_node_config_snapshot(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
+    let lock = CONFIG_BUILD_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().await;
+    let config = build_node_config(db, group_id).await?;
+    let fingerprint = relay_shared::reconciliation::config_fingerprint(&config)
+        .as_str()
+        .to_string();
+    let key = format!("{REVISION_PREFIX}{group_id}");
+    let previous = db
+        .get(&key)
+        .await?
+        .map(|raw| serde_json::from_str::<PersistedConfigRevision>(&raw))
+        .transpose()
+        .map_err(|error| {
+            NodeConfigBuildError::InvalidConfig(format!("invalid revision state: {error}"))
+        })?;
+    let revision = match previous {
+        Some(previous) if previous.fingerprint == fingerprint && previous.revision > 0 => {
+            previous.revision
+        }
+        Some(previous) if previous.revision > 0 => previous.revision.saturating_add(1),
+        Some(_) | None => 1,
+    };
+    let state = serde_json::to_string(&PersistedConfigRevision {
+        revision,
+        fingerprint: fingerprint.clone(),
+    })
+    .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
+    db.set(&key, &state).await?;
+    Ok(NodeConfigSnapshot {
+        config_revision: revision,
+        config_fingerprint: fingerprint,
+        config,
     })
 }
 
@@ -696,5 +749,27 @@ mod tests {
             Err(NodeConfigBuildError::InvalidConfig(message))
                 if message.contains("mixed upstream Proxy Protocol modes")
         ));
+    }
+
+    #[tokio::test]
+    async fn config_snapshot_revision_is_stable_for_replay_and_increments_on_change() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        add_group(&pool, 10, "in", 2).await;
+        add_rule(&pool, 100, 2, 10, 443).await;
+        let repository = repo(&pool);
+
+        let first = build_node_config_snapshot(&repository, 10).await.unwrap();
+        let replay = build_node_config_snapshot(&repository, 10).await.unwrap();
+        assert_eq!(first.config_revision, replay.config_revision);
+        assert_eq!(first.config_fingerprint, replay.config_fingerprint);
+
+        sqlx::query("UPDATE forward_rules SET target_port=81 WHERE id=100")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let changed = build_node_config_snapshot(&repository, 10).await.unwrap();
+        assert!(changed.config_revision > first.config_revision);
+        assert_ne!(changed.config_fingerprint, first.config_fingerprint);
     }
 }

@@ -42,7 +42,10 @@ use serde::{Deserialize, Serialize};
 /// v9 = camouflage certificate `domain` may be a DNS-01 wildcard that covers
 /// the concrete SNI. A v8 node rejects that semantic as an exact-domain
 /// mismatch, so Panel and Node must upgrade together.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 9;
+/// v10 = Panel config snapshots carry a durable monotonic revision and their
+/// semantic fingerprint. Nodes reject stale HTTP/WS delivery rather than
+/// allowing transport arrival order to roll runtime and LKG state backward.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 10;
 
 pub fn config_protocol_versions_compatible(panel: u32, node: u32) -> bool {
     panel == node
@@ -152,6 +155,32 @@ pub struct NodeConfigResponse {
     /// material or filesystem paths; relay-node owns ACME generations and LKG.
     #[serde(default)]
     pub camouflage_sites: Vec<CamouflageSiteDesired>,
+}
+
+/// Panel-authoritative configuration plus its durable monotonic ordering
+/// metadata. The revision is intentionally outside `NodeConfigResponse`: it
+/// orders snapshots but does not alter the semantic configuration fingerprint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfigSnapshot {
+    /// Revision 0 is reserved for a pre-v10 cache loaded during upgrade. A v10
+    /// Panel must always emit a positive revision.
+    #[serde(default)]
+    pub config_revision: u64,
+    /// Fingerprint of the Panel-authoritative desired config. It remains the
+    /// desired fingerprint when the cached effective config withholds a
+    /// dependency, so restart ordering cannot confuse effective with desired.
+    #[serde(default)]
+    pub config_fingerprint: String,
+    #[serde(flatten)]
+    pub config: NodeConfigResponse,
+}
+
+impl std::ops::Deref for NodeConfigSnapshot {
+    type Target = NodeConfigResponse;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -615,6 +644,10 @@ pub struct ReconciliationStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desired_config_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_config_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_success_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -628,6 +661,8 @@ impl Default for ReconciliationStatus {
             desired_fingerprint: None,
             applied_fingerprint: None,
             observed_fingerprint: None,
+            desired_config_revision: None,
+            applied_config_revision: None,
             last_success_at: None,
             last_error: None,
             recovery_source: ReconciliationRecoverySource::None,
@@ -859,6 +894,12 @@ pub struct DiagnoseRuleMessage {
     pub msg_type: String,
     pub request_id: String,
     pub rule_id: i64,
+    #[serde(default)]
+    pub desired_sni: Option<String>,
+    #[serde(default)]
+    pub config_revision: u64,
+    #[serde(default)]
+    pub config_fingerprint: String,
     /// v0.4.9: opaque per-run challenge the node MUST echo back in its
     /// DiagnoseResult. `#[serde(default)]` so a v0.4.8 node still deserializes
     /// the message (it just ignores the field); the panel never sends a probe
@@ -969,11 +1010,21 @@ pub fn lifecycle_artifact_architecture(value: &str) -> Option<&'static str> {
 }
 
 impl DiagnoseRuleMessage {
-    pub fn new(request_id: String, rule_id: i64, challenge: String) -> Self {
+    pub fn new(
+        request_id: String,
+        rule_id: i64,
+        desired_sni: Option<String>,
+        config_revision: u64,
+        config_fingerprint: String,
+        challenge: String,
+    ) -> Self {
         Self {
             msg_type: "diagnose_rule".into(),
             request_id,
             rule_id,
+            desired_sni,
+            config_revision,
+            config_fingerprint,
             challenge,
         }
     }
@@ -1118,6 +1169,34 @@ pub struct RealityRuntimeDiagnosis {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RealityConvergenceDiagnosis {
+    pub check: RealityCheck,
+    pub desired_sni: Option<String>,
+    pub active_sni: Option<String>,
+    pub desired_config_revision: u64,
+    pub active_config_revision: u64,
+    pub desired_fingerprint: String,
+    pub active_fingerprint: String,
+}
+
+impl Default for RealityConvergenceDiagnosis {
+    fn default() -> Self {
+        Self {
+            check: RealityCheck {
+                state: "fail".into(),
+                detail: Some("configuration convergence evidence is unavailable".into()),
+            },
+            desired_sni: None,
+            active_sni: None,
+            desired_config_revision: 0,
+            active_config_revision: 0,
+            desired_fingerprint: String::new(),
+            active_fingerprint: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RealityBackendDiagnosis {
     pub address: String,
     pub check: RealityCheck,
@@ -1162,6 +1241,8 @@ pub struct RealityFallbackDiagnosis {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RealityDiagnosis {
+    #[serde(default)]
+    pub convergence: RealityConvergenceDiagnosis,
     pub config: RealityConfigDiagnosis,
     pub nginx: RealityNginxDiagnosis,
     pub runtime: RealityRuntimeDiagnosis,
@@ -1202,6 +1283,12 @@ pub struct DiagnoseResult {
     pub msg_type: String,
     pub request_id: String,
     pub rule_id: i64,
+    #[serde(default)]
+    pub diagnosed_sni: Option<String>,
+    #[serde(default)]
+    pub config_revision: u64,
+    #[serde(default)]
+    pub config_fingerprint: String,
     /// The node_id the node reports in its StatusReport (may be empty on old
     /// nodes; the panel falls back to a group-scoped id).
     #[serde(default)]
@@ -1941,9 +2028,15 @@ mod tests {
 
         // The reverse is NOT ambiguous: diagnose carries no node_id, so it can
         // never be mistaken for a restart.
-        let diag =
-            serde_json::to_string(&DiagnoseRuleMessage::new("req-2".into(), 7, "chal".into()))
-                .unwrap();
+        let diag = serde_json::to_string(&DiagnoseRuleMessage::new(
+            "req-2".into(),
+            7,
+            None,
+            0,
+            String::new(),
+            "chal".into(),
+        ))
+        .unwrap();
         assert!(
             serde_json::from_str::<RestartRuleMessage>(&diag).is_err(),
             "diagnose must not parse as restart (node_id is required)"
@@ -2055,13 +2148,15 @@ mod tests {
         }"#;
         let report: StatusReport = serde_json::from_str(legacy).unwrap();
         assert!(report.reconciliation.is_none());
-        assert_eq!(CONFIG_PROTOCOL_VERSION, 9);
+        assert_eq!(CONFIG_PROTOCOL_VERSION, 10);
 
         let status = ReconciliationStatus {
             state: ReconciliationStatusState::Converged,
             desired_fingerprint: Some("a".repeat(64)),
             applied_fingerprint: Some("b".repeat(64)),
             observed_fingerprint: Some("c".repeat(64)),
+            desired_config_revision: None,
+            applied_config_revision: None,
             last_success_at: Some("2026-08-26T00:00:00Z".into()),
             last_error: None,
             recovery_source: ReconciliationRecoverySource::Panel,
@@ -2072,13 +2167,13 @@ mod tests {
     }
 
     #[test]
-    fn omitted_acme_challenge_method_remains_http01_on_protocol_v9() {
+    fn omitted_acme_challenge_method_remains_http01_on_protocol_v10() {
         let policy: CamouflageCertificatePolicy = serde_json::from_str(
             r#"{"domain":"site.example.com","expected_public_ip":"192.0.2.10","renew_before_days":30}"#,
         )
         .unwrap();
         assert_eq!(policy.challenge_method, AcmeChallengeMethod::Http01);
-        assert_eq!(CONFIG_PROTOCOL_VERSION, 9);
+        assert_eq!(CONFIG_PROTOCOL_VERSION, 10);
     }
 
     #[test]
@@ -2094,7 +2189,7 @@ mod tests {
         .unwrap();
         assert_eq!(status.site_status, "future_site_state");
         assert_eq!(status.certificate_status, "future_certificate_state");
-        assert_eq!(CONFIG_PROTOCOL_VERSION, 9);
+        assert_eq!(CONFIG_PROTOCOL_VERSION, 10);
     }
 
     #[test]

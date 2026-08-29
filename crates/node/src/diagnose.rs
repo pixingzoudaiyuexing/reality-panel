@@ -26,10 +26,12 @@
 use crate::config::NodeConfig;
 use crate::forwarder::camouflage_site::{CamouflageSite, CamouflageSiteManager};
 use crate::forwarder::ForwarderManager;
+use crate::reconciler::Reconciler;
 use relay_shared::protocol::{
     DiagnoseResult, DiagnoseTargetResult, RealityBackendDiagnosis, RealityCamouflageDiagnosis,
-    RealityCertificateDiagnosis, RealityCheck, RealityConfigDiagnosis, RealityDiagnosis,
-    RealityFallbackDiagnosis, RealityNginxDiagnosis, RealityRuntimeDiagnosis, TargetProbeOutcome,
+    RealityCertificateDiagnosis, RealityCheck, RealityConfigDiagnosis, RealityConvergenceDiagnosis,
+    RealityDiagnosis, RealityFallbackDiagnosis, RealityNginxDiagnosis, RealityRuntimeDiagnosis,
+    TargetProbeOutcome,
 };
 use std::fs;
 use std::process::Command;
@@ -53,13 +55,28 @@ const MAX_TARGETS: usize = 32;
 pub async fn run_and_report(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    reconciler: &Arc<Mutex<Reconciler>>,
     config: &NodeConfig,
     node_id: &str,
     request_id: String,
     rule_id: i64,
+    desired_sni: Option<String>,
+    desired_config_revision: u64,
+    desired_fingerprint: String,
     challenge: String,
 ) {
-    let result = diagnose(manager, camouflage, &request_id, rule_id, challenge).await;
+    let result = diagnose(
+        manager,
+        camouflage,
+        reconciler,
+        &request_id,
+        rule_id,
+        desired_sni,
+        desired_config_revision,
+        desired_fingerprint,
+        challenge,
+    )
+    .await;
     let mut result = result;
     result.node_id = node_id.to_string();
     if let Err(e) = report(config, result).await {
@@ -71,8 +88,12 @@ pub async fn run_and_report(
 async fn diagnose(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    reconciler: &Arc<Mutex<Reconciler>>,
     request_id: &str,
     rule_id: i64,
+    desired_sni: Option<String>,
+    desired_config_revision: u64,
+    desired_fingerprint: String,
     challenge: String,
 ) -> DiagnoseResult {
     // v0.4.9: select the rule's TCP listener explicitly. For a tcp_udp rule
@@ -103,8 +124,22 @@ async fn diagnose(
         // diagnosis never retains the shared camouflage state mutex.
         let camouflage = camouflage.lock().await.clone();
         let manager = manager.lock().await;
-        let mut diagnosis =
-            build_reality_diagnosis(&manager, config.as_ref(), &listener, &camouflage);
+        let active_revision = reconciler
+            .lock()
+            .await
+            .status_snapshot()
+            .applied_config_revision
+            .unwrap_or_default();
+        let mut diagnosis = build_reality_diagnosis(
+            &manager,
+            config.as_ref(),
+            &listener,
+            &camouflage,
+            desired_sni.as_deref(),
+            desired_config_revision,
+            &desired_fingerprint,
+            active_revision,
+        );
         drop(manager);
         diagnosis.backends = reality_backend_results(&listener.targets).await;
         if let Some(sni) = diagnosis.config.sni.as_deref() {
@@ -152,6 +187,17 @@ async fn diagnose(
         request_id: request_id.to_string(),
         rule_id,
         node_id: String::new(), // filled by caller
+        diagnosed_sni: reality
+            .as_ref()
+            .and_then(|d| d.convergence.active_sni.clone()),
+        config_revision: reality
+            .as_ref()
+            .map(|d| d.convergence.active_config_revision)
+            .unwrap_or_default(),
+        config_fingerprint: reality
+            .as_ref()
+            .map(|d| d.convergence.active_fingerprint.clone())
+            .unwrap_or_default(),
         // Echoed back verbatim; the panel rejects the result without an exact
         // match (v0.4.9 secure-diagnose challenge).
         challenge,
@@ -176,6 +222,10 @@ fn build_reality_diagnosis(
     config: Option<&relay_shared::protocol::NodeConfigResponse>,
     listener: &relay_shared::protocol::ListenerConfig,
     camouflage: &CamouflageSiteManager,
+    desired_sni: Option<&str>,
+    desired_config_revision: u64,
+    desired_fingerprint: &str,
+    active_config_revision: u64,
 ) -> RealityDiagnosis {
     let sni = listener.sni.clone().filter(|s| !s.trim().is_empty());
     let config_ok = sni.is_some() && !listener.targets.is_empty() && listener.port > 0;
@@ -255,6 +305,38 @@ fn build_reality_diagnosis(
     let (certificate, camouflage_status) =
         certificate_and_camouflage(camouflage, sni.as_deref(), site.as_ref());
     RealityDiagnosis {
+        convergence: RealityConvergenceDiagnosis {
+            check: if desired_config_revision > 0
+                && desired_sni == sni.as_deref()
+                && desired_config_revision == active_config_revision
+                && !desired_fingerprint.is_empty()
+                && config
+                    .map(|value| {
+                        relay_shared::reconciliation::config_fingerprint(value).as_str()
+                            == desired_fingerprint
+                    })
+                    .unwrap_or(false)
+            {
+                check(
+                    "pass",
+                    "active rule matches current desired SNI and config revision",
+                )
+            } else {
+                check(
+                    "fail",
+                    "active rule does not match current desired configuration",
+                )
+            },
+            desired_sni: desired_sni.map(str::to_string),
+            active_sni: sni.clone(),
+            desired_config_revision,
+            active_config_revision,
+            desired_fingerprint: desired_fingerprint.to_string(),
+            active_fingerprint: config
+                .map(relay_shared::reconciliation::config_fingerprint)
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_default(),
+        },
         config: RealityConfigDiagnosis {
             check: config_status,
             listen_port: listener.port,

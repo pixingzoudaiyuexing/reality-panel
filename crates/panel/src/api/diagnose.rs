@@ -414,8 +414,9 @@ async fn reality_dependencies(
         None => dependency_check("blocked", "DNS synchronization state is unavailable"),
     };
 
-    let any_certificate_pass =
-        result_reality_checks(nodes).any(|diagnosis| diagnosis.certificate.check.state == "pass");
+    let any_certificate_pass = result_reality_checks(nodes).any(|diagnosis| {
+        diagnosis.certificate.check.state == "pass" && diagnosis.convergence.check.state == "pass"
+    });
     let any_certificate_fail =
         result_reality_checks(nodes).any(|diagnosis| diagnosis.certificate.check.state == "fail");
     let certificate = if any_certificate_pass {
@@ -428,8 +429,9 @@ async fn reality_dependencies(
         dependency_check("not_tested", "No Relay certificate result was returned")
     };
 
-    let any_route_pass =
-        result_reality_checks(nodes).any(|diagnosis| diagnosis.runtime.check.state == "pass");
+    let any_route_pass = result_reality_checks(nodes).any(|diagnosis| {
+        diagnosis.runtime.check.state == "pass" && diagnosis.convergence.check.state == "pass"
+    });
     let any_route_fail =
         result_reality_checks(nodes).any(|diagnosis| diagnosis.runtime.check.state == "fail");
     let route = if any_route_pass {
@@ -664,9 +666,31 @@ pub async fn diagnose_rule(
     //    never holds the wait open for a reply that will never come (the
     //    disconnect-race that previously caused a false 8s "timeout").
     let (request_id, challenge) = state.diagnose.start(rule_id, candidates.clone()).await;
+    let desired_snapshot =
+        crate::service::node_config::build_node_config_snapshot(state.db.as_ref(), group_id)
+            .await
+            .ok();
+    let desired_sni = desired_snapshot.as_ref().and_then(|snapshot| {
+        snapshot
+            .listeners
+            .iter()
+            .find(|listener| listener.rule_id == rule_id)
+            .and_then(|listener| listener.sni.clone())
+    });
+    let desired_revision = desired_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.config_revision)
+        .unwrap_or_default();
+    let desired_fingerprint = desired_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.config_fingerprint.clone())
+        .unwrap_or_default();
     let msg = serde_json::to_string(&DiagnoseRuleMessage::new(
         request_id.clone(),
         rule_id,
+        desired_sni,
+        desired_revision,
+        desired_fingerprint,
         challenge,
     ))
     .unwrap_or_default();
@@ -1015,6 +1039,9 @@ mod tests {
             request_id: req.into(),
             rule_id: 1,
             node_id: nid.into(),
+            diagnosed_sni: None,
+            config_revision: 0,
+            config_fingerprint: String::new(),
             // Default empty challenge; tests that exercise the challenge check
             // override this with `with_challenge`.
             challenge: String::new(),

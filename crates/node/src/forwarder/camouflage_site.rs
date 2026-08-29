@@ -107,7 +107,6 @@ pub struct CamouflageSiteManager {
 struct CertificateReconcileSnapshot {
     generation: u64,
     fingerprint: ConfigFingerprint,
-    runtime_revision: u64,
     manifest: CamouflageSitesManifest,
     active: Option<CamouflageSitesManifest>,
     config: CamouflageSiteConfig,
@@ -416,7 +415,6 @@ impl CamouflageSiteManager {
         Some(CertificateReconcileSnapshot {
             generation: self.desired_generation,
             fingerprint: self.desired_fingerprint.clone(),
-            runtime_revision: self.runtime_revision,
             manifest: self.active.clone()?,
             active: self.active.clone(),
             config: self.config.clone(),
@@ -518,7 +516,6 @@ impl CamouflageSiteManager {
         Some(CertificateReconcileSnapshot {
             generation: self.desired_generation,
             fingerprint: self.desired_fingerprint.clone(),
-            runtime_revision: self.runtime_revision,
             manifest: candidate,
             active: self.active.clone(),
             config: self.config.clone(),
@@ -1426,13 +1423,11 @@ async fn commit_snapshot(
         let current = shared.lock().await;
         if current.desired_generation != snapshot.generation
             || current.desired_fingerprint != snapshot.fingerprint
-            || current.runtime_revision != snapshot.runtime_revision
+            || current.active != snapshot.active
         {
             tracing::info!(
                 old_generation = snapshot.generation,
                 current_generation = current.desired_generation,
-                old_runtime_revision = snapshot.runtime_revision,
-                current_runtime_revision = current.runtime_revision,
                 old_fingerprint = %snapshot.fingerprint,
                 current_fingerprint = %current.desired_fingerprint,
                 "stale camouflage certificate reconcile result discarded"
@@ -1469,7 +1464,7 @@ async fn commit_snapshot(
             let mut current = shared.lock().await;
             if current.desired_generation != snapshot.generation
                 || current.desired_fingerprint != snapshot.fingerprint
-                || current.runtime_revision != snapshot.runtime_revision
+                || current.active != snapshot.active
             {
                 if snapshot.desired_request {
                     current.finish_desired_worker(false);
@@ -1509,13 +1504,11 @@ async fn commit_snapshot(
     let mut current = shared.lock().await;
     if current.desired_generation != snapshot.generation
         || current.desired_fingerprint != snapshot.fingerprint
-        || current.runtime_revision != snapshot.runtime_revision
+        || current.active != snapshot.active
     {
         tracing::error!(
             old_generation = snapshot.generation,
             current_generation = current.desired_generation,
-            old_runtime_revision = snapshot.runtime_revision,
-            current_runtime_revision = current.runtime_revision,
             "camouflage generation changed while the apply gate was held"
         );
         if snapshot.desired_request {
@@ -3151,6 +3144,23 @@ mod tests {
             ReconcileCommit::Stale
         );
         assert!(shared.lock().await.active_snis().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn unrelated_runtime_revision_does_not_discard_certificate_result() {
+        let dir = unique_dir("runtime-revision-not-stale");
+        let mut state = manager(&dir, "true", "true");
+        assert!(state.apply_candidate(manifest(&dir)));
+        state.update_desired(&[desired_site("op1", "op1.example.com")], true);
+        let snapshot = state.active_reconcile_snapshot().unwrap();
+        state.runtime_revision = state.runtime_revision.wrapping_add(1);
+        let shared = Arc::new(AsyncMutex::new(state));
+
+        assert_eq!(
+            commit_snapshot(&shared, successful_result(snapshot)).await,
+            ReconcileCommit::Applied
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

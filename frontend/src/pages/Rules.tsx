@@ -51,6 +51,7 @@ export function isRealityRule(rule: Pick<ForwardRule, 'public_transport' | 'node
 }
 
 type RealityRuntimeChecks = {
+  convergence: Pick<RealityDiagnosis['convergence'], 'check'>;
   config: Pick<RealityDiagnosis['config'], 'check'>;
   nginx: Pick<RealityDiagnosis['nginx'], 'check'>;
   runtime: Pick<RealityDiagnosis['runtime'], 'check'>;
@@ -65,7 +66,8 @@ export function diagnoseRuntimeStatus(listenerRunning: boolean, reality?: Realit
   }
   const healthy = reality.config.check.state === 'pass'
     && reality.nginx.check.state === 'pass'
-    && reality.runtime.check.state === 'pass';
+    && reality.runtime.check.state === 'pass'
+    && reality.convergence.check.state === 'pass';
   return {
     healthy,
     labelKey: healthy ? 'diagnoseRealityRunning' : 'diagnoseRealityFailed',
@@ -1723,6 +1725,8 @@ function RealityDiagnosisView({ diagnosis, t }: { diagnosis: RealityDiagnosis; t
     <Space orientation="vertical" size={8} style={{ width: '100%', marginTop: 8 }}>
       <Typography.Text strong>{t('realityConfigLayer')}</Typography.Text>{status(diagnosis.config.check)}
       <Text type="secondary">SNI {diagnosis.config.sni ?? '-'} · :{diagnosis.config.listen_port} · PP {diagnosis.config.send_proxy_protocol ? 'ON' : 'OFF'}</Text>
+      <Typography.Text strong>{t('realityConvergence')}</Typography.Text>{status(diagnosis.convergence.check)}
+      <Text type="secondary">{t('realityDesiredSni')} {diagnosis.convergence.desired_sni ?? '-'} · {t('realityActiveSni')} {diagnosis.convergence.active_sni ?? '-'} · {t('realityRevision')} {diagnosis.convergence.desired_config_revision}/{diagnosis.convergence.active_config_revision}</Text>
       <Typography.Text strong>{t('realityNginxLayer')}</Typography.Text>{status(diagnosis.nginx.check)}
       <Text type="secondary">{diagnosis.nginx.config_valid ? 'nginx -t PASS' : 'nginx -t FAIL'} · {diagnosis.nginx.managed_file_matches ? t('configConsistent') : t('configDrifted')}</Text>
       <Typography.Text strong>{t('realityRuntimeLayer')}</Typography.Text>{status(diagnosis.runtime.check)}

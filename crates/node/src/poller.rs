@@ -1,7 +1,9 @@
 use crate::config::NodeConfig;
 use crate::forwarder::camouflage_site::CamouflageSiteManager;
 use crate::forwarder::ForwarderManager;
-use relay_shared::protocol::{NodeConfigResponse, NodeTransport, CONFIG_PROTOCOL_VERSION};
+use relay_shared::protocol::{
+    NodeConfigResponse, NodeConfigSnapshot, NodeTransport, CONFIG_PROTOCOL_VERSION,
+};
 use relay_shared::reconciliation::{fingerprint_bytes, ConfigFingerprint};
 use std::fs::{self, File};
 use std::io::Write;
@@ -24,7 +26,7 @@ const NODE_ID_FILE: &str = "node-id";
 /// → keep the normal interval.
 pub enum FetchResult {
     /// A valid config was received. It is cached only after the manager applies it.
-    Ok(NodeConfigResponse),
+    Ok(NodeConfigSnapshot),
     /// The panel reports a permanent config-protocol mismatch (426). The node
     /// keeps its cached config; the caller should back off (the only fix is an
     /// upgrade, so polling fast is pointless).
@@ -76,13 +78,21 @@ pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
         return FetchResult::Transient;
     }
 
-    match resp.json::<NodeConfigResponse>().await {
-        Ok(cfg) if validate_config(&cfg).is_ok() => FetchResult::Ok(cfg),
+    match resp.json::<NodeConfigSnapshot>().await {
+        Ok(snapshot)
+            if snapshot.config_revision > 0
+                && snapshot.config_fingerprint
+                    == relay_shared::reconciliation::config_fingerprint(&snapshot.config)
+                        .as_str()
+                && validate_config(&snapshot.config).is_ok() =>
+        {
+            FetchResult::Ok(snapshot)
+        }
         Ok(e) => {
-            tracing::warn!(
-                "fetch_config: response validation failed: {}",
-                validate_config(&e).unwrap_err()
-            );
+            let reason = validate_config(&e.config)
+                .err()
+                .unwrap_or_else(|| "invalid snapshot metadata".into());
+            tracing::warn!("fetch_config: response validation failed: {}", reason);
             FetchResult::Transient
         }
         Err(e) => {
@@ -112,6 +122,8 @@ pub(crate) enum CacheRecoverySource {
 pub(crate) struct CacheLoad {
     pub config: NodeConfigResponse,
     pub source: CacheRecoverySource,
+    pub config_revision: u64,
+    pub config_fingerprint: ConfigFingerprint,
 }
 
 #[derive(Debug)]
@@ -137,6 +149,8 @@ pub(crate) struct PendingFinalization {
     pub effective: NodeConfigResponse,
     pub referenced_snis: std::collections::HashSet<String>,
     pub lkg_committed: bool,
+    pub config_revision: u64,
+    pub config_fingerprint: ConfigFingerprint,
 }
 
 impl CoordinatedApplyOutcome {
@@ -189,14 +203,31 @@ pub(crate) async fn apply_and_commit_coordinated_at(
     config: &NodeConfigResponse,
     paths: &CachePaths,
 ) -> CoordinatedApplyOutcome {
+    let fingerprint = relay_shared::reconciliation::config_fingerprint(config);
+    let snapshot = NodeConfigSnapshot {
+        config_revision: 0,
+        config_fingerprint: fingerprint.as_str().to_string(),
+        config: config.clone(),
+    };
+    apply_and_commit_coordinated_snapshot_at(manager, camouflage, &snapshot, paths).await
+}
+
+pub(crate) async fn apply_and_commit_coordinated_snapshot_at(
+    manager: &Arc<Mutex<ForwarderManager>>,
+    camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    snapshot: &NodeConfigSnapshot,
+    paths: &CachePaths,
+) -> CoordinatedApplyOutcome {
     let previous = load_cache_at(paths);
     apply_coordinated(
         manager,
         camouflage,
-        config,
+        &snapshot.config,
         previous.as_ref(),
         Some(paths),
         true,
+        snapshot.config_revision,
+        &snapshot.config_fingerprint,
     )
     .await
 }
@@ -206,7 +237,18 @@ pub(crate) async fn apply_cached_coordinated(
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
     config: &NodeConfigResponse,
 ) -> CoordinatedApplyOutcome {
-    apply_coordinated(manager, camouflage, config, Some(config), None, false).await
+    let fingerprint = relay_shared::reconciliation::config_fingerprint(config);
+    apply_coordinated(
+        manager,
+        camouflage,
+        config,
+        Some(config),
+        None,
+        false,
+        0,
+        fingerprint.as_str(),
+    )
+    .await
 }
 
 async fn apply_coordinated(
@@ -216,6 +258,8 @@ async fn apply_coordinated(
     previous: Option<&NodeConfigResponse>,
     commit_paths: Option<&CachePaths>,
     allow_cleanup: bool,
+    config_revision: u64,
+    config_fingerprint: &str,
 ) -> CoordinatedApplyOutcome {
     if let Err(error) = validate_config(desired) {
         tracing::warn!("refusing invalid node config: {}", error);
@@ -251,7 +295,9 @@ async fn apply_coordinated(
         return CoordinatedApplyOutcome::failed(effective, dependency_withheld, None);
     }
     if let Some(paths) = commit_paths {
-        if let Err(error) = commit_cache_at(&effective, paths) {
+        if let Err(error) =
+            commit_cache_with_metadata_at(&effective, paths, config_revision, config_fingerprint)
+        {
             tracing::error!(
                 "coordinated config applied but LKG commit failed: {}",
                 error
@@ -263,6 +309,8 @@ async fn apply_coordinated(
                     effective,
                     referenced_snis,
                     lkg_committed: false,
+                    config_revision,
+                    config_fingerprint: ConfigFingerprint::from_string(config_fingerprint),
                 }),
             );
         }
@@ -286,6 +334,8 @@ async fn apply_coordinated(
                 effective,
                 referenced_snis,
                 lkg_committed: true,
+                config_revision,
+                config_fingerprint: ConfigFingerprint::from_string(config_fingerprint),
             }),
         );
     }
@@ -418,7 +468,12 @@ pub(crate) async fn retry_pending_finalization(
     paths: &CachePaths,
 ) -> bool {
     if !pending.lkg_committed {
-        if let Err(error) = commit_cache_at(&pending.effective, paths) {
+        if let Err(error) = commit_cache_with_metadata_at(
+            &pending.effective,
+            paths,
+            pending.config_revision,
+            pending.config_fingerprint.as_str(),
+        ) {
             tracing::warn!("pending listener LKG commit still unavailable: {}", error);
             return false;
         }
@@ -551,7 +606,9 @@ pub(crate) fn load_cache_at(paths: &CachePaths) -> Option<NodeConfigResponse> {
 }
 
 pub(crate) fn load_cache_state_at(paths: &CachePaths) -> Option<CacheLoad> {
-    if let Ok(config) = read_valid_cache(&paths.primary) {
+    if let Ok((config, config_revision, config_fingerprint)) =
+        read_valid_cache_snapshot(&paths.primary)
+    {
         remove_tmp_if_safe(&paths.tmp);
         tracing::info!(
             "Loaded cached config from primary {} ({} listeners)",
@@ -561,10 +618,14 @@ pub(crate) fn load_cache_state_at(paths: &CachePaths) -> Option<CacheLoad> {
         return Some(CacheLoad {
             config,
             source: CacheRecoverySource::PrimaryLkg,
+            config_revision,
+            config_fingerprint,
         });
     }
 
-    if let Ok(config) = read_valid_cache(&paths.backup) {
+    if let Ok((config, config_revision, config_fingerprint)) =
+        read_valid_cache_snapshot(&paths.backup)
+    {
         let source = match repair_primary_from_backup(paths) {
             Ok(()) => CacheRecoverySource::RepairedFromBackup,
             Err(error) => {
@@ -581,7 +642,12 @@ pub(crate) fn load_cache_state_at(paths: &CachePaths) -> Option<CacheLoad> {
             paths.backup.display(),
             config.listeners.len()
         );
-        return Some(CacheLoad { config, source });
+        return Some(CacheLoad {
+            config,
+            source,
+            config_revision,
+            config_fingerprint,
+        });
     }
 
     remove_tmp_if_safe(&paths.tmp);
@@ -618,10 +684,25 @@ pub(crate) fn commit_cache_at(
     config: &NodeConfigResponse,
     paths: &CachePaths,
 ) -> Result<(), String> {
+    let fingerprint = relay_shared::reconciliation::config_fingerprint(config);
+    commit_cache_with_metadata_at(config, paths, 0, fingerprint.as_str())
+}
+
+pub(crate) fn commit_cache_with_metadata_at(
+    config: &NodeConfigResponse,
+    paths: &CachePaths,
+    config_revision: u64,
+    config_fingerprint: &str,
+) -> Result<(), String> {
     validate_config(config)?;
-    let json = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
+    let snapshot = NodeConfigSnapshot {
+        config_revision,
+        config_fingerprint: config_fingerprint.to_string(),
+        config: config.clone(),
+    };
+    let json = serde_json::to_vec_pretty(&snapshot).map_err(|e| e.to_string())?;
     // Validate the serialized representation before it can replace any LKG.
-    let _: NodeConfigResponse = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
+    let _: NodeConfigSnapshot = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
 
     write_durable(&paths.tmp, &json).map_err(|e| e.to_string())?;
     if let Err(e) = read_valid_cache(&paths.tmp) {
@@ -741,6 +822,24 @@ fn read_valid_cache(path: &Path) -> Result<NodeConfigResponse, String> {
     let config = serde_json::from_slice::<NodeConfigResponse>(&data).map_err(|e| e.to_string())?;
     validate_config(&config)?;
     Ok(config)
+}
+
+fn read_valid_cache_snapshot(
+    path: &Path,
+) -> Result<(NodeConfigResponse, u64, ConfigFingerprint), String> {
+    let data = fs::read(path).map_err(|e| e.to_string())?;
+    if let Ok(snapshot) = serde_json::from_slice::<NodeConfigSnapshot>(&data) {
+        validate_config(&snapshot.config)?;
+        let fingerprint = relay_shared::reconciliation::config_fingerprint(&snapshot.config);
+        if snapshot.config_revision > 0 && snapshot.config_fingerprint != fingerprint.as_str() {
+            return Err("cached config fingerprint mismatch".into());
+        }
+        return Ok((snapshot.config, snapshot.config_revision, fingerprint));
+    }
+    let config = serde_json::from_slice::<NodeConfigResponse>(&data).map_err(|e| e.to_string())?;
+    validate_config(&config)?;
+    let fingerprint = relay_shared::reconciliation::config_fingerprint(&config);
+    Ok((config, 0, fingerprint))
 }
 
 fn write_durable(path: &Path, contents: &[u8]) -> std::io::Result<()> {
@@ -881,6 +980,17 @@ fn fallback_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_dir(label: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "relay-panel-poller-{label}-{}-{stamp}",
+            std::process::id()
+        ))
+    }
 
     /// A node_id generated once must be reused verbatim on every subsequent
     /// call — this stability is the contract the panel's status dedup depends
@@ -1436,5 +1546,22 @@ mod tests {
             "site removal is finalized only after this route apply"
         );
         assert!(!withheld);
+    }
+
+    #[test]
+    fn cache_round_trip_preserves_config_revision_and_fingerprint() {
+        let dir = unique_dir("cache-revision");
+        let paths = CachePaths {
+            primary: dir.join("config-cache.json"),
+            backup: dir.join("config-cache.backup.json"),
+            tmp: dir.join("config-cache.json.tmp"),
+        };
+        let config = cache_config(77);
+        let fingerprint = relay_shared::reconciliation::config_fingerprint(&config);
+        commit_cache_with_metadata_at(&config, &paths, 12, fingerprint.as_str()).unwrap();
+        let loaded = load_cache_state_at(&paths).expect("revision-bearing cache");
+        assert_eq!(loaded.config_revision, 12);
+        assert_eq!(loaded.config_fingerprint, fingerprint);
+        let _ = fs::remove_dir_all(dir);
     }
 }

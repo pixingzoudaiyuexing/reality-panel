@@ -692,6 +692,9 @@ export interface DiagnoseResult {
   type: string;
   request_id: string;
   rule_id: number;
+  diagnosed_sni?: string | null;
+  config_revision?: number;
+  config_fingerprint?: string;
   node_id: string;
   /** v0.4.9: per-run challenge echoed back from the node. The backend verifies
    *  it's non-empty and matches what it sent; the UI doesn't render it. */
@@ -710,6 +713,7 @@ export interface RealityCheck {
 }
 
 export interface RealityDiagnosis {
+  convergence: { check: RealityCheck; desired_sni?: string | null; active_sni?: string | null; desired_config_revision: number; active_config_revision: number; desired_fingerprint: string; active_fingerprint: string };
   config: { check: RealityCheck; listen_port: number; sni?: string | null; targets: string[]; send_proxy_protocol: boolean };
   nginx: { check: RealityCheck; plan_contains_rule: boolean; mapping_matches: boolean; expected_fingerprint?: string | null; deployed_fingerprint?: string | null; managed_file_matches: boolean; config_valid: boolean; service_healthy: boolean };
   runtime: { check: RealityCheck; listen_443: boolean; listen_8443: boolean };

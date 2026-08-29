@@ -30,6 +30,10 @@ impl ConfigFingerprint {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn from_string(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
 }
 
 /// Fingerprint opaque runtime evidence without exposing the evidence itself.

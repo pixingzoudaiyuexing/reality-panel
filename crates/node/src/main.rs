@@ -42,8 +42,13 @@ async fn run_local_recovery_tick(
             reconciler::LocalRecoverySource::DegradedNoTrustedLkg
         }
     };
+    let snapshot = relay_shared::protocol::NodeConfigSnapshot {
+        config_revision: cached.config_revision,
+        config_fingerprint: cached.config_fingerprint.as_str().to_string(),
+        config: cached.config,
+    };
     let Ok(input) =
-        reconciler::ReconciliationInput::local_recovery_from(cached.config, recovery_source)
+        reconciler::ReconciliationInput::local_recovery_snapshot(snapshot, recovery_source)
     else {
         return;
     };
@@ -360,7 +365,12 @@ async fn run() {
                 reconciler::LocalRecoverySource::DegradedNoTrustedLkg
             }
         };
-        match reconciler::ReconciliationInput::local_recovery_from(cached.config, recovery_source) {
+        let snapshot = relay_shared::protocol::NodeConfigSnapshot {
+            config_revision: cached.config_revision,
+            config_fingerprint: cached.config_fingerprint.as_str().to_string(),
+            config: cached.config,
+        };
+        match reconciler::ReconciliationInput::local_recovery_snapshot(snapshot, recovery_source) {
             Ok(input) => {
                 let result = reconciler
                     .lock()
@@ -434,7 +444,7 @@ async fn run() {
 
         match poller::fetch_config(&config).await {
             poller::FetchResult::Ok(resp) => {
-                match reconciler::ReconciliationInput::validated_panel(resp) {
+                match reconciler::ReconciliationInput::validated_panel_snapshot(resp) {
                     Ok(input) => {
                         let result = reconciler
                             .lock()

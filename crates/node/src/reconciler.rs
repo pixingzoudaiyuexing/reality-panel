@@ -3,7 +3,7 @@ use crate::forwarder::ForwarderManager;
 use crate::poller;
 use crate::poller::PendingFinalization;
 use relay_shared::protocol::{
-    NodeConfigResponse, ReconciliationRecoverySource, ReconciliationStatus,
+    NodeConfigResponse, NodeConfigSnapshot, ReconciliationRecoverySource, ReconciliationStatus,
     ReconciliationStatusState,
 };
 use relay_shared::reconciliation::{config_fingerprint, ConfigFingerprint};
@@ -42,11 +42,23 @@ pub struct TrustedSnapshot {
     recovery_source: Option<LocalRecoverySource>,
     config: NodeConfigResponse,
     fingerprint: ConfigFingerprint,
+    config_revision: u64,
 }
 
 impl TrustedSnapshot {
     pub fn validated_panel(config: NodeConfigResponse) -> Result<Self, String> {
-        Self::new(AuthoritySource::ValidatedPanel, config)
+        Self::new_snapshot(
+            AuthoritySource::ValidatedPanel,
+            NodeConfigSnapshot {
+                config_revision: 0,
+                config_fingerprint: config_fingerprint(&config).as_str().to_string(),
+                config,
+            },
+        )
+    }
+
+    pub fn validated_panel_snapshot(snapshot: NodeConfigSnapshot) -> Result<Self, String> {
+        Self::new_snapshot(AuthoritySource::ValidatedPanel, snapshot)
     }
 
     pub fn local_recovery(config: NodeConfigResponse) -> Result<Self, String> {
@@ -57,29 +69,59 @@ impl TrustedSnapshot {
         config: NodeConfigResponse,
         recovery_source: LocalRecoverySource,
     ) -> Result<Self, String> {
-        Self::new_with_recovery(
+        Self::new_snapshot_with_recovery(
             AuthoritySource::LocalRecovery,
             Some(recovery_source),
-            config,
+            NodeConfigSnapshot {
+                config_revision: 0,
+                config_fingerprint: config_fingerprint(&config).as_str().to_string(),
+                config,
+            },
+        )
+    }
+
+    pub fn local_recovery_snapshot(
+        snapshot: NodeConfigSnapshot,
+        recovery_source: LocalRecoverySource,
+    ) -> Result<Self, String> {
+        Self::new_snapshot_with_recovery(
+            AuthoritySource::LocalRecovery,
+            Some(recovery_source),
+            snapshot,
         )
     }
 
     fn new(source: AuthoritySource, config: NodeConfigResponse) -> Result<Self, String> {
-        Self::new_with_recovery(source, None, config)
+        Self::new_snapshot(
+            source,
+            NodeConfigSnapshot {
+                config_revision: 0,
+                config_fingerprint: config_fingerprint(&config).as_str().to_string(),
+                config,
+            },
+        )
     }
 
-    fn new_with_recovery(
+    fn new_snapshot(source: AuthoritySource, snapshot: NodeConfigSnapshot) -> Result<Self, String> {
+        Self::new_snapshot_with_recovery(source, None, snapshot)
+    }
+
+    fn new_snapshot_with_recovery(
         source: AuthoritySource,
         recovery_source: Option<LocalRecoverySource>,
-        config: NodeConfigResponse,
+        snapshot: NodeConfigSnapshot,
     ) -> Result<Self, String> {
-        poller::validate_config(&config)?;
-        let fingerprint = config_fingerprint(&config);
+        poller::validate_config(&snapshot.config)?;
+        let fingerprint = config_fingerprint(&snapshot.config);
+        if snapshot.config_revision > 0 && snapshot.config_fingerprint != fingerprint.as_str() {
+            return Err("config snapshot fingerprint mismatch".into());
+        }
         Ok(Self {
             source,
             recovery_source,
-            config,
+            config: snapshot.config,
             fingerprint,
+            config_revision: snapshot.config_revision,
         })
     }
 
@@ -99,6 +141,10 @@ impl TrustedSnapshot {
 
     pub fn fingerprint(&self) -> &ConfigFingerprint {
         &self.fingerprint
+    }
+
+    pub fn config_revision(&self) -> u64 {
+        self.config_revision
     }
 
     pub fn is_panel_authoritative(&self) -> bool {
@@ -123,6 +169,10 @@ impl ReconciliationInput {
         TrustedSnapshot::validated_panel(config).map(Self::Trusted)
     }
 
+    pub fn validated_panel_snapshot(config: NodeConfigSnapshot) -> Result<Self, String> {
+        TrustedSnapshot::validated_panel_snapshot(config).map(Self::Trusted)
+    }
+
     pub fn local_recovery(config: NodeConfigResponse) -> Result<Self, String> {
         TrustedSnapshot::local_recovery(config).map(Self::Trusted)
     }
@@ -132,6 +182,13 @@ impl ReconciliationInput {
         recovery_source: LocalRecoverySource,
     ) -> Result<Self, String> {
         TrustedSnapshot::local_recovery_from(config, recovery_source).map(Self::Trusted)
+    }
+
+    pub fn local_recovery_snapshot(
+        snapshot: NodeConfigSnapshot,
+        recovery_source: LocalRecoverySource,
+    ) -> Result<Self, String> {
+        TrustedSnapshot::local_recovery_snapshot(snapshot, recovery_source).map(Self::Trusted)
     }
 
     pub fn degraded_local_recovery() -> Self {
@@ -178,6 +235,34 @@ pub enum ReconciliationState {
     DegradedLocalRecovery,
     InvalidUntrustedInput,
     ApplyFailed,
+    StaleIgnored,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelSnapshotOrder {
+    Accept,
+    Stale,
+    RevisionFingerprintConflict,
+}
+
+fn panel_snapshot_order(
+    current: Option<&TrustedSnapshot>,
+    highest_revision: u64,
+    incoming: &TrustedSnapshot,
+) -> PanelSnapshotOrder {
+    let revision = incoming.config_revision();
+    if revision == 0 {
+        return PanelSnapshotOrder::Accept;
+    }
+    if revision < highest_revision {
+        return PanelSnapshotOrder::Stale;
+    }
+    if revision == highest_revision
+        && current.is_some_and(|current| current.fingerprint() != incoming.fingerprint())
+    {
+        return PanelSnapshotOrder::RevisionFingerprintConflict;
+    }
+    PanelSnapshotOrder::Accept
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +302,8 @@ pub struct Reconciler {
     last_applied: Option<ConfigFingerprint>,
     pending: Option<PendingApply>,
     status: ReconciliationStatus,
+    highest_config_revision: u64,
+    last_applied_revision: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -363,6 +450,11 @@ impl Reconciler {
     }
 
     fn record_status(&mut self, result: &ReconciliationResult) {
+        // A stale transport delivery is deliberately invisible to status: it
+        // must not overwrite the status of the newer authoritative snapshot.
+        if result.state == ReconciliationState::StaleIgnored {
+            return;
+        }
         let state = match result.state {
             ReconciliationState::Converged => ReconciliationStatusState::Converged,
             ReconciliationState::ApplyRequired => ReconciliationStatusState::Reconciling,
@@ -376,6 +468,7 @@ impl Reconciler {
                 ReconciliationStatusState::WaitingForAuthority
             }
             ReconciliationState::ApplyFailed => ReconciliationStatusState::ApplyFailed,
+            ReconciliationState::StaleIgnored => unreachable!(),
         };
         let last_success_at = if state == ReconciliationStatusState::Converged {
             Some(chrono::Utc::now().to_rfc3339())
@@ -396,6 +489,11 @@ impl Reconciler {
                 .observed_fingerprint
                 .as_ref()
                 .map(|value| value.as_str().to_string()),
+            desired_config_revision: self
+                .latest_panel_snapshot
+                .as_ref()
+                .map(TrustedSnapshot::config_revision),
+            applied_config_revision: self.last_applied_revision,
             last_success_at,
             // Failure details are deliberately fixed and do not accept raw
             // command output, generated config, tokens, or certificate data.
@@ -416,6 +514,11 @@ impl Reconciler {
             desired_fingerprint: Some(snapshot.fingerprint().as_str().to_string()),
             applied_fingerprint: Some(applied.as_str().to_string()),
             observed_fingerprint: Some(observed.as_str().to_string()),
+            desired_config_revision: self
+                .latest_panel_snapshot
+                .as_ref()
+                .map(TrustedSnapshot::config_revision),
+            applied_config_revision: self.last_applied_revision,
             last_success_at: self.status.last_success_at.clone(),
             last_error: None,
             recovery_source: if snapshot.source() == AuthoritySource::ValidatedPanel {
@@ -450,7 +553,55 @@ impl Reconciler {
             }
             ReconciliationInput::Untrusted(_) => return ReconciliationResult::untrusted(),
         };
+        if snapshot.source() == AuthoritySource::LocalRecovery {
+            self.highest_config_revision =
+                self.highest_config_revision.max(snapshot.config_revision());
+        }
         if snapshot.source() == AuthoritySource::ValidatedPanel {
+            match panel_snapshot_order(
+                self.latest_panel_snapshot.as_ref(),
+                self.highest_config_revision,
+                &snapshot,
+            ) {
+                PanelSnapshotOrder::RevisionFingerprintConflict => {
+                    tracing::error!(
+                        revision = snapshot.config_revision(),
+                        "rejecting config snapshot with reused revision and different fingerprint"
+                    );
+                    return ReconciliationResult {
+                        state: ReconciliationState::StaleIgnored,
+                        source: Some(snapshot.source()),
+                        desired_fingerprint: Some(snapshot.fingerprint().clone()),
+                        applied_fingerprint: self.last_applied.clone(),
+                        observed_fingerprint: None,
+                        cleanup_authorized: false,
+                        apply_required: false,
+                        dependency_withheld: false,
+                        recovery_source: snapshot.recovery_source(),
+                    };
+                }
+                PanelSnapshotOrder::Stale => {
+                    tracing::warn!(
+                        received_revision = snapshot.config_revision(),
+                        highest_revision = self.highest_config_revision,
+                        "ignoring stale Panel config snapshot"
+                    );
+                    return ReconciliationResult {
+                        state: ReconciliationState::StaleIgnored,
+                        source: Some(snapshot.source()),
+                        desired_fingerprint: Some(snapshot.fingerprint().clone()),
+                        applied_fingerprint: self.last_applied.clone(),
+                        observed_fingerprint: None,
+                        cleanup_authorized: false,
+                        apply_required: false,
+                        dependency_withheld: false,
+                        recovery_source: snapshot.recovery_source(),
+                    };
+                }
+                PanelSnapshotOrder::Accept => {}
+            }
+            self.highest_config_revision =
+                self.highest_config_revision.max(snapshot.config_revision());
             self.latest_panel_snapshot = Some(snapshot.clone());
         }
 
@@ -515,6 +666,7 @@ impl Reconciler {
             }
             let dependency_withheld = pending.dependency_withheld;
             self.last_applied = Some(applied_fingerprint.clone());
+            self.last_applied_revision = Some(snapshot.config_revision());
             if snapshot.is_panel_authoritative() {
                 self.last_panel_desired = Some(snapshot.fingerprint().clone());
             }
@@ -639,10 +791,14 @@ impl Reconciler {
 
         let outcome = match snapshot.source() {
             AuthoritySource::ValidatedPanel => {
-                poller::apply_and_commit_coordinated_at(
+                poller::apply_and_commit_coordinated_snapshot_at(
                     manager,
                     camouflage,
-                    snapshot.config(),
+                    &NodeConfigSnapshot {
+                        config_revision: snapshot.config_revision(),
+                        config_fingerprint: snapshot.fingerprint().as_str().to_string(),
+                        config: snapshot.config().clone(),
+                    },
                     &paths,
                 )
                 .await
@@ -675,6 +831,7 @@ impl Reconciler {
         }
 
         self.last_applied = applied_fingerprint.clone();
+        self.last_applied_revision = Some(snapshot.config_revision());
         if snapshot.is_panel_authoritative() {
             self.last_panel_desired = Some(snapshot.fingerprint().clone());
         }
@@ -2333,6 +2490,36 @@ mod tests {
         assert_eq!(healthy.state, ReconciliationStatusState::Converged);
         assert!(healthy.last_success_at.is_some());
         assert!(healthy.last_error.is_none());
+    }
+
+    #[test]
+    fn panel_snapshot_order_rejects_old_revision_and_reused_revision() {
+        let empty_config = empty();
+        let first = TrustedSnapshot::validated_panel_snapshot(NodeConfigSnapshot {
+            config_revision: 4,
+            config_fingerprint: config_fingerprint(&empty_config).as_str().into(),
+            config: empty_config.clone(),
+        })
+        .unwrap();
+        let changed_config = raw_config(32001);
+        let changed = TrustedSnapshot::validated_panel_snapshot(NodeConfigSnapshot {
+            config_revision: 4,
+            config_fingerprint: config_fingerprint(&changed_config).as_str().into(),
+            config: changed_config,
+        })
+        .unwrap();
+        assert_eq!(
+            panel_snapshot_order(Some(&first), 4, &first),
+            PanelSnapshotOrder::Accept
+        );
+        assert_eq!(
+            panel_snapshot_order(Some(&first), 4, &changed),
+            PanelSnapshotOrder::RevisionFingerprintConflict
+        );
+        assert_eq!(
+            panel_snapshot_order(Some(&first), 5, &first),
+            PanelSnapshotOrder::Stale
+        );
     }
 
     #[test]

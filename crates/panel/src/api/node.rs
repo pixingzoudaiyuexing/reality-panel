@@ -86,8 +86,9 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     // push path (ws.rs) now use the SAME function.
     //
     // Only an inbound group with genuinely no active rules yields Ok(empty).
-    match crate::service::node_config::build_node_config(state.db.as_ref(), group.id).await {
-        Ok(cfg) => Json(cfg).into_response(),
+    match crate::service::node_config::build_node_config_snapshot(state.db.as_ref(), group.id).await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
         Err(crate::service::node_config::NodeConfigBuildError::NotInboundGroup) => {
             StatusCode::FORBIDDEN.into_response()
         }
@@ -603,6 +604,8 @@ mod tests {
                 desired_fingerprint: None,
                 applied_fingerprint: None,
                 observed_fingerprint: None,
+                desired_config_revision: None,
+                applied_config_revision: None,
                 last_success_at: Some(chrono::Utc::now().to_rfc3339()),
                 last_error: None,
                 recovery_source: ReconciliationRecoverySource::Panel,
@@ -637,14 +640,14 @@ mod tests {
     }
 
     #[test]
-    fn config_protocol_v8_is_rejected_and_v9_is_accepted() {
+    fn config_protocol_v8_is_rejected_and_v10_is_accepted() {
         let mut v8 = HeaderMap::new();
         v8.insert("X-Config-Protocol-Version", "8".parse().unwrap());
         assert!(!config_protocol_compatible(&v8));
 
-        let mut v9 = HeaderMap::new();
-        v9.insert("X-Config-Protocol-Version", "9".parse().unwrap());
-        assert!(config_protocol_compatible(&v9));
+        let mut v10 = HeaderMap::new();
+        v10.insert("X-Config-Protocol-Version", "10".parse().unwrap());
+        assert!(config_protocol_compatible(&v10));
         assert!(!config_protocol_compatible(&HeaderMap::new()));
     }
 
@@ -1072,23 +1075,29 @@ mod tests {
         let http = get_config(State(state.clone()), config_headers(Some("tok-A"))).await;
         assert_eq!(http.status(), axum::http::StatusCode::OK);
         let body = axum::body::to_bytes(http.into_body(), 65536).await.unwrap();
-        let http_config: NodeConfigResponse = serde_json::from_slice(&body).unwrap();
+        let http_snapshot: NodeConfigSnapshot = serde_json::from_slice(&body).unwrap();
+        let http_config = &http_snapshot.config;
         let ws_config = crate::api::ws::build_config_snapshot(state.db.as_ref(), 10)
             .await
             .expect("WS snapshot");
 
         assert_eq!(
-            serde_json::to_value(&http_config).unwrap(),
-            serde_json::to_value(&ws_config).unwrap()
+            serde_json::to_value(http_config).unwrap(),
+            serde_json::to_value(&ws_config.config).unwrap()
         );
         assert_eq!(
-            relay_shared::reconciliation::config_fingerprint(&http_config),
-            relay_shared::reconciliation::config_fingerprint(&ws_config),
+            relay_shared::reconciliation::config_fingerprint(http_config),
+            relay_shared::reconciliation::config_fingerprint(&ws_config.config),
             "HTTP and WS snapshots must have one canonical desired fingerprint"
         );
         assert_eq!(http_config.camouflage_sites.len(), 1);
         assert!(http_config.listeners[0].camouflage_required);
-        let serialized = serde_json::to_string(&http_config).unwrap();
+        assert_eq!(http_snapshot.config_revision, ws_config.config_revision);
+        assert_eq!(
+            http_snapshot.config_fingerprint,
+            ws_config.config_fingerprint
+        );
+        let serialized = serde_json::to_string(&http_snapshot).unwrap();
         for forbidden in ["PRIVATE KEY", "privkey.pem", "NODE_TOKEN", "Bearer", "uuid"] {
             assert!(!serialized.contains(forbidden));
         }
@@ -1173,6 +1182,8 @@ mod tests {
                 desired_fingerprint: Some("a".repeat(64)),
                 applied_fingerprint: Some("b".repeat(64)),
                 observed_fingerprint: Some("c".repeat(64)),
+                desired_config_revision: None,
+                applied_config_revision: None,
                 last_success_at: Some("2026-08-26T00:00:00Z".into()),
                 last_error: None,
                 recovery_source: relay_shared::protocol::ReconciliationRecoverySource::Panel,

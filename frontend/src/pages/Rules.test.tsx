@@ -342,6 +342,7 @@ describe('Reality rule controls and compact status', () => {
 
 describe('diagnosis runtime status', () => {
   const reality = (overrides: Partial<RealityDiagnosis> = {}): RealityDiagnosis => ({
+    convergence: { check: { state: 'pass' }, desired_sni: 'op1.example.com', active_sni: 'op1.example.com', desired_config_revision: 1, active_config_revision: 1, desired_fingerprint: 'a'.repeat(64), active_fingerprint: 'a'.repeat(64) },
     config: { check: { state: 'pass' }, listen_port: 443, sni: 'op1.example.com', targets: ['192.0.2.1:443'], send_proxy_protocol: true },
     nginx: { check: { state: 'pass' }, plan_contains_rule: true, mapping_matches: true, managed_file_matches: true, config_valid: true, service_healthy: true },
     runtime: { check: { state: 'pass' }, listen_443: true, listen_8443: true },

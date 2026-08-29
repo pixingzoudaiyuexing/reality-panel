@@ -12,7 +12,7 @@ use relay_shared::control_protocol::{
     legacy_node_supports_lifecycle, lifecycle_protocol_versions_compatible,
     LIFECYCLE_PROTOCOL_VERSION,
 };
-use relay_shared::protocol::NodeConfigResponse;
+use relay_shared::protocol::NodeConfigSnapshot;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -525,7 +525,7 @@ async fn handle_node_ws(
 pub(crate) async fn build_config_snapshot(
     db: &dyn crate::db::Repository,
     group_id: i64,
-) -> Option<NodeConfigResponse> {
+) -> Option<NodeConfigSnapshot> {
     // v0.3.6: delegate to the shared `build_node_config` (same function
     // `get_config` uses). This fixes the v0.3.5 drift where the WS path queried
     // forward_rules WITHOUT joining users, so a reconnecting node could be
@@ -536,7 +536,7 @@ pub(crate) async fn build_config_snapshot(
     // Returns None on DB error so the caller skips the snapshot push (rather
     // than pushing an empty config that would incorrectly tear down the node's
     // listeners). An empty Ok is a legitimate "no rules" snapshot.
-    match crate::service::node_config::build_node_config(db, group_id).await {
+    match crate::service::node_config::build_node_config_snapshot(db, group_id).await {
         Ok(cfg) => Some(cfg),
         Err(e) => {
             tracing::error!(
