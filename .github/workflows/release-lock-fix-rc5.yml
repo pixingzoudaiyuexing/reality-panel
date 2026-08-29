@@ -1,0 +1,55 @@
+name: Fix rc5 Lockfile
+
+on:
+  push:
+    branches:
+      - fix/protocol-independent-node-upgrade
+
+permissions:
+  contents: write
+
+jobs:
+  fix-lock:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/protocol-independent-node-upgrade
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Restore baseline lock and update only local package versions
+        run: |
+          git fetch origin main
+          git checkout origin/main -- Cargo.lock
+          cargo check --workspace
+          python3 - <<'PY'
+          import subprocess
+          diff = subprocess.check_output(['git','diff','--','Cargo.lock'], text=True)
+          allowed = {
+              '-version = "1.1.0-rc.4"',
+              '+version = "1.1.0-rc.5"',
+          }
+          changed = [line for line in diff.splitlines() if line.startswith(('+','-')) and not line.startswith(('+++','---'))]
+          if len(changed) != 4 or any(line not in allowed for line in changed):
+              print(diff)
+              raise SystemExit(f'unexpected Cargo.lock changes: {changed!r}')
+          print(diff)
+          PY
+      - name: Validate
+        run: |
+          bash scripts/release-version-contract.sh v1.1.0-rc.5
+          cargo fmt --all -- --check
+          cargo check --workspace --locked
+          cargo test -p relay-shared control_protocol --locked -- --nocapture
+          cargo test -p relay-panel api::ws::tests --locked -- --nocapture
+          git diff --check
+      - name: Commit corrected lockfile
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.lock
+          git commit -m 'release: 仅更新 rc.5 本地包锁版本 [skip ci]'
+          git push origin HEAD:fix/protocol-independent-node-upgrade
