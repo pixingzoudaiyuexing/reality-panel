@@ -25,7 +25,9 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Apply patch
-        run: python3 .github/scripts/apply-v1.0.2-public-url.py
+        run: |
+          python3 .github/scripts/apply-v1.0.2-public-url.py
+          sed -i '/contact: "tg:@someone".into(),/a\                public_panel_url: String::new(),' crates/panel/src/api/admin/mod.rs
       - name: Rust format
         run: cargo fmt --all
       - name: Rust check
@@ -37,7 +39,7 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npm run typecheck
-          npm test -- --run
+          npm test
           npm run build
       - name: Commit verified change
         run: |
