@@ -1,6 +1,5 @@
 name: RC4 Full Validation Once
 
-# protocol v9 assertion refreshed; rerun the complete release gate.
 on:
   push:
     branches:
@@ -65,3 +64,5 @@ jobs:
 
       - name: Verify node artifact permission contract
         run: bash scripts/node-artifact-permissions.test.sh
+
+# rc.4 final gate trigger
