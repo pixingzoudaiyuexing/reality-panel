@@ -1,0 +1,29 @@
+name: RC4 Publish Once
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: "${{ github.event.head_commit.message == 'ci: 准备 rc4 一次性发布触发器' }}"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create v1.1.0-rc.4 tag
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          test ! "$(git tag -l v1.1.0-rc.4)"
+          bash scripts/release-version-contract.sh v1.1.0-rc.4
+          git tag -a v1.1.0-rc.4 -m 'Reality Panel v1.1.0-rc.4'
+          git push origin v1.1.0-rc.4
