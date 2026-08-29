@@ -6,8 +6,8 @@
 # RelayPanel node installer - downloads and runs relay-node as a systemd service.
 #
 # Usage:
-#   bash <(curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.1.0-rc.1/relay-node-install.sh) \
-#     -t <NODE_TOKEN> -u <PANEL_URL> --version 1.1.0-rc.1
+#   bash <(curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.1.0-rc.2/relay-node-install.sh) \
+#     -t <NODE_TOKEN> -u <PANEL_URL> --version 1.1.0-rc.2
 #
 # Options:
 #   -t, --token         Node token (required, from the panel UI)
@@ -44,7 +44,7 @@ cd / 2>/dev/null || true
 
 # Bump this when releasing a new version. The binary is downloaded from
 # GitHub Releases assets.
-SCRIPT_VERSION="1.1.0-rc.1"
+SCRIPT_VERSION="1.1.0-rc.2"
 REPO="pixingzoudaiyuexing/reality-panel"
 
 GREEN='\033[0;32m'
@@ -1004,6 +1004,8 @@ Wants=${SERVICE_WANTS}
 
 [Service]
 Type=simple
+RuntimeDirectory=relay-node
+RuntimeDirectoryMode=0755
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=/bin/bash ${START_SH}
 Restart=always

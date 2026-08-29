@@ -488,29 +488,26 @@ async fn node_status(
         .transpose()
 }
 
-fn is_reality_panel_1_0_stable(version: Option<&str>) -> bool {
+fn is_modern_reality_panel_release(version: Option<&str>) -> bool {
     let Some(version) = version else {
         return false;
     };
     let normalized = version.trim().trim_start_matches('v');
-    let mut parts = normalized.split('.');
-    let parsed = (
-        parts.next().and_then(|part| part.parse::<u64>().ok()),
-        parts.next().and_then(|part| part.parse::<u64>().ok()),
-        parts.next().and_then(|part| part.parse::<u64>().ok()),
-        parts.next(),
-    );
-    matches!(parsed, (Some(1), Some(0), Some(_), None))
+    semver::Version::parse(normalized).is_ok_and(|version| version >= semver::Version::new(1, 0, 0))
 }
 
 fn status_supports_lifecycle(
     status: Option<&serde_json::Value>,
     current_version: Option<&str>,
 ) -> bool {
+    // Historical nodes with an explicitly known lifecycle wire capability
+    // remain supported. All modern Reality Panel releases use the stable
+    // semver floor plus the reported config protocol instead of adding a
+    // new product-version exception for every future release line.
     if relay_shared::protocol::node_supports_lifecycle(current_version) {
         return true;
     }
-    if !is_reality_panel_1_0_stable(current_version) {
+    if !is_modern_reality_panel_release(current_version) {
         return false;
     }
     status
@@ -920,15 +917,23 @@ mod tests {
     }
 
     #[test]
-    fn stable_reality_panel_1_0_lifecycle_requires_current_protocol() {
+    fn modern_reality_panel_lifecycle_uses_semver_and_current_protocol() {
         let compatible = serde_json::json!({
             "config_protocol_version": CONFIG_PROTOCOL_VERSION
         });
-        assert!(status_supports_lifecycle(Some(&compatible), Some("v1.0.0")));
-        assert!(status_supports_lifecycle(Some(&compatible), Some("1.0.1")));
+        for version in ["v1.0.0", "1.0.1", "1.1.0-rc.1", "1.1.0", "2.0.0-rc.1"] {
+            assert!(
+                status_supports_lifecycle(Some(&compatible), Some(version)),
+                "expected {version} with current protocol to support lifecycle"
+            );
+        }
         assert!(!status_supports_lifecycle(
             Some(&compatible),
             Some("1.0.0-rc.4")
+        ));
+        assert!(!status_supports_lifecycle(
+            Some(&compatible),
+            Some("invalid")
         ));
 
         let legacy_protocol = serde_json::json!({
@@ -938,8 +943,16 @@ mod tests {
             Some(&legacy_protocol),
             Some("1.0.0")
         ));
-        assert!(!status_supports_lifecycle(None, Some("1.0.0")));
+        assert!(!status_supports_lifecycle(
+            Some(&legacy_protocol),
+            Some("1.1.0-rc.1")
+        ));
+        assert!(!status_supports_lifecycle(None, Some("1.1.0-rc.1")));
+
+        // Explicitly-known historical lifecycle versions keep their
+        // compatibility path independently from config snapshot gates.
         assert!(status_supports_lifecycle(None, Some("1.2.3")));
+        assert!(status_supports_lifecycle(None, Some("1.0.0-rc.5")));
     }
 
     #[test]

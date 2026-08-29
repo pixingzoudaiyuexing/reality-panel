@@ -387,7 +387,8 @@ pub fn inspect_rendered(expected: &[u8], cfg: &NginxSniConfig) -> NginxRuntimeOb
     let actual = fs::read(&cfg.conf_path).ok();
     let managed_file_exists = actual.is_some();
     let file_matches = actual.as_deref() == Some(expected);
-    let config_valid = run_shell(&cfg.test_cmd).is_ok();
+    let runtime_dir_ready = ensure_managed_runtime_dir(cfg).is_ok();
+    let config_valid = runtime_dir_ready && run_shell(&cfg.test_cmd).is_ok();
     let service_healthy = nginx_service_healthy(cfg);
     let mut evidence = b"nginx-runtime-v1\0".to_vec();
     evidence.extend_from_slice(actual.as_deref().unwrap_or(b"<missing>"));
@@ -416,6 +417,7 @@ pub fn apply_rendered(contents: &[u8], cfg: &NginxSniConfig) -> Result<(), Apply
         return Ok(());
     }
 
+    ensure_managed_runtime_dir(cfg)?;
     if let Some(parent) = cfg.conf_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -431,12 +433,11 @@ pub fn apply_rendered(contents: &[u8], cfg: &NginxSniConfig) -> Result<(), Apply
         restore_previous(&cfg.conf_path, previous.as_deref())?;
         return Err(e);
     }
-    if let Err(e) = run_shell(&cfg.reload_cmd) {
+    if let Err(e) = reload_nginx(cfg) {
         restore_previous(&cfg.conf_path, previous.as_deref())?;
         // The previous config is only a real rollback once Nginx has accepted
         // and reloaded it again. Preserve the original apply failure either way.
-        if let Err(restore_err) = run_shell(&cfg.test_cmd).and_then(|_| run_shell(&cfg.reload_cmd))
-        {
+        if let Err(restore_err) = run_shell(&cfg.test_cmd).and_then(|_| reload_nginx(cfg)) {
             tracing::error!(
                 "nginx_sni rollback runtime restore failed after reload failure: {}",
                 restore_err
@@ -458,9 +459,10 @@ pub fn restore_rendered(previous: Option<&[u8]>, cfg: &NginxSniConfig) -> Result
     if !cfg.enabled {
         return Ok(());
     }
+    ensure_managed_runtime_dir(cfg)?;
     restore_previous(&cfg.conf_path, previous)?;
     run_shell(&cfg.test_cmd)?;
-    run_shell(&cfg.reload_cmd)
+    reload_nginx(cfg)
 }
 
 fn temp_path(path: &std::path::Path) -> PathBuf {
@@ -524,6 +526,35 @@ fn run_shell(cmd: &str) -> Result<(), ApplyError> {
         cmd: cmd.to_string(),
         detail,
     })
+}
+
+fn ensure_managed_runtime_dir(cfg: &NginxSniConfig) -> Result<(), ApplyError> {
+    // Production `nginx -t` validates the whole Nginx configuration,
+    // including an already-deployed Proxy Protocol Unix listener. /run
+    // is volatile across reboot, so every managed validation recreates
+    // the directory before Nginx can reject the otherwise-valid config.
+    if cfg.test_cmd.trim() == "nginx -t" {
+        ensure_proxy_protocol_strip_dir()?;
+    }
+    Ok(())
+}
+
+fn uses_default_systemd_reload(cfg: &NginxSniConfig) -> bool {
+    cfg.reload_cmd.trim() == "systemctl reload nginx"
+}
+
+fn reload_nginx(cfg: &NginxSniConfig) -> Result<(), ApplyError> {
+    match run_shell(&cfg.reload_cmd) {
+        Ok(()) => Ok(()),
+        Err(original) if uses_default_systemd_reload(cfg) => {
+            if run_shell("systemctl is-active --quiet nginx").is_ok() {
+                return Err(original);
+            }
+            tracing::warn!("managed Nginx is inactive after reload failure; attempting restart");
+            run_shell("systemctl restart nginx")
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn nginx_service_healthy(cfg: &NginxSniConfig) -> bool {
@@ -908,6 +939,23 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(temp_path(path));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn only_default_systemd_reload_enables_inactive_service_recovery() {
+        let production = test_config(
+            unique_path("production-reload").join("relay.conf"),
+            "nginx -t",
+            "systemctl reload nginx",
+        );
+        assert!(uses_default_systemd_reload(&production));
+
+        let custom = test_config(
+            unique_path("custom-reload").join("relay.conf"),
+            "true",
+            "custom-reload-command",
+        );
+        assert!(!uses_default_systemd_reload(&custom));
     }
 
     #[test]

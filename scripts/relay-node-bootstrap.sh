@@ -996,6 +996,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+RuntimeDirectory=relay-node
+RuntimeDirectoryMode=0755
 EnvironmentFile=/etc/relay-node/relay-node.env
 WorkingDirectory=/opt/relay-node
 ExecStart=/opt/relay-node/relay-node
