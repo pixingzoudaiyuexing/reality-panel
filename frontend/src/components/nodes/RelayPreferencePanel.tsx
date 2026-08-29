@@ -84,26 +84,30 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [submittingNodeId, setSubmittingNodeId] = useState<string | null>(null);
-  const requestInFlight = useRef(false);
+  const operationInFlight = useRef(false);
+
+  const fetchPreference = useCallback(async () => {
+    const response = await api.get<unknown, ApiEnvelope<RelayPreferenceView>>(
+      `/groups/${groupId}/relay-preference`,
+    );
+    if (response.code !== 0 || !response.data) throw new Error(response.message);
+    return response.data;
+  }, [groupId]);
 
   const load = useCallback(async (showSpinner = false) => {
-    if (requestInFlight.current) return;
-    requestInFlight.current = true;
+    if (operationInFlight.current) return;
+    operationInFlight.current = true;
     if (showSpinner) setLoading(true);
     try {
-      const response = await api.get<unknown, ApiEnvelope<RelayPreferenceView>>(
-        `/groups/${groupId}/relay-preference`,
-      );
-      if (response.code !== 0 || !response.data) throw new Error(response.message);
-      setView(response.data);
+      setView(await fetchPreference());
       setLoadError(false);
     } catch {
       setLoadError(true);
     } finally {
-      requestInFlight.current = false;
+      operationInFlight.current = false;
       setLoading(false);
     }
-  }, [groupId]);
+  }, [fetchPreference]);
 
   useEffect(() => {
     void load(true);
@@ -116,6 +120,8 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
   }, [load, view?.state]);
 
   const setPreferred = async (nodeId: string) => {
+    if (operationInFlight.current) return;
+    operationInFlight.current = true;
     setSubmittingNodeId(nodeId);
     try {
       const response = await api.post<unknown, ApiEnvelope<RelayPreferenceView>>(
@@ -123,14 +129,18 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
         { node_id: nodeId },
       );
       if (response.code !== 0) throw new Error(response.message);
-      await load();
+      setView(await fetchPreference());
+      setLoadError(false);
       message.success(t('relaySwitchStarted'));
     } catch (error) {
       message.error(requestErrorLabel(error, t));
     } finally {
+      operationInFlight.current = false;
       setSubmittingNodeId(null);
     }
   };
+
+  const busy = loading || submittingNodeId !== null;
 
   return (
     <div style={{ padding: '0 12px 12px' }} data-testid={`relay-preference-${groupId}`}>
@@ -149,6 +159,7 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
             icon={<ReloadOutlined />}
             aria-label={t('refresh')}
             loading={loading && view !== null}
+            disabled={submittingNodeId !== null}
             onClick={() => void load(true)}
           />
         </Tooltip>
@@ -180,7 +191,7 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
         <div>
           {view.nodes.map((node) => {
             const isIdlePreferred = view.state === 'idle' && node.node_id === view.preferred_node_id;
-            const disabled = !node.ready || view.state === 'switching';
+            const disabled = busy || !node.ready || view.state === 'switching';
             return (
               <div
                 key={node.node_id}

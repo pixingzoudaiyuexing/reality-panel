@@ -17,6 +17,12 @@ import { RelayPreferencePanel } from './RelayPreferencePanel';
 const t = ((key: string) => key) as unknown as Tfn;
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 function relayNode(nodeId: string, over: Partial<RelayReadyNode> = {}): RelayReadyNode {
   return {
     node_id: nodeId,
@@ -87,6 +93,65 @@ describe('RelayPreferencePanel', () => {
     expect(within(rowFor('node-c')).getByRole('button', { name: /relayPreferenceUnavailable/ })).toBeDisabled();
   });
 
+  it('disables every Relay action while one switch POST is pending', async () => {
+    const post = deferred<ApiEnvelope<RelayPreferenceView>>();
+    mockGet.mockResolvedValue(ok(preference({
+      nodes: [relayNode('node-a', { preferred: true }), relayNode('node-b'), relayNode('node-c')],
+    })));
+    mockPost.mockReturnValue(post.promise);
+
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    await screen.findByText('node-c');
+    fireEvent.click(within(rowFor('node-b')).getByRole('button', { name: /relayPreferenceSet/ }));
+
+    await waitFor(() => {
+      expect(within(rowFor('node-b')).getByRole('button', { name: /relayPreferenceSet/ })).toBeDisabled();
+      expect(within(rowFor('node-c')).getByRole('button', { name: /relayPreferenceSet/ })).toBeDisabled();
+    });
+    post.resolve(ok(preference({ state: 'switching', pending_node_id: 'node-b' })));
+    await waitFor(() => expect(mockGet).toHaveBeenCalledTimes(2));
+  });
+
+  it('cannot issue a second switch POST while the first POST is pending', async () => {
+    const post = deferred<ApiEnvelope<RelayPreferenceView>>();
+    mockGet.mockResolvedValue(ok(preference({
+      nodes: [relayNode('node-a', { preferred: true }), relayNode('node-b'), relayNode('node-c')],
+    })));
+    mockPost.mockReturnValue(post.promise);
+
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    await screen.findByText('node-c');
+    fireEvent.click(within(rowFor('node-b')).getByRole('button', { name: /relayPreferenceSet/ }));
+    fireEvent.click(within(rowFor('node-c')).getByRole('button', { name: /relayPreferenceSet/ }));
+
+    expect(mockPost).toHaveBeenCalledTimes(1);
+    expect(mockPost).toHaveBeenCalledWith('/groups/10/relay-preference', { node_id: 'node-b' });
+    post.resolve(ok(preference({ state: 'switching', pending_node_id: 'node-b' })));
+    await waitFor(() => expect(mockGet).toHaveBeenCalledTimes(2));
+  });
+
+  it('blocks switch actions while a manual refresh GET is pending', async () => {
+    const refresh = deferred<ApiEnvelope<RelayPreferenceView>>();
+    mockGet
+      .mockResolvedValueOnce(ok(preference()))
+      .mockReturnValueOnce(refresh.promise);
+
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    await screen.findByText('node-b');
+    fireEvent.click(screen.getByRole('button', { name: 'refresh' }));
+
+    await waitFor(() => {
+      expect(within(rowFor('node-b')).getByRole('button', { name: /relayPreferenceSet/ })).toBeDisabled();
+    });
+    fireEvent.click(within(rowFor('node-b')).getByRole('button', { name: /relayPreferenceSet/ }));
+    expect(mockPost).not.toHaveBeenCalled();
+
+    refresh.resolve(ok(preference()));
+    await waitFor(() => {
+      expect(within(rowFor('node-b')).getByRole('button', { name: /relayPreferenceSet/ })).toBeEnabled();
+    });
+  });
+
   it('keeps the old preferred visible and locks every action while switching', async () => {
     mockGet.mockResolvedValue(ok(preference({
       state: 'switching',
@@ -143,14 +208,11 @@ describe('RelayPreferencePanel', () => {
   });
 
   it('does not optimistically change preferred and re-GETs after POST success', async () => {
-    let resolvePost: ((value: ApiEnvelope<RelayPreferenceView>) => void) | undefined;
-    const postPending = new Promise<ApiEnvelope<RelayPreferenceView>>((resolve) => {
-      resolvePost = resolve;
-    });
+    const post = deferred<ApiEnvelope<RelayPreferenceView>>();
     mockGet
       .mockResolvedValueOnce(ok(preference()))
       .mockResolvedValueOnce(ok(preference({ state: 'switching', pending_node_id: 'node-b' })));
-    mockPost.mockReturnValue(postPending);
+    mockPost.mockReturnValue(post.promise);
 
     render(<RelayPreferencePanel groupId={10} t={t} />);
     await screen.findByText('node-b');
@@ -160,10 +222,31 @@ describe('RelayPreferencePanel', () => {
     expect(within(rowFor('node-b')).queryByText('relayPreferenceCurrent')).toBeNull();
     expect(mockPost).toHaveBeenCalledWith('/groups/10/relay-preference', { node_id: 'node-b' });
 
-    resolvePost?.(ok(preference({ state: 'switching', pending_node_id: 'node-b' })));
+    post.resolve(ok(preference({ state: 'switching', pending_node_id: 'node-b' })));
     await waitFor(() => expect(mockGet).toHaveBeenCalledTimes(2));
     expect(await screen.findByText('relayPreferenceSwitchingTo: node-b')).toBeInTheDocument();
     expect(within(rowFor('node-a')).getByText('relayPreferenceCurrent')).toBeInTheDocument();
+  });
+
+  it('starts polling when the authoritative post-switch GET returns switching', async () => {
+    vi.useFakeTimers();
+    mockGet
+      .mockResolvedValueOnce(ok(preference()))
+      .mockResolvedValueOnce(ok(preference({ state: 'switching', pending_node_id: 'node-b' })))
+      .mockResolvedValueOnce(ok(preference({ state: 'idle', pending_node_id: null })));
+    mockPost.mockResolvedValue(ok(preference({ state: 'switching', pending_node_id: 'node-b' })));
+
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.click(within(rowFor('node-b')).getByRole('button', { name: /relayPreferenceSet/ }));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(mockPost).toHaveBeenCalledTimes(1);
+    expect(mockGet).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('relayPreferenceSwitchingTo: node-b')).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(mockGet).toHaveBeenCalledTimes(3);
   });
 
   it('polls switching every five seconds and stops after idle', async () => {
