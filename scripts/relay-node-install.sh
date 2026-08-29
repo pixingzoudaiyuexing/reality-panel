@@ -7,7 +7,7 @@
 #
 # Usage:
 #   bash <(curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.1.0-rc.2/relay-node-install.sh) \
-#     -t <NODE_TOKEN> -u <PANEL_URL> --version 1.1.0-rc.1
+#     -t <NODE_TOKEN> -u <PANEL_URL> --version 1.1.0-rc.2
 #
 # Options:
 #   -t, --token         Node token (required, from the panel UI)
@@ -1004,6 +1004,8 @@ Wants=${SERVICE_WANTS}
 
 [Service]
 Type=simple
+RuntimeDirectory=relay-node
+RuntimeDirectoryMode=0755
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=/bin/bash ${START_SH}
 Restart=always
