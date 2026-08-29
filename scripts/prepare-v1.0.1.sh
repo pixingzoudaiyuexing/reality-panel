@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+sed -i '0,/version = "1.0.0"/s//version = "1.0.1"/' crates/panel/Cargo.toml
+sed -i '0,/version = "1.0.0"/s//version = "1.0.1"/' crates/node/Cargo.toml
+sed -i 's/^SCRIPT_VERSION="1.0.0"/SCRIPT_VERSION="1.0.1"/' scripts/relay-node-install.sh
+sed -i 's|releases/download/v1.0.0/relay-node-install.sh|releases/download/v1.0.1/relay-node-install.sh|' scripts/relay-node-install.sh
+sed -i 's/--version 1.0.0/--version 1.0.1/' scripts/relay-node-install.sh
+
+python3 - <<'PY'
+from pathlib import Path
+
+changelog = Path('CHANGELOG.md')
+text = changelog.read_text()
+marker = '---\n\n## [1.0.0] - 2026-08-29'
+section = '''---\n\n## [1.0.1] - 2026-08-29\n\nProduction hotfix for fresh Node deployment and stable lifecycle detection.\n\n### Fixed\n\n- Node bootstrap installs the AppArmor userspace package and verifies\n  `apparmor_parser` when AppArmor is enabled, preventing Docker/OpenList startup\n  failures on minimal Debian images.\n- Stable Reality Panel `1.0.x` Nodes using config protocol 8 are accepted by the\n  lifecycle capability gate, so log/restart operations are no longer rejected as\n  `NODE_LIFECYCLE_UNSUPPORTED`; older or ambiguous Nodes remain restricted.\n\n## [1.0.0] - 2026-08-29'''
+if marker not in text:
+    raise SystemExit('CHANGELOG.md insertion marker not found')
+changelog.write_text(text.replace(marker, section, 1))
+
+node_changelog = Path('CHANGELOG-NODE.md')
+text = node_changelog.read_text()
+marker = '---\n\n## [1.0.0] - 2026-08-29'
+section = '''---\n\n## [1.0.1] - 2026-08-29\n\nUnified hotfix release. The relay-node runtime behavior and config protocol 8\nremain unchanged; the Node package version is aligned with the Panel release.\n\n## [1.0.0] - 2026-08-29'''
+if marker not in text:
+    raise SystemExit('CHANGELOG-NODE.md insertion marker not found')
+node_changelog.write_text(text.replace(marker, section, 1))
+PY
+
+cargo check --workspace
+bash scripts/release-version-contract.sh v1.0.1
+test "$(sed -n 's/^SCRIPT_VERSION="\(.*\)"/\1/p' scripts/relay-node-install.sh | head -n1)" = "1.0.1"
+
+rm -f .github/workflows/prepare-v1.0.1-hotfix.yml scripts/prepare-v1.0.1.sh
+
+git config user.name "github-actions[bot]"
+git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+git add -A
+git commit -m "chore: release v1.0.1"
+git push origin HEAD:hotfix/v1.0.1
