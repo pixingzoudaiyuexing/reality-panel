@@ -991,9 +991,11 @@ mod tests {
     }
 
     fn evaluate(raw: &str, rules: &[ForwardRule], online: bool) -> RelayReadyNode {
-        let ids = online
-            .then(|| HashSet::from(["node-a".to_string()]))
-            .unwrap_or_default();
+        let ids = if online {
+            HashSet::from(["node-a".to_string()])
+        } else {
+            HashSet::new()
+        };
         evaluate_node("node-a".into(), Some(raw), Utc::now(), &ids, rules).info
     }
 
@@ -1196,7 +1198,7 @@ mod tests {
         assert!(second
             .nodes
             .iter()
-            .any(|node| node.node_id == "node-b" && node.ready && node.preferred == false));
+            .any(|node| node.node_id == "node-b" && node.ready && !node.preferred));
         connections.unregister(7, b_connection).await;
     }
 
