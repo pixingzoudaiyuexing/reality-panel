@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use relay_shared::protocol::{
     lifecycle_artifact_architecture, ApiResponse, NodeLifecycleAction, NodeLifecycleCommand,
-    NodeLifecycleEvent, NodeLifecycleEventStatus,
+    NodeLifecycleEvent, NodeLifecycleEventStatus, CONFIG_PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -488,6 +488,37 @@ async fn node_status(
         .transpose()
 }
 
+fn is_reality_panel_1_0_stable(version: Option<&str>) -> bool {
+    let Some(version) = version else {
+        return false;
+    };
+    let normalized = version.trim().trim_start_matches('v');
+    let mut parts = normalized.split('.');
+    let parsed = (
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts.next(),
+    );
+    matches!(parsed, (Some(1), Some(0), Some(_), None))
+}
+
+fn status_supports_lifecycle(
+    status: Option<&serde_json::Value>,
+    current_version: Option<&str>,
+) -> bool {
+    if relay_shared::protocol::node_supports_lifecycle(current_version) {
+        return true;
+    }
+    if !is_reality_panel_1_0_stable(current_version) {
+        return false;
+    }
+    status
+        .and_then(|value| value.get("config_protocol_version"))
+        .and_then(|value| value.as_u64())
+        == Some(CONFIG_PROTOCOL_VERSION as u64)
+}
+
 async fn create_operation(
     state: &AppState,
     actor_id: i64,
@@ -515,7 +546,7 @@ async fn create_operation(
         .and_then(|value| value.get("node_version"))
         .and_then(|value| value.as_str())
         .map(str::to_string);
-    if !relay_shared::protocol::node_supports_lifecycle(current_version.as_deref()) {
+    if !status_supports_lifecycle(status.as_ref(), current_version.as_deref()) {
         return Err(response::<()>(
             StatusCode::CONFLICT,
             409,
@@ -886,6 +917,26 @@ mod tests {
         assert!(uninstall_confirmed(Some("UNINSTALL")));
         assert!(!uninstall_confirmed(Some("uninstall")));
         assert!(!uninstall_confirmed(None));
+    }
+
+    #[test]
+    fn stable_reality_panel_1_0_lifecycle_requires_current_protocol() {
+        let compatible = serde_json::json!({
+            "config_protocol_version": CONFIG_PROTOCOL_VERSION
+        });
+        assert!(status_supports_lifecycle(Some(&compatible), Some("v1.0.0")));
+        assert!(status_supports_lifecycle(Some(&compatible), Some("1.0.1")));
+        assert!(!status_supports_lifecycle(Some(&compatible), Some("1.0.0-rc.4")));
+
+        let legacy_protocol = serde_json::json!({
+            "config_protocol_version": CONFIG_PROTOCOL_VERSION - 1
+        });
+        assert!(!status_supports_lifecycle(
+            Some(&legacy_protocol),
+            Some("1.0.0")
+        ));
+        assert!(!status_supports_lifecycle(None, Some("1.0.0")));
+        assert!(status_supports_lifecycle(None, Some("1.2.3")));
     }
 
     #[test]
