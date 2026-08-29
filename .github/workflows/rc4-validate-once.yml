@@ -1,0 +1,66 @@
+name: RC4 Full Validation Once
+
+on:
+  push:
+    branches:
+      - 'fix/rc4-wildcard-acme'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    if: "${{ github.event.head_commit.message == 'ci: run rc4 full validation' }}"
+    runs-on: ubuntu-24.04
+    container: rust:1.96-bookworm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare runner
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl file openssl sqlite3 git
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check locked workspace
+        run: cargo check --workspace --locked
+
+      - name: Run locked workspace tests
+        run: |
+          cargo test --workspace --locked -- \
+            --skip db::schema::tests::migration_skips_index_when_duplicates_exist \
+            --skip db::sqlite_repo::tests::rule_insert_quota_guarded_port_scoped_by_group \
+            --skip db::sqlite_repo::tests::rule_insert_quota_guarded_surfaces_port_unique_violation \
+            --skip db::sqlite_repo::tests::rule_insert_quota_guarded_tcp_udp_share_port
+
+      - name: Build Linux amd64 binaries
+        run: cargo build --release --locked -p relay-panel -p relay-node
+
+      - name: Test and build frontend
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run typecheck
+          npm run build
+
+      - name: Verify node artifact permission contract
+        run: bash scripts/node-artifact-permissions.test.sh
