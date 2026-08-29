@@ -1,0 +1,32 @@
+name: RC5 Release Once
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify release commit and create tag
+        run: |
+          set -euo pipefail
+          RELEASE_SHA="5e8b92c6511f3d63b220f30ea5bf210f85cd82ee"
+          TAG="v1.1.0-rc.5"
+          git cat-file -e "${RELEASE_SHA}^{commit}"
+          test "$(git show "${RELEASE_SHA}:crates/panel/Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -n1)" = "1.1.0-rc.5"
+          test "$(git show "${RELEASE_SHA}:crates/node/Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -n1)" = "1.1.0-rc.5"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag already exists: ${TAG}"
+            exit 1
+          fi
+          git tag "${TAG}" "${RELEASE_SHA}"
+          git push origin "refs/tags/${TAG}"
