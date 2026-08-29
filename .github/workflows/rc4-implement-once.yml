@@ -1,0 +1,69 @@
+name: RC4 Wildcard ACME Implementation Once
+
+on:
+  push:
+    branches:
+      - 'fix/rc4-wildcard-acme'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  implement:
+    if: github.event.head_commit.message == 'ci: start rc4 implementation'
+    runs-on: ubuntu-24.04
+    container: rust:1.96-bookworm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare runner
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          apt-get update
+          apt-get install -y --no-install-recommends python3 git ca-certificates openssl sqlite3
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Apply rc4 source patch
+        run: python3 scripts/rc4_patch.py
+
+      - name: Format
+        run: cargo fmt --all
+
+      - name: Test Panel ACME DNS-01
+        run: cargo test -p relay-panel service::acme_dns01 -- --nocapture
+
+      - name: Test Panel wildcard scope
+        run: cargo test -p relay-panel wildcard_scope_uses_direct_parent_inside_managed_zone -- --nocapture
+
+      - name: Test Node ACME hook and wildcard lifecycle
+        run: |
+          cargo test -p relay-node acme_dns01 -- --nocapture
+          cargo test -p relay-node wildcard_certificate_scope_covers_exactly_one_label -- --nocapture
+          cargo test -p relay-node wildcard_certbot_args_keep_wildcard_but_use_safe_cert_name -- --nocapture
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Commit tested implementation
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/shared/src/protocol.rs \
+                  crates/panel/src/service/node_config.rs \
+                  crates/panel/src/service/acme_dns01.rs \
+                  crates/panel/src/api/node.rs \
+                  crates/node/src/acme_dns01.rs \
+                  crates/node/src/forwarder/certificate_lifecycle.rs
+          git diff --cached --check
+          git diff --cached --stat
+          git commit -m 'feat: 增加通配符证书与多 Provider DNS-01'
+          git push origin HEAD:fix/rc4-wildcard-acme
