@@ -27,8 +27,13 @@ Relay 是 L4 SNI/Reality 透传，不终止或改写 Reality 握手，也不从 
 Reality 私钥。Nginx Stream 使用 `ssl_preread`；Reality 认证由后端控制。
 OpenList/camouflage 是独立的 fallback 路径。
 
-控制协议保持版本 8。Reality `xver=0` 与可选的 Relay 到后端 HAProxy
-PROXY protocol 是两套机制。启用 PROXY 时，先在远端 Reality/Xray 后端启用
+配置协议当前为 v9；节点生命周期/一键升级使用独立的 Lifecycle Protocol v1，
+两者不得绑定升级。配置协议不兼容时，已具备 lifecycle 能力的托管 Node 仍可建立
+**upgrade-only** 控制通道：继续使用本地 LKG，不接收新配置、诊断、重启或卸载命令，
+但 Panel 必须仍能向它下发经过版本、架构和 SHA-256 校验的一键升级。这样未来配置协议
+从 v9 升到 v10/v20 时，不会再次出现“因为需要升级，所以反而无法升级”的死锁。
+
+Reality `xver=0` 与可选的 Relay 到后端 HAProxy PROXY protocol 是两套机制。启用 PROXY 时，先在远端 Reality/Xray 后端启用
 接收，等待后端/Xray reload 并验证运行态接收已生效，最后启用 Relay 发送；
 关闭时顺序相反。
 

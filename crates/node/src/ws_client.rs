@@ -211,6 +211,17 @@ async fn connect_and_run(
     {
         request.headers_mut().insert("X-Config-Protocol-Version", v);
     }
+    // Lifecycle protocol is intentionally independent from config protocol. A
+    // future config bump may put this connection into upgrade-only mode, but
+    // the Panel must still be able to deliver a signed/validated Node upgrade.
+    if let Ok(v) = relay_shared::control_protocol::LIFECYCLE_PROTOCOL_VERSION
+        .to_string()
+        .parse()
+    {
+        request
+            .headers_mut()
+            .insert("X-Lifecycle-Protocol-Version", v);
+    }
     if let Ok(v) = "relay-node-ws".parse() {
         request.headers_mut().insert("User-Agent", v);
     }

@@ -116,13 +116,18 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
         const arch = r.architecture === 'x86_64' ? 'amd64' : r.architecture === 'aarch64' ? 'arm64' : (r.architecture || '');
         const target = artifactVersions[arch];
         const lifecycleReady = !!r.node_id && !!r.online && r.install_method === 'systemd';
+        const protocolCompatible = r.config_protocol_version == null || panelProtocol <= 0 || r.config_protocol_version === panelProtocol;
+        // Config protocol skew deliberately leaves Upgrade enabled. All other
+        // lifecycle controls remain disabled until the Node reconnects on the
+        // current config protocol.
+        const normalLifecycleReady = lifecycleReady && protocolCompatible;
         const canUpgrade = lifecycleReady && !!target && target !== r.node_version;
         return (
           <span style={{ display: 'inline-flex', gap: 2 }}>
-            <Tooltip title={t('nodeLogs')}><Button size="small" type="text" icon={<FileTextOutlined />} disabled={!r.node_id || !r.online} aria-label={t('nodeLogs')} onClick={() => onLifecycle(r, 'logs')} /></Tooltip>
-            <Tooltip title={t('nodeRestart')}><Button size="small" type="text" icon={<ReloadOutlined />} disabled={!lifecycleReady} aria-label={t('nodeRestart')} onClick={() => onLifecycle(r, 'restart')} /></Tooltip>
+            <Tooltip title={t('nodeLogs')}><Button size="small" type="text" icon={<FileTextOutlined />} disabled={!normalLifecycleReady} aria-label={t('nodeLogs')} onClick={() => onLifecycle(r, 'logs')} /></Tooltip>
+            <Tooltip title={t('nodeRestart')}><Button size="small" type="text" icon={<ReloadOutlined />} disabled={!normalLifecycleReady} aria-label={t('nodeRestart')} onClick={() => onLifecycle(r, 'restart')} /></Tooltip>
             <Tooltip title={target ? t('nodeUpgradeTip').replace('{v}', target) : t('nodeArtifactMissing')}><Button size="small" type="text" icon={<CloudDownloadOutlined />} disabled={!canUpgrade} aria-label={t('nodeUpgrade')} onClick={() => onLifecycle(r, 'upgrade')} /></Tooltip>
-            <Tooltip title={t('nodeUninstall')}><Button size="small" type="text" danger icon={<StopOutlined />} disabled={!lifecycleReady} aria-label={t('nodeUninstall')} onClick={() => onLifecycle(r, 'uninstall')} /></Tooltip>
+            <Tooltip title={t('nodeUninstall')}><Button size="small" type="text" danger icon={<StopOutlined />} disabled={!normalLifecycleReady} aria-label={t('nodeUninstall')} onClick={() => onLifecycle(r, 'uninstall')} /></Tooltip>
           </span>
         );
       },

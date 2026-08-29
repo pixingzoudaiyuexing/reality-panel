@@ -5,16 +5,8 @@
  * `latest_node_version`, NOT the panel version), plus a failed-check flag,
  * return the upgrade state.
  *
- * The ladder (mirrors the desktop column exactly):
- * - no node_id            → 'none' (placeholder row; render "-")
- * - node-version check failed → 'checkFailed' (neutral "-", no green check)
- * - protocol incompatible → 'protocolIncompatible' (priority over version)
- * - version unknown       → 'unknown' (render "-", never a green check)
- * - same                  → 'latest' (green check, "up to date")
- * - ahead                 → 'ahead' (green check, "leading build" — never stale)
- * - behind + docker       → 'docker' (amber "update image" hint)
- * - behind + non-systemd  → 'manual' (grey "no supervisor")
- * - behind + systemd      → 'upgradeable' if online, else 'offline'
+ * 核心不变量：配置协议不兼容不能阻断一键升级。只要 Node 比最新工件旧、在线且
+ * 为 systemd 托管，就仍然返回 `upgradeable`；协议不兼容只阻断配置/普通控制能力。
  */
 import type { NodeDisplayRow } from '../../api/types';
 import { versionRelation } from '../../utils/version';
@@ -42,10 +34,8 @@ export interface NodeUpgrade {
  * `nodeVersionCheckFailed` is true the lookup failed and we MUST show a neutral
  * state (never a green check or an upgrade button based on a stale/empty value).
  *
- * 'latest' (node == compareVersion) and 'ahead' (node > compareVersion, e.g. a
- * development build) are distinct states so the caller can show different
- * tooltips ("up to date" vs "leading build"), but both render as a green check
- * and neither ever offers a downgrade.
+ * Config protocol skew is deliberately NOT an early return when the node is
+ * behind. That skew is exactly when the operator most needs the upgrade path.
  */
 export function resolveNodeUpgrade(
   row: NodeDisplayRow,
@@ -53,22 +43,24 @@ export function resolveNodeUpgrade(
   panelProtocol: number,
   nodeVersionCheckFailed: boolean,
 ): NodeUpgrade {
-  // Placeholder row (no real node) → nothing to render.
   if (!row.node_id) return { state: 'none' };
-  // Failed node-version check → neutral, never a green check / button.
   if (nodeVersionCheckFailed) return { state: 'checkFailed' };
-  // Protocol-incompatible takes priority over any version status.
+
   const pv = row.config_protocol_version;
-  if (pv != null && panelProtocol > 0 && pv !== panelProtocol) {
-    return { state: 'protocolIncompatible' };
-  }
+  const protocolMismatch = pv != null && panelProtocol > 0 && pv !== panelProtocol;
   const rel = versionRelation(row.node_version, compareVersion);
+
+  if (rel === 'behind') {
+    if (row.install_method === 'docker') return { state: 'docker' };
+    if (row.install_method !== 'systemd') return { state: 'manual' };
+    // 即使 config protocol 不匹配，也必须保留在线 systemd Node 的升级入口。
+    return { state: row.online ? 'upgradeable' : 'offline' };
+  }
+
+  // 没有更高版本可升时，协议不兼容仍应明确提示，而不是错误显示“已最新”。
+  if (protocolMismatch) return { state: 'protocolIncompatible' };
   if (rel === 'unknown') return { state: 'unknown' };
   if (rel === 'ahead') return { state: 'ahead' };
   if (rel === 'same') return { state: 'latest' };
-  // rel === 'behind' → the offer depends on how the node is installed.
-  if (row.install_method === 'docker') return { state: 'docker' };
-  if (row.install_method !== 'systemd') return { state: 'manual' };
-  return { state: row.online ? 'upgradeable' : 'offline' };
+  return { state: 'unknown' };
 }
-
