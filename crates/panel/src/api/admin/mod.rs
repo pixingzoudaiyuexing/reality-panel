@@ -934,6 +934,7 @@ mod tests {
                 announcement: String::new(),
                 announcement_type: "info".into(),
                 contact: "tg:@someone".into(),
+                public_panel_url: String::new(),
             }),
         )
         .await;

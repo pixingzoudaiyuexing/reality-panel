@@ -21,6 +21,7 @@ pub const MAX_NAME: usize = 64;
 pub const MAX_SUBTITLE: usize = 128;
 pub const MAX_ANNOUNCEMENT: usize = 4000;
 pub const MAX_CONTACT: usize = 256;
+pub const MAX_PUBLIC_PANEL_URL: usize = 2048;
 
 /// Falls back to the current hardcoded brand, so an operator who never opens
 /// the page sees exactly what they saw before.
@@ -52,6 +53,9 @@ pub struct SiteConfig {
     pub announcement_type: String,
     /// How users reach the operator (Telegram handle, email, whatever).
     pub contact: String,
+    /// 管理员配置的面板公网根地址。仅供 Panel 内部生成 Bootstrap / Enrollment 地址，
+    /// 不通过公开站点信息接口暴露。留空时继续使用部署环境的 PUBLIC_PANEL_URL。
+    pub public_panel_url: String,
 }
 
 /// Allowed values for `announcement_type`, and the fallback for anything else.
@@ -99,6 +103,7 @@ impl SiteConfig {
                 DEFAULT_ANNOUNCEMENT_TYPE.to_string()
             },
             contact: clamp(&self.contact, MAX_CONTACT),
+            public_panel_url: clamp(&self.public_panel_url, MAX_PUBLIC_PANEL_URL),
         };
         if out.site_name.is_empty() {
             out.site_name = DEFAULT_NAME.to_string();
@@ -193,9 +198,19 @@ mod tests {
     /// A stored name is kept as-is; only blank falls back.
     #[test]
     fn from_json_keeps_a_configured_name() {
-        let cfg = SiteConfig::from_json(Some(r#"{"site_name":"我的中转","contact":"tg"}"#));
+        let cfg = SiteConfig::from_json(Some(
+            r#"{"site_name":"我的中转","contact":"tg","public_panel_url":"https://panel.example.com"}"#,
+        ));
         assert_eq!(cfg.site_name, "我的中转");
         assert_eq!(cfg.contact, "tg");
+        assert_eq!(cfg.public_panel_url, "https://panel.example.com");
+    }
+
+    #[test]
+    fn old_site_json_without_public_panel_url_remains_compatible() {
+        let cfg = SiteConfig::from_json(Some(r#"{"site_name":"旧站点"}"#));
+        assert_eq!(cfg.site_name, "旧站点");
+        assert!(cfg.public_panel_url.is_empty());
     }
 
     /// Truncation counts characters, not bytes. A byte slice at MAX_NAME would
