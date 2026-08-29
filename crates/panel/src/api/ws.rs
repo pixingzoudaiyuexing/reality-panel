@@ -57,6 +57,7 @@ impl NodeConnections {
     /// Register a new connection. Returns (conn_id, receiver) — the caller
     /// owns the receiver and forwards anything it receives to the socket.
     /// `node_id` is the v0.4.14 X-Node-ID (None for older nodes).
+    #[cfg(test)]
     pub async fn register(
         &self,
         group_id: i64,
@@ -394,6 +395,9 @@ pub async fn node_ws_handler(
     })
 }
 
+// 连接处理需要同时携带认证后的节点元数据、协议能力与共享运行态。
+// 这些参数属于同一个 WS 生命周期，当前保持显式传递以避免为 rc.5 引入无关重构。
+#[allow(clippy::too_many_arguments)]
 async fn handle_node_ws(
     socket: WebSocket,
     group_id: i64,
