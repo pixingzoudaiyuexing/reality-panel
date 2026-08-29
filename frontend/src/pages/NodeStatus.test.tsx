@@ -88,6 +88,39 @@ describe('NodeStatus page data source', () => {
     expect(mockGet).not.toHaveBeenCalledWith('/nodes');
     expect(mockGet).not.toHaveBeenCalledWith('/admin/node-artifacts');
   });
+
+  it('mounts Relay preference management only for admin inbound groups', async () => {
+    mockUseAuth.mockReturnValue({ isAdmin: true });
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/nodes') return Promise.resolve(ok([
+        adminNode,
+        { ...adminNode, group_id: 2, group_name: 'out-group', node_id: 'out-node' },
+      ]));
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      if (url === '/groups') return Promise.resolve(ok([
+        { id: 1, group_type: 'in' },
+        { id: 2, group_type: 'out' },
+      ]));
+      if (url === '/groups/1/relay-preference') return Promise.resolve(ok({
+        group_id: 1,
+        preferred_node_id: 'n1',
+        preferred_node_public_ipv4: '203.0.113.10',
+        pending_node_id: null,
+        state: 'idle',
+        started_at: null,
+        last_error: null,
+        nodes: [{ node_id: 'n1', public_ipv4: '203.0.113.10', online: true, ready: true, ready_reasons: [], preferred: true }],
+      }));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+
+    renderPage();
+    await flush();
+
+    expect(screen.getByText('relayPreferenceTitle')).toBeInTheDocument();
+    expect(mockGet).toHaveBeenCalledWith('/groups/1/relay-preference');
+    expect(mockGet).not.toHaveBeenCalledWith('/groups/2/relay-preference');
+  });
 });
 
 describe('NodeStatus load-failure behavior', () => {

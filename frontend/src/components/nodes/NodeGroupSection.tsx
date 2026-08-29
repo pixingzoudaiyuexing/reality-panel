@@ -5,6 +5,7 @@ import type { NodeDisplayRow } from '../../api/types';
 import type { NodeLifecycleHandler, Tfn } from './types';
 import { NodeDesktopTable } from './NodeDesktopTable';
 import { NodeMobileList } from './NodeMobileList';
+import { RelayPreferencePanel } from './RelayPreferencePanel';
 import { formatBps } from '../../utils/format';
 
 const { Text } = Typography;
@@ -25,6 +26,7 @@ interface Props {
   onLifecycle?: NodeLifecycleHandler;
   artifactVersions?: Record<string, string>;
   onDelete?: (row: NodeDisplayRow) => void;
+  showRelayPreference?: boolean;
 }
 
 /** Per-group summary: online/total (placeholders excluded) + aggregate live
@@ -43,7 +45,7 @@ function groupSummary(rows: NodeDisplayRow[]) {
 /** One group block: header bar (name · ID · online/total · aggregate ↑↓) +
  *  either a desktop table or mobile list. Collapsible. A group with only a
  *  placeholder row shows "no node reporting". */
-export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade, onLifecycle, artifactVersions, onDelete }: Props) {
+export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade, onLifecycle, artifactVersions, onDelete, showRelayPreference = false }: Props) {
   const head = rows[0];
   const { total, online, up, down } = groupSummary(rows);
   const region = head.region;
@@ -65,7 +67,7 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
     </div>
   );
 
-  const body = onlyPlaceholder ? (
+  const nodeBody = onlyPlaceholder ? (
     <div style={{ padding: 12 }}>
       <Text type="secondary">{t('noNodeReportingInGroup')}</Text>
     </div>
@@ -85,6 +87,13 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
     </div>
   ) : (
     <NodeDesktopTable rows={rows} panelProtocol={panelProtocol} latestNodeVersion={latestNodeVersion} nodeVersionCheckFailed={nodeVersionCheckFailed} t={t} openDetail={openDetail} onUpgrade={onUpgrade} onLifecycle={onLifecycle} artifactVersions={artifactVersions} onDelete={onDelete} />
+  );
+
+  const body = (
+    <>
+      {nodeBody}
+      {showRelayPreference ? <RelayPreferencePanel groupId={head.group_id} t={t} /> : null}
+    </>
   );
 
   return (
