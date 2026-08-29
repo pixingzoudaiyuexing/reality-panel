@@ -29,9 +29,8 @@ const PAGE_LIMIT: u16 = 100;
 // 同一个 SNI 的 TXT read-modify-write 必须串行，避免两个 Relay 同时读取旧值后
 // 相互覆盖；但锁只覆盖 DNS 提交/清理的临界区，绝不能覆盖传播等待和 CA 验证。
 // Weak 避免长期运行的 Panel 因历史 SNI 不断累积锁对象。
-static SNI_OPERATIONS: Lazy<
-    Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
-> = Lazy::new(|| Mutex::new(HashMap::new()));
+static SNI_OPERATIONS: Lazy<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AcmeDns01Request {
@@ -86,9 +85,7 @@ impl AcmeDns01Error {
     }
 }
 
-fn sni_operation(
-    sni: &str,
-) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>, AcmeDns01Error> {
+fn sni_operation(sni: &str) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>, AcmeDns01Error> {
     let mut operations = SNI_OPERATIONS
         .lock()
         .map_err(|_| AcmeDns01Error::Conflict)?;
