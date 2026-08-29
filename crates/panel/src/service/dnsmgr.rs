@@ -613,9 +613,11 @@ pub(crate) async fn ensure_record(
     };
     let desired = match derive_dns_desired(db, input.rule_id).await {
         Ok(DnsDesiredResolution::Eligible(desired)) => desired,
-        Ok(DnsDesiredResolution::NotEligible | DnsDesiredResolution::ConfigurationError { .. }) => {
-            return EnsureRecordResult::Failed(EnsureRecordFailure::InvalidRule)
-        }
+        Ok(
+            DnsDesiredResolution::NotEligible
+            | DnsDesiredResolution::Frozen
+            | DnsDesiredResolution::ConfigurationError { .. },
+        ) => return EnsureRecordResult::Failed(EnsureRecordFailure::InvalidRule),
         Err(_) => return EnsureRecordResult::Failed(EnsureRecordFailure::Database),
     };
     if desired.fqdn != fqdn.as_str()
@@ -1108,6 +1110,7 @@ pub(crate) struct DnsDesiredRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DnsDesiredResolution {
     NotEligible,
+    Frozen,
     Eligible(DnsDesiredRecord),
     ConfigurationError {
         desired: Option<DnsDesiredRecord>,
@@ -1136,6 +1139,13 @@ pub(crate) async fn derive_dns_desired(
         return Ok(DnsDesiredResolution::NotEligible);
     };
 
+    if matches!(
+        crate::service::relay_preference::resolve_dns_target(db, rule.device_group_in).await?,
+        crate::service::relay_preference::RelayDnsTarget::Frozen
+    ) {
+        return Ok(DnsDesiredResolution::Frozen);
+    }
+
     if rule.paused || (!rule.camouflage_enabled && rule.node_transport != "nginx_sni") {
         return Ok(DnsDesiredResolution::NotEligible);
     }
@@ -1153,7 +1163,25 @@ pub(crate) async fn derive_dns_desired(
     let sni = rule.sni.as_deref().unwrap_or_default().trim();
     let expected_value =
         match GroupRepository::find_by_id(db, rule.device_group_in, &ResourceScope::All).await? {
-            Some(group) if group.group_type == "in" => group.connect_host.trim().to_string(),
+            Some(group) if group.group_type == "in" => {
+                match crate::service::relay_preference::resolve_dns_target(db, rule.device_group_in)
+                    .await?
+                {
+                    crate::service::relay_preference::RelayDnsTarget::Resolved(ip) => ip,
+                    crate::service::relay_preference::RelayDnsTarget::NotSet => {
+                        group.connect_host.trim().to_string()
+                    }
+                    crate::service::relay_preference::RelayDnsTarget::Frozen => {
+                        return Ok(DnsDesiredResolution::Frozen)
+                    }
+                    crate::service::relay_preference::RelayDnsTarget::Invalid(category) => {
+                        return Ok(DnsDesiredResolution::ConfigurationError {
+                            desired: None,
+                            category,
+                        })
+                    }
+                }
+            }
             Some(_) => {
                 return Ok(DnsDesiredResolution::ConfigurationError {
                     desired: None,
@@ -1275,6 +1303,7 @@ async fn persist_resolution(
     force_schedule: bool,
 ) -> Result<(), crate::db::error::DbError> {
     match resolution {
+        DnsDesiredResolution::Frozen => {}
         DnsDesiredResolution::NotEligible => {
             if db.find_dns_record_sync(rule_id).await?.is_some() {
                 let now = utc_now();
@@ -1393,7 +1422,9 @@ pub async fn audit_sync_scheduled(state: &AppState, actor_id: Option<i64>, rule_
     .await;
 }
 
-async fn refresh_all_desired(db: &dyn Repository) -> Result<(), crate::db::error::DbError> {
+pub(crate) async fn refresh_all_desired(
+    db: &dyn Repository,
+) -> Result<(), crate::db::error::DbError> {
     for rule in db.list_rules(&ResourceScope::All).await? {
         let resolution = derive_dns_desired(db, rule.id).await?;
         persist_resolution(db, rule.id, resolution, false).await?;
@@ -1408,9 +1439,113 @@ pub async fn schedule_all_eligible(db: &dyn Repository) -> Result<(), crate::db:
     Ok(())
 }
 
+fn rule_is_dns_eligible(rule: &relay_shared::models::ForwardRule) -> bool {
+    !rule.paused
+        && rule.camouflage_enabled
+        && rule.node_transport == "nginx_sni"
+        && normalize_fqdn(rule.sni.as_deref().unwrap_or_default().trim()).is_ok()
+}
+
+pub async fn eligible_rule_ids_for_group(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<Vec<i64>, crate::db::error::DbError> {
+    let mut ids: Vec<i64> = db
+        .list_rules(&ResourceScope::All)
+        .await?
+        .into_iter()
+        .filter(|rule| rule.device_group_in == group_id && rule_is_dns_eligible(rule))
+        .map(|rule| rule.id)
+        .collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// Schedule only the eligible Reality records belonging to one inbound group.
+/// `eligible_rule_ids` comes from the preflight performed under the preference
+/// mutation lock, so another group can never be pulled into this transaction.
+pub async fn schedule_group_eligible(
+    db: &dyn Repository,
+    group_id: i64,
+    eligible_rule_ids: &[i64],
+) -> Result<(), crate::db::error::DbError> {
+    let current_ids = eligible_rule_ids_for_group(db, group_id).await?;
+    for rule_id in eligible_rule_ids {
+        if current_ids.binary_search(rule_id).is_ok() {
+            schedule_rule(db, *rule_id).await?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn disable_all_syncs(db: &dyn Repository) -> Result<u64, crate::db::error::DbError> {
-    db.mark_all_dns_record_syncs_disabled(&utc_now(), "DNSMGR_DISABLED")
-        .await
+    let now = utc_now();
+    let mut updated = 0;
+    for rule in db.list_rules(&ResourceScope::All).await? {
+        if matches!(
+            crate::service::relay_preference::resolve_dns_target(db, rule.device_group_in).await?,
+            crate::service::relay_preference::RelayDnsTarget::Frozen
+        ) {
+            continue;
+        }
+        if db.find_dns_record_sync(rule.id).await?.is_some() {
+            updated += db
+                .schedule_dns_record_sync(
+                    rule.id,
+                    "DISABLED",
+                    "UNKNOWN",
+                    Some("DNSMGR_DISABLED"),
+                    None,
+                    &now,
+                )
+                .await?;
+        }
+    }
+    Ok(updated)
+}
+
+async fn resume_unfrozen_syncs_on_startup(
+    db: &dyn Repository,
+) -> Result<u64, crate::db::error::DbError> {
+    let now = utc_now();
+    let mut updated = 0;
+    for rule in db.list_rules(&ResourceScope::All).await? {
+        if matches!(
+            crate::service::relay_preference::resolve_dns_target(db, rule.device_group_in).await?,
+            crate::service::relay_preference::RelayDnsTarget::Frozen
+        ) {
+            continue;
+        }
+        let Some(sync) = db.find_dns_record_sync(rule.id).await? else {
+            continue;
+        };
+        let resumed_state = match sync.state.as_str() {
+            "MUTATION_VERIFIED" | "PROPAGATING" => Some("PROPAGATING"),
+            "PENDING" | "SYNCING" => Some("PENDING"),
+            "FAILED"
+                if matches!(
+                    sync.last_error_category.as_deref(),
+                    Some("DNSMGR_TRANSPORT" | "DNSMGR_TIMEOUT" | "DNSMGR_TEMPORARY" | "DATABASE")
+                ) =>
+            {
+                Some("PENDING")
+            }
+            _ => None,
+        };
+        if let Some(resumed_state) = resumed_state {
+            updated += db
+                .schedule_dns_record_sync(
+                    rule.id,
+                    resumed_state,
+                    &sync.ownership,
+                    sync.last_error_category.as_deref(),
+                    Some(&now),
+                    &now,
+                )
+                .await?;
+        }
+    }
+    Ok(updated)
 }
 
 fn retry_delay(attempt: i32) -> Duration {
@@ -1854,6 +1989,9 @@ pub(crate) async fn load_client(db: &dyn Repository) -> Result<Option<DnsMgrClie
 
 async fn reconciliation_tick(state: &AppState) {
     crate::service::acme_dns01::cleanup_expired(state.db.as_ref()).await;
+    // Fail unsafe switching transactions before refresh/due processing so a
+    // vanished target cannot receive one more automatic DNS mutation.
+    crate::service::relay_preference::finalize_switching_preferences(state).await;
     let settings = match state.db.get(DNSMGR_CONFIG_KEY).await {
         Ok(raw) => DnsMgrSettings::from_json(raw.as_deref()),
         Err(error) => {
@@ -1865,6 +2003,7 @@ async fn reconciliation_tick(state: &AppState) {
         if let Err(error) = disable_all_syncs(state.db.as_ref()).await {
             tracing::error!("dns reconciliation: disabling sync state failed: {}", error);
         }
+        crate::service::relay_preference::finalize_switching_preferences(state).await;
         return;
     }
     if let Err(error) = refresh_all_desired(state.db.as_ref()).await {
@@ -1875,21 +2014,22 @@ async fn reconciliation_tick(state: &AppState) {
     }
     let client = match load_client(state.db.as_ref()).await {
         Ok(Some(client)) => client,
-        Ok(None) => return,
+        Ok(None) => {
+            crate::service::relay_preference::finalize_switching_preferences(state).await;
+            return;
+        }
         Err(error) => {
             tracing::error!("dns reconciliation: client configuration failed: {}", error);
+            crate::service::relay_preference::finalize_switching_preferences(state).await;
             return;
         }
     };
     let now = utc_now();
-    let due = match state
-        .db
-        .list_due_dns_record_syncs(&now, DNS_SYNC_MAX_BATCH)
-        .await
-    {
+    let due = match list_executable_due_syncs(state.db.as_ref(), &now).await {
         Ok(due) => due,
         Err(error) => {
             tracing::error!("dns reconciliation: due-state query failed: {}", error);
+            crate::service::relay_preference::finalize_switching_preferences(state).await;
             return;
         }
     };
@@ -1900,17 +2040,43 @@ async fn reconciliation_tick(state: &AppState) {
             audit.record(state).await;
         }
     }
+    crate::service::relay_preference::finalize_switching_preferences(state).await;
+}
+
+async fn list_executable_due_syncs(
+    db: &dyn Repository,
+    now: &str,
+) -> Result<Vec<DnsRecordSync>, crate::db::error::DbError> {
+    // There is at most one DNS sync per rule. Reading up to the rule count
+    // ensures frozen transactions cannot consume the executable batch slots.
+    let rule_count = db.list_rules(&ResourceScope::All).await?.len();
+    let due_limit = i64::try_from(rule_count)
+        .unwrap_or(i64::MAX)
+        .max(DNS_SYNC_MAX_BATCH);
+    let due = db.list_due_dns_record_syncs(now, due_limit).await?;
+    let mut executable = Vec::with_capacity(DNS_SYNC_MAX_BATCH as usize);
+
+    for sync in due {
+        if matches!(
+            derive_dns_desired(db, sync.rule_id).await,
+            Ok(DnsDesiredResolution::Frozen)
+        ) {
+            continue;
+        }
+        executable.push(sync);
+        if executable.len() == DNS_SYNC_MAX_BATCH as usize {
+            break;
+        }
+    }
+
+    Ok(executable)
 }
 
 /// Start the Panel-only DNS reconciliation worker. It never touches Relay
 /// runtime state and exits only when the Panel process exits.
 pub fn spawn(state: AppState) {
     tokio::spawn(async move {
-        if let Err(error) = state
-            .db
-            .resume_dns_record_syncs_on_startup(&utc_now())
-            .await
-        {
+        if let Err(error) = resume_unfrozen_syncs_on_startup(state.db.as_ref()).await {
             tracing::error!("dns reconciliation: startup recovery failed: {}", error);
         }
         let mut ticker = tokio::time::interval(DNS_SYNC_TICK);
@@ -3066,6 +3232,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn desired_state_prefers_pending_then_preferred_then_legacy_connect_host() {
+        use crate::service::relay_preference::{
+            RelayPreferencePhase, RelayPreferenceState, RELAY_PREFERENCE_KEY_PREFIX,
+        };
+
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        let desired_value = |resolution: DnsDesiredResolution| match resolution {
+            DnsDesiredResolution::Eligible(desired) => desired.expected_value,
+            other => panic!("unexpected desired state: {other:?}"),
+        };
+        assert_eq!(
+            desired_value(derive_dns_desired(&db, 100).await.unwrap()),
+            "192.0.2.10"
+        );
+
+        db.set("node_status:10:node-a", r#"{"public_ipv4":"192.0.2.20"}"#)
+            .await
+            .unwrap();
+        db.set("node_status:10:node-b", r#"{"public_ipv4":"192.0.2.30"}"#)
+            .await
+            .unwrap();
+        let key = format!("{RELAY_PREFERENCE_KEY_PREFIX}10");
+        db.set(
+            &key,
+            &serde_json::to_string(&RelayPreferenceState {
+                preferred_node_id: Some("node-a".into()),
+                pending_node_id: None,
+                state: RelayPreferencePhase::Idle,
+                started_at: None,
+                last_error: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            desired_value(derive_dns_desired(&db, 100).await.unwrap()),
+            "192.0.2.20"
+        );
+        db.set("node_status:10:node-a", r#"{"public_ipv4":"192.0.2.21"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            desired_value(derive_dns_desired(&db, 100).await.unwrap()),
+            "192.0.2.21",
+            "preferred IP must be read from current node telemetry"
+        );
+        db.set("node_status:10:node-a", r#"{"public_ipv4":"192.0.2.20"}"#)
+            .await
+            .unwrap();
+
+        db.set(
+            &key,
+            &serde_json::to_string(&RelayPreferenceState {
+                preferred_node_id: Some("node-a".into()),
+                pending_node_id: Some("node-b".into()),
+                state: RelayPreferencePhase::Switching,
+                started_at: Some("2026-08-29T00:00:00Z".into()),
+                last_error: None,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            desired_value(derive_dns_desired(&db, 100).await.unwrap()),
+            "192.0.2.30"
+        );
+        schedule_rule(&db, 100).await.unwrap();
+        let pending_b = db.find_dns_record_sync(100).await.unwrap().unwrap();
+        assert_eq!(pending_b.expected_value, "192.0.2.30");
+
+        db.set(
+            &key,
+            &serde_json::to_string(&RelayPreferenceState {
+                preferred_node_id: Some("node-a".into()),
+                pending_node_id: Some("node-b".into()),
+                state: RelayPreferencePhase::Failed,
+                started_at: Some("2026-08-29T00:00:00Z".into()),
+                last_error: Some("DNS_RECORD_CONFLICT".into()),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            derive_dns_desired(&db, 100).await.unwrap(),
+            DnsDesiredResolution::Frozen
+        );
+
+        refresh_all_desired(&db).await.unwrap();
+        schedule_all_eligible(&db).await.unwrap();
+        disable_all_syncs(&db).await.unwrap();
+        resume_unfrozen_syncs_on_startup(&db).await.unwrap();
+        assert_eq!(
+            db.find_dns_record_sync(100).await.unwrap().unwrap(),
+            pending_b,
+            "failed Relay transactions must freeze desired value and sync state"
+        );
+
+        db.set("node_status:10:node-a", r#"{"public_ipv4":"192.0.2.21"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            derive_dns_desired(&db, 100).await.unwrap(),
+            DnsDesiredResolution::Frozen,
+            "preferred telemetry changes must not thaw a failed transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_due_syncs_do_not_starve_executable_work() {
+        let db = due_queue_db(DNS_SYNC_MAX_BATCH, 1).await;
+        let frozen_before = frozen_sync_rows(&db, DNS_SYNC_MAX_BATCH).await;
+
+        let executable = list_executable_due_syncs(&db, "2026-08-30 00:00:00")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            executable
+                .iter()
+                .map(|sync| sync.rule_id)
+                .collect::<Vec<_>>(),
+            vec![1000],
+            "a full leading batch of frozen rows must not starve later work"
+        );
+        assert_eq!(
+            frozen_sync_rows(&db, DNS_SYNC_MAX_BATCH).await,
+            frozen_before,
+            "filtering frozen rows must not change their state or diagnostics"
+        );
+    }
+
+    #[tokio::test]
+    async fn executable_due_syncs_remain_bounded_after_frozen_filtering() {
+        let db = due_queue_db(DNS_SYNC_MAX_BATCH - 1, DNS_SYNC_MAX_BATCH + 1).await;
+
+        let executable = list_executable_due_syncs(&db, "2026-08-30 00:00:00")
+            .await
+            .unwrap();
+
+        assert_eq!(executable.len(), DNS_SYNC_MAX_BATCH as usize);
+        assert_eq!(executable.first().unwrap().rule_id, 1000);
+        assert_eq!(executable.last().unwrap().rule_id, 1015);
+        assert!(executable.iter().all(|sync| sync.rule_id >= 1000));
+    }
+
+    #[tokio::test]
     async fn scheduling_is_persisted_and_rule_edit_replaces_only_desired_state() {
         let db = ensure_db().await;
         db.set(
@@ -3602,6 +3918,118 @@ mod tests {
 
     async fn sync_row(db: &SqliteRepository) -> DnsRecordSync {
         db.find_dns_record_sync(100).await.unwrap().unwrap()
+    }
+
+    async fn due_queue_db(frozen_count: i64, executable_count: i64) -> SqliteRepository {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (10, 'frozen-group', 'in', 'frozen-token', 1, '192.0.2.10'), \
+                    (20, 'active-group', 'in', 'active-token', 1, '192.0.2.40')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for offset in 0..frozen_count {
+            sqlx::query(
+                "INSERT INTO forward_rules \
+                 (id, name, uid, listen_port, device_group_in, target_addr, target_port, \
+                  public_transport, node_transport, protocol, sni, camouflage_enabled) \
+                 VALUES (?, ?, 1, ?, 10, '127.0.0.1', 80, \
+                         'nginx_sni', 'nginx_sni', 'tcp', ?, 1)",
+            )
+            .bind(100 + offset)
+            .bind(format!("frozen-rule-{offset}"))
+            .bind(21000 + offset)
+            .bind(format!("frozen-{offset}.example.com"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for offset in 0..executable_count {
+            sqlx::query(
+                "INSERT INTO forward_rules \
+                 (id, name, uid, listen_port, device_group_in, target_addr, target_port, \
+                  public_transport, node_transport, protocol, sni, camouflage_enabled) \
+                 VALUES (?, ?, 1, ?, 20, '127.0.0.1', 80, \
+                         'nginx_sni', 'nginx_sni', 'tcp', ?, 1)",
+            )
+            .bind(1000 + offset)
+            .bind(format!("active-rule-{offset}"))
+            .bind(22000 + offset)
+            .bind(format!("active-{offset}.example.com"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let db = SqliteRepository::new(pool);
+        db.set(
+            "relay_preference:10",
+            r#"{"preferred_node_id":"node-a","pending_node_id":"node-b","state":"failed","started_at":"2026-08-29T00:00:00Z","last_error":"DNS_RECORD_CONFLICT"}"#,
+        )
+        .await
+        .unwrap();
+        for offset in 0..frozen_count {
+            db.insert_dns_record_sync(&NewDnsRecordSync {
+                rule_id: 100 + offset,
+                fqdn: format!("frozen-{offset}.example.com"),
+                record_type: "A".into(),
+                expected_value: "192.0.2.30".into(),
+                line: "default".into(),
+                line_key: "default".into(),
+                state: "FAILED".into(),
+                ownership: "PANEL".into(),
+                last_error_category: Some("DNS_RECORD_CONFLICT".into()),
+                next_attempt_at: Some("2026-08-29 00:00:00".into()),
+                created_at: "2026-08-29 00:00:00".into(),
+                updated_at: "2026-08-29 00:00:00".into(),
+            })
+            .await
+            .unwrap();
+        }
+        for offset in 0..executable_count {
+            db.insert_dns_record_sync(&NewDnsRecordSync {
+                rule_id: 1000 + offset,
+                fqdn: format!("active-{offset}.example.com"),
+                record_type: "A".into(),
+                expected_value: "192.0.2.40".into(),
+                line: "default".into(),
+                line_key: "default".into(),
+                state: "PENDING".into(),
+                ownership: "UNKNOWN".into(),
+                last_error_category: None,
+                next_attempt_at: Some("2026-08-29 00:00:00".into()),
+                created_at: "2026-08-29 00:00:00".into(),
+                updated_at: "2026-08-29 00:00:00".into(),
+            })
+            .await
+            .unwrap();
+        }
+        db
+    }
+
+    async fn frozen_sync_rows(db: &SqliteRepository, count: i64) -> Vec<DnsRecordSync> {
+        let mut rows = Vec::new();
+        for offset in 0..count {
+            rows.push(
+                db.find_dns_record_sync(100 + offset)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        rows
     }
 
     async fn ensure_db() -> SqliteRepository {

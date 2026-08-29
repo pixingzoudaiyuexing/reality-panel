@@ -64,8 +64,9 @@ describe('monitor-only groups hide the forwarding fields', () => {
     render(<Groups />);
     await user.click(screen.getByRole('button', { name: /addGroup/i }));
 
-    // Inbound is the default: the fields are there to begin with.
-    await waitFor(() => expect(screen.getByLabelText('connectHost')).toBeInTheDocument());
+    // Inbound is the default: it keeps forwarding controls but no longer asks
+    // for the legacy Relay address.
+    await waitFor(() => expect(screen.queryByLabelText('connectHost')).toBeNull());
     expect(screen.getByLabelText('portRange')).toBeInTheDocument();
 
     // Switch to monitor-only.
@@ -90,8 +91,6 @@ describe('monitor-only groups hide the forwarding fields', () => {
     await user.click(screen.getByRole('button', { name: /addGroup/i }));
 
     await user.type(await screen.findByLabelText('name'), 'watch-only');
-    await user.type(screen.getByLabelText('connectHost'), '9.9.9.9');
-
     await user.click(screen.getByLabelText('type'));
     await user.click(await screen.findByTitle('typeMonitor'));
     await user.click(screen.getByRole('button', { name: /^create$/i }));
@@ -161,5 +160,61 @@ describe('monitor-only groups hide the forwarding fields', () => {
     await waitFor(() => expect(screen.getByText('g1')).toBeInTheDocument());
     expect(screen.queryByText('10000-65535')).toBeNull();
     expect(screen.queryByText('1.2.3.4')).toBeNull();
+  });
+});
+
+describe('inbound and outbound connect host behavior', () => {
+  it('hides connect_host for inbound create and submits an explicit empty value', async () => {
+    const user = userEvent.setup();
+    mockPost.mockResolvedValue(ok(group({ connect_host: '' })));
+    render(<Groups />);
+
+    await user.click(screen.getByRole('button', { name: /addGroup/i }));
+    expect(screen.queryByLabelText('connectHost')).toBeNull();
+    await user.type(screen.getByLabelText('name'), 'reality-in');
+    await user.click(screen.getByRole('button', { name: /^create$/i }));
+
+    await waitFor(() => expect(mockPost).toHaveBeenCalled());
+    expect(mockPost.mock.calls[0][1]).toMatchObject({
+      name: 'reality-in', group_type: 'in', connect_host: '', port_range: '10000-65535',
+    });
+  });
+
+  it('hides and clears the legacy connect_host when an inbound group is edited', async () => {
+    const user = userEvent.setup();
+    mockPut.mockResolvedValue(ok(null));
+    render(<Groups />);
+
+    await screen.findByText('g1');
+    expect(screen.queryByText('1.2.3.4')).toBeNull();
+    await user.click(screen.getByRole('button', { name: /edit/i }));
+    expect(screen.queryByLabelText('connectHost')).toBeNull();
+    await user.clear(screen.getByLabelText('name'));
+    await user.type(screen.getByLabelText('name'), 'renamed');
+    await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+    await waitFor(() => expect(mockPut).toHaveBeenCalled());
+    expect(mockPut.mock.calls[0]).toEqual(['/groups/1', { name: 'renamed', connect_host: '' }]);
+  });
+
+  it('keeps connect_host visible and editable for an existing outbound group', async () => {
+    const user = userEvent.setup();
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/groups') return Promise.resolve(ok([group({ group_type: 'out' })]));
+      return Promise.resolve(ok([]));
+    });
+    mockPut.mockResolvedValue(ok(null));
+    render(<Groups />);
+
+    await screen.findByText('1.2.3.4');
+    await user.click(screen.getByRole('button', { name: /edit/i }));
+    const input = screen.getByLabelText('connectHost');
+    expect(input).toHaveValue('1.2.3.4');
+    await user.clear(input);
+    await user.type(input, '198.51.100.20');
+    await user.click(screen.getByRole('button', { name: /^save$/i }));
+
+    await waitFor(() => expect(mockPut).toHaveBeenCalled());
+    expect(mockPut.mock.calls[0]).toEqual(['/groups/1', { connect_host: '198.51.100.20' }]);
   });
 });

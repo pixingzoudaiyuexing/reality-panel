@@ -388,6 +388,28 @@ export interface DeviceGroup {
   created_at: string;
 }
 
+export type RelayPreferencePhase = 'idle' | 'switching' | 'failed';
+
+export interface RelayReadyNode {
+  node_id: string;
+  public_ipv4: string | null;
+  online: boolean;
+  ready: boolean;
+  ready_reasons: string[];
+  preferred: boolean;
+}
+
+export interface RelayPreferenceView {
+  group_id: number;
+  preferred_node_id: string | null;
+  preferred_node_public_ipv4: string | null;
+  pending_node_id: string | null;
+  state: RelayPreferencePhase;
+  started_at: string | null;
+  last_error: string | null;
+  nodes: RelayReadyNode[];
+}
+
 export interface Plan {
   id: number;
   name: string;

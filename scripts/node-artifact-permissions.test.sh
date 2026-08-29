@@ -42,6 +42,7 @@ exit 0
 EOF
 cat > "$FAKE_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
+printf 'curl %s\n' "$*" >> "$HARNESS_LOG"
 case "$*" in
     *api/v1/health*) printf '{"status":"ok","version":"1.0.0"}\n' ;;
     *) exit 1 ;;
@@ -89,20 +90,22 @@ run_deploy() {
     local mode="${1:-install}"
     HARNESS_LOG="$LOG" HARNESS_DATA_ROOT="$DATA_ROOT" PATH="$FAKE_BIN:$PATH" \
         RELEASE_DIR="$RELEASE_DIR" RELEASE_VERSION=v1.0.0 \
-        PUBLIC_PANEL_URL=http://203.0.113.10:18888 bash "$TEST_DEPLOY" "$mode"
+        PUBLIC_PANEL_URL=http://203.0.113.10:28888 PANEL_PORT=28888 bash "$TEST_DEPLOY" "$mode"
 }
 
 fresh_output="$(run_deploy install)"
 grep -Fq '✓ 安装成功' <<<"$fresh_output" || fail "fresh success marker missing"
 grep -Fq '管理员账号：admin' <<<"$fresh_output" || fail "fresh admin username missing"
 grep -Fq '初始密码：admin123' <<<"$fresh_output" || fail "fresh admin password missing"
+grep -Fqx 'LISTEN=0.0.0.0:28888' "$CONFIG_ROOT/relay-panel.env" || fail "fresh install ignored PANEL_PORT"
+grep -Fq 'http://127.0.0.1:28888/api/v1/health' "$LOG" || fail "fresh health check ignored PANEL_PORT"
 metadata="$INSTALL_ROOT/node-assets/amd64/metadata.json"
 [ "$(stat -c '%a' "$metadata")" = "644" ] || fail "fresh metadata mode is not 0644"
 [ "$(stat -c '%U:%G' "$metadata")" = "root:root" ] || fail "fresh metadata owner changed"
 runuser -u relay-panel -- cat "$metadata" >/dev/null || fail "relay-panel cannot read fresh metadata"
 ok "fresh install metadata is 0644 and relay-panel-readable"
 
-printf 'JWT_SECRET=preserve-me\nPANEL_KEY=preserve-me\n' > "$CONFIG_ROOT/relay-panel.env"
+printf 'LISTEN=0.0.0.0:28888\nJWT_SECRET=preserve-me\nPANEL_KEY=preserve-me\n' > "$CONFIG_ROOT/relay-panel.env"
 sqlite3 "$DATA_ROOT/data.db" \
     'CREATE TABLE harness_sentinel (value TEXT NOT NULL); INSERT INTO harness_sentinel VALUES ("database sentinel");'
 chmod 0600 "$metadata"
@@ -116,6 +119,7 @@ fi
 [ "$(stat -c '%U:%G' "$metadata")" = "root:root" ] || fail "update changed metadata owner"
 runuser -u relay-panel -- cat "$metadata" >/dev/null || fail "relay-panel cannot read repaired metadata"
 grep -Fq 'JWT_SECRET=preserve-me' "$CONFIG_ROOT/relay-panel.env" || fail "update changed config"
+grep -Fq 'LISTEN=0.0.0.0:28888' "$CONFIG_ROOT/relay-panel.env" || fail "update changed listen port"
 sqlite3 "$DATA_ROOT/data.db" 'SELECT value FROM harness_sentinel;' | \
     grep -Fqx 'database sentinel' || fail "update changed database"
 ok "0600 metadata was repaired to 0644 without changing config or data"

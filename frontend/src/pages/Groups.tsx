@@ -15,6 +15,10 @@ function isMonitorOnly(g: { group_type: string }): boolean {
   return g.group_type === 'monitor';
 }
 
+function usesConnectHost(g: { group_type: string }): boolean {
+  return g.group_type === 'out';
+}
+
 const dash = <span style={{ color: 'var(--rp-text-tertiary)' }}>-</span>;
 
 export default function Groups() {
@@ -103,6 +107,8 @@ export default function Groups() {
         payload.port_range = '';
         payload.rate = 1.0;
         payload.hidden = false;
+      } else if (values.group_type === 'in') {
+        payload.connect_host = '';
       }
       const res = await api.post<unknown, ApiEnvelope<DeviceGroup>>('/groups', payload);
       if (res.code !== 0) { message.error(res.message); return; }
@@ -131,7 +137,11 @@ export default function Groups() {
     // round trip. No special case is needed here: hiding those Form.Items
     // unregisters them, so they arrive undefined and the `!== undefined` guards
     // below already skip them. Groups.test.tsx pins that round trip.
-    if (values.connect_host !== undefined && values.connect_host !== editing.connect_host) payload.connect_host = values.connect_host;
+    if (values.group_type === 'in' && editing.connect_host !== '') {
+      payload.connect_host = '';
+    } else if (values.connect_host !== undefined && values.connect_host !== editing.connect_host) {
+      payload.connect_host = values.connect_host;
+    }
     if (values.port_range !== undefined && values.port_range !== editing.port_range) payload.port_range = values.port_range;
     // v1.0.8: only send rate when it actually changed (avoid no-op 400s and
     // keep the diff-based payload pattern used for the other fields).
@@ -243,11 +253,10 @@ export default function Groups() {
         return <span>{total > 0 ? `${online}/${total}` : '-'}</span>;
       },
     },
-    // v1.2.5: these four say nothing about a monitor-only group — it forwards
-    // nothing and is never shown to a user — so it reads "-" rather than a
-    // stored value that looks like configuration but is inert. The value itself
-    // is kept in the DB; see handleUpdate.
-    { title: t('connectHost'), dataIndex: 'connect_host', key: 'connect_host', render: (v: string, g: DeviceGroup) => isMonitorOnly(g) ? dash : <span className="rp-mono">{v}</span> },
+    // Reality inbound resolves its Relay IP from node telemetry, while monitor
+    // groups do not forward at all. Only legacy outbound groups display their
+    // stored connect_host; the column remains for those existing rows.
+    { title: t('connectHost'), dataIndex: 'connect_host', key: 'connect_host', render: (v: string, g: DeviceGroup) => usesConnectHost(g) ? <span className="rp-mono">{v}</span> : dash },
     { title: t('portRange'), dataIndex: 'port_range', key: 'port_range', render: (v: string, g: DeviceGroup) => isMonitorOnly(g) ? dash : <span className="rp-mono">{v}</span> },
     {
       // v1.0.8: billing rate. Only show a tag when it differs from 1.0 — a 1x
@@ -371,7 +380,7 @@ export default function Groups() {
             />
           ) : (
             <>
-              <Form.Item name="connect_host" label={t('connectHost')} rules={[{ required: true }]}><Input placeholder="1.2.3.4 or node.example.com" /></Form.Item>
+              {createType === 'out' ? <Form.Item name="connect_host" label={t('connectHost')} rules={[{ required: true }]}><Input placeholder="1.2.3.4 or node.example.com" /></Form.Item> : null}
               <Form.Item name="port_range" label={t('portRange')} rules={[{ required: true }]} initialValue="10000-65535"><Input placeholder="10000-65535" /></Form.Item>
               {/* v1.0.8: billing rate. Users are charged real bytes × rate; the
                   rule/user byte counters keep real bytes. 1.0 = bill as used. */}
@@ -401,7 +410,7 @@ export default function Groups() {
             />
           ) : (
             <>
-              <Form.Item name="connect_host" label={t('connectHost')}><Input /></Form.Item>
+              {editType === 'out' ? <Form.Item name="connect_host" label={t('connectHost')}><Input /></Form.Item> : null}
               <Form.Item name="port_range" label={t('portRange')}><Input /></Form.Item>
               <Form.Item name="rate" label={t('rate')} extra={t('rateHint')}>
                 <InputNumber min={0.1} max={100} step={0.1} style={{ width: '100%' }} />

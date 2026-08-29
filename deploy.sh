@@ -68,8 +68,11 @@ esac
 release_dir="${RELEASE_DIR:?RELEASE_DIR is required}"
 release_tag="${RELEASE_VERSION:?RELEASE_VERSION is required}"
 public_url="${PUBLIC_PANEL_URL:?PUBLIC_PANEL_URL is required}"
+panel_port="${PANEL_PORT:-18888}"
 version="${release_tag#v}"
 [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] || fail "Invalid release tag"
+[[ "$panel_port" =~ ^[0-9]+$ ]] && [ "$panel_port" -ge 1 ] && [ "$panel_port" -le 65535 ] || \
+    fail "PANEL_PORT must be an integer from 1 to 65535"
 
 required=(reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh update.sh deploy.sh)
 for asset in "${required[@]}"; do [ -s "$release_dir/$asset" ] || fail "Missing release asset: $asset"; done
@@ -96,7 +99,7 @@ if [ ! -e "$env_file" ]; then
     umask 077
     cat > "$env_file" <<EOF
 DATABASE_URL=sqlite:$DATA_ROOT/data.db?mode=rwc
-LISTEN=0.0.0.0:18888
+LISTEN=0.0.0.0:$panel_port
 PUBLIC_DIR=$INSTALL_ROOT/public
 NODE_ARTIFACT_DIR=$INSTALL_ROOT/node-assets
 PUBLIC_PANEL_URL=$public_url
@@ -109,6 +112,11 @@ EOF
 else
     info "Preserving existing configuration and secrets in $env_file"
 fi
+
+listen="$(sed -n 's/^LISTEN=//p' "$env_file" | tail -n 1)"
+health_port="${listen##*:}"
+[[ "$health_port" =~ ^[0-9]+$ ]] && [ "$health_port" -ge 1 ] && [ "$health_port" -le 65535 ] || \
+    fail "Existing LISTEN does not contain a valid health-check port"
 
 staging="$INSTALL_ROOT/releases/.${version}.staging.$$"
 final="$INSTALL_ROOT/releases/$version"
@@ -169,7 +177,7 @@ systemctl restart relay-panel.service
 
 healthy=0
 for _ in $(seq 1 30); do
-    body="$(curl -fsS http://127.0.0.1:18888/api/v1/health 2>/dev/null || true)"
+    body="$(curl -fsS "http://127.0.0.1:$health_port/api/v1/health" 2>/dev/null || true)"
     if printf '%s' "$body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' && \
        printf '%s' "$body" | grep -Fq "\"version\":\"$version\""; then
         healthy=1

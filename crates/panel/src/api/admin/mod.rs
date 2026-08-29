@@ -967,6 +967,14 @@ mod tests {
     async fn delete_empty_group_succeeds() {
         let (state, pool) = test_state().await;
         add_group(&pool, 20, 1, "empty-in").await;
+        state
+            .db
+            .set(
+                "relay_preference:20",
+                r#"{"preferred_node_id":"node-a","pending_node_id":null,"state":"idle","started_at":null,"last_error":null}"#,
+            )
+            .await
+            .unwrap();
 
         let Json(resp) =
             super::delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(20)).await;
@@ -975,6 +983,7 @@ mod tests {
             "empty group must be deletable: {}",
             resp.message
         );
+        assert!(state.db.get("relay_preference:20").await.unwrap().is_none());
     }
 
     /// v1.0.4: count_rules_by_group detects rule references correctly.

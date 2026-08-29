@@ -8,8 +8,7 @@ not the v1 production deployment path.
 ## Install
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.0.0/install.sh \
-  | bash -s -- install --version v1.0.0 --public-panel-url http://203.0.113.10:18888
+curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh | bash
 ```
 
 The installer checks Linux, amd64, Debian 12, root, and systemd; downloads
@@ -18,6 +17,20 @@ each item against `SHA256SUMS`. It creates only the internal secrets required
 by the application. On a genuinely fresh install, the healthy completion
 output shows the seeded `admin` credentials once; upgrades and retained
 databases never print a default password.
+
+The bootstrap script on `main` selects the latest stable Release; all runtime
+assets still come only from that versioned GitHub Release. Select an exact RC
+or historical Release and optional local port with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh \
+  | bash -s -- v1.1.0-rc.1 --port 28888
+```
+
+Without `--public-panel-url`, the installer uses `api.ipify.org` to create
+`http://PUBLIC_IPV4:PORT`. An explicit
+`--public-panel-url https://panel.example.com` overrides that lookup without
+changing the local listen port.
 
 ## Configuration
 

@@ -3,7 +3,7 @@ import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typogr
 import { CloudUploadOutlined, LineChartOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog } from '../api/types';
+import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
 import { NodeGroupSection } from '../components/nodes/NodeGroupSection';
@@ -40,6 +40,7 @@ export default function NodeStatus() {
   const [loadFailed, setLoadFailed] = useState(false);
   const [artifactVersions, setArtifactVersions] = useState<Record<string, string>>({});
   const [panelProtocol, setPanelProtocol] = useState(0);
+  const [inboundGroupIds, setInboundGroupIds] = useState<Set<number>>(() => new Set());
   const [detailRow, setDetailRow] = useState<AnyNodeRow | null>(null);
   const [activeOperation, setActiveOperation] = useState<NodeOperation | null>(null);
   const [uninstallRow, setUninstallRow] = useState<AnyNodeRow | null>(null);
@@ -88,6 +89,12 @@ export default function NodeStatus() {
           .map((artifact) => [artifact.architecture, artifact.version as string]),
       ));
     } catch { /* ignore */ }
+    try {
+      const res = await api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups');
+      setInboundGroupIds(new Set((res.data ?? []).filter((group) => group.group_type === 'in').map((group) => group.id)));
+    } catch {
+      setInboundGroupIds(new Set());
+    }
   };
 
   const refresh = async () => {
@@ -243,6 +250,7 @@ export default function NodeStatus() {
           onLifecycle={isAdmin ? handleLifecycle : undefined}
           artifactVersions={artifactVersions}
           onDelete={isAdmin ? handleDelete : undefined}
+          showRelayPreference={isAdmin && inboundGroupIds.has(gid)}
         />
       ))}
       <NodeDetailDrawer
