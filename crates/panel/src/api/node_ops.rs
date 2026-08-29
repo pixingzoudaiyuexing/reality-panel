@@ -926,7 +926,10 @@ mod tests {
         });
         assert!(status_supports_lifecycle(Some(&compatible), Some("v1.0.0")));
         assert!(status_supports_lifecycle(Some(&compatible), Some("1.0.1")));
-        assert!(!status_supports_lifecycle(Some(&compatible), Some("1.0.0-rc.4")));
+        assert!(!status_supports_lifecycle(
+            Some(&compatible),
+            Some("1.0.0-rc.4")
+        ));
 
         let legacy_protocol = serde_json::json!({
             "config_protocol_version": CONFIG_PROTOCOL_VERSION - 1
