@@ -27,7 +27,7 @@ vi.mock('react-router-dom', () => ({
   useSearchParams: () => [new URLSearchParams(), vi.fn()],
 }));
 
-import Rules, { RULE_TABLE_SCROLL_X } from './Rules';
+import Rules, { RULE_SELECTION_COLUMN_WIDTH, RULE_TABLE_SCROLL_X } from './Rules';
 
 describe('Rules table practical layout', () => {
   it('keeps page actions in the header and search/filter in a separate toolbar', async () => {
@@ -52,8 +52,9 @@ describe('Rules table practical layout', () => {
   });
 
   it('uses a stable wide table width instead of compressing columns', () => {
-    expect(RULE_TABLE_SCROLL_X).toBe(1890);
-    expect(RULE_TABLE_SCROLL_X).toBeGreaterThan(1200);
+    expect(RULE_SELECTION_COLUMN_WIDTH).toBe(48);
+    expect(RULE_TABLE_SCROLL_X).toBe(1950);
+    expect(RULE_TABLE_SCROLL_X).toBeGreaterThan(1890 + RULE_SELECTION_COLUMN_WIDTH);
   });
 
   it('keeps long fields single-line and preserves the complete action set', async () => {

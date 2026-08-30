@@ -16,7 +16,8 @@ import { RuleDiagnosisModal } from '../components/diagnosis/RuleDiagnosisModal';
 const { Text } = Typography;
 const { TextArea } = Input;
 
-export const RULE_TABLE_SCROLL_X = 1890;
+export const RULE_SELECTION_COLUMN_WIDTH = 48;
+export const RULE_TABLE_SCROLL_X = 1950;
 
 function RuleEllipsis({ value, mono = true, tooltip = true }: { value: string; mono?: boolean; tooltip?: boolean }) {
   const content = <span className={`rp-rules-ellipsis${mono ? ' rp-mono' : ''}`} title={value}>{value}</span>;
@@ -1295,7 +1296,11 @@ export default function Rules() {
         />
       )}
       <Table
-        rowSelection={{ selectedRowKeys, onChange: (keys) => setSelectedRowKeys(keys as number[]) }}
+        rowSelection={{
+          selectedRowKeys,
+          onChange: (keys) => setSelectedRowKeys(keys as number[]),
+          columnWidth: RULE_SELECTION_COLUMN_WIDTH,
+        }}
         dataSource={visibleRules} columns={columns} rowKey="id" loading={loading}
         pagination={{ pageSize: 20 }} className="rp-rules-table" scroll={{ x: RULE_TABLE_SCROLL_X }}
       />
