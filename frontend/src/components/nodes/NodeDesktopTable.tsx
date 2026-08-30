@@ -115,12 +115,13 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
       render: (_: unknown, r: NodeDisplayRow) => {
         const arch = r.architecture === 'x86_64' ? 'amd64' : r.architecture === 'aarch64' ? 'arm64' : (r.architecture || '');
         const target = artifactVersions[arch];
-        const lifecycleReady = !!r.node_id && !!r.online && r.install_method === 'systemd';
+        const lifecycleOnline = r.lifecycle_online ?? r.online;
+        const lifecycleReady = !!r.node_id && !!lifecycleOnline && r.install_method === 'systemd';
         const protocolCompatible = r.config_protocol_version == null || panelProtocol <= 0 || r.config_protocol_version === panelProtocol;
         // Config protocol skew deliberately leaves Upgrade enabled. All other
         // lifecycle controls remain disabled until the Node reconnects on the
         // current config protocol.
-        const normalLifecycleReady = lifecycleReady && protocolCompatible;
+        const normalLifecycleReady = !!r.node_id && !!r.online && r.install_method === 'systemd' && protocolCompatible;
         const canUpgrade = lifecycleReady && !!target && target !== r.node_version;
         return (
           <span style={{ display: 'inline-flex', gap: 2 }}>

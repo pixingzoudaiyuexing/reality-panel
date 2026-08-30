@@ -516,17 +516,31 @@ async fn list_txt_records(
 
 async fn wait_for_authoritative_txt(fqdn: &str, zone_name: &str, expected: &str) -> Result<(), ()> {
     let system_resolver = TokioAsyncResolver::tokio_from_system_conf().map_err(|_| ())?;
-    let authoritative_resolvers = authoritative_resolvers(&system_resolver, zone_name).await?;
+    let authorities = authoritative_resolvers(&system_resolver, zone_name).await?;
+    let mut propagation =
+        AuthoritativePropagation::new(authorities.iter().map(|authority| authority.name.clone()));
     let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
     loop {
-        let visible = join_all(authoritative_resolvers.iter().map(|resolver| async move {
-            resolver
-                .txt_lookup(fqdn)
-                .await
-                .is_ok_and(|lookup| txt_lookup_matches(&lookup, expected))
+        let visible = join_all(authorities.iter().map(|authority| async move {
+            let endpoint_results =
+                join_all(authority.resolvers.iter().map(|resolver| async move {
+                    resolver
+                        .txt_lookup(fqdn)
+                        .await
+                        .is_ok_and(|lookup| txt_lookup_matches(&lookup, expected))
+                }))
+                .await;
+            (
+                authority.name.as_str(),
+                endpoint_results.into_iter().any(|matched| matched),
+            )
         }))
         .await;
-        if visible.iter().all(|matched| *matched) {
+        // 一个权威 NS 可能有多个地址，只要其中一个地址能权威返回目标值即可。
+        // 不要求所有 NS 在同一轮同时可见，但每个 NS 都必须在超时窗口内至少
+        // 观察到一次目标值，避免正常的分批传播被误判，同时不放宽权威覆盖。
+        propagation.observe_round(visible);
+        if propagation.complete() {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -536,20 +550,50 @@ async fn wait_for_authoritative_txt(fqdn: &str, zone_name: &str, expected: &str)
     }
 }
 
+struct AuthoritativeResolver {
+    name: String,
+    resolvers: Vec<TokioAsyncResolver>,
+}
+
+struct AuthoritativePropagation {
+    pending: HashSet<String>,
+}
+
+impl AuthoritativePropagation {
+    fn new(authorities: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            pending: authorities.into_iter().collect(),
+        }
+    }
+
+    fn observe_round<'a>(&mut self, observations: impl IntoIterator<Item = (&'a str, bool)>) {
+        for (authority, visible) in observations {
+            if visible {
+                self.pending.remove(authority);
+            }
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
 async fn authoritative_resolvers(
     system_resolver: &TokioAsyncResolver,
     zone_name: &str,
-) -> Result<Vec<TokioAsyncResolver>, ()> {
+) -> Result<Vec<AuthoritativeResolver>, ()> {
     let nameservers = system_resolver.ns_lookup(zone_name).await.map_err(|_| ())?;
-    let mut addresses = HashSet::<IpAddr>::new();
+    let mut authorities = HashMap::<String, HashSet<IpAddr>>::new();
     for nameserver in nameservers.iter() {
         let ips = system_resolver
             .lookup_ip(nameserver.0.clone())
             .await
             .map_err(|_| ())?;
-        addresses.extend(ips.iter());
+        let name = nameserver.0.to_ascii().to_ascii_lowercase();
+        authorities.entry(name).or_default().extend(ips.iter());
     }
-    if addresses.is_empty() {
+    if authorities.is_empty() || authorities.values().any(HashSet::is_empty) {
         return Err(());
     }
 
@@ -557,22 +601,30 @@ async fn authoritative_resolvers(
     options.attempts = 1;
     options.timeout = Duration::from_secs(3);
     options.recursion_desired = false;
-    Ok(addresses
+    let mut authorities = authorities
         .into_iter()
-        .map(|address| {
-            TokioAsyncResolver::tokio(
-                ResolverConfig::from_parts(
-                    None,
-                    Vec::new(),
-                    vec![NameServerConfig::new(
-                        SocketAddr::new(address, 53),
-                        Protocol::Udp,
-                    )],
-                ),
-                options.clone(),
-            )
+        .map(|(name, addresses)| AuthoritativeResolver {
+            name,
+            resolvers: addresses
+                .into_iter()
+                .map(|address| {
+                    TokioAsyncResolver::tokio(
+                        ResolverConfig::from_parts(
+                            None,
+                            Vec::new(),
+                            vec![NameServerConfig::new(
+                                SocketAddr::new(address, 53),
+                                Protocol::Udp,
+                            )],
+                        ),
+                        options.clone(),
+                    )
+                })
+                .collect(),
         })
-        .collect())
+        .collect::<Vec<_>>();
+    authorities.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(authorities)
 }
 
 fn txt_lookup_matches(lookup: &hickory_resolver::lookup::TxtLookup, expected: &str) -> bool {
@@ -693,6 +745,15 @@ mod tests {
         values: Vec<String>,
         creates: usize,
         updates: usize,
+        deletes: usize,
+    }
+
+    #[derive(Default)]
+    struct SeparateRecordProviderState {
+        host: String,
+        records: HashMap<String, String>,
+        next_id: usize,
+        creates: usize,
         deletes: usize,
     }
 
@@ -844,6 +905,107 @@ mod tests {
         (base_url, state, handle)
     }
 
+    async fn mock_separate_record_provider(
+        host: &str,
+    ) -> (
+        String,
+        Arc<AsyncMutex<SeparateRecordProviderState>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let state = Arc::new(AsyncMutex::new(SeparateRecordProviderState {
+            host: host.into(),
+            ..Default::default()
+        }));
+        let list_state = Arc::clone(&state);
+        let add_state = Arc::clone(&state);
+        let delete_state = Arc::clone(&state);
+        let router = Router::new()
+            .route(
+                "/api/domain",
+                post(|| async {
+                    Json(json!({
+                        "total": 1,
+                        "rows": [{"id": 7, "name": "example.com", "type": "cloudflare", "recordcount": 0}]
+                    }))
+                }),
+            )
+            .route(
+                "/api/domain/7",
+                post(|| async {
+                    Json(json!({
+                        "code": 0,
+                        "data": {
+                            "id": 7,
+                            "name": "example.com",
+                            "config": {"type": "cloudflare"},
+                            "recordcount": 0,
+                            "minTTL": 60,
+                            "recordLine": [{"id": "default_view", "name": "Global default", "parent": null}]
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/api/record/data/7",
+                post(move || {
+                    let state = Arc::clone(&list_state);
+                    async move {
+                        let state = state.lock().await;
+                        let mut records = state.records.iter().collect::<Vec<_>>();
+                        records.sort_by(|left, right| left.0.cmp(right.0));
+                        let rows = records
+                            .into_iter()
+                            .map(|(record_id, value)| {
+                                json!({
+                                    "RecordId": record_id,
+                                    "Domain": "example.com",
+                                    "Name": state.host,
+                                    "Type": "TXT",
+                                    "Value": value,
+                                    "Line": "default_view",
+                                    "LineName": "Global default",
+                                    "TTL": 60,
+                                    "Status": "1"
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        Json(json!({"total": rows.len(), "rows": rows}))
+                    }
+                }),
+            )
+            .route(
+                "/api/record/add/7",
+                post(move |Form(form): Form<HashMap<String, String>>| {
+                    let state = Arc::clone(&add_state);
+                    async move {
+                        let mut state = state.lock().await;
+                        state.next_id += 1;
+                        let record_id = format!("txt-{}", state.next_id);
+                        state.creates += 1;
+                        state.records.insert(record_id, form["value"].clone());
+                        Json(json!({"code": 0}))
+                    }
+                }),
+            )
+            .route(
+                "/api/record/delete/7",
+                post(move |Form(form): Form<HashMap<String, String>>| {
+                    let state = Arc::clone(&delete_state);
+                    async move {
+                        let mut state = state.lock().await;
+                        let record_id = &form["recordid"];
+                        assert!(state.records.remove(record_id).is_some());
+                        state.deletes += 1;
+                        Json(json!({"code": 0}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (base_url, state, handle)
+    }
+
     fn decode_huawei_mutation(value: &str) -> Vec<String> {
         let wrapped = if value.starts_with('"') {
             value.to_string()
@@ -905,6 +1067,27 @@ mod tests {
         assert!(!first.contains("challenge-token"));
     }
 
+    #[test]
+    fn authoritative_propagation_accumulates_each_ns_without_same_round_unanimity() {
+        let mut propagation =
+            AuthoritativePropagation::new(["ns1.example.".into(), "ns2.example.".into()]);
+        propagation.observe_round([("ns1.example.", true), ("ns2.example.", false)]);
+        assert!(!propagation.complete());
+
+        propagation.observe_round([("ns1.example.", false), ("ns2.example.", true)]);
+        assert!(propagation.complete());
+    }
+
+    #[test]
+    fn authoritative_propagation_never_ignores_a_stale_ns() {
+        let mut propagation =
+            AuthoritativePropagation::new(["ns1.example.".into(), "ns2.example.".into()]);
+        for _ in 0..20 {
+            propagation.observe_round([("ns1.example.", true), ("ns2.example.", false)]);
+        }
+        assert!(!propagation.complete());
+    }
+
     #[tokio::test]
     async fn same_sni_operations_share_a_mutex_without_blocking_other_snis() {
         let first = sni_operation("serialized.example.com").unwrap();
@@ -925,12 +1108,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_same_sni_challenges_share_txt_and_cleanup_independently() {
+    async fn huawei_rrset_contract_serializes_multi_relay_present_and_cleanup() {
         let first_value = "challenge-token-relay-a";
         let second_value = "challenge-token-relay-b";
+        let third_value = "challenge-token-relay-c";
         let sni = "concurrent.example.com";
         let (base_url, provider, handle) =
             mock_provider("_acme-challenge.concurrent", Vec::new()).await;
+        let db = test_db(&base_url).await;
+        let first = request_for("node-a", sni, first_value);
+        let second = request_for("node-b", sni, second_value);
+        let third = request_for("node-c", sni, third_value);
+        let propagation = FixedPropagation(true);
+
+        let (first_result, second_result, third_result) = tokio::join!(
+            present_with_observer(&db, 10, &first, &propagation),
+            present_with_observer(&db, 10, &second, &propagation),
+            present_with_observer(&db, 10, &third, &propagation),
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+        third_result.unwrap();
+
+        {
+            let state = provider.lock().await;
+            let mut actual = state.values.clone();
+            actual.sort();
+            let mut expected = vec![
+                first_value.to_string(),
+                second_value.to_string(),
+                third_value.to_string(),
+            ];
+            expected.sort();
+            assert_eq!(actual, expected);
+            assert_eq!((state.creates, state.updates, state.deletes), (1, 2, 0));
+        }
+
+        let (first_cleanup, second_cleanup) =
+            tokio::join!(cleanup(&db, 10, &first), cleanup(&db, 10, &second));
+        first_cleanup.unwrap();
+        second_cleanup.unwrap();
+        {
+            let state = provider.lock().await;
+            assert_eq!(state.values, [third_value]);
+        }
+        cleanup(&db, 10, &third).await.unwrap();
+        let state = provider.lock().await;
+        assert!(state.values.is_empty());
+        assert_eq!((state.creates, state.updates, state.deletes), (1, 4, 1));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn separate_record_provider_contract_keeps_multi_relay_values_independent() {
+        let first_value = "challenge-token-relay-a";
+        let second_value = "challenge-token-relay-b";
+        let sni = "separate.example.com";
+        let (base_url, provider, handle) =
+            mock_separate_record_provider("_acme-challenge.separate").await;
         let db = test_db(&base_url).await;
         let first = request_for("node-a", sni, first_value);
         let second = request_for("node-b", sni, second_value);
@@ -942,26 +1177,21 @@ mod tests {
         );
         first_result.unwrap();
         second_result.unwrap();
-
         {
             let state = provider.lock().await;
-            let mut actual = state.values.clone();
-            actual.sort();
-            let mut expected = vec![first_value.to_string(), second_value.to_string()];
-            expected.sort();
-            assert_eq!(actual, expected);
-            assert_eq!((state.creates, state.updates, state.deletes), (1, 1, 0));
+            let mut values = state.records.values().cloned().collect::<Vec<_>>();
+            values.sort();
+            assert_eq!(values, [first_value.to_string(), second_value.to_string()]);
+            assert_eq!((state.creates, state.deletes), (2, 0));
         }
 
-        cleanup(&db, 10, &first).await.unwrap();
-        {
-            let state = provider.lock().await;
-            assert_eq!(state.values, [second_value]);
-        }
-        cleanup(&db, 10, &second).await.unwrap();
+        let (first_cleanup, second_cleanup) =
+            tokio::join!(cleanup(&db, 10, &first), cleanup(&db, 10, &second));
+        first_cleanup.unwrap();
+        second_cleanup.unwrap();
         let state = provider.lock().await;
-        assert!(state.values.is_empty());
-        assert_eq!((state.creates, state.updates, state.deletes), (1, 2, 1));
+        assert!(state.records.is_empty());
+        assert_eq!((state.creates, state.deletes), (2, 2));
         handle.abort();
     }
 
@@ -1035,6 +1265,36 @@ mod tests {
         let (_, raw) = db.scan_prefix(STATE_PREFIX).await.unwrap().pop().unwrap();
         let state: ChallengeState = serde_json::from_str(&raw).unwrap();
         assert_eq!(state.cleanup_state, "CLEANED");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn active_txt_challenge_survives_panel_restart_and_cleans_from_persisted_state() {
+        let challenge = "restart-token-12345678";
+        let sni = "restart.example.com";
+        let (base_url, provider, handle) =
+            mock_provider("_acme-challenge.restart", vec!["unrelated-token".into()]).await;
+        let db = test_db(&base_url).await;
+        let request = request_for("node-restart", sni, challenge);
+
+        present_with_observer(&db, 10, &request, &FixedPropagation(true))
+            .await
+            .unwrap();
+        let (_, raw) = db.scan_prefix(STATE_PREFIX).await.unwrap().pop().unwrap();
+        let persisted: ChallengeState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted.cleanup_state, "ACTIVE");
+
+        // Panel 重启后进程内 SNI lock 不存在；cleanup 必须只依赖持久化的
+        // challenge identity/provider record identity 恢复，且不能误删其他 TXT。
+        SNI_OPERATIONS.lock().unwrap().clear();
+        cleanup(&db, 10, &request).await.unwrap();
+
+        let provider = provider.lock().await;
+        assert_eq!(provider.values, ["unrelated-token"]);
+        drop(provider);
+        let (_, raw) = db.scan_prefix(STATE_PREFIX).await.unwrap().pop().unwrap();
+        let persisted: ChallengeState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted.cleanup_state, "CLEANED");
         handle.abort();
     }
 }

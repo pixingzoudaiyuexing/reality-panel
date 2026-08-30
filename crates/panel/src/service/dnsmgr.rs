@@ -190,7 +190,7 @@ pub(crate) struct DiscoveredRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Slice 3 foundation; consumed by Slice 4 ensure_record.
+#[allow(dead_code, clippy::large_enum_variant)] // 保持发现结果的现有内部形态，不为 lint 改写状态机。
 pub(crate) enum RecordDiscovery {
     NoRecord,
     SingleMatchingRecord(DiscoveredRecord),
@@ -788,8 +788,8 @@ async fn handle_discovered_records(
             && binding.state == "BOUND"
             && binding.last_error_category.is_none()
     });
-    if !binding_is_current || updated {
-        if persist_verified_binding(
+    if (!binding_is_current || updated)
+        && persist_verified_binding(
             db,
             input,
             fqdn,
@@ -800,9 +800,8 @@ async fn handle_discovered_records(
         )
         .await
         .is_err()
-        {
-            return EnsureRecordResult::Failed(EnsureRecordFailure::Database);
-        }
+    {
+        return EnsureRecordResult::Failed(EnsureRecordFailure::Database);
     }
 
     if updated {
@@ -1140,7 +1139,12 @@ pub(crate) async fn derive_dns_desired(
     };
 
     if matches!(
-        crate::service::relay_preference::resolve_dns_target(db, rule.device_group_in).await?,
+        crate::service::relay_preference::resolve_dns_target_for_rule(
+            db,
+            rule.device_group_in,
+            Some(rule.id),
+        )
+        .await?,
         crate::service::relay_preference::RelayDnsTarget::Frozen
     ) {
         return Ok(DnsDesiredResolution::Frozen);
@@ -1164,8 +1168,12 @@ pub(crate) async fn derive_dns_desired(
     let expected_value =
         match GroupRepository::find_by_id(db, rule.device_group_in, &ResourceScope::All).await? {
             Some(group) if group.group_type == "in" => {
-                match crate::service::relay_preference::resolve_dns_target(db, rule.device_group_in)
-                    .await?
+                match crate::service::relay_preference::resolve_dns_target_for_rule(
+                    db,
+                    rule.device_group_in,
+                    Some(rule.id),
+                )
+                .await?
                 {
                     crate::service::relay_preference::RelayDnsTarget::Resolved(ip) => ip,
                     crate::service::relay_preference::RelayDnsTarget::NotSet => {
@@ -1375,6 +1383,9 @@ pub async fn schedule_rule(
     rule_id: i64,
 ) -> Result<(), crate::db::error::DbError> {
     let resolution = derive_dns_desired(db, rule_id).await?;
+    if matches!(resolution, DnsDesiredResolution::Frozen) {
+        return Ok(());
+    }
     persist_resolution(db, rule_id, resolution, true).await?;
     let settings = db
         .get(DNSMGR_CONFIG_KEY)
@@ -1580,7 +1591,7 @@ fn is_transient_failure(failure: &EnsureRecordFailure) -> bool {
 }
 
 fn public_dns_state(answers: &[Ipv4Addr], expected: Ipv4Addr) -> PublicDnsObservation {
-    if answers.iter().any(|answer| *answer == expected) {
+    if answers.contains(&expected) {
         if answers.iter().any(|answer| *answer != expected) {
             PublicDnsObservation::ExpectedPresentWithOtherAnswers
         } else {
@@ -1609,6 +1620,7 @@ async fn observe_public_dns(fqdn: &str, expected: Ipv4Addr) -> PublicDnsObservat
     public_dns_state(&answers, expected)
 }
 
+#[allow(clippy::too_many_arguments)] // 状态转移字段与持久化 CAS 参数一一对应，保持事务语义。
 async fn update_sync(
     db: &dyn Repository,
     sync: &DnsRecordSync,
@@ -3259,10 +3271,7 @@ mod tests {
             &key,
             &serde_json::to_string(&RelayPreferenceState {
                 preferred_node_id: Some("node-a".into()),
-                pending_node_id: None,
-                state: RelayPreferencePhase::Idle,
-                started_at: None,
-                last_error: None,
+                ..RelayPreferenceState::default()
             })
             .unwrap(),
         )
@@ -3291,7 +3300,7 @@ mod tests {
                 pending_node_id: Some("node-b".into()),
                 state: RelayPreferencePhase::Switching,
                 started_at: Some("2026-08-29T00:00:00Z".into()),
-                last_error: None,
+                ..RelayPreferenceState::default()
             })
             .unwrap(),
         )
@@ -3313,6 +3322,7 @@ mod tests {
                 state: RelayPreferencePhase::Failed,
                 started_at: Some("2026-08-29T00:00:00Z".into()),
                 last_error: Some("DNS_RECORD_CONFLICT".into()),
+                ..RelayPreferenceState::default()
             })
             .unwrap(),
         )

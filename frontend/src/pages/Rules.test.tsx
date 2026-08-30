@@ -1,8 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { Form } from 'antd';
-import { CamouflageFormFields, camouflageCertificateMessage, compactRealityStatus, deriveCamouflageStatus, diagnosisStateDisplay, diagnoseRuntimeStatus, DnsStatusCell, isRealityRule, ProxyProtocolFormField } from './Rules';
+import { CamouflageFormFields, DnsStatusCell, ProxyProtocolFormField } from './Rules';
 import type { NodeStatus, RealityDiagnosis, RuleDnsStatus } from '../api/types';
+import {
+  camouflageCertificateMessage,
+  compactRealityStatus,
+  deriveCamouflageStatus,
+  diagnosisStateDisplay,
+  diagnoseRuntimeStatus,
+  isRealityRule,
+} from '../utils/realityRuleStatus';
 
 // ============================================================
 // Pure-function tests for Rules.tsx helpers
@@ -151,6 +159,32 @@ describe('camouflage observed status', () => {
       .toBe('camouflageDnsMismatch');
     expect(camouflageCertificateMessage('failed', 'hard certificate failure', translate))
       .toBe('hard certificate failure');
+  });
+
+  it('keeps renewal warning usable and distinguishes failed retrying', () => {
+    const warning = deriveCamouflageStatus(rule, [node({
+      certificate_status: 'renewal_warning',
+      last_error: 'renewal will retry',
+    })]);
+    expect(warning.state).toBe('active');
+    expect(warning.activeCount).toBe(1);
+
+    const retrying = deriveCamouflageStatus(rule, [node({
+      site_status: 'failed_retrying',
+      certificate_status: 'failed_retrying',
+      last_error: 'issuance will retry',
+    }, { active_listener_rule_ids: [] })]);
+    expect(retrying.state).toBe('failed');
+    expect(retrying.activeCount).toBe(0);
+  });
+
+  it('treats unknown camouflage status strings as not active', () => {
+    const result = deriveCamouflageStatus(rule, [node({
+      site_status: 'future_site_state',
+      certificate_status: 'future_certificate_state',
+    })]);
+    expect(result.state).not.toBe('active');
+    expect(result.activeCount).toBe(0);
   });
 
   it('returns unknown when no Relay has useful observed state', () => {
@@ -316,6 +350,7 @@ describe('Reality rule controls and compact status', () => {
 
 describe('diagnosis runtime status', () => {
   const reality = (overrides: Partial<RealityDiagnosis> = {}): RealityDiagnosis => ({
+    convergence: { check: { state: 'pass' }, desired_sni: 'op1.example.com', active_sni: 'op1.example.com', desired_config_revision: 1, active_config_revision: 1, desired_fingerprint: 'a'.repeat(64), active_fingerprint: 'a'.repeat(64) },
     config: { check: { state: 'pass' }, listen_port: 443, sni: 'op1.example.com', targets: ['192.0.2.1:443'], send_proxy_protocol: true },
     nginx: { check: { state: 'pass' }, plan_contains_rule: true, mapping_matches: true, managed_file_matches: true, config_valid: true, service_healthy: true },
     runtime: { check: { state: 'pass' }, listen_443: true, listen_8443: true },

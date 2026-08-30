@@ -19,8 +19,10 @@ Requires: the panel/node binaries already built (cargo build).
 
 import json
 import os
+import re
 import socket
 import socketserver
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -40,6 +42,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PANEL_BIN = os.path.join(PROJECT_ROOT, "target", "debug", "relay-panel.exe")
 NODE_BIN = os.path.join(PROJECT_ROOT, "target", "debug", "relay-node.exe")
 DB_PATH = os.path.join(PROJECT_ROOT, "data.db")
+PROTOCOL_SOURCE = os.path.join(PROJECT_ROOT, "crates", "shared", "src", "protocol.rs")
 
 # Test topology
 TCP_LISTEN_PORT = 19999
@@ -105,6 +108,13 @@ def wait_for_port(host, port, timeout=30):
     return False
 
 
+def current_config_protocol_version():
+    with open(PROTOCOL_SOURCE, encoding="utf-8") as source:
+        match = re.search(r"CONFIG_PROTOCOL_VERSION:\s*u32\s*=\s*(\d+)", source.read())
+    assert match, "CONFIG_PROTOCOL_VERSION constant not found"
+    return match.group(1)
+
+
 def tcp_roundtrip(port, payload):
     with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
         s.sendall(payload)
@@ -132,8 +142,14 @@ def main():
 
     start_echo_servers()
 
-    panel_env = dict(os.environ, LISTEN="127.0.0.1:18888", RUST_LOG="info",
-                     REGISTRATION_ENABLED="1")
+    panel_env = dict(
+        os.environ,
+        LISTEN="127.0.0.1:18888",
+        RUST_LOG="info",
+        REGISTRATION_ENABLED="1",
+        # 仅用于隔离的本地 E2E 进程。生产启动必须继续拒绝空值和默认占位值。
+        JWT_SECRET="e2e-only-jwt-secret-0123456789abcdef0123456789abcdef",
+    )
     panel = subprocess.Popen([PANEL_BIN], env=panel_env,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     node = None
@@ -188,7 +204,15 @@ def main():
         })
         in_g1_id = in_g1["data"]["id"]
         out_g1_id = out_g1["data"]["id"]
-        in_g1_token = in_g1["data"]["token"]
+        # 管理 API 按安全契约不返回永久 group token。这个 harness 拥有并在
+        # 结束时删除自己的本地 SQLite fixture，因此直接读取 fixture 只用于
+        # 启动测试 Node，不为产品增加第二条 token 暴露路径。
+        with sqlite3.connect(DB_PATH) as fixture_db:
+            row = fixture_db.execute(
+                "SELECT token FROM device_groups WHERE id = ?", (in_g1_id,)
+            ).fetchone()
+        assert row and row[0], "local fixture did not persist the inbound group token"
+        in_g1_token = row[0]
 
         # Verify group uid came from token (admin = uid 1)
         assert in_g1["data"]["uid"] == admin_uid, \
@@ -246,7 +270,9 @@ def main():
         #     token check returns empty). This confirms the gate is before the
         #     token check but both work.
         with_auth = api("GET", "/node/config", token=in_g1_token,
-                        extra_headers={"X-Config-Protocol-Version": "4"})
+                        extra_headers={
+                            "X-Config-Protocol-Version": current_config_protocol_version()
+                        })
         assert with_auth["listeners"] != [], \
             "config pull with valid header + token should return listeners"
         print("[ok] config pull with valid header + token returns listeners")

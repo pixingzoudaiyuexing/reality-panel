@@ -5,8 +5,9 @@
  * `latest_node_version`, NOT the panel version), plus a failed-check flag,
  * return the upgrade state.
  *
- * 核心不变量：配置协议不兼容不能阻断一键升级。只要 Node 比最新工件旧、在线且
- * 为 systemd 托管，就仍然返回 `upgradeable`；协议不兼容只阻断配置/普通控制能力。
+ * 核心不变量：配置协议不兼容不能阻断一键升级。只要 Node 比最新工件旧、
+ * Lifecycle 通道在线且为 systemd 托管，就仍然返回 `upgradeable`；协议不兼容只
+ * 阻断配置/普通控制能力。
  */
 import type { NodeDisplayRow } from '../../api/types';
 import { versionRelation } from '../../utils/version';
@@ -53,8 +54,10 @@ export function resolveNodeUpgrade(
   if (rel === 'behind') {
     if (row.install_method === 'docker') return { state: 'docker' };
     if (row.install_method !== 'systemd') return { state: 'manual' };
-    // 即使 config protocol 不匹配，也必须保留在线 systemd Node 的升级入口。
-    return { state: row.online ? 'upgradeable' : 'offline' };
+    // Older payloads have no lifecycle_online field; preserve their established
+    // online fallback while current Panels publish the authoritative WS state.
+    const lifecycleOnline = row.lifecycle_online ?? row.online;
+    return { state: lifecycleOnline ? 'upgradeable' : 'offline' };
   }
 
   // 没有更高版本可升时，协议不兼容仍应明确提示，而不是错误显示“已最新”。

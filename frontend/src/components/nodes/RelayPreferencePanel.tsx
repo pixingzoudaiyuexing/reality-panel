@@ -42,12 +42,16 @@ function switchErrorLabel(error: string | null, t: Tfn): string {
     DNS_RECORD_CONFLICT: 'relaySwitchErrorRecordConflict',
     TARGET_STATUS_UNAVAILABLE: 'relaySwitchErrorTargetStatus',
     TARGET_PUBLIC_IPV4_UNAVAILABLE: 'relaySwitchErrorTargetIpv4',
+    TARGET_PUBLIC_IPV4_CHANGED: 'relaySwitchErrorTargetIpv4Changed',
     TARGET_NOT_READY_AFTER_DNS: 'relaySwitchErrorTargetNotReady',
     DNS_SCHEDULING_FAILED: 'relaySwitchErrorScheduling',
     MUTATION_OUTCOME_UNKNOWN: 'relaySwitchErrorMutationUnknown',
     DISABLED: 'relaySwitchErrorDisabled',
     NO_ELIGIBLE_DNS_RULES: 'relaySwitchErrorNoRules',
     PENDING_NODE_MISSING: 'relaySwitchErrorPendingMissing',
+    ROLLBACK_SCHEDULING_FAILED: 'relaySwitchErrorRollbackScheduling',
+    ROLLBACK_RULE_NOT_ELIGIBLE: 'relaySwitchErrorRollbackRule',
+    ROLLBACK_VALUE_UNAVAILABLE: 'relaySwitchErrorRollbackValue',
   };
   const key = labels[error];
   return key ? t(key) : error;
@@ -67,12 +71,12 @@ function requestErrorLabel(error: unknown, t: Tfn): string {
 
 function actionLabel(view: RelayPreferenceView, node: RelayReadyNode, t: Tfn): string {
   if (!node.ready) return t('relayPreferenceUnavailable');
-  if (view.state === 'switching') {
+  if (view.state === 'switching' || view.state === 'rolling_back') {
     return node.node_id === view.pending_node_id
       ? t('relayPreferenceSwitching')
       : t('relayPreferenceSwitchLocked');
   }
-  if (view.state === 'failed') {
+  if (view.state.startsWith('failed')) {
     if (node.node_id === view.pending_node_id) return t('relayPreferenceRetry');
     if (node.node_id === view.preferred_node_id) return t('relayPreferenceReconfirm');
   }
@@ -114,7 +118,7 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
   }, [load]);
 
   useEffect(() => {
-    if (view?.state !== 'switching') return;
+    if (view?.state !== 'switching' && view?.state !== 'rolling_back') return;
     const timer = window.setInterval(() => void load(), 5000);
     return () => window.clearInterval(timer);
   }, [load, view?.state]);
@@ -176,6 +180,33 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
           description={t('relayPreferenceSwitchingHint')}
         />
       ) : null}
+      {view?.state === 'rolling_back' ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 10 }}
+          title={t('relayPreferenceRollingBack')}
+          description={`${t('relayPreferenceRollingBackHint')} · ${switchErrorLabel(view.last_error, t)}`}
+        />
+      ) : null}
+      {view?.state === 'failed_rolled_back' ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 10 }}
+          title={t('relayPreferenceRolledBack')}
+          description={`${t('relayPreferenceLastTarget')}: ${view.pending_node_id ?? '-'} · ${switchErrorLabel(view.last_error, t)}`}
+        />
+      ) : null}
+      {view?.state === 'failed_manual_intervention' ? (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 10 }}
+          title={t('relayPreferenceManualIntervention')}
+          description={`${switchErrorLabel(view.last_error, t)} · ${switchErrorLabel(view.rollback_error, t)}`}
+        />
+      ) : null}
       {view?.state === 'failed' ? (
         <Alert
           type="error"
@@ -186,12 +217,45 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
         />
       ) : null}
 
+      {view && view.state !== 'idle' && (view.dns_records ?? []).length > 0 ? (
+        <div data-testid="relay-preference-dns-records" style={{ marginBottom: 10 }}>
+          <Text strong>{t('relayPreferenceDnsRecords')}</Text>
+          {(view.dns_records ?? []).map((record) => {
+            const positionLabel = record.position === 'rollback'
+              ? t('relayPreferenceDnsAtPrevious')
+              : record.position === 'target'
+                ? t('relayPreferenceDnsAtTarget')
+                : t('relayPreferenceDnsUnknown');
+            const value = record.position === 'rollback'
+              ? record.rollback_value
+              : record.position === 'target'
+                ? record.target_value
+                : record.expected_value;
+            return (
+              <div
+                key={record.rule_id}
+                data-testid={`relay-dns-record-${record.rule_id}`}
+                style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '6px 0', borderBottom: '1px solid var(--rp-border)' }}
+              >
+                <Text code>{record.fqdn}</Text>
+                <Tag color={record.position === 'rollback' ? 'green' : record.position === 'target' ? 'orange' : 'red'}>
+                  {positionLabel}
+                </Tag>
+                <Text type="secondary" className="rp-mono">{value ?? '-'}</Text>
+                <Text type="secondary">{record.sync_state ?? '-'}</Text>
+                {record.last_error ? <Text type="danger">{record.last_error}</Text> : null}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+
       {view && view.nodes.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('relayPreferenceNoNodes')} /> : null}
       {view && view.nodes.length > 0 ? (
         <div>
           {view.nodes.map((node) => {
             const isIdlePreferred = view.state === 'idle' && node.node_id === view.preferred_node_id;
-            const disabled = busy || !node.ready || view.state === 'switching';
+            const disabled = busy || !node.ready || view.state === 'switching' || view.state === 'rolling_back';
             return (
               <div
                 key={node.node_id}
@@ -213,7 +277,7 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
                     <Tag color={node.ready ? 'green' : 'red'}>{node.ready ? t('relayReady') : t('relayNotReady')}</Tag>
                     {node.node_id === view.preferred_node_id ? <Tag color="blue">{t('relayPreferenceCurrent')}</Tag> : null}
                     {node.node_id === view.pending_node_id ? (
-                      <Tag color={view.state === 'switching' ? 'processing' : 'error'}>
+                      <Tag color={view.state === 'switching' || view.state === 'rolling_back' ? 'processing' : 'error'}>
                         {view.state === 'switching' ? t('relayPreferencePending') : t('relayPreferenceLastTarget')}
                       </Tag>
                     ) : null}

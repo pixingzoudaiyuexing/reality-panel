@@ -26,10 +26,12 @@
 use crate::config::NodeConfig;
 use crate::forwarder::camouflage_site::{CamouflageSite, CamouflageSiteManager};
 use crate::forwarder::ForwarderManager;
+use crate::reconciler::Reconciler;
 use relay_shared::protocol::{
     DiagnoseResult, DiagnoseTargetResult, RealityBackendDiagnosis, RealityCamouflageDiagnosis,
-    RealityCertificateDiagnosis, RealityCheck, RealityConfigDiagnosis, RealityDiagnosis,
-    RealityFallbackDiagnosis, RealityNginxDiagnosis, RealityRuntimeDiagnosis, TargetProbeOutcome,
+    RealityCertificateDiagnosis, RealityCheck, RealityConfigDiagnosis, RealityConvergenceDiagnosis,
+    RealityDiagnosis, RealityFallbackDiagnosis, RealityNginxDiagnosis, RealityRuntimeDiagnosis,
+    TargetProbeOutcome,
 };
 use std::fs;
 use std::process::Command;
@@ -50,16 +52,32 @@ const MAX_TARGETS: usize = 32;
 /// `challenge` is the opaque per-run string the panel sent in the probe; we
 /// MUST echo it back verbatim in DiagnoseResult.challenge or the panel rejects
 /// the result (v0.4.9 secure-diagnose protocol).
+#[allow(clippy::too_many_arguments)] // 诊断请求绑定字段保持显式，避免改变现有安全调用链。
 pub async fn run_and_report(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    reconciler: &Arc<Mutex<Reconciler>>,
     config: &NodeConfig,
     node_id: &str,
     request_id: String,
     rule_id: i64,
+    desired_sni: Option<String>,
+    desired_config_revision: u64,
+    desired_fingerprint: String,
     challenge: String,
 ) {
-    let result = diagnose(manager, camouflage, &request_id, rule_id, challenge).await;
+    let result = diagnose(
+        manager,
+        camouflage,
+        reconciler,
+        &request_id,
+        rule_id,
+        desired_sni,
+        desired_config_revision,
+        desired_fingerprint,
+        challenge,
+    )
+    .await;
     let mut result = result;
     result.node_id = node_id.to_string();
     if let Err(e) = report(config, result).await {
@@ -68,11 +86,16 @@ pub async fn run_and_report(
 }
 
 /// Build the DiagnoseResult for a rule (probe targets, capture listener state).
+#[allow(clippy::too_many_arguments)] // 参数逐项对应 wire identity，rc.7 不引入包装结构。
 async fn diagnose(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    reconciler: &Arc<Mutex<Reconciler>>,
     request_id: &str,
     rule_id: i64,
+    desired_sni: Option<String>,
+    desired_config_revision: u64,
+    desired_fingerprint: String,
     challenge: String,
 ) -> DiagnoseResult {
     // v0.4.9: select the rule's TCP listener explicitly. For a tcp_udp rule
@@ -103,8 +126,22 @@ async fn diagnose(
         // diagnosis never retains the shared camouflage state mutex.
         let camouflage = camouflage.lock().await.clone();
         let manager = manager.lock().await;
-        let mut diagnosis =
-            build_reality_diagnosis(&manager, config.as_ref(), &listener, &camouflage);
+        let active_revision = reconciler
+            .lock()
+            .await
+            .status_snapshot()
+            .applied_config_revision
+            .unwrap_or_default();
+        let mut diagnosis = build_reality_diagnosis(
+            &manager,
+            config.as_ref(),
+            &listener,
+            &camouflage,
+            desired_sni.as_deref(),
+            desired_config_revision,
+            &desired_fingerprint,
+            active_revision,
+        );
         drop(manager);
         diagnosis.backends = reality_backend_results(&listener.targets).await;
         if let Some(sni) = diagnosis.config.sni.as_deref() {
@@ -152,6 +189,17 @@ async fn diagnose(
         request_id: request_id.to_string(),
         rule_id,
         node_id: String::new(), // filled by caller
+        diagnosed_sni: reality
+            .as_ref()
+            .and_then(|d| d.convergence.active_sni.clone()),
+        config_revision: reality
+            .as_ref()
+            .map(|d| d.convergence.active_config_revision)
+            .unwrap_or_default(),
+        config_fingerprint: reality
+            .as_ref()
+            .map(|d| d.convergence.active_fingerprint.clone())
+            .unwrap_or_default(),
         // Echoed back verbatim; the panel rejects the result without an exact
         // match (v0.4.9 secure-diagnose challenge).
         challenge,
@@ -171,11 +219,16 @@ fn check(state: &str, detail: impl Into<String>) -> RealityCheck {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // desired/effective identity 必须独立传入以防旧状态误判。
 fn build_reality_diagnosis(
     manager: &ForwarderManager,
     config: Option<&relay_shared::protocol::NodeConfigResponse>,
     listener: &relay_shared::protocol::ListenerConfig,
     camouflage: &CamouflageSiteManager,
+    desired_sni: Option<&str>,
+    desired_config_revision: u64,
+    desired_fingerprint: &str,
+    active_config_revision: u64,
 ) -> RealityDiagnosis {
     let sni = listener.sni.clone().filter(|s| !s.trim().is_empty());
     let config_ok = sni.is_some() && !listener.targets.is_empty() && listener.port > 0;
@@ -255,6 +308,38 @@ fn build_reality_diagnosis(
     let (certificate, camouflage_status) =
         certificate_and_camouflage(camouflage, sni.as_deref(), site.as_ref());
     RealityDiagnosis {
+        convergence: RealityConvergenceDiagnosis {
+            check: if desired_config_revision > 0
+                && desired_sni == sni.as_deref()
+                && desired_config_revision == active_config_revision
+                && !desired_fingerprint.is_empty()
+                && config
+                    .map(|value| {
+                        relay_shared::reconciliation::config_fingerprint(value).as_str()
+                            == desired_fingerprint
+                    })
+                    .unwrap_or(false)
+            {
+                check(
+                    "pass",
+                    "active rule matches current desired SNI and config revision",
+                )
+            } else {
+                check(
+                    "fail",
+                    "active rule does not match current desired configuration",
+                )
+            },
+            desired_sni: desired_sni.map(str::to_string),
+            active_sni: sni.clone(),
+            desired_config_revision,
+            active_config_revision,
+            desired_fingerprint: desired_fingerprint.to_string(),
+            active_fingerprint: config
+                .map(relay_shared::reconciliation::config_fingerprint)
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_default(),
+        },
         config: RealityConfigDiagnosis {
             check: config_status,
             listen_port: listener.port,
@@ -362,8 +447,10 @@ fn certificate_and_camouflage(
         remaining_days,
         cert_error,
     ) = inspect_certificate(site.as_ref(), sni.unwrap_or_default());
-    let cert_ok = status.certificate_status == "active"
-        && san_match
+    let cert_ok = matches!(
+        status.certificate_status.as_str(),
+        "active" | "renewal_warning"
+    ) && san_match
         && cert_key_match
         && cert_error.is_none();
     let renewal = renewal_diagnosis(&status);
@@ -407,11 +494,11 @@ fn certificate_and_camouflage(
 
 fn renewal_diagnosis(status: &relay_shared::protocol::CamouflageSiteStatus) -> RealityCheck {
     match status.certificate_status.as_str() {
-        "active" => match status.last_error.as_deref() {
+        "active" | "renewal_warning" => match status.last_error.as_deref() {
             Some(error) => check("warning", error),
             None => check("pass", "no renewal warning reported"),
         },
-        "failed" => check(
+        "failed" | "failed_retrying" => check(
             "fail",
             status
                 .last_error
@@ -422,6 +509,7 @@ fn renewal_diagnosis(status: &relay_shared::protocol::CamouflageSiteStatus) -> R
     }
 }
 
+#[allow(clippy::type_complexity)] // 返回项直接映射公开 diagnosis 字段，避免 lint 改动 wire 类型。
 fn inspect_certificate(
     site: Option<&CamouflageSite>,
     domain: &str,
@@ -455,7 +543,11 @@ fn inspect_certificate(
         let (_, cert) = x509_parser::prelude::X509Certificate::from_der(&pem.contents).ok()?;
         let san_match = cert.subject_alternative_name().ok().flatten().is_some_and(|san| {
             san.value.general_names.iter().any(|name| {
-                matches!(name, x509_parser::extensions::GeneralName::DNSName(value) if *value == domain)
+                matches!(
+                    name,
+                    x509_parser::extensions::GeneralName::DNSName(value)
+                        if relay_shared::reconciliation::certificate_domain_covers_sni(value, domain)
+                )
             })
         });
         let issuer = cert.issuer().to_string();
@@ -590,6 +682,99 @@ async fn report(config: &NodeConfig, result: DiagnoseResult) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forwarder::camouflage_site::{
+        CamouflageSiteConfig, CamouflageSitesManifest, CertificateReference, OPENLIST_BACKEND,
+    };
+    use crate::forwarder::certificate_lifecycle::CertificateLifecycleConfig;
+    use crate::forwarder::nginx_sni::NginxSniConfig;
+    use relay_shared::protocol::{
+        AcmeChallengeMethod, CamouflageCertificatePolicy, CamouflageLocalBackend,
+        CamouflageSiteDesired,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    fn diagnosis_test_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "relay-node-diagnosis-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn diagnosis_certificate(
+        dir: &std::path::Path,
+        name: &str,
+        san: &str,
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> CertificateReference {
+        use rcgen::{CertificateParams, KeyPair};
+        std::fs::create_dir_all(dir).unwrap();
+        let mut params = CertificateParams::new(vec![san.to_string()]).unwrap();
+        params.not_before = not_before;
+        params.not_after = not_after;
+        let key = KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        let cert_path = dir.join(format!("{name}.crt"));
+        let key_path = dir.join(format!("{name}.key"));
+        std::fs::write(&cert_path, certificate.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        CertificateReference {
+            cert_path,
+            key_path,
+            lifecycle: None,
+        }
+    }
+
+    fn diagnosis_manager(
+        dir: &std::path::Path,
+        certificate: CertificateReference,
+    ) -> (CamouflageSiteManager, CamouflageSiteDesired) {
+        let mut manager = CamouflageSiteManager::new(CamouflageSiteConfig {
+            enabled: false,
+            manifest_path: dir.join("source.json"),
+            state_dir: dir.join("state"),
+            nginx: NginxSniConfig {
+                enabled: false,
+                conf_path: dir.join("camouflage.conf"),
+                test_cmd: "true".into(),
+                reload_cmd: "true".into(),
+                default_backend: "127.0.0.1:9".into(),
+                access_log_path: dir.join("camouflage.log").display().to_string(),
+            },
+            certificate_lifecycle: CertificateLifecycleConfig::disabled_for_test(dir),
+        });
+        assert!(manager.apply_candidate(CamouflageSitesManifest {
+            sites: vec![CamouflageSite {
+                id: "q1".into(),
+                sni: "q1.example.com".into(),
+                tls_listener_port: 8443,
+                local_backend: OPENLIST_BACKEND.into(),
+                certificate,
+            }],
+        }));
+        let desired = CamouflageSiteDesired {
+            site_id: "q1".into(),
+            sni: "q1.example.com".into(),
+            tls_listener_port: 8443,
+            local_backend: CamouflageLocalBackend::OpenList,
+            certificate: CamouflageCertificatePolicy {
+                domain: "q1.example.com".into(),
+                expected_public_ip: "192.0.2.10".into(),
+                renew_before_days: 30,
+                challenge_method: AcmeChallengeMethod::Dns01,
+            },
+            enabled: true,
+        };
+        manager.prepare_desired(std::slice::from_ref(&desired), true);
+        manager.record_renewal_warning_for_test("q1", "renewal failed");
+        (manager, desired)
+    }
 
     #[test]
     fn target_probe_outcome_serializes_snake_case() {
@@ -651,7 +836,7 @@ mod tests {
             site_id: "op1".into(),
             sni: "op1.example.com".into(),
             site_status: "active".into(),
-            certificate_status: "active".into(),
+            certificate_status: "renewal_warning".into(),
             issuer: None,
             valid_from: None,
             valid_until: None,
@@ -666,6 +851,111 @@ mod tests {
             renewal.detail.as_deref(),
             Some("renewal failed; will retry")
         );
+    }
+
+    #[test]
+    fn renewal_warning_diagnosis_rejects_invalid_certificate_counterexamples() {
+        use time::{Duration as TimeDuration, OffsetDateTime};
+
+        let dir = diagnosis_test_dir("renewal-warning-strict");
+        let now = OffsetDateTime::now_utc();
+        let valid = diagnosis_certificate(
+            &dir,
+            "valid",
+            "q1.example.com",
+            now - TimeDuration::days(1),
+            now + TimeDuration::days(90),
+        );
+        let mut key_mismatch = diagnosis_certificate(
+            &dir,
+            "key-mismatch",
+            "q1.example.com",
+            now - TimeDuration::days(1),
+            now + TimeDuration::days(90),
+        );
+        key_mismatch.key_path = valid.key_path;
+        let cases = vec![
+            diagnosis_certificate(
+                &dir,
+                "expired",
+                "q1.example.com",
+                now - TimeDuration::days(10),
+                now - TimeDuration::days(1),
+            ),
+            diagnosis_certificate(
+                &dir,
+                "san-mismatch",
+                "other.example.com",
+                now - TimeDuration::days(1),
+                now + TimeDuration::days(90),
+            ),
+            key_mismatch,
+            diagnosis_certificate(
+                &dir,
+                "not-yet-valid",
+                "q1.example.com",
+                now + TimeDuration::days(1),
+                now + TimeDuration::days(90),
+            ),
+        ];
+
+        for certificate in cases {
+            let case_dir = diagnosis_test_dir("renewal-warning-case");
+            let (manager, desired) = diagnosis_manager(&case_dir, certificate);
+            assert_eq!(
+                manager.status_snapshot()[0].certificate_status,
+                "renewal_warning"
+            );
+            let (certificate, _) =
+                certificate_and_camouflage(&manager, Some("q1.example.com"), Some(&desired));
+            assert_eq!(certificate.check.state, "fail");
+            std::fs::remove_dir_all(case_dir).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn diagnosis_san_matching_uses_shared_wildcard_semantics() {
+        use time::{Duration as TimeDuration, OffsetDateTime};
+
+        let dir = diagnosis_test_dir("san-matching");
+        let now = OffsetDateTime::now_utc();
+        let cases = [
+            ("wildcard", "*.example.com", "q1.example.com", true),
+            ("exact", "q1.example.com", "q1.example.com", true),
+            ("apex", "*.example.com", "example.com", false),
+            (
+                "multiple-labels",
+                "*.example.com",
+                "deep.q1.example.com",
+                false,
+            ),
+            ("wrong-domain", "*.example.net", "q1.example.com", false),
+        ];
+
+        for (name, san, sni, expected) in cases {
+            let certificate = diagnosis_certificate(
+                &dir,
+                name,
+                san,
+                now - TimeDuration::days(1),
+                now + TimeDuration::days(90),
+            );
+            let site = CamouflageSite {
+                id: name.into(),
+                sni: sni.into(),
+                tls_listener_port: 8443,
+                local_backend: OPENLIST_BACKEND.into(),
+                certificate,
+            };
+            let (_, _, san_match, key_match, _, _, _, error) =
+                inspect_certificate(Some(&site), sni);
+            assert_eq!(san_match, expected, "SAN {san} against SNI {sni}");
+            assert!(key_match, "generated certificate and key must match");
+            assert_eq!(error.is_none(), expected, "SAN {san} against SNI {sni}");
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

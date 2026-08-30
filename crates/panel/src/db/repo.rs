@@ -819,6 +819,7 @@ pub struct NewDnsRecordSync {
     pub updated_at: String,
 }
 
+#[allow(clippy::too_many_arguments)] // Repository 参数顺序是 SQLite/PG 共享契约，本次不改 API。
 #[async_trait]
 pub trait DnsRecordSyncRepository: Send + Sync {
     async fn insert_dns_record_sync(&self, sync: &NewDnsRecordSync) -> Result<(), DbError>;

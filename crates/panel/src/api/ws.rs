@@ -12,7 +12,7 @@ use relay_shared::control_protocol::{
     legacy_node_supports_lifecycle, lifecycle_protocol_versions_compatible,
     LIFECYCLE_PROTOCOL_VERSION,
 };
-use relay_shared::protocol::NodeConfigResponse;
+use relay_shared::protocol::NodeConfigSnapshot;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -67,7 +67,7 @@ impl NodeConnections {
             .await
     }
 
-    async fn register_with_capabilities(
+    pub(crate) async fn register_with_capabilities(
         &self,
         group_id: i64,
         node_id: Option<String>,
@@ -218,6 +218,44 @@ impl NodeConnections {
             .await
             .get(&group_id)
             .map(|conns| conns.values().filter_map(|e| e.node_id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Node identities with a currently live Lifecycle-compatible channel.
+    /// This capability is independent of ordinary status freshness and config
+    /// protocol compatibility so an upgrade-only node can still be upgraded.
+    pub async fn lifecycle_online_node_ids(
+        &self,
+        group_id: i64,
+    ) -> std::collections::HashSet<String> {
+        self.inner
+            .read()
+            .await
+            .get(&group_id)
+            .map(|conns| {
+                conns
+                    .values()
+                    .filter(|entry| entry.lifecycle_capable && !entry.tx.is_closed())
+                    .filter_map(|entry| entry.node_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Node identities whose live channel accepts ordinary config-bound
+    /// lifecycle commands. Upgrade-only connections are deliberately absent.
+    pub async fn config_online_node_ids(&self, group_id: i64) -> std::collections::HashSet<String> {
+        self.inner
+            .read()
+            .await
+            .get(&group_id)
+            .map(|conns| {
+                conns
+                    .values()
+                    .filter(|entry| entry.config_compatible && !entry.tx.is_closed())
+                    .filter_map(|entry| entry.node_id.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -422,7 +460,12 @@ async fn handle_node_ws(
     let (mut sender, mut receiver) = socket.split();
     let lifecycle_node_id = node_id.clone();
     let (conn_id, mut push_rx) = node_connections
-        .register_with_capabilities(group_id, node_id, config_compatible, lifecycle_capable)
+        .register_with_capabilities(
+            group_id,
+            node_id.clone(),
+            config_compatible,
+            lifecycle_capable,
+        )
         .await;
     if let Some(node_id) = lifecycle_node_id.as_deref() {
         for operation in node_operations.connected(
@@ -439,7 +482,9 @@ async fn handle_node_ws(
     // immediately, without waiting for the first HTTP poll. None (DB error) →
     // skip the push; the node will get its config on the next HTTP poll.
     if config_compatible {
-        if let Some(config) = build_config_snapshot(db.as_ref(), group_id).await {
+        if let Some(config) =
+            build_config_snapshot_for_node(db.as_ref(), group_id, node_id.as_deref()).await
+        {
             if let Ok(config_json) = serde_json::to_string(&config) {
                 let _ = sender.send(Message::Text(config_json.into())).await;
             }
@@ -522,10 +567,11 @@ async fn handle_node_ws(
     }
 }
 
-pub(crate) async fn build_config_snapshot(
+pub(crate) async fn build_config_snapshot_for_node(
     db: &dyn crate::db::Repository,
     group_id: i64,
-) -> Option<NodeConfigResponse> {
+    node_id: Option<&str>,
+) -> Option<NodeConfigSnapshot> {
     // v0.3.6: delegate to the shared `build_node_config` (same function
     // `get_config` uses). This fixes the v0.3.5 drift where the WS path queried
     // forward_rules WITHOUT joining users, so a reconnecting node could be
@@ -536,7 +582,9 @@ pub(crate) async fn build_config_snapshot(
     // Returns None on DB error so the caller skips the snapshot push (rather
     // than pushing an empty config that would incorrectly tear down the node's
     // listeners). An empty Ok is a legitimate "no rules" snapshot.
-    match crate::service::node_config::build_node_config(db, group_id).await {
+    match crate::service::node_config::build_node_config_snapshot_for_node(db, group_id, node_id)
+        .await
+    {
         Ok(cfg) => Some(cfg),
         Err(e) => {
             tracing::error!(
@@ -728,8 +776,24 @@ mod tests {
         assert_eq!(conns.send_upgrade_node(1, "old-node", "upgrade").await, 1);
         assert_eq!(old_rx.recv().await.as_deref(), Some("upgrade"));
 
-        // It remains an authenticated online node so the UI can offer Upgrade.
-        assert!(conns.online_node_ids(1).await.contains("old-node"));
+        assert!(conns
+            .lifecycle_online_node_ids(1)
+            .await
+            .contains("old-node"));
+        assert!(!conns.config_online_node_ids(1).await.contains("old-node"));
+        assert!(conns
+            .config_online_node_ids(1)
+            .await
+            .contains("current-node"));
+
+        drop(old_rx);
+        assert!(
+            !conns
+                .lifecycle_online_node_ids(1)
+                .await
+                .contains("old-node"),
+            "a closed Lifecycle channel must immediately lose Upgrade capability"
+        );
     }
 
     #[test]

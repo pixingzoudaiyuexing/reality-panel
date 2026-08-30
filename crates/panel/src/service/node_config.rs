@@ -22,9 +22,21 @@ use crate::db::Repository;
 use relay_shared::models::{DeviceGroup, ForwardRule};
 use relay_shared::protocol::{
     validate_proxy_protocol_invariants, AcmeChallengeMethod, CamouflageCertificatePolicy,
-    CamouflageLocalBackend, CamouflageSiteDesired, NodeConfigResponse,
+    CamouflageLocalBackend, CamouflageSiteDesired, NodeConfigResponse, NodeConfigSnapshot,
 };
+use relay_shared::reconciliation::certificate_domain_covers_sni;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
+
+const REVISION_PREFIX: &str = "node_config_revision:";
+static CONFIG_BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedConfigRevision {
+    revision: u64,
+    fingerprint: String,
+}
 
 #[derive(Debug)]
 pub enum NodeConfigBuildError {
@@ -70,9 +82,21 @@ impl From<DbError> for NodeConfigBuildError {
 ///
 /// Returns `Ok(empty)` only for an existing inbound group with no matching
 /// rules. Any other state is an explicit error.
+#[cfg(test)]
 pub async fn build_node_config(
     db: &dyn Repository,
     group_id: i64,
+) -> Result<NodeConfigResponse, NodeConfigBuildError> {
+    build_node_config_for_node(db, group_id, None).await
+}
+
+/// Build a config for one concrete Relay.  Inbound camouflage certificate
+/// ownership is node-local, so a multi-Relay group must never inherit another
+/// node's `connect_host` as its expected public IP.
+pub async fn build_node_config_for_node(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: Option<&str>,
 ) -> Result<NodeConfigResponse, NodeConfigBuildError> {
     // 1. Group + "in" gate. Non-`in` groups (out / monitor / chained_outbound)
     //    never receive listeners — they are egress/observation only.
@@ -160,16 +184,18 @@ pub async fn build_node_config(
             if let Some(sni) = camouflage_sni {
                 let certificate_domain =
                     certificate_domain_for_rule(db, effective_rule.id, &sni).await?;
+                let expected_public_ip =
+                    expected_camouflage_public_ipv4(db, &group, node_id).await?;
                 camouflage_by_sni
                     .entry(sni.clone())
                     .or_insert_with(|| CamouflageSiteDesired {
-                        site_id: sni.replace('.', "_"),
+                        site_id: relay_shared::reconciliation::stable_camouflage_site_id(&sni),
                         sni: sni.clone(),
                         tls_listener_port: 8443,
                         local_backend: CamouflageLocalBackend::OpenList,
                         certificate: CamouflageCertificatePolicy {
                             domain: certificate_domain,
-                            expected_public_ip: group.connect_host.trim().to_string(),
+                            expected_public_ip,
                             renew_before_days: 30,
                             // Reality Panel 的证书权威路径固定使用 Panel DNS-01。
                             // DNSMgr 未就绪时由依赖状态阻塞签发，不降级到 :80 HTTP-01。
@@ -182,11 +208,116 @@ pub async fn build_node_config(
     }
 
     validate_proxy_protocol_invariants(&listeners).map_err(NodeConfigBuildError::InvalidConfig)?;
+    for site in camouflage_by_sni.values() {
+        if !certificate_domain_covers_sni(&site.certificate.domain, &site.sni) {
+            return Err(NodeConfigBuildError::InvalidConfig(format!(
+                "certificate domain {} does not cover camouflage SNI {}",
+                site.certificate.domain, site.sni
+            )));
+        }
+    }
 
     Ok(NodeConfigResponse {
         listeners,
         camouflage_sites: camouflage_by_sni.into_values().collect(),
     })
+}
+
+/// Build the Panel-authoritative snapshot shared by HTTP and WS delivery.
+/// Revision state is stored in KVS so process restarts cannot reuse an older
+/// revision or race two transports into different ordering metadata.
+#[cfg(test)]
+pub async fn build_node_config_snapshot(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
+    build_node_config_snapshot_for_node(db, group_id, None).await
+}
+
+pub async fn build_node_config_snapshot_for_node(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: Option<&str>,
+) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
+    let lock = CONFIG_BUILD_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().await;
+    let config = build_node_config_for_node(db, group_id, node_id).await?;
+    let fingerprint = relay_shared::reconciliation::config_fingerprint(&config)
+        .as_str()
+        .to_string();
+    let key = match node_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(node_id) => format!("{REVISION_PREFIX}{group_id}:{node_id}"),
+        None => format!("{REVISION_PREFIX}{group_id}"),
+    };
+    let previous = db
+        .get(&key)
+        .await?
+        .map(|raw| serde_json::from_str::<PersistedConfigRevision>(&raw))
+        .transpose()
+        .map_err(|error| {
+            NodeConfigBuildError::InvalidConfig(format!("invalid revision state: {error}"))
+        })?;
+    let revision = match previous {
+        Some(previous) if previous.fingerprint == fingerprint && previous.revision > 0 => {
+            previous.revision
+        }
+        Some(previous) if previous.revision > 0 => previous.revision.saturating_add(1),
+        Some(_) | None => 1,
+    };
+    let state = serde_json::to_string(&PersistedConfigRevision {
+        revision,
+        fingerprint: fingerprint.clone(),
+    })
+    .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
+    db.set(&key, &state).await?;
+    Ok(NodeConfigSnapshot {
+        config_revision: revision,
+        config_fingerprint: fingerprint,
+        config,
+    })
+}
+
+async fn expected_camouflage_public_ipv4(
+    db: &dyn Repository,
+    group: &DeviceGroup,
+    node_id: Option<&str>,
+) -> Result<String, NodeConfigBuildError> {
+    if let Some(node_id) = node_id.map(str::trim).filter(|id| !id.is_empty()) {
+        let key = format!("node_status:{}:{}", group.id, node_id);
+        let raw = db.get(&key).await?.ok_or_else(|| {
+            NodeConfigBuildError::InvalidConfig(format!("node status unavailable for {node_id}"))
+        })?;
+        let status: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+            NodeConfigBuildError::InvalidConfig(format!("invalid node status: {error}"))
+        })?;
+        let value = status
+            .get("public_ipv4")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                NodeConfigBuildError::InvalidConfig(format!(
+                    "node {node_id} has no public IPv4 telemetry"
+                ))
+            })?;
+        let address = value.parse::<std::net::Ipv4Addr>().map_err(|_| {
+            NodeConfigBuildError::InvalidConfig(format!("node {node_id} has invalid public IPv4"))
+        })?;
+        if address.is_loopback() || address.is_unspecified() {
+            return Err(NodeConfigBuildError::InvalidConfig(format!(
+                "node {node_id} has unusable public IPv4"
+            )));
+        }
+        return Ok(address.to_string());
+    }
+
+    let legacy = group.connect_host.trim();
+    if legacy.is_empty() {
+        return Err(NodeConfigBuildError::InvalidConfig(
+            "node identity is required for inbound camouflage config".into(),
+        ));
+    }
+    Ok(legacy.to_string())
 }
 
 /// 根据已经验证过的 Panel DNS ownership 计算证书作用域。
@@ -289,6 +420,7 @@ fn format_target_endpoint(host: &str, port: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::repo::KvsRepository;
     use crate::db::schema::SCHEMA_SQL;
     use crate::db::sqlite_repo::SqliteRepository;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -610,7 +742,10 @@ mod tests {
         assert_eq!(cfg.listeners[0].targets, vec!["198.51.100.20:55443"]);
         assert_eq!(cfg.camouflage_sites.len(), 1);
         let site = &cfg.camouflage_sites[0];
-        assert_eq!(site.site_id, "op1_example_com");
+        assert_eq!(
+            site.site_id,
+            relay_shared::reconciliation::stable_camouflage_site_id("op1.example.com")
+        );
         assert_eq!(site.sni, "op1.example.com");
         assert_eq!(site.tls_listener_port, 8443);
         assert_eq!(site.certificate.expected_public_ip, "203.0.113.10");
@@ -657,6 +792,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbound_camouflage_uses_node_status_ip_when_connect_host_is_empty() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        add_group(&pool, 10, "in", 2).await;
+        add_rule(&pool, 100, 2, 10, 443).await;
+        sqlx::query("UPDATE device_groups SET connect_host='' WHERE id=10")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE forward_rules SET protocol='tcp', public_transport='nginx_sni', \
+             node_transport='nginx_sni', entry_transport='nginx_sni', \
+             sni='long.example.com', camouflage_enabled=1 WHERE id=100",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        repo(&pool)
+            .set(
+                "node_status:10:node-a",
+                r#"{"public_ipv4":"198.51.100.20"}"#,
+            )
+            .await
+            .unwrap();
+
+        let config = build_node_config_for_node(&repo(&pool), 10, Some("node-a"))
+            .await
+            .unwrap();
+        assert_eq!(
+            config.camouflage_sites[0].certificate.expected_public_ip,
+            "198.51.100.20"
+        );
+        assert_eq!(
+            config.camouflage_sites[0].site_id,
+            relay_shared::reconciliation::stable_camouflage_site_id("long.example.com")
+        );
+        repo(&pool)
+            .set(
+                "node_status:10:node-b",
+                r#"{"public_ipv4":"198.51.100.21"}"#,
+            )
+            .await
+            .unwrap();
+        let other = build_node_config_for_node(&repo(&pool), 10, Some("node-b"))
+            .await
+            .unwrap();
+        assert_eq!(
+            other.camouflage_sites[0].certificate.expected_public_ip,
+            "198.51.100.21"
+        );
+        assert_ne!(
+            config.camouflage_sites[0].certificate.expected_public_ip,
+            other.camouflage_sites[0].certificate.expected_public_ip
+        );
+    }
+
+    #[tokio::test]
     async fn mixed_proxy_protocol_state_fails_canonical_config_build() {
         let pool = pool().await;
         add_user(&pool, 2).await;
@@ -687,5 +879,27 @@ mod tests {
             Err(NodeConfigBuildError::InvalidConfig(message))
                 if message.contains("mixed upstream Proxy Protocol modes")
         ));
+    }
+
+    #[tokio::test]
+    async fn config_snapshot_revision_is_stable_for_replay_and_increments_on_change() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        add_group(&pool, 10, "in", 2).await;
+        add_rule(&pool, 100, 2, 10, 443).await;
+        let repository = repo(&pool);
+
+        let first = build_node_config_snapshot(&repository, 10).await.unwrap();
+        let replay = build_node_config_snapshot(&repository, 10).await.unwrap();
+        assert_eq!(first.config_revision, replay.config_revision);
+        assert_eq!(first.config_fingerprint, replay.config_fingerprint);
+
+        sqlx::query("UPDATE forward_rules SET target_port=81 WHERE id=100")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let changed = build_node_config_snapshot(&repository, 10).await.unwrap();
+        assert!(changed.config_revision > first.config_revision);
+        assert_ne!(changed.config_fingerprint, first.config_fingerprint);
     }
 }

@@ -61,6 +61,22 @@ describe('resolveNodeUpgrade — eligibility ladder (shared by desktop + mobile)
     expect(resolveNodeUpgrade(r, '1.1.0', 0, false).state).toBe('offline');
   });
 
+  it('allows a stale upgrade-only node while its Lifecycle channel is live', () => {
+    const r = row({
+      node_version: '1.0.0', install_method: 'systemd', online: false,
+      lifecycle_online: true, config_protocol_version: 9,
+    });
+    expect(resolveNodeUpgrade(r, '1.1.0', 10, false).state).toBe('upgradeable');
+  });
+
+  it('disables a stale upgrade-only node after its Lifecycle channel disconnects', () => {
+    const r = row({
+      node_version: '1.0.0', install_method: 'systemd', online: false,
+      lifecycle_online: false, config_protocol_version: 9,
+    });
+    expect(resolveNodeUpgrade(r, '1.1.0', 10, false).state).toBe('offline');
+  });
+
   it('panel-version-ahead does NOT make a current node look stale (compare target is the node release)', () => {
     // Panel is 1.2.0 but latest node release is 1.1.0; a node on 1.1.0 is
     // current (latest), NOT behind. This is the core PR5 scenario.

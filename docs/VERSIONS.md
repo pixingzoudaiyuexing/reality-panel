@@ -1,8 +1,9 @@
 # Release Contract
 
 Reality Panel uses one release tag and one compatibility version for the Panel
-and Node. The current stable release is `v1.0.0`; the wire protocol remains
-`CONFIG_PROTOCOL_VERSION = 8`.
+and Node. The current stable release is `v1.0.1`; the current 1.1 development
+candidate is `v1.1.0-rc.7`. The wire protocol remains
+`CONFIG_PROTOCOL_VERSION = 10`.
 
 ## Release assets
 

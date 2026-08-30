@@ -128,6 +128,46 @@ describe('Stage 2 lifecycle controls', () => {
       expect(screen.getByRole('button', { name: action })).toBeDisabled();
     }
   });
+
+  it('allows only Upgrade for a stale upgrade-only node with a live Lifecycle channel', () => {
+    render(
+      <NodeGroupSection
+        rows={[row({ online: false, lifecycle_online: true, config_protocol_version: 9, node_version: '1.1.0-rc.6', architecture: 'x86_64', install_method: 'systemd' })]}
+        panelProtocol={10}
+        latestNodeVersion=""
+        nodeVersionCheckFailed={false}
+        isMobile={false}
+        t={t}
+        openDetail={vi.fn()}
+        onLifecycle={vi.fn()}
+        artifactVersions={{ amd64: '1.1.0-rc.7' }}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'nodeUpgrade' })).toBeEnabled();
+    for (const action of ['nodeLogs', 'nodeRestart', 'nodeUninstall']) {
+      expect(screen.getByRole('button', { name: action })).toBeDisabled();
+    }
+  });
+
+  it('keeps the mobile Upgrade action enabled for the same upgrade-only capability', () => {
+    render(
+      <NodeGroupSection
+        rows={[row({ online: false, lifecycle_online: true, config_protocol_version: 9, node_version: '1.1.0-rc.6', architecture: 'x86_64', install_method: 'systemd' })]}
+        panelProtocol={10}
+        latestNodeVersion=""
+        nodeVersionCheckFailed={false}
+        isMobile
+        t={t}
+        openDetail={vi.fn()}
+        onLifecycle={vi.fn()}
+        artifactVersions={{ amd64: '1.1.0-rc.7' }}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'nodeUpgrade' })).toBeEnabled();
+    for (const action of ['nodeLogs', 'nodeRestart', 'nodeUninstall']) {
+      expect(screen.getByRole('button', { name: action })).toBeDisabled();
+    }
+  });
 });
 
 // ── v1.2.5: offline nodes are greyed so a stale row is distinguishable from a

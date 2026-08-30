@@ -388,7 +388,24 @@ export interface DeviceGroup {
   created_at: string;
 }
 
-export type RelayPreferencePhase = 'idle' | 'switching' | 'failed';
+export type RelayPreferencePhase =
+  | 'idle'
+  | 'switching'
+  | 'rolling_back'
+  | 'failed'
+  | 'failed_rolled_back'
+  | 'failed_manual_intervention';
+
+export interface RelayDnsRecordView {
+  rule_id: number;
+  fqdn: string;
+  rollback_value: string | null;
+  target_value: string;
+  expected_value: string | null;
+  sync_state: string | null;
+  position: 'rollback' | 'target' | 'unknown';
+  last_error: string | null;
+}
 
 export interface RelayReadyNode {
   node_id: string;
@@ -407,6 +424,8 @@ export interface RelayPreferenceView {
   state: RelayPreferencePhase;
   started_at: string | null;
   last_error: string | null;
+  rollback_error: string | null;
+  dns_records: RelayDnsRecordView[];
   nodes: RelayReadyNode[];
 }
 
@@ -523,6 +542,8 @@ export interface NodeStatus {
    *  The admin /nodes endpoint now stamps this so the frontend never recomputes
    *  an online threshold of its own. Optional for older payloads. */
   online?: boolean;
+  /** Live Lifecycle-compatible WS capability used for one-click Upgrade. */
+  lifecycle_online?: boolean;
   cpu: number;
   mem: number;
   connections: number;
@@ -692,6 +713,9 @@ export interface DiagnoseResult {
   type: string;
   request_id: string;
   rule_id: number;
+  diagnosed_sni?: string | null;
+  config_revision?: number;
+  config_fingerprint?: string;
   node_id: string;
   /** v0.4.9: per-run challenge echoed back from the node. The backend verifies
    *  it's non-empty and matches what it sent; the UI doesn't render it. */
@@ -710,6 +734,7 @@ export interface RealityCheck {
 }
 
 export interface RealityDiagnosis {
+  convergence: { check: RealityCheck; desired_sni?: string | null; active_sni?: string | null; desired_config_revision: number; active_config_revision: number; desired_fingerprint: string; active_fingerprint: string };
   config: { check: RealityCheck; listen_port: number; sni?: string | null; targets: string[]; send_proxy_protocol: boolean };
   nginx: { check: RealityCheck; plan_contains_rule: boolean; mapping_matches: boolean; expected_fingerprint?: string | null; deployed_fingerprint?: string | null; managed_file_matches: boolean; config_valid: boolean; service_healthy: boolean };
   runtime: { check: RealityCheck; listen_443: boolean; listen_8443: boolean };
@@ -836,6 +861,8 @@ export interface NodeDisplayRow {
   group_name?: string | null;
   node_id?: string | null;
   online?: boolean;
+  /** Live Lifecycle-compatible WS capability. Independent of status freshness. */
+  lifecycle_online?: boolean;
   node_version?: string | null;
   /** v1.0.10: "systemd" | "docker" | "manual" — gates one-click upgrade. */
   install_method?: string | null;

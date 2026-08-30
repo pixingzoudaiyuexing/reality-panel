@@ -1444,24 +1444,63 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
 
     // Reality/SNI fork: Nginx SNI rules intentionally share one TCP listen
     // port, so exclude them from the regular TCP port-uniqueness partition and
-    // make uniqueness depend on SNI instead.
-    sqlx::query("DROP INDEX IF EXISTS idx_fr_port_tcp")
+    // make uniqueness depend on SNI instead. This block can run on databases
+    // where Migration 16/28 skipped an index because historical duplicates are
+    // still present, so every destructive index rebuild keeps the same guard.
+    let raw_tcp_dupes: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM (
+             SELECT device_group_in, listen_port FROM forward_rules
+             WHERE protocol IN ('tcp', 'tcp_udp') AND node_transport != 'nginx_sni'
+             GROUP BY device_group_in, listen_port HAVING COUNT(*) > 1
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    if raw_tcp_dupes.0 > 0 {
+        tracing::error!(
+            "Reality/SNI TCP index SKIPPED: forward_rules has {} conflicting raw TCP \
+             (device_group_in, listen_port) value(s). Existing rows were preserved; resolve \
+             the conflicts and restart to activate the index.",
+            raw_tcp_dupes.0
+        );
+    } else {
+        sqlx::query("DROP INDEX IF EXISTS idx_fr_port_tcp")
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_port_tcp
+             ON forward_rules (device_group_in, listen_port)
+             WHERE protocol IN ('tcp', 'tcp_udp') AND node_transport != 'nginx_sni'",
+        )
         .execute(pool)
         .await?;
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_port_tcp
-     ON forward_rules (device_group_in, listen_port)
-     WHERE protocol IN ('tcp', 'tcp_udp') AND node_transport != 'nginx_sni'",
+    }
+
+    let nginx_sni_dupes: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM (
+             SELECT device_group_in, listen_port, lower(sni) FROM forward_rules
+             WHERE node_transport = 'nginx_sni' AND sni IS NOT NULL AND sni != ''
+             GROUP BY device_group_in, listen_port, lower(sni) HAVING COUNT(*) > 1
+         )",
     )
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_nginx_sni
-     ON forward_rules (device_group_in, listen_port, lower(sni))
-         WHERE node_transport = 'nginx_sni' AND sni IS NOT NULL AND sni != ''",
-    )
-    .execute(pool)
-    .await?;
+    if nginx_sni_dupes.0 > 0 {
+        tracing::error!(
+            "Reality/SNI index SKIPPED: forward_rules has {} conflicting \
+             (device_group_in, listen_port, lower(sni)) value(s). Existing rows were \
+             preserved; resolve the conflicts and restart to activate the index.",
+            nginx_sni_dupes.0
+        );
+    } else {
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_fr_nginx_sni
+             ON forward_rules (device_group_in, listen_port, lower(sni))
+             WHERE node_transport = 'nginx_sni' AND sni IS NOT NULL AND sni != ''",
+        )
+        .execute(pool)
+        .await?;
+    }
 
     // ── Migration 29: v0.4.21 PR2 registration allowed plan ids ──
     //
@@ -2701,16 +2740,19 @@ mod tests {
             "duplicate rows must survive migration (no data loss)"
         );
 
-        // And the UNIQUE index must NOT exist (it was skipped).
+        // Neither the legacy global index nor the later partial TCP index may
+        // bypass the duplicate-data safety check.
         let (idx_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_forward_rules_listen_port'",
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='index'
+               AND name IN ('idx_forward_rules_listen_port', 'idx_fr_port_tcp')",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(
             idx_count, 0,
-            "UNIQUE index must be skipped when duplicates exist"
+            "TCP UNIQUE indexes must be skipped when duplicates exist"
         );
     }
 

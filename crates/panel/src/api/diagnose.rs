@@ -277,6 +277,7 @@ fn uuid_v4_str() -> String {
 /// discriminated object rather than the default externally-tagged form.
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // Box 会改变公开 serde/调用形态，rc.7 保持现有 wire contract。
 pub enum NodeDiagnoseStatus {
     /// The node replied with a DiagnoseResult.
     ///
@@ -414,8 +415,9 @@ async fn reality_dependencies(
         None => dependency_check("blocked", "DNS synchronization state is unavailable"),
     };
 
-    let any_certificate_pass =
-        result_reality_checks(nodes).any(|diagnosis| diagnosis.certificate.check.state == "pass");
+    let any_certificate_pass = result_reality_checks(nodes).any(|diagnosis| {
+        diagnosis.certificate.check.state == "pass" && diagnosis.convergence.check.state == "pass"
+    });
     let any_certificate_fail =
         result_reality_checks(nodes).any(|diagnosis| diagnosis.certificate.check.state == "fail");
     let certificate = if any_certificate_pass {
@@ -428,8 +430,9 @@ async fn reality_dependencies(
         dependency_check("not_tested", "No Relay certificate result was returned")
     };
 
-    let any_route_pass =
-        result_reality_checks(nodes).any(|diagnosis| diagnosis.runtime.check.state == "pass");
+    let any_route_pass = result_reality_checks(nodes).any(|diagnosis| {
+        diagnosis.runtime.check.state == "pass" && diagnosis.convergence.check.state == "pass"
+    });
     let any_route_fail =
         result_reality_checks(nodes).any(|diagnosis| diagnosis.runtime.check.state == "fail");
     let route = if any_route_pass {
@@ -664,12 +667,6 @@ pub async fn diagnose_rule(
     //    never holds the wait open for a reply that will never come (the
     //    disconnect-race that previously caused a false 8s "timeout").
     let (request_id, challenge) = state.diagnose.start(rule_id, candidates.clone()).await;
-    let msg = serde_json::to_string(&DiagnoseRuleMessage::new(
-        request_id.clone(),
-        rule_id,
-        challenge,
-    ))
-    .unwrap_or_default();
     let mut expected: Vec<String> = Vec::new();
     // Index nodes by node_id so the send loop can carry group_name/public_ip
     // onto any reclassified ControlChannelOffline (the candidates vec only
@@ -678,6 +675,40 @@ pub async fn diagnose_rule(
         nodes.iter().map(|n| (n.node_id.as_str(), n)).collect();
     for nid in &candidates {
         let row = node_by_id.get(nid.as_str()).copied();
+        // Config fingerprints include node-local camouflage ownership IP, so
+        // diagnosis must bind each probe to the snapshot intended for that
+        // concrete Relay instead of reusing one group-wide snapshot.
+        let desired_snapshot = crate::service::node_config::build_node_config_snapshot_for_node(
+            state.db.as_ref(),
+            group_id,
+            Some(nid),
+        )
+        .await
+        .ok();
+        let desired_sni = desired_snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .listeners
+                .iter()
+                .find(|listener| listener.rule_id == rule_id)
+                .and_then(|listener| listener.sni.clone())
+        });
+        let desired_revision = desired_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.config_revision)
+            .unwrap_or_default();
+        let desired_fingerprint = desired_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.config_fingerprint.clone())
+            .unwrap_or_default();
+        let msg = serde_json::to_string(&DiagnoseRuleMessage::new(
+            request_id.clone(),
+            rule_id,
+            desired_sni,
+            desired_revision,
+            desired_fingerprint,
+            challenge.clone(),
+        ))
+        .unwrap_or_default();
         if state.node_connections.send_node(group_id, nid, &msg).await > 0 {
             expected.push(nid.clone());
         } else {
@@ -1015,6 +1046,9 @@ mod tests {
             request_id: req.into(),
             rule_id: 1,
             node_id: nid.into(),
+            diagnosed_sni: None,
+            config_revision: 0,
+            config_fingerprint: String::new(),
             // Default empty challenge; tests that exercise the challenge check
             // override this with `with_challenge`.
             challenge: String::new(),

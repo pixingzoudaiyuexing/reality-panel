@@ -18,4 +18,3 @@ pub mod udp;
 pub mod ws;
 
 pub use manager::ForwarderManager;
-pub use manager::ListenerInfo;

@@ -3,7 +3,7 @@ use crate::forwarder::ForwarderManager;
 use crate::poller;
 use crate::poller::PendingFinalization;
 use relay_shared::protocol::{
-    NodeConfigResponse, ReconciliationRecoverySource, ReconciliationStatus,
+    NodeConfigResponse, NodeConfigSnapshot, ReconciliationRecoverySource, ReconciliationStatus,
     ReconciliationStatusState,
 };
 use relay_shared::reconciliation::{config_fingerprint, ConfigFingerprint};
@@ -42,44 +42,90 @@ pub struct TrustedSnapshot {
     recovery_source: Option<LocalRecoverySource>,
     config: NodeConfigResponse,
     fingerprint: ConfigFingerprint,
+    config_revision: u64,
 }
 
 impl TrustedSnapshot {
+    #[allow(dead_code)] // 无 ordering metadata 的兼容构造器由故障注入覆盖。
     pub fn validated_panel(config: NodeConfigResponse) -> Result<Self, String> {
-        Self::new(AuthoritySource::ValidatedPanel, config)
+        Self::new_snapshot(
+            AuthoritySource::ValidatedPanel,
+            NodeConfigSnapshot {
+                config_revision: 0,
+                config_fingerprint: config_fingerprint(&config).as_str().to_string(),
+                config,
+            },
+        )
     }
 
+    pub fn validated_panel_snapshot(snapshot: NodeConfigSnapshot) -> Result<Self, String> {
+        Self::new_snapshot(AuthoritySource::ValidatedPanel, snapshot)
+    }
+
+    #[allow(dead_code)] // 保留旧 LKG 恢复入口，现代路径使用带来源的 snapshot。
     pub fn local_recovery(config: NodeConfigResponse) -> Result<Self, String> {
         Self::local_recovery_from(config, LocalRecoverySource::PrimaryLkg)
     }
 
+    #[allow(dead_code)] // 测试显式注入恢复来源，生产路径使用 revision-bearing snapshot。
     pub fn local_recovery_from(
         config: NodeConfigResponse,
         recovery_source: LocalRecoverySource,
     ) -> Result<Self, String> {
-        Self::new_with_recovery(
+        Self::new_snapshot_with_recovery(
             AuthoritySource::LocalRecovery,
             Some(recovery_source),
-            config,
+            NodeConfigSnapshot {
+                config_revision: 0,
+                config_fingerprint: config_fingerprint(&config).as_str().to_string(),
+                config,
+            },
         )
     }
 
-    fn new(source: AuthoritySource, config: NodeConfigResponse) -> Result<Self, String> {
-        Self::new_with_recovery(source, None, config)
+    pub fn local_recovery_snapshot(
+        snapshot: NodeConfigSnapshot,
+        recovery_source: LocalRecoverySource,
+    ) -> Result<Self, String> {
+        Self::new_snapshot_with_recovery(
+            AuthoritySource::LocalRecovery,
+            Some(recovery_source),
+            snapshot,
+        )
     }
 
-    fn new_with_recovery(
+    #[allow(dead_code)] // 上述兼容构造器共享此严格校验实现。
+    fn new(source: AuthoritySource, config: NodeConfigResponse) -> Result<Self, String> {
+        Self::new_snapshot(
+            source,
+            NodeConfigSnapshot {
+                config_revision: 0,
+                config_fingerprint: config_fingerprint(&config).as_str().to_string(),
+                config,
+            },
+        )
+    }
+
+    fn new_snapshot(source: AuthoritySource, snapshot: NodeConfigSnapshot) -> Result<Self, String> {
+        Self::new_snapshot_with_recovery(source, None, snapshot)
+    }
+
+    fn new_snapshot_with_recovery(
         source: AuthoritySource,
         recovery_source: Option<LocalRecoverySource>,
-        config: NodeConfigResponse,
+        snapshot: NodeConfigSnapshot,
     ) -> Result<Self, String> {
-        poller::validate_config(&config)?;
-        let fingerprint = config_fingerprint(&config);
+        poller::validate_config(&snapshot.config)?;
+        let fingerprint = config_fingerprint(&snapshot.config);
+        if snapshot.config_revision > 0 && snapshot.config_fingerprint != fingerprint.as_str() {
+            return Err("config snapshot fingerprint mismatch".into());
+        }
         Ok(Self {
             source,
             recovery_source,
-            config,
+            config: snapshot.config,
             fingerprint,
+            config_revision: snapshot.config_revision,
         })
     }
 
@@ -101,6 +147,10 @@ impl TrustedSnapshot {
         &self.fingerprint
     }
 
+    pub fn config_revision(&self) -> u64 {
+        self.config_revision
+    }
+
     pub fn is_panel_authoritative(&self) -> bool {
         self.source == AuthoritySource::ValidatedPanel
     }
@@ -119,19 +169,33 @@ pub enum ReconciliationInput {
 }
 
 impl ReconciliationInput {
+    #[allow(dead_code)] // 保留无 revision 的 Panel 输入供故障注入验证。
     pub fn validated_panel(config: NodeConfigResponse) -> Result<Self, String> {
         TrustedSnapshot::validated_panel(config).map(Self::Trusted)
     }
 
+    pub fn validated_panel_snapshot(config: NodeConfigSnapshot) -> Result<Self, String> {
+        TrustedSnapshot::validated_panel_snapshot(config).map(Self::Trusted)
+    }
+
+    #[allow(dead_code)] // 保留旧 LKG 输入入口，现代启动使用 local_recovery_snapshot。
     pub fn local_recovery(config: NodeConfigResponse) -> Result<Self, String> {
         TrustedSnapshot::local_recovery(config).map(Self::Trusted)
     }
 
+    #[allow(dead_code)] // 恢复来源必须显式可测，不折叠为默认状态。
     pub fn local_recovery_from(
         config: NodeConfigResponse,
         recovery_source: LocalRecoverySource,
     ) -> Result<Self, String> {
         TrustedSnapshot::local_recovery_from(config, recovery_source).map(Self::Trusted)
+    }
+
+    pub fn local_recovery_snapshot(
+        snapshot: NodeConfigSnapshot,
+        recovery_source: LocalRecoverySource,
+    ) -> Result<Self, String> {
+        TrustedSnapshot::local_recovery_snapshot(snapshot, recovery_source).map(Self::Trusted)
     }
 
     pub fn degraded_local_recovery() -> Self {
@@ -178,6 +242,34 @@ pub enum ReconciliationState {
     DegradedLocalRecovery,
     InvalidUntrustedInput,
     ApplyFailed,
+    StaleIgnored,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelSnapshotOrder {
+    Accept,
+    Stale,
+    RevisionFingerprintConflict,
+}
+
+fn panel_snapshot_order(
+    current: Option<&TrustedSnapshot>,
+    highest_revision: u64,
+    incoming: &TrustedSnapshot,
+) -> PanelSnapshotOrder {
+    let revision = incoming.config_revision();
+    if revision == 0 {
+        return PanelSnapshotOrder::Accept;
+    }
+    if revision < highest_revision {
+        return PanelSnapshotOrder::Stale;
+    }
+    if revision == highest_revision
+        && current.is_some_and(|current| current.fingerprint() != incoming.fingerprint())
+    {
+        return PanelSnapshotOrder::RevisionFingerprintConflict;
+    }
+    PanelSnapshotOrder::Accept
 }
 
 #[derive(Clone, Debug)]
@@ -212,10 +304,13 @@ impl ReconciliationResult {
 
 #[derive(Debug, Default)]
 pub struct Reconciler {
+    latest_panel_snapshot: Option<TrustedSnapshot>,
     last_panel_desired: Option<ConfigFingerprint>,
     last_applied: Option<ConfigFingerprint>,
     pending: Option<PendingApply>,
     status: ReconciliationStatus,
+    highest_config_revision: u64,
+    last_applied_revision: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -306,6 +401,46 @@ impl Reconciler {
         result
     }
 
+    /// 证书依赖完成或到达重试时间后，重放最近一次已验证的 Panel desired。
+    /// 该路径仍经过唯一 reconciler mutation path，不创建第二套配置应用逻辑。
+    pub async fn reconcile_latest_panel_desired(
+        &mut self,
+        manager: &Arc<Mutex<ForwarderManager>>,
+        camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    ) -> Option<ReconciliationResult> {
+        let snapshot = self.latest_panel_snapshot.clone()?;
+        let result = self
+            .reconcile_with_paths(
+                manager,
+                camouflage,
+                ReconciliationInput::Trusted(snapshot),
+                poller::current_cache_paths(),
+            )
+            .await;
+        self.record_status(&result);
+        Some(result)
+    }
+
+    #[cfg(test)]
+    async fn reconcile_latest_panel_desired_with_test_paths(
+        &mut self,
+        manager: &Arc<Mutex<ForwarderManager>>,
+        camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+        paths: poller::CachePaths,
+    ) -> Option<ReconciliationResult> {
+        let snapshot = self.latest_panel_snapshot.clone()?;
+        let result = self
+            .reconcile_with_paths(
+                manager,
+                camouflage,
+                ReconciliationInput::Trusted(snapshot),
+                paths,
+            )
+            .await;
+        self.record_status(&result);
+        Some(result)
+    }
+
     #[cfg(test)]
     async fn reconcile_with_test_paths(
         &mut self,
@@ -322,6 +457,11 @@ impl Reconciler {
     }
 
     fn record_status(&mut self, result: &ReconciliationResult) {
+        // A stale transport delivery is deliberately invisible to status: it
+        // must not overwrite the status of the newer authoritative snapshot.
+        if result.state == ReconciliationState::StaleIgnored {
+            return;
+        }
         let state = match result.state {
             ReconciliationState::Converged => ReconciliationStatusState::Converged,
             ReconciliationState::ApplyRequired => ReconciliationStatusState::Reconciling,
@@ -335,6 +475,7 @@ impl Reconciler {
                 ReconciliationStatusState::WaitingForAuthority
             }
             ReconciliationState::ApplyFailed => ReconciliationStatusState::ApplyFailed,
+            ReconciliationState::StaleIgnored => unreachable!(),
         };
         let last_success_at = if state == ReconciliationStatusState::Converged {
             Some(chrono::Utc::now().to_rfc3339())
@@ -355,6 +496,11 @@ impl Reconciler {
                 .observed_fingerprint
                 .as_ref()
                 .map(|value| value.as_str().to_string()),
+            desired_config_revision: self
+                .latest_panel_snapshot
+                .as_ref()
+                .map(TrustedSnapshot::config_revision),
+            applied_config_revision: self.last_applied_revision,
             last_success_at,
             // Failure details are deliberately fixed and do not accept raw
             // command output, generated config, tokens, or certificate data.
@@ -375,6 +521,11 @@ impl Reconciler {
             desired_fingerprint: Some(snapshot.fingerprint().as_str().to_string()),
             applied_fingerprint: Some(applied.as_str().to_string()),
             observed_fingerprint: Some(observed.as_str().to_string()),
+            desired_config_revision: self
+                .latest_panel_snapshot
+                .as_ref()
+                .map(TrustedSnapshot::config_revision),
+            applied_config_revision: self.last_applied_revision,
             last_success_at: self.status.last_success_at.clone(),
             last_error: None,
             recovery_source: if snapshot.source() == AuthoritySource::ValidatedPanel {
@@ -409,6 +560,57 @@ impl Reconciler {
             }
             ReconciliationInput::Untrusted(_) => return ReconciliationResult::untrusted(),
         };
+        if snapshot.source() == AuthoritySource::LocalRecovery {
+            self.highest_config_revision =
+                self.highest_config_revision.max(snapshot.config_revision());
+        }
+        if snapshot.source() == AuthoritySource::ValidatedPanel {
+            match panel_snapshot_order(
+                self.latest_panel_snapshot.as_ref(),
+                self.highest_config_revision,
+                &snapshot,
+            ) {
+                PanelSnapshotOrder::RevisionFingerprintConflict => {
+                    tracing::error!(
+                        revision = snapshot.config_revision(),
+                        "rejecting config snapshot with reused revision and different fingerprint"
+                    );
+                    return ReconciliationResult {
+                        state: ReconciliationState::StaleIgnored,
+                        source: Some(snapshot.source()),
+                        desired_fingerprint: Some(snapshot.fingerprint().clone()),
+                        applied_fingerprint: self.last_applied.clone(),
+                        observed_fingerprint: None,
+                        cleanup_authorized: false,
+                        apply_required: false,
+                        dependency_withheld: false,
+                        recovery_source: snapshot.recovery_source(),
+                    };
+                }
+                PanelSnapshotOrder::Stale => {
+                    tracing::warn!(
+                        received_revision = snapshot.config_revision(),
+                        highest_revision = self.highest_config_revision,
+                        "ignoring stale Panel config snapshot"
+                    );
+                    return ReconciliationResult {
+                        state: ReconciliationState::StaleIgnored,
+                        source: Some(snapshot.source()),
+                        desired_fingerprint: Some(snapshot.fingerprint().clone()),
+                        applied_fingerprint: self.last_applied.clone(),
+                        observed_fingerprint: None,
+                        cleanup_authorized: false,
+                        apply_required: false,
+                        dependency_withheld: false,
+                        recovery_source: snapshot.recovery_source(),
+                    };
+                }
+                PanelSnapshotOrder::Accept => {}
+            }
+            self.highest_config_revision =
+                self.highest_config_revision.max(snapshot.config_revision());
+            self.latest_panel_snapshot = Some(snapshot.clone());
+        }
 
         // A failed durable finalization still owns the runtime that was
         // successfully applied from a validated Panel snapshot. If the Panel
@@ -471,6 +673,7 @@ impl Reconciler {
             }
             let dependency_withheld = pending.dependency_withheld;
             self.last_applied = Some(applied_fingerprint.clone());
+            self.last_applied_revision = Some(snapshot.config_revision());
             if snapshot.is_panel_authoritative() {
                 self.last_panel_desired = Some(snapshot.fingerprint().clone());
             }
@@ -507,7 +710,13 @@ impl Reconciler {
             let withheld_dependency_ready = panel_unchanged
                 && effective_fingerprint != *snapshot.fingerprint()
                 && poller::camouflage_dependencies_ready(camouflage, snapshot.config()).await;
-            if (panel_unchanged || local_recovery) && !withheld_dependency_ready {
+            let withheld_retry_due = panel_unchanged
+                && effective_fingerprint != *snapshot.fingerprint()
+                && crate::forwarder::camouflage_site::desired_retry_due(camouflage).await;
+            if (panel_unchanged || local_recovery)
+                && !withheld_dependency_ready
+                && !withheld_retry_due
+            {
                 let inspection = poller::inspect_runtime(manager, camouflage, &effective).await;
                 if inspection.healthy {
                     return ReconciliationResult {
@@ -580,15 +789,23 @@ impl Reconciler {
                 tracing::info!(
                     "previously withheld camouflage dependency is ready; applying desired config"
                 );
+            } else if withheld_retry_due {
+                tracing::info!(
+                    "camouflage dependency retry is due; replaying desired certificate work"
+                );
             }
         }
 
         let outcome = match snapshot.source() {
             AuthoritySource::ValidatedPanel => {
-                poller::apply_and_commit_coordinated_at(
+                poller::apply_and_commit_coordinated_snapshot_at(
                     manager,
                     camouflage,
-                    snapshot.config(),
+                    &NodeConfigSnapshot {
+                        config_revision: snapshot.config_revision(),
+                        config_fingerprint: snapshot.fingerprint().as_str().to_string(),
+                        config: snapshot.config().clone(),
+                    },
                     &paths,
                 )
                 .await
@@ -621,6 +838,7 @@ impl Reconciler {
         }
 
         self.last_applied = applied_fingerprint.clone();
+        self.last_applied_revision = Some(snapshot.config_revision());
         if snapshot.is_panel_authoritative() {
             self.last_panel_desired = Some(snapshot.fingerprint().clone());
         }
@@ -1242,7 +1460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_background_camouflage_dependency_reapplies_withheld_listener() {
+    async fn periodic_replay_converges_completed_certificate_without_notify() {
         let dir = std::env::temp_dir().join(format!(
             "relaypanel-reconciler-background-ready-{}-{}",
             std::process::id(),
@@ -1826,7 +2044,7 @@ mod tests {
                 &manager,
                 &camouflage,
                 ReconciliationInput::validated_panel(next).unwrap(),
-                paths,
+                paths.clone(),
             )
             .await;
         assert_eq!(withheld.state, ReconciliationState::DependencyWithheld);
@@ -1850,6 +2068,49 @@ mod tests {
             .await
             .active_snis()
             .contains("op1.example.com"));
+
+        // 模拟后台证书任务已完成但 Notify 没有被消费：不再注入新的
+        // config_changed，后续周期 tick 只重放最近一次已验证 desired，仍必须
+        // 主动完成 listener 与 LKG 收敛。
+        let p1 = modern_camouflage_manifest(&dir).sites.remove(0);
+        let mut q1 = p1.clone();
+        q1.id = "op2_example_com".into();
+        q1.sni = "op2.example.com".into();
+        assert!(camouflage
+            .lock()
+            .await
+            .apply_candidate(CamouflageSitesManifest {
+                sites: vec![p1, q1],
+            }));
+        let converged = reconciler
+            .reconcile_latest_panel_desired_with_test_paths(&manager, &camouflage, paths)
+            .await
+            .expect("validated Panel desired must be retained for dependency wakeup");
+        assert_eq!(converged.state, ReconciliationState::Converged);
+        assert_eq!(
+            manager
+                .lock()
+                .await
+                .nginx_sni_rule_id_for(443, "op1.example.com"),
+            None
+        );
+        assert_eq!(
+            manager
+                .lock()
+                .await
+                .nginx_sni_rule_id_for(443, "op2.example.com"),
+            Some(1)
+        );
+        assert_eq!(
+            camouflage.lock().await.active_snis(),
+            std::collections::HashSet::from(["op2.example.com".to_string()])
+        );
+        let lkg: CamouflageSitesManifest = serde_json::from_slice(
+            &std::fs::read(dir.join("camouflage-state/site-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(lkg.sites.len(), 1);
+        assert_eq!(lkg.sites[0].id, "op2_example_com");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2236,6 +2497,148 @@ mod tests {
         assert_eq!(healthy.state, ReconciliationStatusState::Converged);
         assert!(healthy.last_success_at.is_some());
         assert!(healthy.last_error.is_none());
+    }
+
+    #[test]
+    fn panel_snapshot_order_rejects_old_revision_and_reused_revision() {
+        let empty_config = empty();
+        let first = TrustedSnapshot::validated_panel_snapshot(NodeConfigSnapshot {
+            config_revision: 4,
+            config_fingerprint: config_fingerprint(&empty_config).as_str().into(),
+            config: empty_config.clone(),
+        })
+        .unwrap();
+        let changed_config = raw_config(32001);
+        let changed = TrustedSnapshot::validated_panel_snapshot(NodeConfigSnapshot {
+            config_revision: 4,
+            config_fingerprint: config_fingerprint(&changed_config).as_str().into(),
+            config: changed_config,
+        })
+        .unwrap();
+        assert_eq!(
+            panel_snapshot_order(Some(&first), 4, &first),
+            PanelSnapshotOrder::Accept
+        );
+        assert_eq!(
+            panel_snapshot_order(Some(&first), 4, &changed),
+            PanelSnapshotOrder::RevisionFingerprintConflict
+        );
+        assert_eq!(
+            panel_snapshot_order(Some(&first), 5, &first),
+            PanelSnapshotOrder::Stale
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_and_out_of_order_panel_snapshots_keep_latest_revision_active() {
+        let dir = unique_runtime_dir("fault-config-order");
+        let paths = runtime_paths(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reservations = Vec::new();
+        for _ in 0..3 {
+            reservations.push(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        }
+        let ports = reservations
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().port())
+            .collect::<Vec<_>>();
+        drop(reservations);
+
+        let mut forwarders = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        forwarders.set_listen_addresses_for_test("127.0.0.1", "");
+        let manager = Arc::new(Mutex::new(forwarders));
+        let camouflage = Arc::new(Mutex::new(test_camouflage_manager(&dir)));
+        let mut reconciler = Reconciler::new();
+        let versioned = |config: NodeConfigResponse, revision: u64| {
+            let fingerprint = config_fingerprint(&config);
+            ReconciliationInput::validated_panel_snapshot(NodeConfigSnapshot {
+                config_revision: revision,
+                config_fingerprint: fingerprint.as_str().to_string(),
+                config,
+            })
+            .unwrap()
+        };
+
+        let p1 = raw_config(ports[0]);
+        let q1 = raw_config(ports[1]);
+        let q2 = raw_config(ports[2]);
+        assert_eq!(
+            reconciler
+                .reconcile_with_test_paths(
+                    &manager,
+                    &camouflage,
+                    versioned(p1.clone(), 20),
+                    paths.clone(),
+                )
+                .await
+                .state,
+            ReconciliationState::Converged
+        );
+        // duplicate WS/HTTP delivery is idempotent and remains converged.
+        assert_eq!(
+            reconciler
+                .reconcile_with_test_paths(
+                    &manager,
+                    &camouflage,
+                    versioned(p1.clone(), 20),
+                    paths.clone(),
+                )
+                .await
+                .state,
+            ReconciliationState::Converged
+        );
+        assert_eq!(
+            reconciler
+                .reconcile_with_test_paths(
+                    &manager,
+                    &camouflage,
+                    versioned(q1.clone(), 21),
+                    paths.clone(),
+                )
+                .await
+                .state,
+            ReconciliationState::Converged
+        );
+        assert_eq!(
+            reconciler
+                .reconcile_with_test_paths(
+                    &manager,
+                    &camouflage,
+                    versioned(q2.clone(), 22),
+                    paths.clone(),
+                )
+                .await
+                .state,
+            ReconciliationState::Converged
+        );
+
+        // q2 已提交后，迟到的 q1 以及复用 q2 revision 的不同 payload 都必须
+        // fail-safe 忽略，不能覆盖 runtime、LKG 或最新收敛状态。
+        for stale in [versioned(q1, 21), versioned(p1, 22)] {
+            assert_eq!(
+                reconciler
+                    .reconcile_with_test_paths(&manager, &camouflage, stale, paths.clone(),)
+                    .await
+                    .state,
+                ReconciliationState::StaleIgnored
+            );
+        }
+        let current = manager.lock().await.current_config().unwrap();
+        assert_eq!(current.listeners[0].port, ports[2]);
+        assert_eq!(
+            serde_json::to_value(poller::load_cache_at(&paths).unwrap()).unwrap(),
+            serde_json::to_value(q2).unwrap()
+        );
+        assert_eq!(
+            reconciler.status_snapshot().state,
+            ReconciliationStatusState::Converged
+        );
+
+        assert!(manager.lock().await.apply_config(&empty()).await);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

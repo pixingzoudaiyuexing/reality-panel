@@ -78,13 +78,16 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
                 {onLifecycle ? (() => {
                   const arch = r.architecture === 'x86_64' ? 'amd64' : r.architecture === 'aarch64' ? 'arm64' : (r.architecture || '');
                   const target = artifactVersions[arch];
-                  const ready = !!r.node_id && !!r.online && r.install_method === 'systemd';
+                  const protocolCompatible = r.config_protocol_version == null || panelProtocol <= 0 || r.config_protocol_version === panelProtocol;
+                  const normalReady = !!r.node_id && !!r.online && r.install_method === 'systemd' && protocolCompatible;
+                  const lifecycleOnline = r.lifecycle_online ?? r.online;
+                  const upgradeReady = !!r.node_id && !!lifecycleOnline && r.install_method === 'systemd';
                   return (
                     <Space size={2}>
-                      <Button size="small" type="text" icon={<FileTextOutlined />} disabled={!r.node_id || !r.online} aria-label={t('nodeLogs')} onClick={() => onLifecycle(r, 'logs')} />
-                      <Button size="small" type="text" icon={<ReloadOutlined />} disabled={!ready} aria-label={t('nodeRestart')} onClick={() => onLifecycle(r, 'restart')} />
-                      <Button size="small" type="text" icon={<CloudDownloadOutlined />} disabled={!ready || !target || target === r.node_version} aria-label={t('nodeUpgrade')} onClick={() => onLifecycle(r, 'upgrade')} />
-                      <Button size="small" type="text" danger icon={<StopOutlined />} disabled={!ready} aria-label={t('nodeUninstall')} onClick={() => onLifecycle(r, 'uninstall')} />
+                      <Button size="small" type="text" icon={<FileTextOutlined />} disabled={!normalReady} aria-label={t('nodeLogs')} onClick={() => onLifecycle(r, 'logs')} />
+                      <Button size="small" type="text" icon={<ReloadOutlined />} disabled={!normalReady} aria-label={t('nodeRestart')} onClick={() => onLifecycle(r, 'restart')} />
+                      <Button size="small" type="text" icon={<CloudDownloadOutlined />} disabled={!upgradeReady || !target || target === r.node_version} aria-label={t('nodeUpgrade')} onClick={() => onLifecycle(r, 'upgrade')} />
+                      <Button size="small" type="text" danger icon={<StopOutlined />} disabled={!normalReady} aria-label={t('nodeUninstall')} onClick={() => onLifecycle(r, 'uninstall')} />
                     </Space>
                   );
                 })() : null}

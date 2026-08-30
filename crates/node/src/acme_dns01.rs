@@ -53,7 +53,7 @@ pub(crate) fn run_hook(args: &[String]) -> Result<(), String> {
         panel_url.trim_end_matches('/')
     );
     let request = ChallengeRequest {
-        node_id,
+        node_id: node_id.clone(),
         sni,
         value,
     };
@@ -72,6 +72,7 @@ pub(crate) fn run_hook(args: &[String]) -> Result<(), String> {
             .post(endpoint)
             .bearer_auth(token)
             .header("X-Config-Protocol-Version", CONFIG_PROTOCOL_VERSION)
+            .header("X-Node-ID", node_id)
             .json(&request)
             .send()
             .await

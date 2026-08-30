@@ -3,6 +3,25 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fmt;
 
+/// 判断证书域名是否覆盖具体 SNI。通配符只覆盖紧邻基域的一层标签。
+pub fn certificate_domain_covers_sni(certificate_domain: &str, sni: &str) -> bool {
+    let certificate_domain = certificate_domain
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let sni = sni.trim_end_matches('.').to_ascii_lowercase();
+    if certificate_domain == sni {
+        return true;
+    }
+    let Some(base) = certificate_domain.strip_prefix("*.") else {
+        return false;
+    };
+    let suffix = format!(".{base}");
+    let Some(label) = sni.strip_suffix(&suffix) else {
+        return false;
+    };
+    !label.is_empty() && !label.contains('.')
+}
+
 /// Deterministic SHA-256 over a canonical typed Node configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ConfigFingerprint(String);
@@ -10,6 +29,10 @@ pub struct ConfigFingerprint(String);
 impl ConfigFingerprint {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn from_string(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 }
 
@@ -19,6 +42,17 @@ impl ConfigFingerprint {
 pub fn fingerprint_bytes(bytes: &[u8]) -> ConfigFingerprint {
     let digest = Sha256::digest(bytes);
     ConfigFingerprint(hex_encode(&digest))
+}
+
+/// Return the stable, bounded identity used for a camouflage SNI.
+///
+/// The previous dotted-name replacement could exceed the Node's 64-byte site
+/// id limit.  The canonical SNI is deliberately the only input so renaming a
+/// site ID cannot create a second identity for the same SNI during migration.
+pub fn stable_camouflage_site_id(sni: &str) -> String {
+    let canonical = sni.trim().trim_end_matches('.').to_ascii_lowercase();
+    let digest = Sha256::digest(canonical.as_bytes());
+    format!("site-{}", hex_encode(&digest[..16]))
 }
 
 impl fmt::Display for ConfigFingerprint {
@@ -245,5 +279,41 @@ mod tests {
         dns01.camouflage_sites[0].certificate.challenge_method = AcmeChallengeMethod::Dns01;
 
         assert_ne!(config_fingerprint(&http01), config_fingerprint(&dns01));
+    }
+
+    #[test]
+    fn certificate_domain_matching_has_one_shared_wildcard_semantics() {
+        assert!(certificate_domain_covers_sni(
+            "site.example.com",
+            "SITE.EXAMPLE.COM."
+        ));
+        assert!(certificate_domain_covers_sni(
+            "*.Example.com",
+            "site.example.com"
+        ));
+        assert!(!certificate_domain_covers_sni(
+            "*.example.com",
+            "nested.site.example.com"
+        ));
+        assert!(!certificate_domain_covers_sni(
+            "*.example.com",
+            "example.com"
+        ));
+        assert!(!certificate_domain_covers_sni(
+            "*.example.com",
+            "site.example.net"
+        ));
+    }
+
+    #[test]
+    fn camouflage_site_identity_is_stable_short_and_case_normalized() {
+        let first = stable_camouflage_site_id("Q1.Example.com.");
+        assert_eq!(first, stable_camouflage_site_id("q1.example.com"));
+        assert!(first.starts_with("site-"));
+        assert!(first.len() <= 64);
+        assert!(first
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_')));
+        assert_ne!(first, stable_camouflage_site_id("q2.example.com"));
     }
 }

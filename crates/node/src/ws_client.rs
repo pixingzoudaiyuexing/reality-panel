@@ -306,7 +306,7 @@ async fn connect_and_run(
                 match msg_result {
                     Ok(Message::Text(text)) => {
                         if let Ok(resp) =
-                            serde_json::from_str::<relay_shared::protocol::NodeConfigResponse>(&text)
+                            serde_json::from_str::<relay_shared::protocol::NodeConfigSnapshot>(&text)
                         {
                             tracing::info!(
                                 "websocket: received config ({} listeners), applying",
@@ -485,10 +485,15 @@ async fn connect_and_run(
                             let nid = node_id.to_string();
                             let req_id = dm.request_id.clone();
                             let rid = dm.rule_id;
+                            let desired_sni = dm.desired_sni.clone();
+                            let desired_revision = dm.config_revision;
+                            let desired_fingerprint = dm.config_fingerprint.clone();
                             let challenge = dm.challenge.clone();
+                            let reconciler = reconciler.clone();
                             tokio::spawn(async move {
                                 crate::diagnose::run_and_report(
-                                    &mgr, &sites, &cfg, &nid, req_id, rid, challenge,
+                                    &mgr, &sites, &reconciler, &cfg, &nid, req_id, rid,
+                                    desired_sni, desired_revision, desired_fingerprint, challenge,
                                 )
                                 .await;
                             });
@@ -570,9 +575,9 @@ async fn apply_snapshot(
     manager: &std::sync::Arc<tokio::sync::Mutex<crate::forwarder::ForwarderManager>>,
     camouflage: &std::sync::Arc<tokio::sync::Mutex<CamouflageSiteManager>>,
     reconciler: &std::sync::Arc<tokio::sync::Mutex<Reconciler>>,
-    config: relay_shared::protocol::NodeConfigResponse,
+    config: relay_shared::protocol::NodeConfigSnapshot,
 ) -> bool {
-    let input = match ReconciliationInput::validated_panel(config) {
+    let input = match ReconciliationInput::validated_panel_snapshot(config) {
         Ok(input) => input,
         Err(error) => {
             tracing::warn!("websocket: refusing untrusted config snapshot: {}", error);

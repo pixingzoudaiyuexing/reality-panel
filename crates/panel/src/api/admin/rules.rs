@@ -284,6 +284,7 @@ pub async fn update_rule(
     }
 }
 
+#[allow(clippy::manual_unwrap_or_default)] // 显式保留 DB error -> None 语义，避免 silent-error shorthand。
 pub async fn delete_rule(
     user: AuthUser,
     State(state): State<AppState>,
