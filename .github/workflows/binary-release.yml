@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -24,8 +25,10 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Check out the tagged source revision
+      - name: Check out the triggering source revision
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Install Rust toolchain
         run: |
@@ -41,8 +44,20 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Validate tag and package versions
-        run: bash scripts/release-version-contract.sh "$GITHUB_REF_NAME"
+      - name: Validate source and package versions
+        id: release-meta
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            RELEASE_TAG="$GITHUB_REF_NAME"
+          else
+            VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/panel/Cargo.toml | head -n1)"
+            RELEASE_TAG="v$VERSION"
+          fi
+          bash scripts/release-version-contract.sh "$RELEASE_TAG"
+          printf 'RELEASE_TAG=%s\n' "$RELEASE_TAG" >> "$GITHUB_ENV"
+          printf 'VERSION=%s\n' "${RELEASE_TAG#v}" >> "$GITHUB_ENV"
+          printf 'version=%s\n' "${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -76,13 +91,13 @@ jobs:
 
       - name: Assemble release assets
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p release-dist/web
           cp target/release/relay-panel release-dist/reality-panel-linux-amd64
           cp target/release/relay-node release-dist/reality-node-linux-amd64
           tar -czf release-dist/reality-panel-web.tar.gz -C frontend/dist .
           cp install.sh deploy.sh update.sh scripts/relay-node-install.sh release-dist/
-          sed -i "s/^DEFAULT_RELEASE_TAG=.*/DEFAULT_RELEASE_TAG=\"$GITHUB_REF_NAME\"/" release-dist/install.sh
+          sed -i "s/^DEFAULT_RELEASE_TAG=.*/DEFAULT_RELEASE_TAG=\"$RELEASE_TAG\"/" release-dist/install.sh
+          printf '%s\n' "$GITHUB_SHA" > release-dist/SOURCE_COMMIT
           chmod +x release-dist/reality-panel-linux-amd64 release-dist/reality-node-linux-amd64
           chmod +x release-dist/install.sh release-dist/deploy.sh release-dist/update.sh release-dist/relay-node-install.sh
           test "$(release-dist/reality-panel-linux-amd64 --version | awk '{print $NF}')" = "$VERSION"
@@ -90,7 +105,7 @@ jobs:
           file release-dist/reality-panel-linux-amd64 | grep -q 'ELF 64-bit.*x86-64'
           file release-dist/reality-node-linux-amd64 | grep -q 'ELF 64-bit.*x86-64'
           test -s release-dist/reality-panel-web.tar.gz
-          (cd release-dist && sha256sum reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh deploy.sh update.sh relay-node-install.sh > SHA256SUMS)
+          (cd release-dist && sha256sum reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh deploy.sh update.sh relay-node-install.sh SOURCE_COMMIT > SHA256SUMS)
 
       - name: Verify release assets
         run: |
@@ -99,8 +114,18 @@ jobs:
           test "$(tar -tzf reality-panel-web.tar.gz | grep -c '^./index.html$')" -eq 1
           grep -Eq '^([0-9a-f]{64})  reality-panel-linux-amd64$' SHA256SUMS
           grep -Eq '^([0-9a-f]{64})  reality-node-linux-amd64$' SHA256SUMS
+          test "$(cat SOURCE_COMMIT)" = "$GITHUB_SHA"
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: reality-panel-${{ steps.release-meta.outputs.version }}-linux-amd64-${{ github.sha }}
+          path: release-dist/
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
@@ -117,3 +142,4 @@ jobs:
             release-dist/deploy.sh
             release-dist/relay-node-install.sh
             release-dist/SHA256SUMS
+            release-dist/SOURCE_COMMIT
