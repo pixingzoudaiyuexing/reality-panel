@@ -44,6 +44,8 @@ function preference(over: Partial<RelayPreferenceView> = {}): RelayPreferenceVie
     state: 'idle',
     started_at: null,
     last_error: null,
+    rollback_error: null,
+    dns_records: [],
     nodes: [relayNode('node-a', { preferred: true }), relayNode('node-b')],
     ...over,
   };
@@ -185,6 +187,57 @@ describe('RelayPreferencePanel', () => {
     expect(within(rowFor('node-a')).getByRole('button', { name: /relayPreferenceReconfirm/ })).toBeEnabled();
     expect(within(rowFor('node-b')).getByRole('button', { name: /relayPreferenceRetry/ })).toBeEnabled();
     expect(within(rowFor('node-c')).getByRole('button', { name: /relayPreferenceSet/ })).toBeEnabled();
+  });
+
+  it('shows rollback progress per domain, locks actions, and keeps polling', async () => {
+    vi.useFakeTimers();
+    mockGet
+      .mockResolvedValueOnce(ok(preference({
+        state: 'rolling_back',
+        pending_node_id: 'node-b',
+        last_error: 'DNS_RECORD_CONFLICT',
+        dns_records: [
+          { rule_id: 1, fqdn: 'q1.example.com', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'PENDING', position: 'target', last_error: null },
+          { rule_id: 2, fqdn: 'q2.example.com', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'PROPAGATED', position: 'rollback', last_error: null },
+        ],
+      })))
+      .mockResolvedValueOnce(ok(preference({ state: 'failed_rolled_back' })));
+
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('relayPreferenceRollingBack')).toBeInTheDocument();
+    expect(within(screen.getByTestId('relay-dns-record-1')).getByText('relayPreferenceDnsAtTarget')).toBeInTheDocument();
+    expect(within(screen.getByTestId('relay-dns-record-2')).getByText('relayPreferenceDnsAtPrevious')).toBeInTheDocument();
+    expect(within(rowFor('node-a')).getByRole('button')).toBeDisabled();
+    expect(within(rowFor('node-b')).getByRole('button')).toBeDisabled();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(mockGet).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('relayPreferenceRolledBack')).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(mockGet).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows split DNS and rollback error when manual intervention is required', async () => {
+    mockGet.mockResolvedValue(ok(preference({
+      state: 'failed_manual_intervention',
+      pending_node_id: 'node-b',
+      last_error: 'DNS_RECORD_CONFLICT',
+      rollback_error: 'ROLLBACK_SCHEDULING_FAILED',
+      dns_records: [
+        { rule_id: 1, fqdn: 'q1.example.com', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'PROPAGATED', position: 'rollback', last_error: null },
+        { rule_id: 2, fqdn: 'q2.example.com', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'CONFLICT', position: 'target', last_error: 'ROLLBACK_PROVIDER_CONFLICT' },
+      ],
+    })));
+
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    await screen.findByText('relayPreferenceManualIntervention');
+
+    expect(screen.getByText(/relaySwitchErrorRollbackScheduling/)).toBeInTheDocument();
+    expect(within(screen.getByTestId('relay-dns-record-1')).getByText('relayPreferenceDnsAtPrevious')).toBeInTheDocument();
+    expect(within(screen.getByTestId('relay-dns-record-2')).getByText('relayPreferenceDnsAtTarget')).toBeInTheDocument();
+    expect(within(rowFor('node-a')).getByRole('button', { name: /relayPreferenceReconfirm/ })).toBeEnabled();
   });
 
   it('maps known Ready reasons with details and preserves unknown codes', async () => {

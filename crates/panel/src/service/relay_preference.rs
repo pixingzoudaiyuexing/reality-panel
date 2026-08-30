@@ -7,7 +7,7 @@
 use crate::api::stats::{parse_status_key, NODE_ONLINE_WINDOW_SECS};
 use crate::api::ws::NodeConnections;
 use crate::db::error::DbError;
-use crate::db::repo::{GroupRepository, Repository, ResourceScope};
+use crate::db::repo::{GroupRepository, Repository, ResourceScope, RuleRepository};
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use relay_shared::models::ForwardRule;
@@ -32,7 +32,22 @@ static RELAY_PREFERENCE_MUTATION_LOCK: Lazy<tokio::sync::Mutex<()>> =
 pub enum RelayPreferencePhase {
     Idle,
     Switching,
+    RollingBack,
     Failed,
+    FailedRolledBack,
+    FailedManualIntervention,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelayDnsTransactionRecord {
+    pub rule_id: i64,
+    pub fqdn: String,
+    pub rollback_value: Option<String>,
+    pub target_value: String,
+    #[serde(default)]
+    pub target_state: Option<String>,
+    #[serde(default)]
+    pub target_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +57,10 @@ pub struct RelayPreferenceState {
     pub state: RelayPreferencePhase,
     pub started_at: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub rollback_error: Option<String>,
+    #[serde(default)]
+    pub dns_records: Vec<RelayDnsTransactionRecord>,
 }
 
 impl Default for RelayPreferenceState {
@@ -52,6 +71,8 @@ impl Default for RelayPreferenceState {
             state: RelayPreferencePhase::Idle,
             started_at: None,
             last_error: None,
+            rollback_error: None,
+            dns_records: Vec::new(),
         }
     }
 }
@@ -75,7 +96,29 @@ pub struct RelayPreferenceView {
     pub state: RelayPreferencePhase,
     pub started_at: Option<String>,
     pub last_error: Option<String>,
+    pub rollback_error: Option<String>,
+    pub dns_records: Vec<RelayDnsRecordView>,
     pub nodes: Vec<RelayReadyNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayDnsRecordPosition {
+    Rollback,
+    Target,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelayDnsRecordView {
+    pub rule_id: i64,
+    pub fqdn: String,
+    pub rollback_value: Option<String>,
+    pub target_value: String,
+    pub expected_value: Option<String>,
+    pub sync_state: Option<String>,
+    pub position: RelayDnsRecordPosition,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -408,6 +451,14 @@ pub async fn resolve_dns_target(
     db: &dyn Repository,
     group_id: i64,
 ) -> Result<RelayDnsTarget, DbError> {
+    resolve_dns_target_for_rule(db, group_id, None).await
+}
+
+pub async fn resolve_dns_target_for_rule(
+    db: &dyn Repository,
+    group_id: i64,
+    rule_id: Option<i64>,
+) -> Result<RelayDnsTarget, DbError> {
     let Some(raw) = db.get(&preference_key(group_id)).await? else {
         return Ok(RelayDnsTarget::NotSet);
     };
@@ -415,13 +466,42 @@ pub async fn resolve_dns_target(
         Ok(preference) => preference,
         Err(_) => return Ok(RelayDnsTarget::Invalid("RELAY_PREFERENCE_INVALID")),
     };
-    if preference.state == RelayPreferencePhase::Failed && preference.pending_node_id.is_some() {
-        return Ok(RelayDnsTarget::Frozen);
-    }
-    let selected_node_id = if preference.state == RelayPreferencePhase::Switching {
-        preference.pending_node_id.as_deref()
-    } else {
-        preference.preferred_node_id.as_deref()
+    let selected_node_id = match preference.state {
+        RelayPreferencePhase::Switching => {
+            if let Some(value) = rule_id
+                .and_then(|rule_id| {
+                    preference
+                        .dns_records
+                        .iter()
+                        .find(|record| record.rule_id == rule_id)
+                })
+                .map(|record| record.target_value.as_str())
+            {
+                return Ok(match valid_public_ipv4(Some(value)) {
+                    Some(value) => RelayDnsTarget::Resolved(value),
+                    None => RelayDnsTarget::Invalid("TARGET_VALUE_UNAVAILABLE"),
+                });
+            }
+            preference.pending_node_id.as_deref()
+        }
+        RelayPreferencePhase::RollingBack => {
+            let rollback_value = rule_id
+                .and_then(|rule_id| {
+                    preference
+                        .dns_records
+                        .iter()
+                        .find(|record| record.rule_id == rule_id)
+                })
+                .and_then(|record| record.rollback_value.as_deref());
+            return Ok(match valid_public_ipv4(rollback_value) {
+                Some(value) => RelayDnsTarget::Resolved(value),
+                None => RelayDnsTarget::Invalid("ROLLBACK_VALUE_UNAVAILABLE"),
+            });
+        }
+        RelayPreferencePhase::Failed
+        | RelayPreferencePhase::FailedRolledBack
+        | RelayPreferencePhase::FailedManualIntervention => return Ok(RelayDnsTarget::Frozen),
+        RelayPreferencePhase::Idle => preference.preferred_node_id.as_deref(),
     };
     match selected_node_id {
         Some(node_id) => stored_node_public_ipv4(db, group_id, node_id).await,
@@ -520,6 +600,66 @@ pub async fn delete_relay_preference(db: &dyn Repository, group_id: i64) -> Resu
     Ok(())
 }
 
+async fn build_dns_transaction_records(
+    db: &dyn Repository,
+    group_id: i64,
+    preference: &RelayPreferenceState,
+    eligible_rule_ids: &[i64],
+    target_value: &str,
+) -> Result<Vec<RelayDnsTransactionRecord>, DbError> {
+    let preferred_value = match preference.preferred_node_id.as_deref() {
+        Some(node_id) => match stored_node_public_ipv4(db, group_id, node_id).await? {
+            RelayDnsTarget::Resolved(value) => Some(value),
+            _ => None,
+        },
+        None => None,
+    };
+    let mut records = Vec::with_capacity(eligible_rule_ids.len());
+    for rule_id in eligible_rule_ids {
+        let Some(rule) = RuleRepository::find_rule_by_id(db, *rule_id, &ResourceScope::All).await?
+        else {
+            continue;
+        };
+        let sync = db.find_dns_record_sync(*rule_id).await?;
+        let rollback_value = preferred_value.clone().or_else(|| {
+            sync.as_ref()
+                .filter(|sync| sync.state == "PROPAGATED")
+                .and_then(|sync| valid_public_ipv4(Some(&sync.expected_value)))
+        });
+        records.push(RelayDnsTransactionRecord {
+            rule_id: *rule_id,
+            fqdn: rule
+                .sni
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .trim_end_matches('.')
+                .to_ascii_lowercase(),
+            rollback_value,
+            target_value: target_value.to_string(),
+            target_state: None,
+            target_error: None,
+        });
+    }
+    Ok(records)
+}
+
+fn transition_to_rollback(preference: &mut RelayPreferenceState, error: &str) {
+    preference.last_error = Some(error.to_string());
+    if !preference.dns_records.is_empty()
+        && preference
+            .dns_records
+            .iter()
+            .all(|record| record.rollback_value.is_some())
+    {
+        preference.state = RelayPreferencePhase::RollingBack;
+        preference.rollback_error = None;
+    } else {
+        preference.state = RelayPreferencePhase::FailedManualIntervention;
+        preference.rollback_error = Some("ROLLBACK_VALUE_UNAVAILABLE".into());
+    }
+}
+
 pub async fn start_relay_switch(
     db: &dyn Repository,
     node_connections: &NodeConnections,
@@ -543,7 +683,10 @@ pub async fn start_relay_switch(
             return Err(StartRelaySwitchError::InvalidPreference(error))
         }
     };
-    if preference.state == RelayPreferencePhase::Switching {
+    if matches!(
+        preference.state,
+        RelayPreferencePhase::Switching | RelayPreferencePhase::RollingBack
+    ) {
         if preference.pending_node_id.as_deref() == Some(target_node_id) {
             return Ok(StartRelaySwitchOutcome::AlreadySwitching);
         }
@@ -566,9 +709,9 @@ pub async fn start_relay_switch(
     else {
         return Err(StartRelaySwitchError::NodeNotInGroup);
     };
-    if valid_public_ipv4(target.public_ipv4.as_deref()).is_none() {
+    let Some(target_public_ipv4) = valid_public_ipv4(target.public_ipv4.as_deref()) else {
         return Err(StartRelaySwitchError::TargetPublicIpv4Invalid);
-    }
+    };
     if !target.info.ready {
         return Err(StartRelaySwitchError::TargetNotReady(
             target.info.ready_reasons.clone(),
@@ -596,18 +739,41 @@ pub async fn start_relay_switch(
     }
 
     let from_node_id = preference.preferred_node_id.clone();
+    preference.dns_records = build_dns_transaction_records(
+        db,
+        group_id,
+        &preference,
+        &eligible_rule_ids,
+        &target_public_ipv4,
+    )
+    .await?;
     preference.pending_node_id = Some(target_node_id.to_string());
     preference.state = RelayPreferencePhase::Switching;
     preference.started_at = Some(Utc::now().to_rfc3339());
     preference.last_error = None;
+    preference.rollback_error = None;
     store_preference(db, group_id, &preference).await?;
 
     if let Err(error) =
         crate::service::dnsmgr::schedule_group_eligible(db, group_id, &eligible_rule_ids).await
     {
-        preference.state = RelayPreferencePhase::Failed;
-        preference.last_error = Some("DNS_SCHEDULING_FAILED".into());
-        store_preference(db, group_id, &preference).await?;
+        match begin_rollback(
+            db,
+            group_id,
+            preference,
+            target_node_id.to_string(),
+            "DNS_SCHEDULING_FAILED",
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(RelayPreferenceError::Database(rollback_error)) => {
+                return Err(StartRelaySwitchError::Database(rollback_error))
+            }
+            Err(RelayPreferenceError::InvalidPreference(rollback_error)) => {
+                return Err(StartRelaySwitchError::InvalidPreference(rollback_error))
+            }
+        }
         return Err(StartRelaySwitchError::DnsSchedulingFailed(error));
     }
 
@@ -620,14 +786,25 @@ pub async fn start_relay_switch(
 #[derive(Debug)]
 enum FinalizeOutcome {
     Pending,
+    RollbackStarted {
+        from_node_id: Option<String>,
+        to_node_id: String,
+        error: String,
+    },
     Committed {
         from_node_id: Option<String>,
         to_node_id: String,
     },
-    Failed {
+    RolledBack {
         from_node_id: Option<String>,
         to_node_id: String,
         error: String,
+    },
+    ManualIntervention {
+        from_node_id: Option<String>,
+        to_node_id: String,
+        error: String,
+        rollback_error: String,
     },
 }
 
@@ -637,27 +814,160 @@ fn terminal_dns_error(sync: &crate::db::repo::DnsRecordSync) -> Option<String> {
         "FAILED" => sync.next_attempt_at.is_none(),
         _ => false,
     };
-    terminal.then(|| {
-        sync.last_error_category
-            .clone()
-            .unwrap_or_else(|| format!("DNS_SYNC_{}", sync.state))
+    terminal.then(|| match sync.last_error_category.as_deref() {
+        Some("DNS_CONFLICT") => "DNS_RECORD_CONFLICT".into(),
+        Some("MUTATION_UNKNOWN" | "POST_WRITE_NOT_VERIFIED") => "MUTATION_OUTCOME_UNKNOWN".into(),
+        Some("DNSMGR_DISABLED") => "DISABLED".into(),
+        Some(category) => category.to_string(),
+        None => format!("DNS_SYNC_{}", sync.state),
     })
 }
 
-async fn fail_switch(
+async fn capture_target_outcomes(
+    db: &dyn Repository,
+    preference: &mut RelayPreferenceState,
+) -> Result<(), DbError> {
+    for record in &mut preference.dns_records {
+        if let Some(sync) = db.find_dns_record_sync(record.rule_id).await? {
+            record.target_state = Some(sync.state);
+            record.target_error = sync.last_error_category;
+        }
+    }
+    Ok(())
+}
+
+async fn begin_rollback(
     db: &dyn Repository,
     group_id: i64,
     mut preference: RelayPreferenceState,
     target_node_id: String,
     error: &str,
 ) -> Result<FinalizeOutcome, RelayPreferenceError> {
-    preference.state = RelayPreferencePhase::Failed;
-    preference.last_error = Some(error.to_string());
+    capture_target_outcomes(db, &mut preference).await?;
+    transition_to_rollback(&mut preference, error);
+    let outcome = if preference.state == RelayPreferencePhase::RollingBack {
+        FinalizeOutcome::RollbackStarted {
+            from_node_id: preference.preferred_node_id.clone(),
+            to_node_id: target_node_id,
+            error: error.to_string(),
+        }
+    } else {
+        FinalizeOutcome::ManualIntervention {
+            from_node_id: preference.preferred_node_id.clone(),
+            to_node_id: target_node_id,
+            error: error.to_string(),
+            rollback_error: preference
+                .rollback_error
+                .clone()
+                .unwrap_or_else(|| "ROLLBACK_VALUE_UNAVAILABLE".into()),
+        }
+    };
     store_preference(db, group_id, &preference).await?;
-    Ok(FinalizeOutcome::Failed {
+    if preference.state == RelayPreferencePhase::RollingBack {
+        let rule_ids = preference
+            .dns_records
+            .iter()
+            .map(|record| record.rule_id)
+            .collect::<Vec<_>>();
+        if let Err(schedule_error) =
+            crate::service::dnsmgr::schedule_group_eligible(db, group_id, &rule_ids).await
+        {
+            preference.state = RelayPreferencePhase::FailedManualIntervention;
+            preference.rollback_error = Some("ROLLBACK_SCHEDULING_FAILED".into());
+            store_preference(db, group_id, &preference).await?;
+            return Ok(FinalizeOutcome::ManualIntervention {
+                from_node_id: preference.preferred_node_id,
+                to_node_id: preference.pending_node_id.unwrap_or_default(),
+                error: error.to_string(),
+                rollback_error: format!("ROLLBACK_SCHEDULING_FAILED:{schedule_error}"),
+            });
+        }
+    }
+    Ok(outcome)
+}
+
+async fn finalize_rollback(
+    db: &dyn Repository,
+    group_id: i64,
+    mut preference: RelayPreferenceState,
+) -> Result<FinalizeOutcome, RelayPreferenceError> {
+    let target_node_id = preference.pending_node_id.clone().unwrap_or_default();
+    let eligible = crate::service::dnsmgr::eligible_rule_ids_for_group(db, group_id).await?;
+    let mut all_propagated = !preference.dns_records.is_empty();
+
+    for record in &preference.dns_records {
+        if eligible.binary_search(&record.rule_id).is_err() {
+            preference.state = RelayPreferencePhase::FailedManualIntervention;
+            preference.rollback_error = Some("ROLLBACK_RULE_NOT_ELIGIBLE".into());
+            store_preference(db, group_id, &preference).await?;
+            return Ok(FinalizeOutcome::ManualIntervention {
+                from_node_id: preference.preferred_node_id,
+                to_node_id: target_node_id,
+                error: preference
+                    .last_error
+                    .unwrap_or_else(|| "RELAY_SWITCH_FAILED".into()),
+                rollback_error: "ROLLBACK_RULE_NOT_ELIGIBLE".into(),
+            });
+        }
+        let Some(rollback_value) = record.rollback_value.as_deref() else {
+            preference.state = RelayPreferencePhase::FailedManualIntervention;
+            preference.rollback_error = Some("ROLLBACK_VALUE_UNAVAILABLE".into());
+            store_preference(db, group_id, &preference).await?;
+            return Ok(FinalizeOutcome::ManualIntervention {
+                from_node_id: preference.preferred_node_id,
+                to_node_id: target_node_id,
+                error: preference
+                    .last_error
+                    .unwrap_or_else(|| "RELAY_SWITCH_FAILED".into()),
+                rollback_error: "ROLLBACK_VALUE_UNAVAILABLE".into(),
+            });
+        };
+        let Some(sync) = db.find_dns_record_sync(record.rule_id).await? else {
+            all_propagated = false;
+            continue;
+        };
+        if sync.expected_value != rollback_value {
+            all_propagated = false;
+            continue;
+        }
+        let rollback_failure = terminal_dns_error(&sync).or_else(|| {
+            (sync.last_error_category.as_deref() == Some("PUBLIC_DNS_MULTIPLE_ANSWERS"))
+                .then(|| "PUBLIC_DNS_MULTIPLE_ANSWERS".into())
+        });
+        if let Some(error) = rollback_failure {
+            preference.state = RelayPreferencePhase::FailedManualIntervention;
+            preference.rollback_error = Some(error.clone());
+            store_preference(db, group_id, &preference).await?;
+            return Ok(FinalizeOutcome::ManualIntervention {
+                from_node_id: preference.preferred_node_id,
+                to_node_id: target_node_id,
+                error: preference
+                    .last_error
+                    .unwrap_or_else(|| "RELAY_SWITCH_FAILED".into()),
+                rollback_error: error,
+            });
+        }
+        if sync.state != "PROPAGATED"
+            || sync.last_error_category.as_deref() == Some("PUBLIC_DNS_MULTIPLE_ANSWERS")
+        {
+            all_propagated = false;
+        }
+    }
+
+    if !all_propagated {
+        return Ok(FinalizeOutcome::Pending);
+    }
+    preference.state = RelayPreferencePhase::FailedRolledBack;
+    preference.rollback_error = None;
+    let error = preference
+        .last_error
+        .clone()
+        .unwrap_or_else(|| "RELAY_SWITCH_FAILED".into());
+    store_preference(db, group_id, &preference).await?;
+    Ok(FinalizeOutcome::RolledBack {
         from_node_id: preference.preferred_node_id,
         to_node_id: target_node_id,
-        error: error.to_string(),
+        error,
     })
 }
 
@@ -668,23 +978,26 @@ async fn finalize_switching_group(
 ) -> Result<FinalizeOutcome, RelayPreferenceError> {
     let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
     let mut preference = load_preference(db, group_id).await?;
+    if preference.state == RelayPreferencePhase::RollingBack {
+        return finalize_rollback(db, group_id, preference).await;
+    }
     if preference.state != RelayPreferencePhase::Switching {
         return Ok(FinalizeOutcome::Pending);
     }
     let Some(target_node_id) = preference.pending_node_id.clone() else {
-        preference.state = RelayPreferencePhase::Failed;
-        preference.last_error = Some("PENDING_NODE_MISSING".into());
-        store_preference(db, group_id, &preference).await?;
-        return Ok(FinalizeOutcome::Failed {
-            from_node_id: preference.preferred_node_id,
-            to_node_id: String::new(),
-            error: "PENDING_NODE_MISSING".into(),
-        });
+        return begin_rollback(
+            db,
+            group_id,
+            preference,
+            String::new(),
+            "PENDING_NODE_MISSING",
+        )
+        .await;
     };
     let target_ipv4 = match stored_node_public_ipv4(db, group_id, &target_node_id).await? {
         RelayDnsTarget::Resolved(target_ipv4) => target_ipv4,
         RelayDnsTarget::Invalid("RELAY_NODE_STATUS_MISSING" | "RELAY_NODE_STATUS_INVALID") => {
-            return fail_switch(
+            return begin_rollback(
                 db,
                 group_id,
                 preference,
@@ -694,7 +1007,7 @@ async fn finalize_switching_group(
             .await;
         }
         RelayDnsTarget::Invalid(_) | RelayDnsTarget::NotSet | RelayDnsTarget::Frozen => {
-            return fail_switch(
+            return begin_rollback(
                 db,
                 group_id,
                 preference,
@@ -707,48 +1020,90 @@ async fn finalize_switching_group(
 
     let rule_ids = crate::service::dnsmgr::eligible_rule_ids_for_group(db, group_id).await?;
     if rule_ids.is_empty() {
-        let error = "NO_ELIGIBLE_DNS_RULES".to_string();
-        preference.state = RelayPreferencePhase::Failed;
-        preference.last_error = Some(error.clone());
-        store_preference(db, group_id, &preference).await?;
-        return Ok(FinalizeOutcome::Failed {
-            from_node_id: preference.preferred_node_id,
-            to_node_id: target_node_id,
-            error,
-        });
+        return begin_rollback(
+            db,
+            group_id,
+            preference,
+            target_node_id,
+            "NO_ELIGIBLE_DNS_RULES",
+        )
+        .await;
     }
 
-    for rule_id in rule_ids {
-        let Some(sync) = db.find_dns_record_sync(rule_id).await? else {
-            return Ok(FinalizeOutcome::Pending);
+    if preference.dns_records.is_empty() {
+        preference.dns_records =
+            build_dns_transaction_records(db, group_id, &preference, &rule_ids, &target_ipv4)
+                .await?;
+        store_preference(db, group_id, &preference).await?;
+    }
+    if preference
+        .dns_records
+        .iter()
+        .any(|record| record.target_value != target_ipv4)
+    {
+        return begin_rollback(
+            db,
+            group_id,
+            preference,
+            target_node_id,
+            "TARGET_PUBLIC_IPV4_CHANGED",
+        )
+        .await;
+    }
+
+    let transaction_ids = preference
+        .dns_records
+        .iter()
+        .map(|record| record.rule_id)
+        .collect::<HashSet<_>>();
+    if rule_ids
+        .iter()
+        .any(|rule_id| !transaction_ids.contains(rule_id))
+        || preference
+            .dns_records
+            .iter()
+            .any(|record| rule_ids.binary_search(&record.rule_id).is_err())
+    {
+        return begin_rollback(
+            db,
+            group_id,
+            preference,
+            target_node_id,
+            "DNS_RULE_SET_CHANGED",
+        )
+        .await;
+    }
+
+    let mut all_propagated = true;
+    let mut terminal_error = None;
+    for record in &preference.dns_records {
+        let Some(sync) = db.find_dns_record_sync(record.rule_id).await? else {
+            all_propagated = false;
+            continue;
         };
-        if sync.expected_value != target_ipv4 {
-            return Ok(FinalizeOutcome::Pending);
+        if sync.expected_value != record.target_value {
+            all_propagated = false;
+            continue;
         }
         if let Some(error) = terminal_dns_error(&sync) {
-            preference.state = RelayPreferencePhase::Failed;
-            preference.last_error = Some(error.clone());
-            store_preference(db, group_id, &preference).await?;
-            return Ok(FinalizeOutcome::Failed {
-                from_node_id: preference.preferred_node_id,
-                to_node_id: target_node_id,
-                error,
-            });
+            terminal_error.get_or_insert(error);
+            continue;
+        }
+        if sync.state == "PROPAGATED"
+            && sync.last_error_category.as_deref() == Some("PUBLIC_DNS_MULTIPLE_ANSWERS")
+        {
+            terminal_error.get_or_insert_with(|| "PUBLIC_DNS_MULTIPLE_ANSWERS".into());
+            continue;
         }
         if sync.state != "PROPAGATED" {
-            return Ok(FinalizeOutcome::Pending);
+            all_propagated = false;
         }
-        if sync.last_error_category.as_deref() == Some("PUBLIC_DNS_MULTIPLE_ANSWERS") {
-            let error = "PUBLIC_DNS_MULTIPLE_ANSWERS".to_string();
-            preference.state = RelayPreferencePhase::Failed;
-            preference.last_error = Some(error.clone());
-            store_preference(db, group_id, &preference).await?;
-            return Ok(FinalizeOutcome::Failed {
-                from_node_id: preference.preferred_node_id,
-                to_node_id: target_node_id,
-                error,
-            });
-        }
+    }
+    if let Some(error) = terminal_error {
+        return begin_rollback(db, group_id, preference, target_node_id, &error).await;
+    }
+    if !all_propagated {
+        return Ok(FinalizeOutcome::Pending);
     }
 
     let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
@@ -756,7 +1111,7 @@ async fn finalize_switching_group(
         .iter()
         .any(|node| node.info.node_id == target_node_id && node.info.ready)
     {
-        return fail_switch(
+        return begin_rollback(
             db,
             group_id,
             preference,
@@ -772,6 +1127,8 @@ async fn finalize_switching_group(
     preference.state = RelayPreferencePhase::Idle;
     preference.started_at = None;
     preference.last_error = None;
+    preference.rollback_error = None;
+    preference.dns_records.clear();
     store_preference(db, group_id, &preference).await?;
     Ok(FinalizeOutcome::Committed {
         from_node_id,
@@ -797,7 +1154,10 @@ pub async fn finalize_switching_preferences(state: &crate::api::AppState) {
             );
             continue;
         };
-        if preference.state != RelayPreferencePhase::Switching {
+        if !matches!(
+            preference.state,
+            RelayPreferencePhase::Switching | RelayPreferencePhase::RollingBack
+        ) {
             continue;
         }
         let Some(group_id) = key
@@ -826,7 +1186,7 @@ pub async fn finalize_switching_preferences(state: &crate::api::AppState) {
                 )
                 .await;
             }
-            Ok(FinalizeOutcome::Failed {
+            Ok(FinalizeOutcome::RollbackStarted {
                 from_node_id,
                 to_node_id,
                 error,
@@ -834,7 +1194,7 @@ pub async fn finalize_switching_preferences(state: &crate::api::AppState) {
                 crate::service::audit::record(
                     state,
                     None,
-                    "RELAY_SWITCH_FAILED",
+                    "RELAY_SWITCH_ROLLBACK_STARTED",
                     "device_group",
                     group_id,
                     &format!(
@@ -843,6 +1203,50 @@ pub async fn finalize_switching_preferences(state: &crate::api::AppState) {
                         from_node_id.as_deref().unwrap_or("none"),
                         to_node_id,
                         error
+                    ),
+                )
+                .await;
+            }
+            Ok(FinalizeOutcome::RolledBack {
+                from_node_id,
+                to_node_id,
+                error,
+            }) => {
+                crate::service::audit::record(
+                    state,
+                    None,
+                    "RELAY_SWITCH_FAILED_ROLLED_BACK",
+                    "device_group",
+                    group_id,
+                    &format!(
+                        "group_id={} from_node_id={} to_node_id={} error={}",
+                        group_id,
+                        from_node_id.as_deref().unwrap_or("none"),
+                        to_node_id,
+                        error
+                    ),
+                )
+                .await;
+            }
+            Ok(FinalizeOutcome::ManualIntervention {
+                from_node_id,
+                to_node_id,
+                error,
+                rollback_error,
+            }) => {
+                crate::service::audit::record(
+                    state,
+                    None,
+                    "RELAY_SWITCH_FAILED_MANUAL_INTERVENTION",
+                    "device_group",
+                    group_id,
+                    &format!(
+                        "group_id={} from_node_id={} to_node_id={} error={} rollback_error={}",
+                        group_id,
+                        from_node_id.as_deref().unwrap_or("none"),
+                        to_node_id,
+                        error,
+                        rollback_error
                     ),
                 )
                 .await;
@@ -864,6 +1268,40 @@ pub async fn get_relay_preference(
 ) -> Result<RelayPreferenceView, RelayPreferenceError> {
     let preference = ensure_preference_initialized(db, node_connections, group_id).await?;
     let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
+    let mut dns_records = Vec::with_capacity(preference.dns_records.len());
+    for record in &preference.dns_records {
+        let sync = db.find_dns_record_sync(record.rule_id).await?;
+        let propagated_value = sync
+            .as_ref()
+            .filter(|sync| sync.state == "PROPAGATED" && sync.last_error_category.is_none())
+            .map(|sync| sync.expected_value.as_str());
+        let position = if propagated_value == record.rollback_value.as_deref() {
+            RelayDnsRecordPosition::Rollback
+        } else if propagated_value == Some(record.target_value.as_str())
+            || (matches!(
+                preference.state,
+                RelayPreferencePhase::RollingBack | RelayPreferencePhase::FailedManualIntervention
+            ) && record.target_state.as_deref() == Some("PROPAGATED")
+                && record.target_error.is_none())
+        {
+            RelayDnsRecordPosition::Target
+        } else {
+            RelayDnsRecordPosition::Unknown
+        };
+        dns_records.push(RelayDnsRecordView {
+            rule_id: record.rule_id,
+            fqdn: record.fqdn.clone(),
+            rollback_value: record.rollback_value.clone(),
+            target_value: record.target_value.clone(),
+            expected_value: sync.as_ref().map(|sync| sync.expected_value.clone()),
+            sync_state: sync.as_ref().map(|sync| sync.state.clone()),
+            position,
+            last_error: sync
+                .as_ref()
+                .and_then(|sync| sync.last_error_category.clone())
+                .or_else(|| record.target_error.clone()),
+        });
+    }
 
     let preferred_node_id = preference.preferred_node_id.clone();
     let preferred_ip = evaluated
@@ -886,6 +1324,8 @@ pub async fn get_relay_preference(
         state: preference.state,
         started_at: preference.started_at,
         last_error: preference.last_error,
+        rollback_error: preference.rollback_error,
+        dns_records,
         nodes,
     })
 }
@@ -1549,65 +1989,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiple_answers_and_terminal_dns_failure_never_commit_pending_node() {
+    async fn partial_target_failure_rolls_back_every_record_before_terminal_failure() {
         let (repo, connections, _) = switch_fixture().await;
         start_relay_switch(&repo, &connections, 7, "node-b")
             .await
             .unwrap();
-        set_sync_state(
-            &repo,
-            1,
-            "PROPAGATED",
-            Some("PUBLIC_DNS_MULTIPLE_ANSWERS"),
-            None,
-        )
-        .await;
+        set_sync_state(&repo, 1, "PROPAGATED", None, None).await;
+        set_sync_state(&repo, 3, "CONFLICT", Some("DNS_CONFLICT"), None).await;
         assert!(matches!(
             finalize_switching_group(&repo, &connections, 7)
                 .await
                 .unwrap(),
-            FinalizeOutcome::Failed { .. }
+            FinalizeOutcome::RollbackStarted { .. }
         ));
-        let failed = load_preference(&repo, 7).await.unwrap();
-        assert_eq!(failed.preferred_node_id.as_deref(), Some("node-a"));
-        assert_eq!(failed.pending_node_id.as_deref(), Some("node-b"));
-        assert_eq!(failed.state, RelayPreferencePhase::Failed);
+        let rolling_back = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(rolling_back.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(rolling_back.pending_node_id.as_deref(), Some("node-b"));
+        assert_eq!(rolling_back.state, RelayPreferencePhase::RollingBack);
         assert_eq!(
-            failed.last_error.as_deref(),
-            Some("PUBLIC_DNS_MULTIPLE_ANSWERS")
+            rolling_back.last_error.as_deref(),
+            Some("DNS_RECORD_CONFLICT")
         );
-        let frozen_multiple = repo.find_dns_record_sync(1).await.unwrap().unwrap();
+        assert_eq!(rolling_back.dns_records.len(), 2);
+        assert_eq!(
+            rolling_back.dns_records[0].target_state.as_deref(),
+            Some("PROPAGATED")
+        );
+
         crate::service::dnsmgr::refresh_all_desired(&repo)
             .await
             .unwrap();
-        assert_eq!(
-            repo.find_dns_record_sync(1).await.unwrap().unwrap(),
-            frozen_multiple
-        );
-
-        let retry = start_relay_switch(&repo, &connections, 7, "node-b")
-            .await
-            .unwrap();
-        assert!(matches!(retry, StartRelaySwitchOutcome::Started { .. }));
-        set_sync_state(&repo, 1, "CONFLICT", Some("DNS_RECORD_CONFLICT"), None).await;
+        for rule_id in [1, 3] {
+            let sync = repo.find_dns_record_sync(rule_id).await.unwrap().unwrap();
+            assert_eq!(sync.expected_value, "203.0.113.5");
+            assert_eq!(sync.state, "PENDING");
+            set_sync_state(&repo, rule_id, "PROPAGATED", None, None).await;
+        }
         assert!(matches!(
             finalize_switching_group(&repo, &connections, 7)
                 .await
                 .unwrap(),
-            FinalizeOutcome::Failed { .. }
+            FinalizeOutcome::RolledBack { .. }
         ));
         let terminal = load_preference(&repo, 7).await.unwrap();
         assert_eq!(terminal.preferred_node_id.as_deref(), Some("node-a"));
         assert_eq!(terminal.pending_node_id.as_deref(), Some("node-b"));
+        assert_eq!(terminal.state, RelayPreferencePhase::FailedRolledBack);
         assert_eq!(terminal.last_error.as_deref(), Some("DNS_RECORD_CONFLICT"));
-        let frozen_conflict = repo.find_dns_record_sync(1).await.unwrap().unwrap();
-        crate::service::dnsmgr::refresh_all_desired(&repo)
-            .await
-            .unwrap();
-        assert_eq!(
-            repo.find_dns_record_sync(1).await.unwrap().unwrap(),
-            frozen_conflict
-        );
+        let view = get_relay_preference(&repo, &connections, 7).await.unwrap();
+        assert!(view
+            .dns_records
+            .iter()
+            .all(|record| record.position == RelayDnsRecordPosition::Rollback));
 
         let choose_c = start_relay_switch(&repo, &connections, 7, "node-c")
             .await
@@ -1620,7 +2053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_switch_requires_explicit_post_to_restore_the_old_preferred() {
+    async fn target_not_ready_after_dns_is_rolled_back_before_explicit_retry() {
         let (repo, connections, _) = switch_fixture().await;
         assert_eq!(
             start_relay_switch(&repo, &connections, 7, "node-a")
@@ -1651,24 +2084,28 @@ mod tests {
             finalize_switching_group(&repo, &connections, 7)
                 .await
                 .unwrap(),
-            FinalizeOutcome::Failed { .. }
+            FinalizeOutcome::RollbackStarted { .. }
         ));
-        let failed = load_preference(&repo, 7).await.unwrap();
-        assert_eq!(failed.preferred_node_id.as_deref(), Some("node-a"));
-        assert_eq!(failed.pending_node_id.as_deref(), Some("node-b"));
-        assert_eq!(failed.state, RelayPreferencePhase::Failed);
+        let rolling_back = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(rolling_back.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(rolling_back.pending_node_id.as_deref(), Some("node-b"));
+        assert_eq!(rolling_back.state, RelayPreferencePhase::RollingBack);
         assert_eq!(
-            failed.last_error.as_deref(),
+            rolling_back.last_error.as_deref(),
             Some("TARGET_NOT_READY_AFTER_DNS")
         );
-        let frozen_b = repo.find_dns_record_sync(1).await.unwrap().unwrap();
         crate::service::dnsmgr::refresh_all_desired(&repo)
             .await
             .unwrap();
-        assert_eq!(
-            repo.find_dns_record_sync(1).await.unwrap().unwrap(),
-            frozen_b
-        );
+        for rule_id in [1, 3] {
+            set_sync_state(&repo, rule_id, "PROPAGATED", None, None).await;
+        }
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::RolledBack { .. }
+        ));
 
         let rollback = start_relay_switch(&repo, &connections, 7, "node-a")
             .await
@@ -1689,7 +2126,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_target_status_or_ip_fails_instead_of_staying_switching() {
+    async fn missing_target_status_or_ip_starts_rollback_instead_of_staying_switching() {
         let (repo, connections, _) = switch_fixture().await;
         start_relay_switch(&repo, &connections, 7, "node-b")
             .await
@@ -1699,21 +2136,27 @@ mod tests {
             finalize_switching_group(&repo, &connections, 7)
                 .await
                 .unwrap(),
-            FinalizeOutcome::Failed { .. }
+            FinalizeOutcome::RollbackStarted { .. }
         ));
         let missing_status = load_preference(&repo, 7).await.unwrap();
         assert_eq!(missing_status.preferred_node_id.as_deref(), Some("node-a"));
         assert_eq!(missing_status.pending_node_id.as_deref(), Some("node-b"));
-        assert_eq!(missing_status.state, RelayPreferencePhase::Failed);
+        assert_eq!(missing_status.state, RelayPreferencePhase::RollingBack);
         assert_eq!(
             missing_status.last_error.as_deref(),
             Some("TARGET_STATUS_UNAVAILABLE")
         );
-        let frozen = repo.find_dns_record_sync(1).await.unwrap().unwrap();
         crate::service::dnsmgr::refresh_all_desired(&repo)
             .await
             .unwrap();
-        assert_eq!(repo.find_dns_record_sync(1).await.unwrap().unwrap(), frozen);
+        assert_eq!(
+            repo.find_dns_record_sync(1)
+                .await
+                .unwrap()
+                .unwrap()
+                .expected_value,
+            "203.0.113.5"
+        );
 
         let (repo, connections, _) = switch_fixture().await;
         start_relay_switch(&repo, &connections, 7, "node-b")
@@ -1733,15 +2176,140 @@ mod tests {
             finalize_switching_group(&repo, &connections, 7)
                 .await
                 .unwrap(),
-            FinalizeOutcome::Failed { .. }
+            FinalizeOutcome::RollbackStarted { .. }
         ));
         let missing_ip = load_preference(&repo, 7).await.unwrap();
         assert_eq!(missing_ip.preferred_node_id.as_deref(), Some("node-a"));
         assert_eq!(missing_ip.pending_node_id.as_deref(), Some("node-b"));
-        assert_eq!(missing_ip.state, RelayPreferencePhase::Failed);
+        assert_eq!(missing_ip.state, RelayPreferencePhase::RollingBack);
         assert_eq!(
             missing_ip.last_error.as_deref(),
             Some("TARGET_PUBLIC_IPV4_UNAVAILABLE")
+        );
+
+        let (repo, connections, _) = switch_fixture().await;
+        start_relay_switch(&repo, &connections, 7, "node-b")
+            .await
+            .unwrap();
+        repo.set("node_status:7:node-b", &switch_status("203.0.113.66"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::RollbackStarted { .. }
+        ));
+        let changed_ip = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(changed_ip.state, RelayPreferencePhase::RollingBack);
+        assert_eq!(
+            changed_ip.last_error.as_deref(),
+            Some("TARGET_PUBLIC_IPV4_CHANGED")
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_failure_exposes_split_dns_and_requires_manual_intervention() {
+        let (repo, connections, _) = switch_fixture().await;
+        start_relay_switch(&repo, &connections, 7, "node-b")
+            .await
+            .unwrap();
+        set_sync_state(&repo, 1, "PROPAGATED", None, None).await;
+        set_sync_state(&repo, 3, "CONFLICT", Some("DNS_RECORD_CONFLICT"), None).await;
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::RollbackStarted { .. }
+        ));
+
+        crate::service::dnsmgr::refresh_all_desired(&repo)
+            .await
+            .unwrap();
+        set_sync_state(
+            &repo,
+            1,
+            "CONFLICT",
+            Some("ROLLBACK_PROVIDER_CONFLICT"),
+            None,
+        )
+        .await;
+        set_sync_state(&repo, 3, "PROPAGATED", None, None).await;
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::ManualIntervention { .. }
+        ));
+
+        let failed = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(failed.state, RelayPreferencePhase::FailedManualIntervention);
+        assert_eq!(failed.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(failed.pending_node_id.as_deref(), Some("node-b"));
+        assert_eq!(
+            failed.rollback_error.as_deref(),
+            Some("ROLLBACK_PROVIDER_CONFLICT")
+        );
+        let view = get_relay_preference(&repo, &connections, 7).await.unwrap();
+        let by_rule = view
+            .dns_records
+            .iter()
+            .map(|record| (record.rule_id, record.position.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_rule[&1], RelayDnsRecordPosition::Target);
+        assert_eq!(by_rule[&3], RelayDnsRecordPosition::Rollback);
+    }
+
+    #[tokio::test]
+    async fn multiple_public_answers_trigger_rollback_and_are_terminal_during_rollback() {
+        let (repo, connections, _) = switch_fixture().await;
+        start_relay_switch(&repo, &connections, 7, "node-b")
+            .await
+            .unwrap();
+        set_sync_state(
+            &repo,
+            1,
+            "PROPAGATED",
+            Some("PUBLIC_DNS_MULTIPLE_ANSWERS"),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::RollbackStarted { .. }
+        ));
+
+        set_sync_state(
+            &repo,
+            1,
+            "PROPAGATED",
+            Some("PUBLIC_DNS_MULTIPLE_ANSWERS"),
+            None,
+        )
+        .await;
+        set_sync_state(&repo, 3, "PROPAGATED", None, None).await;
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::ManualIntervention { .. }
+        ));
+        let failed = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(failed.state, RelayPreferencePhase::FailedManualIntervention);
+        assert_eq!(
+            failed.rollback_error.as_deref(),
+            Some("PUBLIC_DNS_MULTIPLE_ANSWERS")
+        );
+        let view = get_relay_preference(&repo, &connections, 7).await.unwrap();
+        assert_eq!(
+            view.dns_records
+                .iter()
+                .find(|record| record.rule_id == 1)
+                .map(|record| &record.position),
+            Some(&RelayDnsRecordPosition::Unknown),
+            "multiple public answers must never be presented as a confirmed target or rollback"
         );
     }
 }

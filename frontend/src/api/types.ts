@@ -388,7 +388,24 @@ export interface DeviceGroup {
   created_at: string;
 }
 
-export type RelayPreferencePhase = 'idle' | 'switching' | 'failed';
+export type RelayPreferencePhase =
+  | 'idle'
+  | 'switching'
+  | 'rolling_back'
+  | 'failed'
+  | 'failed_rolled_back'
+  | 'failed_manual_intervention';
+
+export interface RelayDnsRecordView {
+  rule_id: number;
+  fqdn: string;
+  rollback_value: string | null;
+  target_value: string;
+  expected_value: string | null;
+  sync_state: string | null;
+  position: 'rollback' | 'target' | 'unknown';
+  last_error: string | null;
+}
 
 export interface RelayReadyNode {
   node_id: string;
@@ -407,6 +424,8 @@ export interface RelayPreferenceView {
   state: RelayPreferencePhase;
   started_at: string | null;
   last_error: string | null;
+  rollback_error: string | null;
+  dns_records: RelayDnsRecordView[];
   nodes: RelayReadyNode[];
 }
 

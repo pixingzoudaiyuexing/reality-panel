@@ -1140,7 +1140,12 @@ pub(crate) async fn derive_dns_desired(
     };
 
     if matches!(
-        crate::service::relay_preference::resolve_dns_target(db, rule.device_group_in).await?,
+        crate::service::relay_preference::resolve_dns_target_for_rule(
+            db,
+            rule.device_group_in,
+            Some(rule.id),
+        )
+        .await?,
         crate::service::relay_preference::RelayDnsTarget::Frozen
     ) {
         return Ok(DnsDesiredResolution::Frozen);
@@ -1164,8 +1169,12 @@ pub(crate) async fn derive_dns_desired(
     let expected_value =
         match GroupRepository::find_by_id(db, rule.device_group_in, &ResourceScope::All).await? {
             Some(group) if group.group_type == "in" => {
-                match crate::service::relay_preference::resolve_dns_target(db, rule.device_group_in)
-                    .await?
+                match crate::service::relay_preference::resolve_dns_target_for_rule(
+                    db,
+                    rule.device_group_in,
+                    Some(rule.id),
+                )
+                .await?
                 {
                     crate::service::relay_preference::RelayDnsTarget::Resolved(ip) => ip,
                     crate::service::relay_preference::RelayDnsTarget::NotSet => {
@@ -3259,10 +3268,7 @@ mod tests {
             &key,
             &serde_json::to_string(&RelayPreferenceState {
                 preferred_node_id: Some("node-a".into()),
-                pending_node_id: None,
-                state: RelayPreferencePhase::Idle,
-                started_at: None,
-                last_error: None,
+                ..RelayPreferenceState::default()
             })
             .unwrap(),
         )
@@ -3291,7 +3297,7 @@ mod tests {
                 pending_node_id: Some("node-b".into()),
                 state: RelayPreferencePhase::Switching,
                 started_at: Some("2026-08-29T00:00:00Z".into()),
-                last_error: None,
+                ..RelayPreferenceState::default()
             })
             .unwrap(),
         )
@@ -3313,6 +3319,7 @@ mod tests {
                 state: RelayPreferencePhase::Failed,
                 started_at: Some("2026-08-29T00:00:00Z".into()),
                 last_error: Some("DNS_RECORD_CONFLICT".into()),
+                ..RelayPreferenceState::default()
             })
             .unwrap(),
         )
