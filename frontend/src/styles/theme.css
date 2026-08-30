@@ -339,11 +339,23 @@ html, body, #root {
   display: none;
 }
 
+.rp-rules-table .rp-rules-status-cell .rp-compact-status.ant-btn {
+  height: auto !important;
+  min-height: 44px;
+  padding-block: 0;
+}
+
+.rp-rules-table .rp-rules-status-cell .rp-compact-status.ant-btn > span {
+  height: 20px;
+  line-height: 20px;
+}
+
 .rp-rules-traffic {
   white-space: nowrap;
   font-family: var(--rp-font-mono);
   font-size: 12px;
   line-height: 14px;
+  margin-top: 2px;
 }
 
 .rp-rules-table .rp-rules-actions {

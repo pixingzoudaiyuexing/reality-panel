@@ -172,6 +172,10 @@ describe('Rules grouped compact layout', () => {
     expect(within(row).getByText(/DNS/)).toBeInTheDocument();
     expect(within(row).getByText(/路由/)).toBeInTheDocument();
     expect(within(row).getByText(/证书/)).toBeInTheDocument();
+    const statusTrigger = row.querySelector('.rp-rules-status-cell .rp-compact-status') as HTMLElement;
+    expect(statusTrigger).toBeInTheDocument();
+    expect(statusTrigger.querySelectorAll(':scope > span')).toHaveLength(2);
+    expect(within(row).getByText('traffic 145 B')).toBeInTheDocument();
     expect(within(row).getByText('paused')).toBeInTheDocument();
     expect(within(row).getByText('traffic 145 B')).toBeInTheDocument();
     expect(row.querySelector('.rp-rules-protocol-cell')).not.toHaveTextContent('paused');
