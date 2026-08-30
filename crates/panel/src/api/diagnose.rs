@@ -27,7 +27,7 @@ use crate::api::middleware::AuthUser;
 use crate::api::node::extract_node_token;
 use crate::api::AppState;
 use crate::db::repo::ResourceScope;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use relay_shared::protocol::ApiResponse;
@@ -489,6 +489,11 @@ pub(crate) struct NodeStatusRow {
     pub(crate) group_name: String,
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct DiagnoseQuery {
+    pub node_id: Option<String>,
+}
+
 /// POST /api/v1/rules/{id}/diagnose — start a diagnosis run for a rule.
 ///
 /// Resolves the rule's inbound group, enumerates nodes that reported status in
@@ -507,6 +512,7 @@ pub async fn diagnose_rule(
     user: AuthUser,
     State(state): State<AppState>,
     Path(rule_id): Path<i64>,
+    Query(query): Query<DiagnoseQuery>,
 ) -> Json<ApiResponse<DiagnoseResponse>> {
     // SECURITY (v0.4.9 SSRF boundary; v0.4.10 scoped): the probe targets are
     // read DIRECTLY from the database (the rule's stored targets + the inbound
@@ -596,7 +602,7 @@ pub async fn diagnose_rule(
 
     // 2. Enumerate the group's nodes from kvs (for node_version + node_id +
     //    public_ip; group_name is passed in for display).
-    let nodes = match group_node_statuses(&state, group_id, group_name.clone()).await {
+    let mut nodes = match group_node_statuses(&state, group_id, group_name.clone()).await {
         Ok(n) => n,
         Err(e) => {
             tracing::error!(
@@ -611,6 +617,20 @@ pub async fn diagnose_rule(
             });
         }
     };
+
+    // 指定节点时只缩小本次诊断的候选集合；后续分类、定向发送、challenge
+    // 校验和依赖诊断全部继续走原路径。其它分组的 node_id 在当前集合中不可见，
+    // 与不存在节点统一返回 404，避免泄漏跨组身份。
+    if let Some(target_node_id) = query.node_id.as_deref().map(str::trim) {
+        let Some(index) = nodes.iter().position(|node| node.node_id == target_node_id) else {
+            return Json(ApiResponse {
+                code: 404,
+                message: "Node not found in rule group".into(),
+                data: None,
+            });
+        };
+        nodes = vec![nodes.swap_remove(index)];
+    }
 
     // 3. Classify each node. v0.4.14 ordering — VERSION first, THEN WS liveness:
     //    - version < 0.4.14: the node has no X-Node-ID, so it can't be targeted
@@ -1040,6 +1060,45 @@ mod tests {
         (state, pool)
     }
 
+    fn test_user() -> AuthUser {
+        AuthUser {
+            user_id: 2,
+            admin: false,
+        }
+    }
+
+    async fn store_node_status(state: &AppState, group_id: i64, node_id: &str, node_version: &str) {
+        state
+            .db
+            .set(
+                &format!("node_status:{group_id}:{node_id}"),
+                &serde_json::json!({
+                    "node_id": node_id,
+                    "node_version": node_version,
+                    "public_ip": format!("192.0.2.{}", node_id.len()),
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn diagnosed_node_id(status: &NodeDiagnoseStatus) -> &str {
+        match status {
+            NodeDiagnoseStatus::Result { result, .. } => &result.node_id,
+            NodeDiagnoseStatus::Unsupported { node_id, .. }
+            | NodeDiagnoseStatus::ControlChannelOffline { node_id, .. }
+            | NodeDiagnoseStatus::Timeout { node_id, .. } => node_id,
+        }
+    }
+
+    fn result_for_message(message: &DiagnoseRuleMessage, node_id: &str) -> DiagnoseResult {
+        let mut result = mk_result(&message.request_id, node_id);
+        result.rule_id = 100;
+        result.challenge = message.challenge.clone();
+        result
+    }
+
     fn mk_result(req: &str, nid: &str) -> DiagnoseResult {
         DiagnoseResult {
             msg_type: "diagnose_result".into(),
@@ -1059,6 +1118,233 @@ mod tests {
             results: vec![],
             reality: None,
         }
+    }
+
+    #[tokio::test]
+    async fn diagnose_without_node_query_still_dispatches_every_candidate() {
+        let (state, _) = test_state().await;
+        store_node_status(&state, 10, "node-a", "1.1.0-rc.8").await;
+        store_node_status(&state, 10, "node-b", "1.1.0-rc.8").await;
+        let (_, mut rx_a) = state
+            .node_connections
+            .register(10, Some("node-a".into()))
+            .await;
+        let (_, mut rx_b) = state
+            .node_connections
+            .register(10, Some("node-b".into()))
+            .await;
+
+        let handler_state = state.clone();
+        let task = tokio::spawn(async move {
+            diagnose_rule(
+                test_user(),
+                State(handler_state),
+                Path(100),
+                Query(DiagnoseQuery::default()),
+            )
+            .await
+        });
+        let message_a: DiagnoseRuleMessage =
+            serde_json::from_str(&rx_a.recv().await.unwrap()).unwrap();
+        let message_b: DiagnoseRuleMessage =
+            serde_json::from_str(&rx_b.recv().await.unwrap()).unwrap();
+        assert_eq!(message_a.request_id, message_b.request_id);
+        assert!(
+            state
+                .diagnose
+                .record(
+                    &message_a.request_id,
+                    result_for_message(&message_a, "node-a")
+                )
+                .await
+        );
+        assert!(
+            state
+                .diagnose
+                .record(
+                    &message_b.request_id,
+                    result_for_message(&message_b, "node-b")
+                )
+                .await
+        );
+
+        let Json(response) = task.await.unwrap();
+        let diagnosis = response.data.unwrap();
+        assert_eq!(response.code, 0);
+        assert_eq!(diagnosis.nodes.len(), 2);
+        let ids: std::collections::HashSet<&str> =
+            diagnosis.nodes.iter().map(diagnosed_node_id).collect();
+        assert_eq!(ids, std::collections::HashSet::from(["node-a", "node-b"]));
+    }
+
+    #[tokio::test]
+    async fn targeted_online_node_is_the_only_dispatch_and_result() {
+        let (state, _) = test_state().await;
+        store_node_status(&state, 10, "node-a", "1.1.0-rc.8").await;
+        store_node_status(&state, 10, "node-b", "1.1.0-rc.8").await;
+        let (_, mut rx_a) = state
+            .node_connections
+            .register(10, Some("node-a".into()))
+            .await;
+        let (_, mut rx_b) = state
+            .node_connections
+            .register(10, Some("node-b".into()))
+            .await;
+
+        let handler_state = state.clone();
+        let task = tokio::spawn(async move {
+            diagnose_rule(
+                test_user(),
+                State(handler_state),
+                Path(100),
+                Query(DiagnoseQuery {
+                    node_id: Some("node-b".into()),
+                }),
+            )
+            .await
+        });
+        let message: DiagnoseRuleMessage =
+            serde_json::from_str(&rx_b.recv().await.unwrap()).unwrap();
+        assert!(matches!(
+            rx_a.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let mut wrong = result_for_message(&message, "node-b");
+        wrong.challenge = "wrong".into();
+        assert!(!state.diagnose.record(&message.request_id, wrong).await);
+        assert!(
+            state
+                .diagnose
+                .record(&message.request_id, result_for_message(&message, "node-b"))
+                .await
+        );
+
+        let Json(response) = task.await.unwrap();
+        let diagnosis = response.data.unwrap();
+        assert_eq!(diagnosis.request_id, message.request_id);
+        assert_eq!(diagnosis.nodes.len(), 1);
+        assert_eq!(diagnosed_node_id(&diagnosis.nodes[0]), "node-b");
+        assert!(matches!(
+            diagnosis.nodes[0],
+            NodeDiagnoseStatus::Result { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn targeted_offline_or_unsupported_returns_only_that_node() {
+        let (state, _) = test_state().await;
+        store_node_status(&state, 10, "node-a", "1.1.0-rc.8").await;
+        store_node_status(&state, 10, "node-b", "1.1.0-rc.8").await;
+        let (_, mut rx_a) = state
+            .node_connections
+            .register(10, Some("node-a".into()))
+            .await;
+
+        let Json(offline_response) = diagnose_rule(
+            test_user(),
+            State(state.clone()),
+            Path(100),
+            Query(DiagnoseQuery {
+                node_id: Some("node-b".into()),
+            }),
+        )
+        .await;
+        let offline = offline_response.data.unwrap();
+        assert_eq!(offline.nodes.len(), 1);
+        assert!(matches!(
+            &offline.nodes[0],
+            NodeDiagnoseStatus::ControlChannelOffline { node_id, .. } if node_id == "node-b"
+        ));
+        assert!(matches!(
+            rx_a.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        store_node_status(&state, 10, "node-b", "0.4.13").await;
+        let Json(unsupported_response) = diagnose_rule(
+            test_user(),
+            State(state.clone()),
+            Path(100),
+            Query(DiagnoseQuery {
+                node_id: Some("node-b".into()),
+            }),
+        )
+        .await;
+        let unsupported = unsupported_response.data.unwrap();
+        assert_eq!(unsupported.nodes.len(), 1);
+        assert!(matches!(
+            &unsupported.nodes[0],
+            NodeDiagnoseStatus::Unsupported { node_id, .. } if node_id == "node-b"
+        ));
+        assert!(matches!(
+            rx_a.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_or_cross_group_target_is_404_without_dispatch() {
+        let (state, pool) = test_state().await;
+        store_node_status(&state, 10, "node-a", "1.1.0-rc.8").await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (11, 'other', 'in', 'token-11', 2, '192.0.2.11')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        store_node_status(&state, 11, "other-node", "1.1.0-rc.8").await;
+        let (_, mut rx_a) = state
+            .node_connections
+            .register(10, Some("node-a".into()))
+            .await;
+
+        for target in ["missing", "other-node"] {
+            let Json(response) = diagnose_rule(
+                test_user(),
+                State(state.clone()),
+                Path(100),
+                Query(DiagnoseQuery {
+                    node_id: Some(target.into()),
+                }),
+            )
+            .await;
+            assert_eq!(response.code, 404);
+            assert_eq!(response.message, "Node not found in rule group");
+            assert!(response.data.is_none());
+        }
+        assert!(matches!(
+            rx_a.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn targeted_disconnect_race_returns_offline_without_timeout() {
+        let (state, _) = test_state().await;
+        store_node_status(&state, 10, "node-b", "1.1.0-rc.8").await;
+        let (_, rx_b) = state
+            .node_connections
+            .register(10, Some("node-b".into()))
+            .await;
+        drop(rx_b);
+
+        let Json(response) = diagnose_rule(
+            test_user(),
+            State(state),
+            Path(100),
+            Query(DiagnoseQuery {
+                node_id: Some("node-b".into()),
+            }),
+        )
+        .await;
+        let diagnosis = response.data.unwrap();
+        assert_eq!(diagnosis.nodes.len(), 1);
+        assert!(matches!(
+            &diagnosis.nodes[0],
+            NodeDiagnoseStatus::ControlChannelOffline { node_id, .. } if node_id == "node-b"
+        ));
     }
 
     #[tokio::test]
