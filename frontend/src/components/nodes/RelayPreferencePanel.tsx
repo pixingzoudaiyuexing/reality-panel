@@ -7,6 +7,10 @@ import type { Tfn } from './types';
 
 const { Text } = Typography;
 
+const INITIAL_LOAD_RETRY_DELAYS_MS = [2000, 5000] as const;
+
+type LoadPreference = (showSpinner?: boolean, allowInitialRetry?: boolean) => Promise<void>;
+
 interface Props {
   groupId: number;
   t: Tfn;
@@ -89,6 +93,18 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
   const [loadError, setLoadError] = useState(false);
   const [submittingNodeId, setSubmittingNodeId] = useState<string | null>(null);
   const operationInFlight = useRef(false);
+  const viewRef = useRef<RelayPreferenceView | null>(null);
+  const retryTimerRef = useRef<number | null>(null);
+  const retryAttemptRef = useRef(0);
+  const loadRef = useRef<LoadPreference | null>(null);
+
+  const clearInitialLoadRetry = useCallback(() => {
+    if (retryTimerRef.current !== null) {
+      window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    retryAttemptRef.current = 0;
+  }, []);
 
   const fetchPreference = useCallback(async () => {
     const response = await api.get<unknown, ApiEnvelope<RelayPreferenceView>>(
@@ -98,24 +114,48 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
     return response.data;
   }, [groupId]);
 
-  const load = useCallback(async (showSpinner = false) => {
+  const load = useCallback(async (showSpinner = false, allowInitialRetry = false) => {
     if (operationInFlight.current) return;
+    if (!allowInitialRetry) clearInitialLoadRetry();
     operationInFlight.current = true;
     if (showSpinner) setLoading(true);
     try {
-      setView(await fetchPreference());
+      const nextView = await fetchPreference();
+      viewRef.current = nextView;
+      setView(nextView);
       setLoadError(false);
+      clearInitialLoadRetry();
     } catch {
       setLoadError(true);
+      if (allowInitialRetry && viewRef.current === null) {
+        const attempt = retryAttemptRef.current;
+        if (attempt < INITIAL_LOAD_RETRY_DELAYS_MS.length) {
+          retryAttemptRef.current += 1;
+          retryTimerRef.current = window.setTimeout(() => {
+            retryTimerRef.current = null;
+            void loadRef.current?.(false, true);
+          }, INITIAL_LOAD_RETRY_DELAYS_MS[attempt]);
+        }
+      }
     } finally {
       operationInFlight.current = false;
       setLoading(false);
     }
-  }, [fetchPreference]);
+  }, [clearInitialLoadRetry, fetchPreference]);
 
   useEffect(() => {
-    void load(true);
+    loadRef.current = load;
+    return () => {
+      loadRef.current = null;
+    };
   }, [load]);
+
+  useEffect(() => {
+    viewRef.current = null;
+    void load(true, true);
+  }, [load]);
+
+  useEffect(() => () => clearInitialLoadRetry(), [clearInitialLoadRetry]);
 
   useEffect(() => {
     if (view?.state !== 'switching' && view?.state !== 'rolling_back') return;

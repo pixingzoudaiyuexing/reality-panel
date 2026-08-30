@@ -65,6 +65,81 @@ afterEach(() => {
 });
 
 describe('RelayPreferencePanel', () => {
+  it('does not retry after the initial request succeeds', async () => {
+    vi.useFakeTimers();
+    mockGet.mockResolvedValue(ok(preference()));
+
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+
+    expect(mockGet).toHaveBeenCalledTimes(1);
+  });
+
+  it('recovers when the first bounded automatic retry succeeds', async () => {
+    vi.useFakeTimers();
+    mockGet
+      .mockRejectedValueOnce(new Error('temporary network failure'))
+      .mockResolvedValueOnce(ok(preference()));
+
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByText('relayPreferenceLoadFailed')).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1999); });
+    expect(mockGet).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(mockGet).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText('relayPreferenceLoadFailed')).toBeNull();
+    expect(screen.getByText('relayPreferenceCurrent')).toBeInTheDocument();
+  });
+
+  it('stops automatic retries after the two retry attempts fail', async () => {
+    vi.useFakeTimers();
+    mockGet.mockRejectedValue(new Error('persistent network failure'));
+
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(60000); });
+
+    expect(mockGet).toHaveBeenCalledTimes(3);
+    expect(screen.getByText('relayPreferenceLoadFailed')).toBeInTheDocument();
+  });
+
+  it('cancels a pending automatic retry after a successful manual refresh', async () => {
+    vi.useFakeTimers();
+    mockGet
+      .mockRejectedValueOnce(new Error('temporary network failure'))
+      .mockResolvedValueOnce(ok(preference()));
+
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.click(screen.getByRole('button', { name: 'refresh' }));
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+
+    expect(mockGet).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText('relayPreferenceLoadFailed')).toBeNull();
+  });
+
+  it('cleans the automatic retry timer when unmounted', async () => {
+    vi.useFakeTimers();
+    mockGet.mockRejectedValue(new Error('temporary network failure'));
+
+    const { unmount } = render(<RelayPreferencePanel groupId={10} t={t} />);
+    await act(async () => { await Promise.resolve(); });
+    unmount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+
+    expect(mockGet).toHaveBeenCalledTimes(1);
+  });
+
   it.each([1, 2, 4])('renders an arbitrary %i Relay list from the GET response', async (count) => {
     const nodes = Array.from({ length: count }, (_, index) => relayNode(`node-${index + 1}`));
     mockGet.mockResolvedValue(ok(preference({ preferred_node_id: nodes[0].node_id, nodes })));
