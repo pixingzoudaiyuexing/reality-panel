@@ -1749,7 +1749,8 @@ pub async fn prepare_desired_shared(
 
 pub async fn desired_retry_due(shared: &Arc<AsyncMutex<CamouflageSiteManager>>) -> bool {
     let current = shared.lock().await;
-    !current.desired_worker_in_flight && current.desired_control_work_is_due()
+    !current.desired_worker_in_flight
+        && (current.desired_reconcile_pending || current.desired_control_work_is_due())
 }
 
 pub async fn desired_dependency_notify(
@@ -3337,6 +3338,44 @@ mod tests {
             ReconcileCommit::Stale
         );
         assert!(shared.lock().await.last_errors.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn stale_completion_keeps_new_desired_due_without_scheduling_failure_retry() {
+        let dir = unique_dir("stale-completion-keeps-pending");
+        let mut state = manager(&dir, "true", "true");
+        assert!(state.apply_candidate(manifest(&dir)));
+        let old_desired = desired_site("op1", "op1.example.com");
+        let stale = state
+            .desired_reconcile_snapshot(&[old_desired], true)
+            .unwrap();
+        state.update_desired(&[desired_site("op2", "op2.example.com")], true);
+        let shared = Arc::new(AsyncMutex::new(state));
+
+        assert!(
+            !desired_retry_due(&shared).await,
+            "in-flight work must not duplicate"
+        );
+        assert_eq!(
+            commit_snapshot(&shared, successful_result(stale)).await,
+            ReconcileCommit::Stale
+        );
+        {
+            let state = shared.lock().await;
+            assert!(state.desired_reconcile_pending);
+            assert!(!state.desired_worker_in_flight);
+            assert_eq!(state.reconcile_retry_attempt, 0);
+            assert!(state.reconcile_retry_at.is_none());
+            assert!(state.acme_retries.is_empty());
+        }
+        assert!(desired_retry_due(&shared).await);
+
+        let mut stable = manager(&dir.join("stable"), "true", "true");
+        stable.desired_reconcile_pending = false;
+        stable.reconcile_retry_at = None;
+        stable.acme_retries.clear();
+        assert!(!desired_retry_due(&Arc::new(AsyncMutex::new(stable))).await);
         let _ = fs::remove_dir_all(dir);
     }
 
