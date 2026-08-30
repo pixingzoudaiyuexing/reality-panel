@@ -718,6 +718,12 @@ pub async fn start_relay_switch(
         ));
     }
 
+    if preference.state == RelayPreferencePhase::Idle
+        && preference.preferred_node_id.as_deref() == Some(target_node_id)
+    {
+        return Ok(StartRelaySwitchOutcome::AlreadyPreferred);
+    }
+
     let settings = db
         .get(crate::service::dnsmgr::DNSMGR_CONFIG_KEY)
         .await?
@@ -730,12 +736,6 @@ pub async fn start_relay_switch(
         crate::service::dnsmgr::eligible_rule_ids_for_group(db, group_id).await?;
     if eligible_rule_ids.is_empty() {
         return Err(StartRelaySwitchError::NoEligibleDnsRules);
-    }
-
-    if preference.state == RelayPreferencePhase::Idle
-        && preference.preferred_node_id.as_deref() == Some(target_node_id)
-    {
-        return Ok(StartRelaySwitchOutcome::AlreadyPreferred);
     }
 
     let from_node_id = preference.preferred_node_id.clone();
@@ -1950,6 +1950,101 @@ mod tests {
             start_relay_switch(&repo, &connections, 7, "node-c").await,
             Err(StartRelaySwitchError::NoEligibleDnsRules)
         ));
+    }
+
+    #[tokio::test]
+    async fn already_preferred_bypasses_only_dns_prerequisites() {
+        let (repo, connections, _) = switch_fixture().await;
+        repo.delete(crate::service::dnsmgr::DNSMGR_CONFIG_KEY)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            start_relay_switch(&repo, &connections, 7, "node-a")
+                .await
+                .unwrap(),
+            StartRelaySwitchOutcome::AlreadyPreferred
+        );
+        assert!(matches!(
+            start_relay_switch(&repo, &connections, 7, "node-c").await,
+            Err(StartRelaySwitchError::DnsMgrUnavailable)
+        ));
+
+        repo.set(
+            crate::service::dnsmgr::DNSMGR_CONFIG_KEY,
+            r#"{"enabled":true,"base_url":"http://127.0.0.1:9","uid":7,"api_key":"test-key"}"#,
+        )
+        .await
+        .unwrap();
+        for rule_id in [1, 3] {
+            crate::db::repo::RuleRepository::update_rule_fields(
+                &repo,
+                rule_id,
+                &ResourceScope::All,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            start_relay_switch(&repo, &connections, 7, "node-a")
+                .await
+                .unwrap(),
+            StartRelaySwitchOutcome::AlreadyPreferred
+        );
+        assert!(matches!(
+            start_relay_switch(&repo, &connections, 7, "node-c").await,
+            Err(StartRelaySwitchError::NoEligibleDnsRules)
+        ));
+
+        let preference = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(preference.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(preference.pending_node_id, None);
+        assert_eq!(preference.state, RelayPreferencePhase::Idle);
+        assert!(repo.find_dns_record_sync(1).await.unwrap().is_none());
+        assert!(repo.find_dns_record_sync(3).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn already_preferred_still_requires_a_ready_target() {
+        let (repo, connections, _) = switch_fixture().await;
+        repo.set(
+            "node_status:7:node-a",
+            &status(serde_json::json!({
+                "public_ipv4": "203.0.113.5",
+                "active_listener_rule_ids": [1, 3],
+                "reconciliation": {
+                    "state": "APPLY_FAILED", "recovery_source": "NONE"
+                }
+            })),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            start_relay_switch(&repo, &connections, 7, "node-a").await,
+            Err(StartRelaySwitchError::TargetNotReady(_))
+        ));
+        let preference = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(preference.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(preference.pending_node_id, None);
+        assert_eq!(preference.state, RelayPreferencePhase::Idle);
     }
 
     #[tokio::test]
