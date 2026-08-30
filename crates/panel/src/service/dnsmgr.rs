@@ -1383,6 +1383,9 @@ pub async fn schedule_rule(
     rule_id: i64,
 ) -> Result<(), crate::db::error::DbError> {
     let resolution = derive_dns_desired(db, rule_id).await?;
+    if matches!(resolution, DnsDesiredResolution::Frozen) {
+        return Ok(());
+    }
     persist_resolution(db, rule_id, resolution, true).await?;
     let settings = db
         .get(DNSMGR_CONFIG_KEY)
