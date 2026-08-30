@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ApiEnvelope, RelayPreferenceView, RelayReadyNode } from '../../api/types';
+import { zhCN } from '../../i18n/zh-CN';
 import type { Tfn } from './types';
 
 const { mockGet, mockPost } = vi.hoisted(() => ({
@@ -19,6 +20,7 @@ vi.mock('./RelaySchedulePanel', () => ({
 import { RelayPreferencePanel } from './RelayPreferencePanel';
 
 const t = ((key: string) => key) as unknown as Tfn;
+const zhT = ((key: keyof typeof zhCN) => zhCN[key]) as Tfn;
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
 
 function deferred<T>() {
@@ -69,6 +71,56 @@ afterEach(() => {
 });
 
 describe('RelayPreferencePanel', () => {
+  it('uses Chinese node wording, IP-first identity, and translated states', async () => {
+    mockGet.mockResolvedValue(ok(preference({
+      preferred_node_public_ipv4: '64.118.154.53',
+      nodes: [
+        relayNode('node-a', { public_ipv4: '64.118.154.53', preferred: true }),
+        relayNode('node-b', {
+          public_ipv4: '64.118.144.159',
+          online: false,
+          ready: false,
+          ready_reasons: ['STALE_STATUS'],
+        }),
+      ],
+    })));
+
+    const { container } = render(<RelayPreferencePanel groupId={10} t={zhT} />);
+    await screen.findByText('64.118.144.159');
+
+    expect(screen.getByText('节点')).toBeInTheDocument();
+    expect(screen.queryByText('Relay 节点')).toBeNull();
+    expect(screen.getByTestId('relay-preference-current')).toHaveTextContent('当前优选: 64.118.154.53');
+
+    const preferredRow = rowFor('node-a');
+    expect(within(preferredRow).getByText('64.118.154.53')).toBeInTheDocument();
+    expect(within(preferredRow).getByText('node-a').closest('code')).not.toBeNull();
+    expect(within(preferredRow).getByText('在线')).toBeInTheDocument();
+    expect(within(preferredRow).getByText('就绪')).toBeInTheDocument();
+    expect(within(preferredRow).getByText('当前优选')).toBeInTheDocument();
+
+    const offlineRow = rowFor('node-b');
+    expect(within(offlineRow).getByText('离线')).toBeInTheDocument();
+    expect(within(offlineRow).getByText('未就绪')).toBeInTheDocument();
+    expect(within(offlineRow).getByText('节点状态已过期')).toBeInTheDocument();
+    expect(container.textContent).not.toMatch(/\b(?:PASS|Running|Ready)\b/);
+  });
+
+  it('falls back to node_id when preferred or row IPv4 is missing', async () => {
+    mockGet.mockResolvedValue(ok(preference({
+      preferred_node_public_ipv4: null,
+      nodes: [relayNode('node-a', { public_ipv4: null, preferred: true })],
+    })));
+
+    render(<RelayPreferencePanel groupId={10} t={zhT} />);
+    await screen.findByTestId('relay-preference-node-node-a');
+
+    expect(screen.getByTestId('relay-preference-current')).toHaveTextContent('当前优选: node-a');
+    const row = rowFor('node-a');
+    expect(within(row).getByText('node-a')).toBeInTheDocument();
+    expect(within(row).queryByText('-')).toBeNull();
+  });
+
   it('does not retry after the initial request succeeds', async () => {
     vi.useFakeTimers();
     mockGet.mockResolvedValue(ok(preference()));
@@ -207,6 +259,7 @@ describe('RelayPreferencePanel', () => {
 
     expect(mockPost).toHaveBeenCalledTimes(1);
     expect(mockPost).toHaveBeenCalledWith('/groups/10/relay-preference', { node_id: 'node-b' });
+    expect(mockPost).not.toHaveBeenCalledWith('/groups/10/relay-preference', { node_id: '203.0.113.98' });
     post.resolve(ok(preference({ state: 'switching', pending_node_id: 'node-b' })));
     await waitFor(() => expect(mockGet).toHaveBeenCalledTimes(2));
   });

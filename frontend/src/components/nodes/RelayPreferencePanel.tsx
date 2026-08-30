@@ -194,7 +194,9 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
         <Space size={8} wrap>
           <Text strong>{t('relayPreferenceTitle')}</Text>
           {view?.preferred_node_id ? (
-            <Text type="secondary">{t('relayPreferenceCurrent')}: <Text code>{view.preferred_node_id}</Text></Text>
+            <Text type="secondary" data-testid="relay-preference-current">
+              {t('relayPreferenceCurrent')}: <Text code>{view.preferred_node_public_ipv4 ?? view.preferred_node_id}</Text>
+            </Text>
           ) : null}
         </Space>
         <Tooltip title={t('refresh')}>
@@ -313,7 +315,7 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
               >
                 <div style={{ flex: '1 1 420px', minWidth: 0 }}>
                   <Space size={6} wrap>
-                    <Text code>{node.node_id}</Text>
+                    <Text strong className="rp-mono">{node.public_ipv4 ?? node.node_id}</Text>
                     <Tag color={node.online ? 'green' : undefined}>{node.online ? t('online') : t('offline')}</Tag>
                     <Tag color={node.ready ? 'green' : 'red'}>{node.ready ? t('relayReady') : t('relayNotReady')}</Tag>
                     {node.node_id === view.preferred_node_id ? <Tag color="blue">{t('relayPreferenceCurrent')}</Tag> : null}
@@ -324,7 +326,7 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
                     ) : null}
                   </Space>
                   <Space orientation="vertical" size={2} style={{ display: 'flex', marginTop: 4 }}>
-                    <Text type="secondary" className="rp-mono">{node.public_ipv4 ?? '-'}</Text>
+                    {node.public_ipv4 ? <Text type="secondary" code>{node.node_id}</Text> : null}
                     {!node.ready && node.ready_reasons.length > 0 ? (
                       <Text type="danger">{node.ready_reasons.map((reason) => readyReasonLabel(reason, t)).join('; ')}</Text>
                     ) : null}
