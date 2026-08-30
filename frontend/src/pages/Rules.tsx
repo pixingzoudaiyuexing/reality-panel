@@ -1358,7 +1358,9 @@ export default function Rules() {
         <section className="rp-rules-group-section" data-testid={`rules-group-${groupId}`} key={groupId}>
           <div className="rp-rules-group-header">
             <Text strong className="rp-rules-group-title" title={groupLabel(groupId)}>{groupLabel(groupId)}</Text>
-            <Text type="secondary">{visibleGroupCounts.get(groupId) ?? groupRules.length} {t('rules')}</Text>
+            <Text type="secondary">
+              {t('ruleCount').replace('{count}', String(visibleGroupCounts.get(groupId) ?? groupRules.length))}
+            </Text>
           </div>
           <Table
             rowSelection={rowSelectionFor(groupRules)}

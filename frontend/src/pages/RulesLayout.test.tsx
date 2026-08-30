@@ -17,6 +17,8 @@ vi.mock('../auth/useAuth', () => ({ useAuth: mockUseAuth }));
 vi.mock('react-router-dom', () => ({ useSearchParams: () => [new URLSearchParams(), vi.fn()] }));
 
 import Rules, { RULE_SELECTION_COLUMN_WIDTH, RULE_TABLE_SCROLL_X, RULES_PAGE_SIZE } from './Rules';
+import { zhCN } from '../i18n/zh-CN';
+import { enUS } from '../i18n/en-US';
 
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
 const group = (id: number, name: string, connect_host = '') => ({
@@ -111,9 +113,14 @@ describe('Rules grouped compact layout', () => {
     const tokyo = await screen.findByTestId('rules-group-7');
     const osaka = screen.getByTestId('rules-group-8');
     expect(within(tokyo).getByText('tokyo')).toBeInTheDocument();
-    expect(within(tokyo).getByText('2 rules')).toBeInTheDocument();
+    expect(within(tokyo).getByText('ruleCount')).toBeInTheDocument();
     expect(within(osaka).getByText('osaka')).toBeInTheDocument();
-    expect(within(osaka).getByText('1 rules')).toBeInTheDocument();
+    expect(within(osaka).getByText('ruleCount')).toBeInTheDocument();
+  });
+
+  it('formats group counts naturally in Chinese and English', () => {
+    expect(zhCN.ruleCount.replace('{count}', '2')).toBe('2 条规则');
+    expect(enUS.ruleCount.replace('{count}', '2')).toBe('2 rules');
   });
 
   it('shows name, id and owner for admins but hides owner metadata from users', async () => {
@@ -260,7 +267,7 @@ describe('Rules grouped compact layout', () => {
     setupAdmin(Array.from({ length: 25 }, (_, index) => rule(index + 1)));
     render(<Rules />);
     const section = await screen.findByTestId('rules-group-7');
-    expect(within(section).getByText('25 rules')).toBeInTheDocument();
+    expect(within(section).getByText('ruleCount')).toBeInTheDocument();
     expect(document.querySelectorAll('.rp-rules-table .ant-table-tbody .ant-table-row')).toHaveLength(20);
     expect(screen.getByTestId('rules-pagination')).toBeInTheDocument();
     fireEvent.click(screen.getByTitle('2'));

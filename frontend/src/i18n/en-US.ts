@@ -864,6 +864,7 @@ export const enUS: Dict = {
   protocolForward: 'Protocol / Forwarding',
   moreActions: 'More actions',
   cancelSelection: 'Clear selection',
+  ruleCount: '{count} rules',
 
   // ── v1.2.0: traffic history ──
   trafficHistory: 'Traffic',

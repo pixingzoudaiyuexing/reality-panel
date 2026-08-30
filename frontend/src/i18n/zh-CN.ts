@@ -861,6 +861,7 @@ export const zhCN = {
   protocolForward: '协议 / 转发',
   moreActions: '更多操作',
   cancelSelection: '取消选择',
+  ruleCount: '{count} 条规则',
 
   // ── v1.2.0: 流量历史 ──
   trafficHistory: '流量趋势',
