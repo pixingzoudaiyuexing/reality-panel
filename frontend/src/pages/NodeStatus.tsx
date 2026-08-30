@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typography } from 'antd';
-import { CloudUploadOutlined, LineChartOutlined, ReloadOutlined } from '@ant-design/icons';
+import { CloudUploadOutlined, CopyOutlined, LineChartOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
 import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog } from '../api/types';
@@ -49,18 +49,20 @@ export default function NodeStatus() {
   // 5s interval) a new tick could otherwise fire before the previous request
   // returned, stacking requests.
   const inFlightRef = useRef(false);
+  const hasLoadedRowsRef = useRef(false);
 
   const loadAdmin = async () => {
     try {
       const res = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes');
       if (res.code !== 0) {
-        setLoadFailed(true);
+        if (!hasLoadedRowsRef.current) setLoadFailed(true);
         return;
       }
       setLoadFailed(false);
       setAdminRows(res.data || []);
+      hasLoadedRowsRef.current = true;
     } catch {
-      setLoadFailed(true);
+      if (!hasLoadedRowsRef.current) setLoadFailed(true);
     }
   };
 
@@ -68,13 +70,14 @@ export default function NodeStatus() {
     try {
       const res = await api.get<unknown, ApiEnvelope<SharedNodeSummary[]>>('/nodes/shared');
       if (res.code !== 0) {
-        setLoadFailed(true);
+        if (!hasLoadedRowsRef.current) setLoadFailed(true);
         return;
       }
       setLoadFailed(false);
       setUserRows(res.data || []);
+      hasLoadedRowsRef.current = true;
     } catch {
-      setLoadFailed(true);
+      if (!hasLoadedRowsRef.current) setLoadFailed(true);
     }
   };
 
@@ -114,6 +117,7 @@ export default function NodeStatus() {
   // load* fns), so a transient poll failure no longer flashes the error page
   // back to stale data every 5s.
   useEffect(() => {
+    hasLoadedRowsRef.current = false;
     if (isAdmin) loadLifecycleMetadata();
     refresh();
     const ti = setInterval(refresh, 5000);
@@ -124,6 +128,16 @@ export default function NodeStatus() {
   const errorMessage = (error: unknown) => {
     const payload = (error as { response?: { data?: { message?: string } } })?.response?.data;
     return payload?.message || t('nodeOperationFailed');
+  };
+
+  const copyLogs = async () => {
+    if (!activeOperation?.logs) return;
+    try {
+      await navigator.clipboard.writeText(activeOperation.logs);
+      message.success(t('copied'));
+    } catch {
+      message.error(t('copyFailed'));
+    }
   };
 
   const pollOperation = async (row: AnyNodeRow, operationId: string) => {
@@ -269,13 +283,23 @@ export default function NodeStatus() {
         extra={activeOperation ? (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
             {activeOperation.action === 'logs' ? (
-              <Button
-                size="small"
-                icon={<ReloadOutlined />}
-                onClick={() => startOperation({ group_id: activeOperation.group_id, node_id: activeOperation.node_id }, 'logs')}
-              >
-                {t('refresh')}
-              </Button>
+              <>
+                <Button
+                  size="small"
+                  icon={<CopyOutlined />}
+                  disabled={!activeOperation.logs}
+                  onClick={() => void copyLogs()}
+                >
+                  {t('nodeCopyLogs')}
+                </Button>
+                <Button
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  onClick={() => startOperation({ group_id: activeOperation.group_id, node_id: activeOperation.node_id }, 'logs')}
+                >
+                  {t('refresh')}
+                </Button>
+              </>
             ) : null}
             <Tag color={activeOperation.status === 'SUCCESS' ? 'green' : activeOperation.status === 'FAILED' || activeOperation.status === 'TIMEOUT' ? 'red' : 'blue'}>{t(`nodeOperationStatus_${activeOperation.status}`)}</Tag>
           </span>

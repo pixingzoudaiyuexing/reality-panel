@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, act } from '@testing-library/react';
+import { render, screen, act, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
+import { message } from 'antd';
 
 // Mock the api client + auth hook before importing the page under test.
 const { mockGet } = vi.hoisted(() => ({ mockGet: vi.fn() }));
@@ -140,16 +141,17 @@ describe('NodeStatus load-failure behavior', () => {
     expect(screen.getByText('loadFailed')).toBeInTheDocument();
   });
 
-  it('does not flash the error page back to stale data on a later poll failure', async () => {
+  it('keeps the last good rows through a transient poll failure and resumes updates', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     let nodeCall = 0;
+    const recovered = { ...adminNode, group_name: 'admin-grp-recovered' };
     mockGet.mockImplementation((url: string) => {
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       if (url === '/nodes') {
         nodeCall += 1;
-        return nodeCall === 1
-          ? Promise.resolve(ok([adminNode]))
-          : Promise.reject(new Error('transient'));
+        if (nodeCall === 1) return Promise.resolve(ok([adminNode]));
+        if (nodeCall === 2) return Promise.reject(new Error('transient'));
+        return Promise.resolve(ok([recovered]));
       }
       return Promise.reject(new Error(`unexpected ${url}`));
     });
@@ -158,11 +160,115 @@ describe('NodeStatus load-failure behavior', () => {
     await flush();
     expect(screen.getByText('admin-grp')).toBeInTheDocument();
 
-    // Trigger the poll; it fails. The page must surface the error and must NOT
-    // keep showing the now-stale prior data underneath as if healthy.
+    // 后台轮询失败时保留最后一次成功数据，不用错误页打断操作。
     await flush(5000);
-    expect(screen.getByText('loadFailed')).toBeInTheDocument();
+    expect(screen.queryByText('loadFailed')).not.toBeInTheDocument();
+    expect(screen.getByText('admin-grp')).toBeInTheDocument();
+
+    await flush(5000);
+    expect(screen.getByText('admin-grp-recovered')).toBeInTheDocument();
     expect(screen.queryByText('admin-grp')).not.toBeInTheDocument();
+  });
+
+  it('keeps the five-second poll from overlapping a slow request', async () => {
+    mockUseAuth.mockReturnValue({ isAdmin: true });
+    type NodesResponse = { code: number; message: string; data: typeof adminNode[] };
+    let resolveNodes!: (value: NodesResponse) => void;
+    const pendingNodes = new Promise<NodesResponse>((resolve) => {
+      resolveNodes = resolve;
+    });
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/nodes') return pendingNodes;
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+
+    renderPage();
+    await flush();
+    await flush(10000);
+    expect(mockGet.mock.calls.filter((call) => call[0] === '/nodes')).toHaveLength(1);
+
+    resolveNodes(ok([adminNode]));
+    await flush();
+    await flush(5000);
+    expect(mockGet.mock.calls.filter((call) => call[0] === '/nodes')).toHaveLength(2);
+  });
+});
+
+describe('NodeStatus log drawer', () => {
+  const logNode = {
+    ...adminNode,
+    install_method: 'systemd',
+    lifecycle_online: true,
+    architecture: 'x86_64',
+    node_version: '1.1.0-rc.8',
+    config_protocol_version: 2,
+  };
+
+  const operation = (logs: string, action = 'logs') => ok({
+    id: 'operation-1',
+    group_id: 1,
+    node_id: 'n1',
+    action,
+    status: 'SUCCESS',
+    message: 'done',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    architecture: 'x86_64',
+    current_version: '1.1.0-rc.8',
+    logs,
+  });
+
+  function mockLogPage(logs: string, action = 'logs') {
+    mockUseAuth.mockReturnValue({ isAdmin: true });
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/nodes') return Promise.resolve(ok([logNode]));
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      if (url === '/groups') return Promise.resolve(ok([]));
+      if (url === '/admin/nodes/1/n1/logs?lines=200') return Promise.resolve(operation(logs, action));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+  }
+
+  it('shows Node logs controls and copies only the complete log body', async () => {
+    mockLogPage('line one\nline two');
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const success = vi.spyOn(message, 'success');
+
+    renderPage();
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: 'nodeLogs' }));
+    await flush();
+
+    expect(screen.getByText('nodeOperation_logs')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /nodeCopyLogs/ })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /refresh/ })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /nodeCopyLogs/ }));
+    await flush();
+    expect(writeText).toHaveBeenCalledWith('line one\nline two');
+    expect(success).toHaveBeenCalledWith('copied');
+    success.mockRestore();
+  });
+
+  it('keeps copy disabled for empty logs and hides it for non-log operations', async () => {
+    mockLogPage('');
+    const first = renderPage();
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: 'nodeLogs' }));
+    await flush();
+    expect(screen.getByRole('button', { name: /nodeCopyLogs/ })).toBeDisabled();
+    first.unmount();
+
+    mockLogPage('restart output', 'restart');
+    renderPage();
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: 'nodeLogs' }));
+    await flush();
+    expect(screen.queryByRole('button', { name: /nodeCopyLogs/ })).toBeNull();
   });
 });
 

@@ -1,7 +1,7 @@
 import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Popover, Tag, Alert, Typography, Dropdown, Switch, Tabs, Spin, Tooltip } from 'antd';
 import type { MenuProps } from 'antd';
 import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, SearchOutlined } from '@ant-design/icons';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
 import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, ReapplyResponse, NodeStatus, RuleDnsStatus, RealityCheck, RealityDiagnosis } from '../api/types';
@@ -207,6 +207,10 @@ export default function Rules() {
   // (owner-scoped) set, so searching needs no round-trip.
   const [ruleSearch, setRuleSearch] = useState('');
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([]);
+  const backgroundRefreshInFlight = useRef(false);
+
+  const ownerUid = filterOwnerUid ?? (isAdmin ? (user?.id ?? null) : null);
+  const scopedRulesUrl = ownerUid ? `/rules?owner_uid=${ownerUid}` : '/rules';
 
   useEffect(() => {
     void refreshCurrentUser();
@@ -223,10 +227,8 @@ export default function Rules() {
       // v0.4.20: admin can filter rules by owner_uid.
       // Admin on own page → filter to their own rules; admin viewing another
       // user → use filterOwnerUid; regular user → backend filters automatically.
-      const ownerUid = filterOwnerUid ?? (isAdmin ? (user?.id ?? null) : null);
-      const rulesUrl = ownerUid ? `/rules?owner_uid=${ownerUid}` : '/rules';
       const [r, g] = await Promise.all([
-        api.get<unknown, ApiEnvelope<ForwardRule[]>>(rulesUrl),
+        api.get<unknown, ApiEnvelope<ForwardRule[]>>(scopedRulesUrl),
         api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
       ]);
       setRules(r.data || []);
@@ -289,9 +291,53 @@ export default function Rules() {
         setSharedGroups([]);
       }
     } finally { setLoading(false); }
-  }, [filterOwnerUid, isAdmin, user?.id]);
+  }, [isAdmin, scopedRulesUrl]);
 
   useEffect(() => { load(); }, [load]);
+
+  const backgroundRefresh = useCallback(async () => {
+    if (backgroundRefreshInFlight.current) return;
+    backgroundRefreshInFlight.current = true;
+    try {
+      if (isAdmin) {
+        const [rulesResult, nodesResult, dnsResult] = await Promise.allSettled([
+          api.get<unknown, ApiEnvelope<ForwardRule[]>>(scopedRulesUrl),
+          api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes'),
+          api.get<unknown, ApiEnvelope<RuleDnsStatus[]>>('/admin/rules/dns-status'),
+        ]);
+        if (rulesResult.status === 'fulfilled' && rulesResult.value.code === 0) {
+          setRules(rulesResult.value.data || []);
+        }
+        if (nodesResult.status === 'fulfilled' && nodesResult.value.code === 0) {
+          setNodeStatuses(nodesResult.value.data || []);
+        }
+        if (dnsResult.status === 'fulfilled' && dnsResult.value.code === 0) {
+          setDnsStatuses(dnsResult.value.data || []);
+        }
+      } else {
+        const [rulesResult, meResult] = await Promise.allSettled([
+          api.get<unknown, ApiEnvelope<ForwardRule[]>>(scopedRulesUrl),
+          api.get<unknown, ApiEnvelope<UserSelf>>('/user/me'),
+        ]);
+        if (rulesResult.status === 'fulfilled' && rulesResult.value.code === 0) {
+          setRules(rulesResult.value.data || []);
+        }
+        if (meResult.status === 'fulfilled' && meResult.value.code === 0 && meResult.value.data) {
+          setSelfQuota({
+            used: meResult.value.data.traffic_used,
+            limit: meResult.value.data.traffic_limit,
+          });
+        }
+      }
+    } finally {
+      backgroundRefreshInFlight.current = false;
+    }
+  }, [isAdmin, scopedRulesUrl]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => void backgroundRefresh(), 10000);
+    return () => window.clearInterval(timer);
+  }, [backgroundRefresh]);
 
   // User lookup map for the "owner" column.
   const userMap = new Map(users.map(u => [u.id, u.username]));
