@@ -217,6 +217,27 @@ impl CamouflageSiteManager {
             .filter(|site| site.enabled)
             .cloned()
             .collect();
+        let next_identities = next
+            .iter()
+            .map(|site| (site.site_id.as_str(), site.sni.as_str()))
+            .collect::<HashSet<_>>();
+        let previous_snis = self
+            .desired
+            .iter()
+            .map(|site| (site.site_id.as_str(), site.sni.as_str()))
+            .collect::<HashSet<_>>();
+        if panel_authoritative {
+            let keep_site_id = |site_id: &str| {
+                previous_snis
+                    .iter()
+                    .any(|(id, sni)| *id == site_id && next_identities.contains(&(*id, *sni)))
+            };
+            self.last_errors.retain(|site_id, _| keep_site_id(site_id));
+            self.last_attempts
+                .retain(|site_id, _| keep_site_id(site_id));
+            self.renewal_warnings
+                .retain(|site_id, _| keep_site_id(site_id));
+        }
         let next_fingerprint = camouflage_desired_fingerprint(&next);
         let next_scope_fingerprint = desired_acme_scope_fingerprint(&next);
         let next_scope_keys = next
@@ -995,13 +1016,66 @@ impl CamouflageSiteManager {
             return false;
         }
 
+        let previous = self.active.clone();
         self.active = Some(candidate.clone());
+        self.cleanup_committed_state(previous.as_ref(), &candidate);
         self.runtime_revision = self.runtime_revision.wrapping_add(1);
         tracing::info!(
             sites = candidate.sites.len(),
             "camouflage sites applied and committed as local LKG"
         );
         true
+    }
+
+    /// Remove state that is no longer reachable from the current LKG while
+    /// retaining the active and immediately previous certificate generations.
+    /// This runs only after runtime activation and LKG commit have succeeded.
+    fn cleanup_committed_state(
+        &self,
+        previous: Option<&CamouflageSitesManifest>,
+        current: &CamouflageSitesManifest,
+    ) {
+        let mut protected_files = Vec::new();
+        for manifest in [previous, Some(current)].into_iter().flatten() {
+            for site in &manifest.sites {
+                protected_files.push(site.certificate.cert_path.clone());
+                protected_files.push(site.certificate.key_path.clone());
+            }
+        }
+
+        let generations_root = self
+            .config
+            .certificate_lifecycle
+            .state_dir
+            .join("generations");
+        let current_ids = current
+            .sites
+            .iter()
+            .map(|site| site.id.as_str())
+            .collect::<HashSet<_>>();
+        if let Ok(entries) = fs::read_dir(&generations_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(site_id) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if current_ids.contains(site_id) {
+                    prune_site_generations(&path, &protected_files);
+                } else if !protected_files.iter().any(|file| file.starts_with(&path)) {
+                    remove_private_directory(&path);
+                }
+            }
+        }
+
+        let pending_root = self.config.certificate_lifecycle.state_dir.join("pending");
+        if let Ok(entries) = fs::read_dir(&pending_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !protected_files.iter().any(|file| file.starts_with(&path)) {
+                    remove_private_directory(&path);
+                }
+            }
+        }
     }
 
     fn apply_runtime(&self, manifest: &CamouflageSitesManifest) -> Result<(), String> {
@@ -2029,6 +2103,59 @@ fn validate_absolute_path(path: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+const MAX_RETAINED_CERTIFICATE_GENERATIONS: usize = 3;
+
+fn prune_site_generations(site_root: &Path, protected_files: &[PathBuf]) {
+    let Ok(metadata) = fs::symlink_metadata(site_root) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return;
+    }
+    let mut generations = fs::read_dir(site_root)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            fs::symlink_metadata(path)
+                .map(|value| value.is_dir() && !value.file_type().is_symlink())
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    generations.sort_by(|left, right| right.cmp(left));
+
+    let mut keep = generations
+        .iter()
+        .take(MAX_RETAINED_CERTIFICATE_GENERATIONS)
+        .cloned()
+        .collect::<HashSet<_>>();
+    for file in protected_files {
+        if let Some(parent) = file.parent() {
+            if parent.parent() == Some(site_root) {
+                keep.insert(parent.to_path_buf());
+            }
+        }
+    }
+    for generation in generations {
+        if !keep.contains(&generation) {
+            remove_private_directory(&generation);
+        }
+    }
+}
+
+fn remove_private_directory(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return;
+    }
+    if let Err(error) = fs::remove_dir_all(path) {
+        tracing::warn!(path = %path.display(), "could not remove stale camouflage state: {error}");
+    }
+}
+
 fn is_safe_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -2159,6 +2286,35 @@ mod tests {
             },
             certificate_lifecycle: CertificateLifecycleConfig::disabled_for_test(dir),
         })
+    }
+
+    #[test]
+    fn committed_generation_cleanup_keeps_active_rollback_and_removes_old_state() {
+        let dir = unique_dir("generation-cleanup");
+        let root = dir.join("state/generations/site");
+        fs::create_dir_all(&root).unwrap();
+        for number in 0..6 {
+            let generation = root.join(format!("generation-{number}"));
+            fs::create_dir_all(&generation).unwrap();
+            fs::write(generation.join("fullchain.pem"), b"cert").unwrap();
+            fs::write(generation.join("privkey.pem"), b"key").unwrap();
+        }
+        let protected = vec![
+            root.join("generation-0/fullchain.pem"),
+            root.join("generation-0/privkey.pem"),
+            root.join("generation-5/fullchain.pem"),
+            root.join("generation-5/privkey.pem"),
+        ];
+
+        prune_site_generations(&root, &protected);
+
+        assert!(root.join("generation-0").is_dir());
+        assert!(root.join("generation-3").is_dir());
+        assert!(root.join("generation-4").is_dir());
+        assert!(root.join("generation-5").is_dir());
+        assert!(!root.join("generation-1").exists());
+        assert!(!root.join("generation-2").exists());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2659,6 +2815,67 @@ mod tests {
             },
             enabled: true,
         }
+    }
+
+    #[test]
+    fn authoritative_desired_update_clears_obsolete_site_diagnostics() {
+        let dir = unique_dir("diagnostic-ghost-cleanup");
+        let mut state = manager(&dir, "true", "true");
+        state.last_errors.insert("old-site".into(), "stale".into());
+        state
+            .last_attempts
+            .insert("old-site".into(), "stale".into());
+        state
+            .renewal_warnings
+            .insert("old-site".into(), ("stale".into(), "stale".into()));
+
+        state.update_desired(&[desired_site("new-site", "new.example.com")], true);
+
+        assert!(state.last_errors.is_empty());
+        assert!(state.last_attempts.is_empty());
+        assert!(state.renewal_warnings.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stable_site_id_migration_reuses_old_lkg_certificate_until_commit() {
+        let dir = unique_dir("site-id-migration");
+        let mut state = manager(&dir, "true", "true");
+        let old_certificate = real_certificate(&dir.join("old"), "old", "q1.example.com", 90);
+        state.active = Some(CamouflageSitesManifest {
+            sites: vec![CamouflageSite {
+                id: "q1_example_com".into(),
+                sni: "q1.example.com".into(),
+                tls_listener_port: CAMOUFLAGE_TLS_PORT,
+                local_backend: OPENLIST_BACKEND.into(),
+                certificate: old_certificate.clone(),
+            }],
+        });
+        let desired = desired_site(
+            &relay_shared::reconciliation::stable_camouflage_site_id("q1.example.com"),
+            "q1.example.com",
+        );
+
+        let snapshot = state.desired_reconcile_snapshot(&[desired], true).unwrap();
+        let migrated = &snapshot.manifest.sites[0];
+        assert_eq!(
+            migrated.id,
+            relay_shared::reconciliation::stable_camouflage_site_id("q1.example.com")
+        );
+        assert_eq!(
+            migrated.certificate.cert_path, old_certificate.cert_path,
+            "site-id migration must reuse the old LKG certificate generation"
+        );
+        assert_eq!(migrated.certificate.key_path, old_certificate.key_path);
+        assert_eq!(
+            migrated
+                .certificate
+                .lifecycle
+                .as_ref()
+                .map(|policy| policy.domain.as_str()),
+            Some("q1.example.com")
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn successful_result(snapshot: CertificateReconcileSnapshot) -> CertificateReconcileResult {

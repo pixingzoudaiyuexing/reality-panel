@@ -16,6 +16,15 @@ pub(crate) fn extract_node_token(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+pub(crate) fn extract_node_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("X-Node-ID")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// v0.4.0: read the node's config-protocol version from the
 /// `X-Config-Protocol-Version` request header. Returns None if absent (treated
 /// as incompatible — the node is too old to know about the gate).
@@ -86,7 +95,12 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     // push path (ws.rs) now use the SAME function.
     //
     // Only an inbound group with genuinely no active rules yields Ok(empty).
-    match crate::service::node_config::build_node_config_snapshot(state.db.as_ref(), group.id).await
+    match crate::service::node_config::build_node_config_snapshot_for_node(
+        state.db.as_ref(),
+        group.id,
+        extract_node_id(&headers).as_deref(),
+    )
+    .await
     {
         Ok(snapshot) => Json(snapshot).into_response(),
         Err(crate::service::node_config::NodeConfigBuildError::NotInboundGroup) => {
@@ -140,11 +154,22 @@ async fn acme_dns01_operation(
         Ok(_) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let config =
-        match crate::service::node_config::build_node_config(state.db.as_ref(), group.id).await {
-            Ok(config) => config,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
+    let node_id = request.node_id.trim();
+    if node_id.is_empty()
+        || extract_node_id(&headers).is_some_and(|header_node_id| header_node_id != node_id)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let config = match crate::service::node_config::build_node_config_for_node(
+        state.db.as_ref(),
+        group.id,
+        Some(node_id),
+    )
+    .await
+    {
+        Ok(config) => config,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let requested_domain = request.sni.trim_end_matches('.');
     let authorized = config.camouflage_sites.iter().any(|site| {
         let certificate_domain = site.certificate.domain.trim_end_matches('.');
@@ -639,6 +664,12 @@ mod tests {
         headers
     }
 
+    fn config_headers_for_node(token: &str, node_id: &str) -> HeaderMap {
+        let mut headers = config_headers(Some(token));
+        headers.insert("X-Node-ID", node_id.parse().unwrap());
+        headers
+    }
+
     #[test]
     fn config_protocol_v8_is_rejected_and_v10_is_accepted() {
         let mut v8 = HeaderMap::new();
@@ -928,6 +959,11 @@ mod tests {
         .unwrap();
         state
             .db
+            .set("node_status:10:node-a", r#"{"public_ipv4":"192.0.2.10"}"#)
+            .await
+            .unwrap();
+        state
+            .db
             .set(
                 crate::service::dnsmgr::DNSMGR_CONFIG_KEY,
                 &serde_json::json!({
@@ -1057,7 +1093,7 @@ mod tests {
     #[tokio::test]
     async fn http_and_ws_use_identical_typed_camouflage_config() {
         let (state, pool) = seeded_state().await;
-        sqlx::query("UPDATE device_groups SET connect_host='203.0.113.10' WHERE id=10")
+        sqlx::query("UPDATE device_groups SET connect_host='' WHERE id=10")
             .execute(&pool)
             .await
             .unwrap();
@@ -1071,15 +1107,25 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        state
+            .db
+            .set("node_status:10:node-a", r#"{"public_ipv4":"203.0.113.10"}"#)
+            .await
+            .unwrap();
 
-        let http = get_config(State(state.clone()), config_headers(Some("tok-A"))).await;
+        let http = get_config(
+            State(state.clone()),
+            config_headers_for_node("tok-A", "node-a"),
+        )
+        .await;
         assert_eq!(http.status(), axum::http::StatusCode::OK);
         let body = axum::body::to_bytes(http.into_body(), 65536).await.unwrap();
         let http_snapshot: NodeConfigSnapshot = serde_json::from_slice(&body).unwrap();
         let http_config = &http_snapshot.config;
-        let ws_config = crate::api::ws::build_config_snapshot(state.db.as_ref(), 10)
-            .await
-            .expect("WS snapshot");
+        let ws_config =
+            crate::api::ws::build_config_snapshot_for_node(state.db.as_ref(), 10, Some("node-a"))
+                .await
+                .expect("WS snapshot");
 
         assert_eq!(
             serde_json::to_value(http_config).unwrap(),

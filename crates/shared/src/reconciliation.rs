@@ -44,6 +44,17 @@ pub fn fingerprint_bytes(bytes: &[u8]) -> ConfigFingerprint {
     ConfigFingerprint(hex_encode(&digest))
 }
 
+/// Return the stable, bounded identity used for a camouflage SNI.
+///
+/// The previous dotted-name replacement could exceed the Node's 64-byte site
+/// id limit.  The canonical SNI is deliberately the only input so renaming a
+/// site ID cannot create a second identity for the same SNI during migration.
+pub fn stable_camouflage_site_id(sni: &str) -> String {
+    let canonical = sni.trim().trim_end_matches('.').to_ascii_lowercase();
+    let digest = Sha256::digest(canonical.as_bytes());
+    format!("site-{}", hex_encode(&digest[..16]))
+}
+
 impl fmt::Display for ConfigFingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -292,5 +303,17 @@ mod tests {
             "*.example.com",
             "site.example.net"
         ));
+    }
+
+    #[test]
+    fn camouflage_site_identity_is_stable_short_and_case_normalized() {
+        let first = stable_camouflage_site_id("Q1.Example.com.");
+        assert_eq!(first, stable_camouflage_site_id("q1.example.com"));
+        assert!(first.starts_with("site-"));
+        assert!(first.len() <= 64);
+        assert!(first
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_')));
+        assert_ne!(first, stable_camouflage_site_id("q2.example.com"));
     }
 }

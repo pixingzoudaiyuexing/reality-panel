@@ -422,7 +422,12 @@ async fn handle_node_ws(
     let (mut sender, mut receiver) = socket.split();
     let lifecycle_node_id = node_id.clone();
     let (conn_id, mut push_rx) = node_connections
-        .register_with_capabilities(group_id, node_id, config_compatible, lifecycle_capable)
+        .register_with_capabilities(
+            group_id,
+            node_id.clone(),
+            config_compatible,
+            lifecycle_capable,
+        )
         .await;
     if let Some(node_id) = lifecycle_node_id.as_deref() {
         for operation in node_operations.connected(
@@ -439,7 +444,9 @@ async fn handle_node_ws(
     // immediately, without waiting for the first HTTP poll. None (DB error) →
     // skip the push; the node will get its config on the next HTTP poll.
     if config_compatible {
-        if let Some(config) = build_config_snapshot(db.as_ref(), group_id).await {
+        if let Some(config) =
+            build_config_snapshot_for_node(db.as_ref(), group_id, node_id.as_deref()).await
+        {
             if let Ok(config_json) = serde_json::to_string(&config) {
                 let _ = sender.send(Message::Text(config_json.into())).await;
             }
@@ -522,9 +529,10 @@ async fn handle_node_ws(
     }
 }
 
-pub(crate) async fn build_config_snapshot(
+pub(crate) async fn build_config_snapshot_for_node(
     db: &dyn crate::db::Repository,
     group_id: i64,
+    node_id: Option<&str>,
 ) -> Option<NodeConfigSnapshot> {
     // v0.3.6: delegate to the shared `build_node_config` (same function
     // `get_config` uses). This fixes the v0.3.5 drift where the WS path queried
@@ -536,7 +544,9 @@ pub(crate) async fn build_config_snapshot(
     // Returns None on DB error so the caller skips the snapshot push (rather
     // than pushing an empty config that would incorrectly tear down the node's
     // listeners). An empty Ok is a legitimate "no rules" snapshot.
-    match crate::service::node_config::build_node_config_snapshot(db, group_id).await {
+    match crate::service::node_config::build_node_config_snapshot_for_node(db, group_id, node_id)
+        .await
+    {
         Ok(cfg) => Some(cfg),
         Err(e) => {
             tracing::error!(

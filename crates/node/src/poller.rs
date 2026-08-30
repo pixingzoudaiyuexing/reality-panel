@@ -43,6 +43,7 @@ pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
     let resp = match client
         .get(&url)
         .header("Authorization", format!("Bearer {}", config.token))
+        .header("X-Node-ID", get_or_create_node_id())
         // v0.4.0: send our config-protocol version so the panel can refuse to
         // send config we can't deserialize (keeps old nodes on their cached
         // config instead of crashing on unknown fields/enum variants).
