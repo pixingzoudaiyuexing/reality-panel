@@ -517,6 +517,25 @@ fn status_supports_lifecycle(
         == Some(CONFIG_PROTOCOL_VERSION as u64)
 }
 
+async fn operation_channel_online(
+    connections: &crate::api::ws::NodeConnections,
+    group_id: i64,
+    node_id: &str,
+    action: NodeLifecycleAction,
+) -> bool {
+    if action == NodeLifecycleAction::Upgrade {
+        connections
+            .lifecycle_online_node_ids(group_id)
+            .await
+            .contains(node_id)
+    } else {
+        connections
+            .config_online_node_ids(group_id)
+            .await
+            .contains(node_id)
+    }
+}
+
 async fn create_operation(
     state: &AppState,
     actor_id: i64,
@@ -525,12 +544,7 @@ async fn create_operation(
     action: NodeLifecycleAction,
     log_lines: Option<u16>,
 ) -> Result<NodeOperation, Response> {
-    if !state
-        .node_connections
-        .online_node_ids(group_id)
-        .await
-        .contains(&node_id)
-    {
+    if !operation_channel_online(&state.node_connections, group_id, &node_id, action).await {
         return Err(response::<()>(StatusCode::CONFLICT, 409, "NODE_OFFLINE"));
     }
     let status = node_status(state, group_id, &node_id)
@@ -1279,6 +1293,32 @@ mod tests {
             assert_eq!(response.status(), StatusCode::CONFLICT);
         }
         assert!(state.node_operations.inner.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upgrade_only_channel_allows_only_upgrade_and_disconnect_revokes_it() {
+        let connections = NodeConnections::new();
+        let (_, lifecycle_rx) = connections
+            .register_with_capabilities(1, Some("old-node".into()), false, true)
+            .await;
+
+        assert!(
+            operation_channel_online(&connections, 1, "old-node", NodeLifecycleAction::Upgrade,)
+                .await
+        );
+        for action in [
+            NodeLifecycleAction::Logs,
+            NodeLifecycleAction::Restart,
+            NodeLifecycleAction::Uninstall,
+        ] {
+            assert!(!operation_channel_online(&connections, 1, "old-node", action).await);
+        }
+
+        drop(lifecycle_rx);
+        assert!(
+            !operation_channel_online(&connections, 1, "old-node", NodeLifecycleAction::Upgrade,)
+                .await
+        );
     }
 
     #[tokio::test]

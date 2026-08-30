@@ -340,6 +340,15 @@ pub async fn get_node_status(
         }
 
         status["online"] = serde_json::json!(status_is_online(value, now));
+        let lifecycle_online = match status.get("node_id").and_then(|value| value.as_str()) {
+            Some(node_id) => state
+                .node_connections
+                .lifecycle_online_node_ids(group_id)
+                .await
+                .contains(node_id),
+            None => false,
+        };
+        status["lifecycle_online"] = serde_json::json!(lifecycle_online);
 
         statuses.push(status);
     }
@@ -501,6 +510,15 @@ pub struct DeleteStatusQuery {
 #[cfg(test)]
 mod tests {
     use super::parse_status_key;
+    use crate::api::middleware::AuthUser;
+    use crate::api::node_ops::NodeOperationRegistry;
+    use crate::api::system::ReleaseCache;
+    use crate::api::ws::NodeConnections;
+    use crate::api::AppState;
+    use crate::config::Config;
+    use crate::db::schema::SCHEMA_SQL;
+    use crate::db::sqlite_repo::SqliteRepository;
+    use std::sync::Arc;
 
     /// The v0.3.0 per-node key must parse into (group_id, Some(node_id)). This
     /// is what lets two nodes sharing one group token keep separate status rows
@@ -571,6 +589,91 @@ mod tests {
             .await
             .unwrap();
         n > 0
+    }
+
+    async fn status_test_state() -> (AppState, SqlitePool) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        let state = AppState {
+            db: Arc::new(SqliteRepository::new(pool.clone())),
+            config: Config {
+                database_path: "sqlite::memory:".into(),
+                listen: "127.0.0.1:0".into(),
+                key: "test-key".into(),
+                jwt_secret: "test-secret".into(),
+                public_dir: "public".into(),
+                public_panel_url: String::new(),
+                registration_enabled: false,
+                cors_origins: vec![],
+                geoip_enabled: false,
+                geoip_cache_ttl: 604_800,
+            },
+            release_cache: ReleaseCache::new(),
+            node_connections: NodeConnections::new(),
+            node_operations: NodeOperationRegistry::new(),
+            deployments: crate::api::node_deploy::DeploymentRegistry::default(),
+            diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
+            geoip_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+        (state, pool)
+    }
+
+    #[tokio::test]
+    async fn stale_upgrade_only_status_exposes_live_lifecycle_capability_until_disconnect() {
+        let (state, pool) = status_test_state().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) \
+             VALUES (7, 'relay', 'in', 'token', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let last_seen = (chrono::Utc::now() - chrono::Duration::seconds(31)).to_rfc3339();
+        put_kvs(
+            &pool,
+            "node_status:7:old-node",
+            &serde_json::json!({
+                "node_id": "old-node",
+                "node_version": "1.1.0-rc.6",
+                "config_protocol_version": 9,
+                "last_seen": last_seen,
+            })
+            .to_string(),
+        )
+        .await;
+        let (_, lifecycle_rx) = state
+            .node_connections
+            .register_with_capabilities(7, Some("old-node".into()), false, true)
+            .await;
+
+        let response = super::get_node_status(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            axum::extract::State(state.clone()),
+        )
+        .await;
+        let row = &response.0.data.unwrap()[0];
+        assert_eq!(row["online"], false);
+        assert_eq!(row["lifecycle_online"], true);
+
+        drop(lifecycle_rx);
+        let response = super::get_node_status(
+            AuthUser {
+                user_id: 1,
+                admin: true,
+            },
+            axum::extract::State(state),
+        )
+        .await;
+        let row = &response.0.data.unwrap()[0];
+        assert_eq!(row["online"], false);
+        assert_eq!(row["lifecycle_online"], false);
     }
 
     /// The exact handler-side SQL delete (single-line, parameterized) is the

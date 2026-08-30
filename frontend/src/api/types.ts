@@ -542,6 +542,8 @@ export interface NodeStatus {
    *  The admin /nodes endpoint now stamps this so the frontend never recomputes
    *  an online threshold of its own. Optional for older payloads. */
   online?: boolean;
+  /** Live Lifecycle-compatible WS capability used for one-click Upgrade. */
+  lifecycle_online?: boolean;
   cpu: number;
   mem: number;
   connections: number;
@@ -859,6 +861,8 @@ export interface NodeDisplayRow {
   group_name?: string | null;
   node_id?: string | null;
   online?: boolean;
+  /** Live Lifecycle-compatible WS capability. Independent of status freshness. */
+  lifecycle_online?: boolean;
   node_version?: string | null;
   /** v1.0.10: "systemd" | "docker" | "manual" — gates one-click upgrade. */
   install_method?: string | null;

@@ -67,7 +67,7 @@ impl NodeConnections {
             .await
     }
 
-    async fn register_with_capabilities(
+    pub(crate) async fn register_with_capabilities(
         &self,
         group_id: i64,
         node_id: Option<String>,
@@ -218,6 +218,44 @@ impl NodeConnections {
             .await
             .get(&group_id)
             .map(|conns| conns.values().filter_map(|e| e.node_id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Node identities with a currently live Lifecycle-compatible channel.
+    /// This capability is independent of ordinary status freshness and config
+    /// protocol compatibility so an upgrade-only node can still be upgraded.
+    pub async fn lifecycle_online_node_ids(
+        &self,
+        group_id: i64,
+    ) -> std::collections::HashSet<String> {
+        self.inner
+            .read()
+            .await
+            .get(&group_id)
+            .map(|conns| {
+                conns
+                    .values()
+                    .filter(|entry| entry.lifecycle_capable && !entry.tx.is_closed())
+                    .filter_map(|entry| entry.node_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Node identities whose live channel accepts ordinary config-bound
+    /// lifecycle commands. Upgrade-only connections are deliberately absent.
+    pub async fn config_online_node_ids(&self, group_id: i64) -> std::collections::HashSet<String> {
+        self.inner
+            .read()
+            .await
+            .get(&group_id)
+            .map(|conns| {
+                conns
+                    .values()
+                    .filter(|entry| entry.config_compatible && !entry.tx.is_closed())
+                    .filter_map(|entry| entry.node_id.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -738,8 +776,24 @@ mod tests {
         assert_eq!(conns.send_upgrade_node(1, "old-node", "upgrade").await, 1);
         assert_eq!(old_rx.recv().await.as_deref(), Some("upgrade"));
 
-        // It remains an authenticated online node so the UI can offer Upgrade.
-        assert!(conns.online_node_ids(1).await.contains("old-node"));
+        assert!(conns
+            .lifecycle_online_node_ids(1)
+            .await
+            .contains("old-node"));
+        assert!(!conns.config_online_node_ids(1).await.contains("old-node"));
+        assert!(conns
+            .config_online_node_ids(1)
+            .await
+            .contains("current-node"));
+
+        drop(old_rx);
+        assert!(
+            !conns
+                .lifecycle_online_node_ids(1)
+                .await
+                .contains("old-node"),
+            "a closed Lifecycle channel must immediately lose Upgrade capability"
+        );
     }
 
     #[test]
