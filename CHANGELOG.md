@@ -7,6 +7,28 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.0-rc.7] - 2026-08-30
+
+Release candidate for the hardened multi-Relay Reality lifecycle.
+
+### Added
+
+- Reality dependency convergence with safe reconciliation, LKG preservation,
+  and rc.7 fault-injection safety gates.
+- Persistent certificate retry backoff and certificate-domain lifecycle
+  deduplication, including Huawei DNS-01 multi-Relay TXT set semantics and
+  authoritative propagation checks.
+- Config revision, ordering, and stale-state protections under Config Protocol
+  10, plus visible Relay DNS partial-failure rollback and split-DNS state.
+- Separate `lifecycle_online` compatibility reporting for upgrade-only Nodes,
+  and corrected wildcard certificate diagnosis semantics.
+- Exact-HEAD `workflow_dispatch` support for release artifact builds.
+
+### Fixed
+
+- SQLite migration safety for duplicate legacy rows and DNSMgr Frozen
+  reconciliation behavior discovered by the rc.7 CI gates.
+
 ## [1.0.1] - 2026-08-29
 
 Production hotfix for fresh Node deployment and stable lifecycle detection.

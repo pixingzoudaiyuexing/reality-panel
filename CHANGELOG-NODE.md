@@ -7,6 +7,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.0-rc.7] - 2026-08-30
+
+Reality relay-node release candidate with Config Protocol 10 and Lifecycle
+Protocol 1 compatibility.
+
+### Added
+
+- Safer Reality dependency reconciliation with LKG preservation, including
+  config revision, ordering, and stale-state protections.
+- Persistent certificate retry backoff and certificate-domain lifecycle
+  deduplication for shared wildcard coverage.
+
+### Fixed
+
+- Wildcard certificate diagnosis now reflects objective certificate
+  usability, while runtime, camouflage, and listener failures preserve the
+  last known good state.
+
 ## [1.0.1] - 2026-08-29
 
 Unified hotfix release. The relay-node runtime behavior and config protocol 8
