@@ -116,6 +116,7 @@ pub(crate) enum CacheRecoverySource {
     PrimaryLkg,
     RepairedFromBackup,
     BackupFallback,
+    #[allow(dead_code)] // 无可信 LKG 的显式降级类别为 fail-safe 兼容状态。
     DegradedNoTrustedLkg,
 }
 
@@ -190,6 +191,7 @@ impl CoordinatedApplyOutcome {
 /// Apply first, then commit the snapshot as LKG while holding the same manager
 /// mutex. HTTP polls and WebSocket snapshots both use this path so an older
 /// snapshot cannot finish its cache write after a newer one.
+#[allow(dead_code)] // 保留无 revision 调用入口，便于旧缓存与故障注入复用同一事务。
 pub(crate) async fn apply_and_commit_coordinated(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
@@ -198,6 +200,7 @@ pub(crate) async fn apply_and_commit_coordinated(
     apply_and_commit_coordinated_at(manager, camouflage, config, &cache_paths()).await
 }
 
+#[allow(dead_code)] // 测试路径可注入独立缓存目录，生产路径使用 versioned snapshot。
 pub(crate) async fn apply_and_commit_coordinated_at(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
@@ -252,6 +255,7 @@ pub(crate) async fn apply_cached_coordinated(
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // 事务边界参数保持显式，避免 rc.7 改写 LKG 调用架构。
 async fn apply_coordinated(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
@@ -598,6 +602,7 @@ pub(crate) async fn apply_and_commit_at(
 
 /// Load the primary cache if valid, otherwise fall back to the last healthy
 /// backup. A startup load is deliberately not committed again.
+#[allow(dead_code)] // 保留旧调用入口；现代启动路径读取带 revision 的 CacheLoad。
 pub fn load_cache() -> Option<NodeConfigResponse> {
     load_cache_state_at(&cache_paths()).map(|state| state.config)
 }
@@ -681,6 +686,7 @@ fn remove_tmp_if_safe(path: &Path) {
     }
 }
 
+#[allow(dead_code)] // 故障注入使用无 revision 提交入口验证 primary/backup 事务。
 pub(crate) fn commit_cache_at(
     config: &NodeConfigResponse,
     paths: &CachePaths,

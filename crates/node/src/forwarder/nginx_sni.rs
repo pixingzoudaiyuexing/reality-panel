@@ -21,6 +21,7 @@ pub struct NginxRuntimeObservation {
     pub fingerprint: ConfigFingerprint,
     pub deployed_fingerprint: Option<ConfigFingerprint>,
     pub healthy: bool,
+    #[allow(dead_code)] // 该原始观测位由故障注入断言使用，运行态汇总读取 healthy。
     pub managed_file_exists: bool,
     pub file_matches: bool,
     pub config_valid: bool,

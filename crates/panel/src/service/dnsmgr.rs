@@ -190,7 +190,7 @@ pub(crate) struct DiscoveredRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Slice 3 foundation; consumed by Slice 4 ensure_record.
+#[allow(dead_code, clippy::large_enum_variant)] // 保持发现结果的现有内部形态，不为 lint 改写状态机。
 pub(crate) enum RecordDiscovery {
     NoRecord,
     SingleMatchingRecord(DiscoveredRecord),
@@ -788,8 +788,8 @@ async fn handle_discovered_records(
             && binding.state == "BOUND"
             && binding.last_error_category.is_none()
     });
-    if !binding_is_current || updated {
-        if persist_verified_binding(
+    if (!binding_is_current || updated)
+        && persist_verified_binding(
             db,
             input,
             fqdn,
@@ -800,9 +800,8 @@ async fn handle_discovered_records(
         )
         .await
         .is_err()
-        {
-            return EnsureRecordResult::Failed(EnsureRecordFailure::Database);
-        }
+    {
+        return EnsureRecordResult::Failed(EnsureRecordFailure::Database);
     }
 
     if updated {
@@ -1589,7 +1588,7 @@ fn is_transient_failure(failure: &EnsureRecordFailure) -> bool {
 }
 
 fn public_dns_state(answers: &[Ipv4Addr], expected: Ipv4Addr) -> PublicDnsObservation {
-    if answers.iter().any(|answer| *answer == expected) {
+    if answers.contains(&expected) {
         if answers.iter().any(|answer| *answer != expected) {
             PublicDnsObservation::ExpectedPresentWithOtherAnswers
         } else {
@@ -1618,6 +1617,7 @@ async fn observe_public_dns(fqdn: &str, expected: Ipv4Addr) -> PublicDnsObservat
     public_dns_state(&answers, expected)
 }
 
+#[allow(clippy::too_many_arguments)] // 状态转移字段与持久化 CAS 参数一一对应，保持事务语义。
 async fn update_sync(
     db: &dyn Repository,
     sync: &DnsRecordSync,

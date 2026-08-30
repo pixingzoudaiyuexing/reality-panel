@@ -3513,13 +3513,17 @@ mod tests {
         locked_rx.recv().unwrap();
 
         let desired = desired_site("same_site", "op1.example.com");
-        assert!(prepare_desired_shared(&shared, &[desired.clone()], true)
-            .await
-            .is_empty());
+        assert!(
+            prepare_desired_shared(&shared, std::slice::from_ref(&desired), true)
+                .await
+                .is_empty()
+        );
         let first_attempt = shared.lock().await.last_attempts["same_site"].clone();
-        assert!(prepare_desired_shared(&shared, &[desired.clone()], true)
-            .await
-            .is_empty());
+        assert!(
+            prepare_desired_shared(&shared, std::slice::from_ref(&desired), true)
+                .await
+                .is_empty()
+        );
         assert!(
             prepare_desired_shared(&shared, std::slice::from_ref(&desired), true)
                 .await
@@ -3566,7 +3570,7 @@ mod tests {
         state.set_desired_retry_backoff_for_test(vec![Duration::ZERO]);
         let desired = desired_site("q1", "q1.example.com");
         let first = state
-            .desired_reconcile_snapshot(&[desired.clone()], true)
+            .desired_reconcile_snapshot(std::slice::from_ref(&desired), true)
             .unwrap();
         let shared = Arc::new(AsyncMutex::new(state));
 
@@ -3613,7 +3617,7 @@ mod tests {
         {
             let mut state = shared.lock().await;
             assert!(state.active_snis().contains("q1.example.com"));
-            assert!(state.last_errors.get("q1").is_none());
+            assert!(!state.last_errors.contains_key("q1"));
             assert_eq!(state.reconcile_retry_attempt, 0);
             assert!(state.acme_retries.is_empty());
             assert!(!desired_acme_retry_path(&state.config.state_dir).exists());
@@ -3641,7 +3645,7 @@ mod tests {
         state.set_desired_retry_backoff_for_test(vec![Duration::ZERO]);
         let desired = desired_site("q1", "q1.example.com");
         let first = state
-            .desired_reconcile_snapshot(&[desired.clone()], true)
+            .desired_reconcile_snapshot(std::slice::from_ref(&desired), true)
             .unwrap();
         let shared = Arc::new(AsyncMutex::new(state));
 

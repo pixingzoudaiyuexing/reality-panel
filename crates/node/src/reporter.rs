@@ -796,6 +796,7 @@ impl NodeMetrics {
 /// the panel. Every new field is independent of the WebSocket control channel
 /// — this runs on the plain-HTTP poll loop, so it keeps reporting even if WS
 /// is down. Failures are logged, never crash.
+#[allow(clippy::too_many_arguments)] // 状态来源保持显式，避免 rc.7 重构 reporter 生命周期。
 pub async fn report_status(
     config: &NodeConfig,
     metrics: &Arc<NodeMetrics>,

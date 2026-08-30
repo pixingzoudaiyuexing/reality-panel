@@ -202,6 +202,7 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
 
     /// Returns a candidate manifest. The caller owns Nginx activation and LKG
     /// commit, ensuring lifecycle failures never replace a healthy runtime.
+    #[allow(dead_code)] // 保留旧同步入口供故障注入兼容；生产路径使用 scoped worker。
     pub fn reconcile(
         &self,
         source: &CamouflageSitesManifest,
@@ -243,6 +244,7 @@ impl<R: CommandRunner> CertificateLifecycle<R> {
         self.reconcile_prepared_with_dns(source, dns_validator)
     }
 
+    #[allow(dead_code)] // 仅由兼容测试入口调用，保留其显式 DNS 校验语义。
     fn reconcile_prepared_with_dns<F>(
         &self,
         source: &CamouflageSitesManifest,
@@ -957,7 +959,7 @@ fn validate_dns(domain: &str, expected: &str) -> Result<(), String> {
         .map_err(|_| "DNS lookup failed")?
         .map(|address| address.ip())
         .collect();
-    if resolved.iter().any(|address| *address == expected) {
+    if resolved.contains(&expected) {
         Ok(())
     } else {
         Err("DNS does not resolve the certificate domain to this node".into())

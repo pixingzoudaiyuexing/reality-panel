@@ -52,6 +52,7 @@ const MAX_TARGETS: usize = 32;
 /// `challenge` is the opaque per-run string the panel sent in the probe; we
 /// MUST echo it back verbatim in DiagnoseResult.challenge or the panel rejects
 /// the result (v0.4.9 secure-diagnose protocol).
+#[allow(clippy::too_many_arguments)] // 诊断请求绑定字段保持显式，避免改变现有安全调用链。
 pub async fn run_and_report(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
@@ -85,6 +86,7 @@ pub async fn run_and_report(
 }
 
 /// Build the DiagnoseResult for a rule (probe targets, capture listener state).
+#[allow(clippy::too_many_arguments)] // 参数逐项对应 wire identity，rc.7 不引入包装结构。
 async fn diagnose(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
@@ -217,6 +219,7 @@ fn check(state: &str, detail: impl Into<String>) -> RealityCheck {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // desired/effective identity 必须独立传入以防旧状态误判。
 fn build_reality_diagnosis(
     manager: &ForwarderManager,
     config: Option<&relay_shared::protocol::NodeConfigResponse>,
@@ -506,6 +509,7 @@ fn renewal_diagnosis(status: &relay_shared::protocol::CamouflageSiteStatus) -> R
     }
 }
 
+#[allow(clippy::type_complexity)] // 返回项直接映射公开 diagnosis 字段，避免 lint 改动 wire 类型。
 fn inspect_certificate(
     site: Option<&CamouflageSite>,
     domain: &str,

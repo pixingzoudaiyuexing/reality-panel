@@ -277,6 +277,7 @@ fn uuid_v4_str() -> String {
 /// discriminated object rather than the default externally-tagged form.
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // Box 会改变公开 serde/调用形态，rc.7 保持现有 wire contract。
 pub enum NodeDiagnoseStatus {
     /// The node replied with a DiagnoseResult.
     ///

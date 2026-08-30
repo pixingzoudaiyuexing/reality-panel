@@ -46,6 +46,7 @@ pub struct TrustedSnapshot {
 }
 
 impl TrustedSnapshot {
+    #[allow(dead_code)] // 无 ordering metadata 的兼容构造器由故障注入覆盖。
     pub fn validated_panel(config: NodeConfigResponse) -> Result<Self, String> {
         Self::new_snapshot(
             AuthoritySource::ValidatedPanel,
@@ -61,10 +62,12 @@ impl TrustedSnapshot {
         Self::new_snapshot(AuthoritySource::ValidatedPanel, snapshot)
     }
 
+    #[allow(dead_code)] // 保留旧 LKG 恢复入口，现代路径使用带来源的 snapshot。
     pub fn local_recovery(config: NodeConfigResponse) -> Result<Self, String> {
         Self::local_recovery_from(config, LocalRecoverySource::PrimaryLkg)
     }
 
+    #[allow(dead_code)] // 测试显式注入恢复来源，生产路径使用 revision-bearing snapshot。
     pub fn local_recovery_from(
         config: NodeConfigResponse,
         recovery_source: LocalRecoverySource,
@@ -91,6 +94,7 @@ impl TrustedSnapshot {
         )
     }
 
+    #[allow(dead_code)] // 上述兼容构造器共享此严格校验实现。
     fn new(source: AuthoritySource, config: NodeConfigResponse) -> Result<Self, String> {
         Self::new_snapshot(
             source,
@@ -165,6 +169,7 @@ pub enum ReconciliationInput {
 }
 
 impl ReconciliationInput {
+    #[allow(dead_code)] // 保留无 revision 的 Panel 输入供故障注入验证。
     pub fn validated_panel(config: NodeConfigResponse) -> Result<Self, String> {
         TrustedSnapshot::validated_panel(config).map(Self::Trusted)
     }
@@ -173,10 +178,12 @@ impl ReconciliationInput {
         TrustedSnapshot::validated_panel_snapshot(config).map(Self::Trusted)
     }
 
+    #[allow(dead_code)] // 保留旧 LKG 输入入口，现代启动使用 local_recovery_snapshot。
     pub fn local_recovery(config: NodeConfigResponse) -> Result<Self, String> {
         TrustedSnapshot::local_recovery(config).map(Self::Trusted)
     }
 
+    #[allow(dead_code)] // 恢复来源必须显式可测，不折叠为默认状态。
     pub fn local_recovery_from(
         config: NodeConfigResponse,
         recovery_source: LocalRecoverySource,
