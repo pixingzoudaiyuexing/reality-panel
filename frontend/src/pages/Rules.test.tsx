@@ -1,8 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { Form } from 'antd';
-import { CamouflageFormFields, camouflageCertificateMessage, compactRealityStatus, deriveCamouflageStatus, diagnosisStateDisplay, diagnoseRuntimeStatus, DnsStatusCell, isRealityRule, ProxyProtocolFormField } from './Rules';
+import { CamouflageFormFields, DnsStatusCell, ProxyProtocolFormField } from './Rules';
 import type { NodeStatus, RealityDiagnosis, RuleDnsStatus } from '../api/types';
+import {
+  camouflageCertificateMessage,
+  compactRealityStatus,
+  deriveCamouflageStatus,
+  diagnosisStateDisplay,
+  diagnoseRuntimeStatus,
+  isRealityRule,
+} from '../utils/realityRuleStatus';
 
 // ============================================================
 // Pure-function tests for Rules.tsx helpers
