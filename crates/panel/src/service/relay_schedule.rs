@@ -1,18 +1,21 @@
-//! Persistent scheduled Relay switch definitions.
+//! 持久化的 Relay 定时切换计划。
 //!
-//! S1 deliberately owns only persistence and validation. Execution belongs to
-//! a later scheduler stage; creating or editing a schedule never starts a
-//! Relay switch and never touches DNS.
+//! S1 只负责持久化和校验。S2 的执行器只计算时间槽、领取计划并调用现有
+//! Relay 切换入口；它不复制 Ready、DNS 或 rollback 状态机。
 
 use crate::api::ws::NodeConnections;
+use crate::api::AppState;
 use crate::db::error::DbError;
 use crate::db::repo::{GroupRepository, Repository, ResourceScope};
-use chrono::DateTime;
+use crate::service::relay_preference::{StartRelaySwitchError, StartRelaySwitchOutcome};
+use chrono::{DateTime, Datelike, FixedOffset, SecondsFormat, TimeZone, Utc};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 pub const RELAY_SWITCH_SCHEDULES_KEY: &str = "relay_switch_schedules:v1";
+const RELAY_SCHEDULE_TICK: Duration = Duration::from_secs(30);
+const RELAY_SCHEDULE_GRACE: chrono::Duration = chrono::Duration::seconds(120);
 
 static RELAY_SCHEDULE_MUTATION_LOCK: Lazy<tokio::sync::Mutex<()>> =
     Lazy::new(|| tokio::sync::Mutex::new(()));
@@ -416,6 +419,306 @@ pub async fn set_schedule_enabled(
     Ok(updated)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OccurrenceDisposition {
+    Due,
+    Missed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScheduleOccurrence {
+    slot: String,
+    disposition: OccurrenceDisposition,
+}
+
+fn canonical_slot(prefix: &str, occurrence: DateTime<Utc>) -> String {
+    format!(
+        "{prefix}:{}",
+        occurrence.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+    )
+}
+
+fn parse_schedule_time(value: &str) -> Result<chrono::NaiveTime, RelayScheduleError> {
+    validate_time(value)?;
+    chrono::NaiveTime::parse_from_str(value, "%H:%M")
+        .map_err(|_| RelayScheduleError::InvalidInput("time must use HH:MM".into()))
+}
+
+fn fixed_offset(minutes: i32) -> Result<FixedOffset, RelayScheduleError> {
+    FixedOffset::east_opt(minutes * 60).ok_or_else(|| {
+        RelayScheduleError::InvalidInput("utc_offset_minutes is outside the valid range".into())
+    })
+}
+
+fn occurrence_for(
+    schedule: &RelaySchedule,
+    now: DateTime<Utc>,
+) -> Result<Option<ScheduleOccurrence>, RelayScheduleError> {
+    if !schedule.enabled {
+        return Ok(None);
+    }
+
+    match schedule.schedule_type {
+        RelayScheduleType::OneTime => {
+            let execute_at = schedule.execute_at.as_deref().ok_or_else(|| {
+                RelayScheduleError::InvalidStoredData("one_time has no execute_at".into())
+            })?;
+            let occurrence = DateTime::parse_from_rfc3339(execute_at)
+                .map_err(|_| {
+                    RelayScheduleError::InvalidStoredData(
+                        "one_time execute_at is not RFC3339".into(),
+                    )
+                })?
+                .with_timezone(&Utc);
+            let slot = canonical_slot("one_time", occurrence);
+            if now < occurrence {
+                return Ok(None);
+            }
+            if now <= occurrence + RELAY_SCHEDULE_GRACE {
+                return Ok(Some(ScheduleOccurrence {
+                    slot,
+                    disposition: OccurrenceDisposition::Due,
+                }));
+            }
+            Ok(Some(ScheduleOccurrence {
+                slot,
+                disposition: OccurrenceDisposition::Missed,
+            }))
+        }
+        RelayScheduleType::Daily | RelayScheduleType::Weekly => {
+            let time = schedule.time.as_deref().ok_or_else(|| {
+                RelayScheduleError::InvalidStoredData("recurring schedule has no time".into())
+            })?;
+            let local_time = parse_schedule_time(time)?;
+            let offset_minutes = schedule.utc_offset_minutes.ok_or_else(|| {
+                RelayScheduleError::InvalidStoredData(
+                    "recurring schedule has no utc_offset_minutes".into(),
+                )
+            })?;
+            let offset = fixed_offset(offset_minutes)?;
+            let local_now = now.with_timezone(&offset);
+            let local_date = local_now.date_naive();
+            if schedule.schedule_type == RelayScheduleType::Weekly
+                && !schedule
+                    .weekdays
+                    .contains(&(local_date.weekday().number_from_monday() as u8))
+            {
+                return Ok(None);
+            }
+            let local_occurrence = local_date.and_time(local_time);
+            let occurrence = offset
+                .from_local_datetime(&local_occurrence)
+                .single()
+                .expect("FixedOffset has one local datetime")
+                .with_timezone(&Utc);
+            if now < occurrence || now > occurrence + RELAY_SCHEDULE_GRACE {
+                return Ok(None);
+            }
+            let prefix = if schedule.schedule_type == RelayScheduleType::Daily {
+                "daily"
+            } else {
+                "weekly"
+            };
+            Ok(Some(ScheduleOccurrence {
+                slot: canonical_slot(prefix, occurrence),
+                disposition: OccurrenceDisposition::Due,
+            }))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SwitchResult {
+    last_result: String,
+    last_error: Option<String>,
+}
+
+type SwitchFuture = Pin<Box<dyn Future<Output = SwitchResult> + Send>>;
+type SwitchStarter = Arc<dyn Fn(i64, String) -> SwitchFuture + Send + Sync>;
+
+fn map_switch_result(
+    result: Result<StartRelaySwitchOutcome, StartRelaySwitchError>,
+) -> SwitchResult {
+    match result {
+        Ok(StartRelaySwitchOutcome::Started { .. }) => SwitchResult {
+            last_result: "started".into(),
+            last_error: None,
+        },
+        Ok(StartRelaySwitchOutcome::AlreadyPreferred) => SwitchResult {
+            last_result: "already_preferred".into(),
+            last_error: None,
+        },
+        Ok(StartRelaySwitchOutcome::AlreadySwitching) => SwitchResult {
+            last_result: "busy".into(),
+            last_error: None,
+        },
+        Err(error @ StartRelaySwitchError::SwitchInProgress { .. }) => SwitchResult {
+            last_result: "busy".into(),
+            last_error: Some(error.to_string()),
+        },
+        Err(error @ StartRelaySwitchError::TargetNotReady(_)) => SwitchResult {
+            last_result: "target_not_ready".into(),
+            last_error: Some(error.to_string()),
+        },
+        Err(error) => SwitchResult {
+            last_result: "failed".into(),
+            last_error: Some(error.to_string()),
+        },
+    }
+}
+
+fn production_switch_starter(
+    db: Arc<dyn Repository>,
+    node_connections: NodeConnections,
+) -> SwitchStarter {
+    Arc::new(move |group_id, target_node_id| {
+        let db = db.clone();
+        let node_connections = node_connections.clone();
+        Box::pin(async move {
+            map_switch_result(
+                crate::service::relay_preference::start_relay_switch(
+                    db.as_ref(),
+                    &node_connections,
+                    group_id,
+                    &target_node_id,
+                )
+                .await,
+            )
+        })
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ClaimedSchedule {
+    id: String,
+    group_id: i64,
+    target_node_id: String,
+    occurrence: ScheduleOccurrence,
+    updated_at: String,
+}
+
+async fn claim_schedule(
+    db: &dyn Repository,
+    schedule_id: &str,
+    occurrence: &ScheduleOccurrence,
+    now: DateTime<Utc>,
+) -> Result<Option<ClaimedSchedule>, RelayScheduleError> {
+    let _guard = RELAY_SCHEDULE_MUTATION_LOCK.lock().await;
+    let mut schedules = load_schedules(db).await?;
+    let Some(schedule) = schedules
+        .iter_mut()
+        .find(|schedule| schedule.id == schedule_id)
+    else {
+        return Ok(None);
+    };
+    if !schedule.enabled || schedule.last_run_slot.as_deref() == Some(occurrence.slot.as_str()) {
+        return Ok(None);
+    }
+    let Some(current_occurrence) = occurrence_for(schedule, now)? else {
+        return Ok(None);
+    };
+    if current_occurrence != *occurrence {
+        return Ok(None);
+    }
+
+    schedule.last_run_at = Some(now.to_rfc3339());
+    schedule.last_run_slot = Some(occurrence.slot.clone());
+    schedule.last_result = None;
+    schedule.last_error = None;
+    if schedule.schedule_type == RelayScheduleType::OneTime {
+        schedule.enabled = false;
+    }
+    if occurrence.disposition == OccurrenceDisposition::Missed {
+        schedule.enabled = false;
+        schedule.last_result = Some("missed".into());
+        schedule.last_error = Some("超过执行宽限窗口，未补执行".into());
+    }
+    schedule.updated_at = now.to_rfc3339();
+    let claim = ClaimedSchedule {
+        id: schedule.id.clone(),
+        group_id: schedule.group_id,
+        target_node_id: schedule.target_node_id.clone(),
+        occurrence: occurrence.clone(),
+        updated_at: schedule.updated_at.clone(),
+    };
+    save_schedules(db, &schedules).await?;
+    Ok(Some(claim))
+}
+
+async fn finalize_claim(
+    db: &dyn Repository,
+    claim: &ClaimedSchedule,
+    result: SwitchResult,
+) -> Result<(), RelayScheduleError> {
+    let _guard = RELAY_SCHEDULE_MUTATION_LOCK.lock().await;
+    let mut schedules = load_schedules(db).await?;
+    let Some(schedule) = schedules
+        .iter_mut()
+        .find(|schedule| schedule.id == claim.id)
+    else {
+        return Ok(());
+    };
+    if schedule.last_run_slot.as_deref() != Some(claim.occurrence.slot.as_str())
+        || schedule.updated_at != claim.updated_at
+    {
+        return Ok(());
+    }
+    schedule.last_result = Some(result.last_result);
+    schedule.last_error = result.last_error;
+    schedule.updated_at = Utc::now().to_rfc3339();
+    save_schedules(db, &schedules).await
+}
+
+async fn run_scheduler_once_with(
+    db: &dyn Repository,
+    now: DateTime<Utc>,
+    starter: SwitchStarter,
+) -> Result<(), RelayScheduleError> {
+    let snapshot = list_schedules(db).await?;
+    for schedule in snapshot {
+        let Some(occurrence) = (match occurrence_for(&schedule, now) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(schedule_id = %schedule.id, "跳过无效 Relay 定时计划: {error}");
+                continue;
+            }
+        }) else {
+            continue;
+        };
+        let Some(claim) = claim_schedule(db, &schedule.id, &occurrence, now).await? else {
+            continue;
+        };
+        if claim.occurrence.disposition == OccurrenceDisposition::Missed {
+            continue;
+        }
+        let result = starter(claim.group_id, claim.target_node_id.clone()).await;
+        if let Err(error) = finalize_claim(db, &claim, result).await {
+            tracing::error!(schedule_id = %claim.id, "保存 Relay 定时计划执行结果失败: {error}");
+        }
+    }
+    Ok(())
+}
+
+/// 启动 Panel 内部的定时 Relay 计划检查。首个 tick 立即执行，之后每 30 秒
+/// 检查一次；执行本身始终复用现有 Relay Preference 切换入口。
+pub fn spawn(state: AppState) {
+    tokio::spawn(async move {
+        let starter = production_switch_starter(state.db.clone(), state.node_connections.clone());
+        let mut ticker = tokio::time::interval(RELAY_SCHEDULE_TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tracing::info!("Relay schedule scheduler started (tick 30s)");
+        ticker.tick().await;
+        loop {
+            if let Err(error) =
+                run_scheduler_once_with(state.db.as_ref(), Utc::now(), starter.clone()).await
+            {
+                tracing::error!("Relay schedule scheduler tick failed: {error}");
+            }
+            ticker.tick().await;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +754,329 @@ mod tests {
             utc_offset_minutes: None,
             weekdays: None,
         }
+    }
+
+    fn utc(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn one_time_schedule(execute_at: &str) -> RelaySchedule {
+        RelaySchedule {
+            id: "schedule-1".into(),
+            group_id: 1,
+            target_node_id: "node-a".into(),
+            schedule_type: RelayScheduleType::OneTime,
+            enabled: true,
+            created_at: "2026-08-30T00:00:00Z".into(),
+            updated_at: "2026-08-30T00:00:00Z".into(),
+            execute_at: Some(execute_at.into()),
+            time: None,
+            utc_offset_minutes: None,
+            weekdays: Vec::new(),
+            last_run_at: None,
+            last_run_slot: None,
+            last_result: None,
+            last_error: None,
+        }
+    }
+
+    fn recurring_schedule(
+        schedule_type: RelayScheduleType,
+        time: &str,
+        utc_offset_minutes: i32,
+        weekdays: Vec<u8>,
+    ) -> RelaySchedule {
+        RelaySchedule {
+            id: "schedule-1".into(),
+            group_id: 1,
+            target_node_id: "node-a".into(),
+            schedule_type,
+            enabled: true,
+            created_at: "2026-08-30T00:00:00Z".into(),
+            updated_at: "2026-08-30T00:00:00Z".into(),
+            execute_at: None,
+            time: Some(time.into()),
+            utc_offset_minutes: Some(utc_offset_minutes),
+            weekdays,
+            last_run_at: None,
+            last_run_slot: None,
+            last_result: None,
+            last_error: None,
+        }
+    }
+
+    async fn put_schedule(repo: &SqliteRepository, schedule: &RelaySchedule) {
+        repo.set(
+            RELAY_SWITCH_SCHEDULES_KEY,
+            &serde_json::to_string(std::slice::from_ref(schedule)).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn recording_starter(
+        calls: std::sync::Arc<std::sync::Mutex<Vec<(i64, String)>>>,
+        result: SwitchResult,
+    ) -> SwitchStarter {
+        std::sync::Arc::new(move |group_id, target_node_id| {
+            let calls = calls.clone();
+            let result = result.clone();
+            Box::pin(async move {
+                calls.lock().unwrap().push((group_id, target_node_id));
+                result
+            })
+        })
+    }
+
+    #[test]
+    fn one_time_occurrence_respects_before_due_grace_and_missed_windows() {
+        let schedule = one_time_schedule("2026-08-30T12:00:00Z");
+        assert!(occurrence_for(&schedule, utc("2026-08-30T11:59:59Z"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            occurrence_for(&schedule, utc("2026-08-30T12:00:03Z"))
+                .unwrap()
+                .unwrap(),
+            ScheduleOccurrence {
+                slot: "one_time:2026-08-30T12:00:00Z".into(),
+                disposition: OccurrenceDisposition::Due,
+            }
+        );
+        assert_eq!(
+            occurrence_for(&schedule, utc("2026-08-30T12:02:01Z"))
+                .unwrap()
+                .unwrap()
+                .disposition,
+            OccurrenceDisposition::Missed
+        );
+    }
+
+    #[test]
+    fn daily_occurrence_uses_positive_negative_offsets_and_utc_boundaries() {
+        let utc_plus_eight = recurring_schedule(RelayScheduleType::Daily, "08:00", 480, vec![]);
+        assert_eq!(
+            occurrence_for(&utc_plus_eight, utc("2026-08-30T00:00:03Z"))
+                .unwrap()
+                .unwrap()
+                .slot,
+            "daily:2026-08-30T00:00:00Z"
+        );
+
+        let utc_minus_five = recurring_schedule(RelayScheduleType::Daily, "03:00", -300, vec![]);
+        assert_eq!(
+            occurrence_for(&utc_minus_five, utc("2026-08-30T08:00:30Z"))
+                .unwrap()
+                .unwrap()
+                .slot,
+            "daily:2026-08-30T08:00:00Z"
+        );
+
+        let boundary = recurring_schedule(RelayScheduleType::Daily, "01:30", 120, vec![]);
+        assert_eq!(
+            occurrence_for(&boundary, utc("2026-08-30T23:30:30Z"))
+                .unwrap()
+                .unwrap()
+                .slot,
+            "daily:2026-08-30T23:30:00Z"
+        );
+    }
+
+    #[test]
+    fn weekly_occurrence_requires_local_weekday_and_keeps_canonical_slot() {
+        let schedule = recurring_schedule(RelayScheduleType::Weekly, "08:00", 0, vec![1]);
+        let monday = utc("2026-08-31T08:00:03Z");
+        let later_same_slot = utc("2026-08-31T08:01:01Z");
+        assert_eq!(
+            occurrence_for(&schedule, monday).unwrap().unwrap().slot,
+            occurrence_for(&schedule, later_same_slot)
+                .unwrap()
+                .unwrap()
+                .slot
+        );
+        assert!(occurrence_for(&schedule, utc("2026-09-01T08:00:03Z"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn scheduler_claims_once_persists_started_and_survives_restart() {
+        let repo = test_repo().await;
+        let schedule = one_time_schedule("2026-08-30T12:00:00Z");
+        put_schedule(&repo, &schedule).await;
+        let now = utc("2026-08-30T12:00:03Z");
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let starter = recording_starter(
+            calls.clone(),
+            SwitchResult {
+                last_result: "started".into(),
+                last_error: None,
+            },
+        );
+
+        run_scheduler_once_with(&repo, now, starter).await.unwrap();
+        assert_eq!(calls.lock().unwrap().as_slice(), &[(1, "node-a".into())]);
+        let stored = list_schedules(&repo).await.unwrap();
+        assert!(!stored[0].enabled);
+        assert_eq!(
+            stored[0].last_run_slot.as_deref(),
+            Some("one_time:2026-08-30T12:00:00Z")
+        );
+        assert_eq!(stored[0].last_result.as_deref(), Some("started"));
+
+        let restart_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_scheduler_once_with(
+            &repo,
+            now,
+            recording_starter(
+                restart_calls.clone(),
+                SwitchResult {
+                    last_result: "started".into(),
+                    last_error: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(restart_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_schedule_is_not_executed() {
+        let repo = test_repo().await;
+        let mut schedule = one_time_schedule("2026-08-30T12:00:00Z");
+        schedule.enabled = false;
+        put_schedule(&repo, &schedule).await;
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_scheduler_once_with(
+            &repo,
+            utc("2026-08-30T12:00:03Z"),
+            recording_starter(
+                calls.clone(),
+                SwitchResult {
+                    last_result: "started".into(),
+                    last_error: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missed_one_time_is_recorded_without_switch_and_recurring_stays_enabled() {
+        let repo = test_repo().await;
+        put_schedule(&repo, &one_time_schedule("2026-08-30T12:00:00Z")).await;
+        let missed_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_scheduler_once_with(
+            &repo,
+            utc("2026-08-30T12:02:01Z"),
+            recording_starter(
+                missed_calls.clone(),
+                SwitchResult {
+                    last_result: "started".into(),
+                    last_error: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(missed_calls.lock().unwrap().is_empty());
+        let missed = list_schedules(&repo).await.unwrap().remove(0);
+        assert!(!missed.enabled);
+        assert_eq!(missed.last_result.as_deref(), Some("missed"));
+        assert_eq!(
+            missed.last_error.as_deref(),
+            Some("超过执行宽限窗口，未补执行")
+        );
+
+        let recurring = recurring_schedule(RelayScheduleType::Daily, "08:00", 0, vec![]);
+        put_schedule(&repo, &recurring).await;
+        let recurring_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_scheduler_once_with(
+            &repo,
+            utc("2026-08-30T08:00:30Z"),
+            recording_starter(
+                recurring_calls,
+                SwitchResult {
+                    last_result: "already_preferred".into(),
+                    last_error: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(list_schedules(&repo).await.unwrap()[0].enabled);
+    }
+
+    #[test]
+    fn switch_results_map_to_stable_schedule_diagnostics() {
+        assert_eq!(
+            map_switch_result(Ok(StartRelaySwitchOutcome::AlreadyPreferred)),
+            SwitchResult {
+                last_result: "already_preferred".into(),
+                last_error: None,
+            }
+        );
+        assert_eq!(
+            map_switch_result(Ok(StartRelaySwitchOutcome::AlreadySwitching)),
+            SwitchResult {
+                last_result: "busy".into(),
+                last_error: None,
+            }
+        );
+        assert_eq!(
+            map_switch_result(Err(StartRelaySwitchError::SwitchInProgress {
+                pending_node_id: Some("node-b".into()),
+            }))
+            .last_result,
+            "busy"
+        );
+        assert_eq!(
+            map_switch_result(Err(StartRelaySwitchError::TargetNotReady(vec![
+                "STALE_STATUS".into(),
+            ])))
+            .last_result,
+            "target_not_ready"
+        );
+        assert_eq!(
+            map_switch_result(Err(StartRelaySwitchError::NoEligibleDnsRules)).last_result,
+            "failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_does_not_recreate_a_deleted_schedule() {
+        let repo = test_repo().await;
+        let schedule = one_time_schedule("2026-08-30T12:00:00Z");
+        put_schedule(&repo, &schedule).await;
+        let occurrence = occurrence_for(&schedule, utc("2026-08-30T12:00:03Z"))
+            .unwrap()
+            .unwrap();
+        let claim = claim_schedule(
+            &repo,
+            &schedule.id,
+            &occurrence,
+            utc("2026-08-30T12:00:03Z"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(delete_schedule(&repo, &schedule.id).await.unwrap());
+        finalize_claim(
+            &repo,
+            &claim,
+            SwitchResult {
+                last_result: "started".into(),
+                last_error: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(list_schedules(&repo).await.unwrap().is_empty());
     }
 
     #[tokio::test]
