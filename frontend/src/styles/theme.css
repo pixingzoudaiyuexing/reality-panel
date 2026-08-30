@@ -224,6 +224,63 @@ html, body, #root {
   margin-bottom: 16px;
 }
 
+.rp-rules-header {
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.rp-rules-header .rp-page-title {
+  margin-bottom: 0;
+  white-space: nowrap;
+}
+
+.rp-rules-page-actions {
+  flex: 0 0 auto;
+}
+
+.rp-rules-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  min-width: 0;
+}
+
+.rp-rules-search {
+  width: 220px;
+}
+
+.rp-rules-group-filter {
+  min-width: 180px;
+}
+
+.rp-rules-table .rp-rules-nowrap,
+.rp-rules-table .rp-rules-actions {
+  white-space: nowrap;
+}
+
+.rp-rules-table .rp-rules-ellipsis {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rp-rules-table .rp-rules-group-tag {
+  display: inline-block;
+  max-width: 104px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.rp-rules-table .rp-rules-actions {
+  display: inline-flex;
+  flex-wrap: nowrap;
+}
+
 .rp-stat-card {
   border-radius: var(--rp-radius);
   border: 1px solid var(--rp-border);

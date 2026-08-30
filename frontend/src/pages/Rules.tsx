@@ -16,6 +16,13 @@ import { RuleDiagnosisModal } from '../components/diagnosis/RuleDiagnosisModal';
 const { Text } = Typography;
 const { TextArea } = Input;
 
+export const RULE_TABLE_SCROLL_X = 1890;
+
+function RuleEllipsis({ value, mono = true, tooltip = true }: { value: string; mono?: boolean; tooltip?: boolean }) {
+  const content = <span className={`rp-rules-ellipsis${mono ? ' rp-mono' : ''}`} title={value}>{value}</span>;
+  return tooltip ? <Tooltip title={value}>{content}</Tooltip> : content;
+}
+
 function targetSummary(rule: ForwardRule): string {
   const targets = ruleTargets(rule).filter(t => t.enabled);
   const first = targets[0] ?? ruleTargets(rule)[0];
@@ -807,29 +814,32 @@ export default function Rules() {
     // v0.4.9: inbound group name. Hidden on small screens (responsive md+) so
     // the mobile view keeps the core columns. Lookup misses → "未知分组 (#ID)".
     {
-      title: t('groupName'), key: 'group_name', width: 140, responsive: ['md' as const],
+      title: t('groupName'), key: 'group_name', width: 120, responsive: ['md' as const],
       render: (_: unknown, r: ForwardRule) => {
         const g = groupInfo.get(r.device_group_in);
         return g
-          ? <Tag>{g.name}</Tag>
+          ? <Tooltip title={g.name}><Tag className="rp-rules-group-tag">{g.name}</Tag></Tooltip>
           : <Text type="secondary">{t('unknownGroup')} (#{r.device_group_in})</Text>;
       },
     },
-    { title: t('name'), dataIndex: 'name', key: 'name' },
     {
-      title: t('listenIp'), key: 'listen_ip', width: 160,
+      title: t('name'), dataIndex: 'name', key: 'name', width: 190,
+      render: (value: string) => <RuleEllipsis value={value} mono={false} />,
+    },
+    {
+      title: t('listenIp'), key: 'listen_ip', width: 150,
       render: (_: unknown, r: ForwardRule) => {
         const host = groupInfo.get(r.device_group_in)?.connect_host ?? '';
         return host
-          ? <span className="rp-mono">{host}</span>
+          ? <RuleEllipsis value={host} />
           : <Text type="secondary">{t('notConfigured')}</Text>;
       },
     },
-    { title: t('listenPort'), dataIndex: 'listen_port', key: 'listen_port', render: (v: number) => <span className="rp-mono">{v}</span> },
+    { title: t('listenPort'), dataIndex: 'listen_port', key: 'listen_port', width: 90, render: (v: number) => <span className="rp-mono rp-rules-nowrap">{v}</span> },
     {
-      title: t('protocol'), dataIndex: 'protocol', key: 'protocol',
+      title: t('protocol'), dataIndex: 'protocol', key: 'protocol', width: 190,
       render: (p: string, r: ForwardRule) => (
-        <Space size={4}>
+        <Space size={4} className="rp-rules-nowrap">
           {protoTags(p)}
           {transportTag(r)}
           {r.paused && <Tag color="red">{t('paused')}</Tag>}
@@ -845,18 +855,18 @@ export default function Rules() {
       title: t('sni'), dataIndex: 'sni', key: 'sni', width: 180,
       render: (v: string | null | undefined, r: ForwardRule) =>
         (r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni') && v
-          ? <span className="rp-mono">{v}</span>
+          ? <RuleEllipsis value={v} />
           : <Text type="secondary">-</Text>,
     },
     {
-      title: t('target'), key: 'target',
+      title: t('target'), key: 'target', width: 220,
       render: (_: unknown, r: ForwardRule) => {
         // v1.0.9: a multi-target rule shows "first (+N)"; hovering lists every
         // enabled target IP so the admin can see the failover/round-robin pool.
         const all = ruleTargets(r).filter(t => t.enabled).map(t => `${t.host}:${t.port}`);
-        const summary = <span className="rp-mono">{targetSummary(r)}</span>;
+        const summary = <RuleEllipsis value={targetSummary(r)} tooltip={all.length <= 1} />;
         return (
-          <Space size={4} wrap>
+          <Space size={4} className="rp-rules-nowrap">
             {all.length > 1 ? (
               <Tooltip title={<div>{all.map((s, i) => <div key={i} className="rp-mono">{s}</div>)}</div>}>
                 {summary}
@@ -917,13 +927,13 @@ export default function Rules() {
       // to "#uid" when the user list isn't available.
       title: t('owner'), key: 'owner', width: 100,
       render: (_: unknown, r: ForwardRule) =>
-        <Text>{userMap.get(r.uid) ?? `#${r.uid}`}</Text>,
+        <Text className="rp-rules-nowrap">{userMap.get(r.uid) ?? `#${r.uid}`}</Text>,
     },
-    { title: t('traffic'), dataIndex: 'traffic_used', key: 'traffic_used', render: (v: number) => formatBytes(v) },
+    { title: t('traffic'), dataIndex: 'traffic_used', key: 'traffic_used', width: 90, render: (v: number) => <span className="rp-mono rp-rules-nowrap">{formatBytes(v)}</span> },
     {
-      title: t('action'), key: 'action', width: 260, fixed: 'right' as const,
+      title: t('action'), key: 'action', width: 320, fixed: 'right' as const,
       render: (_: unknown, r: ForwardRule) => (
-        <Space>
+        <Space size={0} className="rp-rules-actions">
           <Button
             size="small" type="text"
             icon={r.paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />}
@@ -1185,10 +1195,20 @@ export default function Rules() {
 
   return (
     <>
-      <div className="rp-page-header">
+      <div className="rp-page-header rp-rules-header">
         <h2 className="rp-page-title"><ApiOutlined /> {t('forwardRules')}</h2>
-        <Space wrap>
+        <Space className="rp-rules-page-actions" size={8} wrap>
+          <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
+          <Dropdown menu={{ items: exportMenuItems }}>
+            <Button icon={<DownloadOutlined />}>{t('exportImport')}</Button>
+          </Dropdown>
+          <Button type="primary" icon={<PlusOutlined />} disabled={!isAdmin && sharedLoadFailed} onClick={() => { createForm.resetFields(); setCreateOpen(true); }}>{t('addRule')}</Button>
+        </Space>
+      </div>
+      <div className="rp-rules-toolbar" data-testid="rules-toolbar">
+        <Space size={8} wrap>
           <Input
+            className="rp-rules-search"
             allowClear
             prefix={<SearchOutlined />}
             placeholder={t('searchRulePlaceholder')}
@@ -1199,6 +1219,7 @@ export default function Rules() {
           {/* v0.4.9: filter by inbound group. Only groups that actually have
               rules are offered, so the list stays short for large fleets. */}
           <Select
+            className="rp-rules-group-filter"
             style={{ minWidth: 180 }}
             allowClear
             placeholder={t('filterByGroup')}
@@ -1210,6 +1231,11 @@ export default function Rules() {
                 return { value: gid, label: g ? g.name : `${t('unknownGroup')} (#${gid})` };
               })}
           />
+          {selectedRowKeys.length > 0 && (
+            <Text type="secondary" className="rp-rules-selection-count">
+              {t('selectedCount').replace('{count}', String(selectedRowKeys.length))}
+            </Text>
+          )}
           {selectedRowKeys.length > 0 && (
             <Button icon={<DownloadOutlined />} onClick={handleExportSelected}>
               {t('batchExport')} ({selectedRowKeys.length})
@@ -1248,11 +1274,6 @@ export default function Rules() {
               </Button>
             </Popconfirm>
           )}
-          <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
-          <Dropdown menu={{ items: exportMenuItems }}>
-            <Button icon={<DownloadOutlined />}>{t('exportImport')}</Button>
-          </Dropdown>
-          <Button type="primary" icon={<PlusOutlined />} disabled={!isAdmin && sharedLoadFailed} onClick={() => { createForm.resetFields(); setCreateOpen(true); }}>{t('addRule')}</Button>
         </Space>
       </div>
       {/* v0.4.20: admin viewing another user's rules — show who. */}
@@ -1276,7 +1297,7 @@ export default function Rules() {
       <Table
         rowSelection={{ selectedRowKeys, onChange: (keys) => setSelectedRowKeys(keys as number[]) }}
         dataSource={visibleRules} columns={columns} rowKey="id" loading={loading}
-        pagination={{ pageSize: 20 }} scroll={{ x: 1200 }}
+        pagination={{ pageSize: 20 }} className="rp-rules-table" scroll={{ x: RULE_TABLE_SCROLL_X }}
       />
 
       <Modal title={t('addRule')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')} width={620}>
