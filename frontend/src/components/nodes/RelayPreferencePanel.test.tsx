@@ -12,6 +12,10 @@ vi.mock('../../api/client', () => ({
   default: { get: mockGet, post: mockPost },
 }));
 
+vi.mock('./RelaySchedulePanel', () => ({
+  RelaySchedulePanel: () => null,
+}));
+
 import { RelayPreferencePanel } from './RelayPreferencePanel';
 
 const t = ((key: string) => key) as unknown as Tfn;

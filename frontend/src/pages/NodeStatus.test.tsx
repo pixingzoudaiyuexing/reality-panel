@@ -118,7 +118,9 @@ describe('NodeStatus page data source', () => {
     await flush();
 
     expect(screen.getByText('relayPreferenceTitle')).toBeInTheDocument();
+    expect(screen.getByText('relayScheduleLoadFailed')).toBeInTheDocument();
     expect(mockGet).toHaveBeenCalledWith('/groups/1/relay-preference');
+    expect(mockGet).toHaveBeenCalledWith('/admin/relay-schedules');
     expect(mockGet).not.toHaveBeenCalledWith('/groups/2/relay-preference');
   });
 });

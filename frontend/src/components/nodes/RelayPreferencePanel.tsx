@@ -4,6 +4,7 @@ import { ReloadOutlined, SwapOutlined } from '@ant-design/icons';
 import api from '../../api/client';
 import type { ApiEnvelope, RelayPreferenceView, RelayReadyNode } from '../../api/types';
 import type { Tfn } from './types';
+import { RelaySchedulePanel } from './RelaySchedulePanel';
 
 const { Text } = Typography;
 
@@ -346,6 +347,7 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
           })}
         </div>
       ) : null}
+      <RelaySchedulePanel groupId={groupId} nodes={view?.nodes ?? []} t={t} />
     </div>
   );
 }

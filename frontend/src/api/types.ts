@@ -429,6 +429,39 @@ export interface RelayPreferenceView {
   nodes: RelayReadyNode[];
 }
 
+export type RelayScheduleType = 'one_time' | 'daily' | 'weekly';
+
+export interface RelaySchedule {
+  id: string;
+  group_id: number;
+  target_node_id: string;
+  schedule_type: RelayScheduleType;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  execute_at: string | null;
+  time: string | null;
+  utc_offset_minutes: number | null;
+  weekdays: number[];
+  last_run_at: string | null;
+  last_run_slot: string | null;
+  last_result: string | null;
+  last_error: string | null;
+}
+
+export interface CreateRelayScheduleRequest {
+  group_id: number;
+  target_node_id: string;
+  schedule_type: RelayScheduleType;
+  enabled: boolean;
+  execute_at?: string;
+  time?: string;
+  utc_offset_minutes?: number;
+  weekdays?: number[];
+}
+
+export type UpdateRelayScheduleRequest = Omit<CreateRelayScheduleRequest, 'group_id'>;
+
 export interface Plan {
   id: number;
   name: string;
