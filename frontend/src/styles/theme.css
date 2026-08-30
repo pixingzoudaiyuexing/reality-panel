@@ -176,6 +176,37 @@ html, body, #root {
 }
 
 /* ---- Layout helpers ---- */
+/* 桌面端让菜单和内容拥有各自的滚动区域；移动端继续使用 Sider 原有的
+   breakpoint/collapsible 布局，不施加固定视口高度。 */
+@media (min-width: 992px) {
+  .rp-app-layout {
+    height: 100vh;
+    min-height: 0 !important;
+    overflow: hidden;
+  }
+
+  .rp-app-sider {
+    position: sticky !important;
+    top: 0;
+    height: 100vh;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+
+  .rp-app-main {
+    height: 100vh;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .rp-app-content {
+    min-width: 0;
+    min-height: 0;
+    overflow: auto;
+  }
+}
+
 .rp-page-title {
   font-size: 18px;
   font-weight: 500;

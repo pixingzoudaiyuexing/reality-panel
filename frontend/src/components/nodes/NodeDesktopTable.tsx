@@ -177,7 +177,9 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
     },
   ];
 
-  if (onDelete) {
+  const removeNode = onDelete;
+  const hasRemovableOfflineNode = !!removeNode && rows.some((row) => !row.online);
+  if (hasRemovableOfflineNode && removeNode) {
     columns.push({
       title: t('actions'), key: 'remove', width: 72, fixed: 'right' as const,
       render: (_: unknown, r: NodeDisplayRow) =>
@@ -191,7 +193,7 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
             okText={t('confirmRemoveNode')}
             cancelText={t('cancel')}
             okButtonProps={{ danger: true }}
-            onConfirm={() => onDelete(r)}
+            onConfirm={() => removeNode(r)}
           >
             <Button size="small" type="text" danger icon={<DeleteOutlined />} />
           </Popconfirm>

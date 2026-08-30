@@ -122,8 +122,9 @@ export default function MainLayout() {
   };
 
   return (
-    <Layout style={{ minHeight: '100vh' }}>
+    <Layout className="rp-app-layout" style={{ minHeight: '100vh' }}>
       <Sider
+        className="rp-app-sider"
         collapsible
         breakpoint="lg"
         width={220}
@@ -148,7 +149,7 @@ export default function MainLayout() {
           style={{ borderRight: 0 }}
         />
       </Sider>
-      <Layout>
+      <Layout className="rp-app-main">
         <Header style={{
           background: '#fff', height: 'var(--rp-header-height)',
           padding: '0 24px', lineHeight: 'var(--rp-header-height)',
@@ -196,7 +197,7 @@ export default function MainLayout() {
             </Button>
           </Space>
         </Header>
-        <Content style={{ margin: 'var(--rp-content-padding)', background: 'var(--rp-bg)' }}>
+        <Content className="rp-app-content" style={{ margin: 'var(--rp-content-padding)', background: 'var(--rp-bg)' }}>
           {/* v1.2 (PR4): lazy-loaded pages (router.tsx) suspend here on first
               navigation to their chunk, showing a centered spinner instead of a
               blank pane. */}

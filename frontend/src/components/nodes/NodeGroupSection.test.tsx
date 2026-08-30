@@ -86,6 +86,46 @@ describe('Node desktop table throughput layout', () => {
   });
 });
 
+describe('Node desktop remove-status column', () => {
+  it('hides the actions column when every node is online', () => {
+    render(
+      <NodeGroupSection
+        rows={[row({ node_id: 'up-a', online: true }), row({ node_id: 'up-b', online: true })]}
+        panelProtocol={0}
+        latestNodeVersion=""
+        nodeVersionCheckFailed={false}
+        isMobile={false}
+        t={t}
+        openDetail={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText('actions')).toBeNull();
+  });
+
+  it('shows the actions column and preserves offline-row deletion', () => {
+    const offline = row({ node_id: 'down', online: false });
+    const onDelete = vi.fn();
+    render(
+      <NodeGroupSection
+        rows={[row({ node_id: 'up', online: true }), offline]}
+        panelProtocol={0}
+        latestNodeVersion=""
+        nodeVersionCheckFailed={false}
+        isMobile={false}
+        t={t}
+        openDetail={vi.fn()}
+        onDelete={onDelete}
+      />,
+    );
+
+    expect(screen.getByRole('columnheader', { name: 'actions' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'delete' }));
+    fireEvent.click(screen.getByRole('button', { name: 'confirmRemoveNode' }));
+    expect(onDelete).toHaveBeenCalledWith(offline);
+  });
+});
+
 describe('Stage 2 lifecycle controls', () => {
   it('renders the four admin actions and routes each explicit action', () => {
     const onLifecycle = vi.fn();

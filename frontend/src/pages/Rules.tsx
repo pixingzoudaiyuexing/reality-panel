@@ -902,7 +902,7 @@ export default function Rules() {
     },
     { title: t('traffic'), dataIndex: 'traffic_used', key: 'traffic_used', render: (v: number) => formatBytes(v) },
     {
-      title: t('action'), key: 'action', width: 260,
+      title: t('action'), key: 'action', width: 260, fixed: 'right' as const,
       render: (_: unknown, r: ForwardRule) => (
         <Space>
           <Button
