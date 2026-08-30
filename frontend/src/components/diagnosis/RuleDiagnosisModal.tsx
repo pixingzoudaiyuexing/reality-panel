@@ -154,7 +154,8 @@ function RealityTechnicalDetails({ diagnosis, t }: { diagnosis: RealityDiagnosis
       <Text type="secondary">{t('realityDesiredSni')} {diagnosis.convergence.desired_sni ?? '-'} · {t('realityActiveSni')} {diagnosis.convergence.active_sni ?? '-'} · {t('realityRevision')} {diagnosis.convergence.desired_config_revision}/{diagnosis.convergence.active_config_revision}</Text>
       <Text className="rp-mono">{diagnosis.convergence.desired_fingerprint} / {diagnosis.convergence.active_fingerprint}</Text>
       <Text strong>{t('realityNginxLayer')}</Text>{status(diagnosis.nginx.check)}
-      <Text type="secondary">config_valid={String(diagnosis.nginx.config_valid)} · managed_file_matches={String(diagnosis.nginx.managed_file_matches)} · service_healthy={String(diagnosis.nginx.service_healthy)}</Text>
+      <Text type="secondary">plan_contains_rule={String(diagnosis.nginx.plan_contains_rule)} · mapping_matches={String(diagnosis.nginx.mapping_matches)} · config_valid={String(diagnosis.nginx.config_valid)} · managed_file_matches={String(diagnosis.nginx.managed_file_matches)} · service_healthy={String(diagnosis.nginx.service_healthy)}</Text>
+      <Text type="secondary">expected_fingerprint={diagnosis.nginx.expected_fingerprint ?? '-'} · deployed_fingerprint={diagnosis.nginx.deployed_fingerprint ?? '-'}</Text>
       <Text strong>{t('realityRuntimeLayer')}</Text>{status(diagnosis.runtime.check)}
       <Text type="secondary">:443 {String(diagnosis.runtime.listen_443)} · :8443 {String(diagnosis.runtime.listen_8443)}</Text>
       <Text strong>{t('diagnosisBackend')}</Text>
@@ -166,6 +167,7 @@ function RealityTechnicalDetails({ diagnosis, t }: { diagnosis: RealityDiagnosis
       <Text strong>{t('diagnosisCamouflage')}</Text>{status(diagnosis.camouflage.check)}
       <Text type="secondary">:{diagnosis.camouflage.tls_listener_port} · {diagnosis.camouflage.local_backend} · HTTP {diagnosis.camouflage.http_status ?? '-'}</Text>
       <Text strong>{t('fallbackE2e')}</Text>{status(diagnosis.fallback.check)}
+      <Text type="secondary">http_status={diagnosis.fallback.http_status ?? '-'} · authenticated_reality_path={String(diagnosis.fallback.authenticated_reality_path)}</Text>
       <Text strong>{t('diagnosisClientPath')}</Text>{status(diagnosis.vless_authentication)}
     </Space>
   );
