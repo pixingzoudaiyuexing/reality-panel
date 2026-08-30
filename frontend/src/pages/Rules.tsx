@@ -1,6 +1,6 @@
-import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Popover, Tag, Alert, Typography, Dropdown, Switch, Tabs, Tooltip } from 'antd';
+import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Popover, Tag, Alert, Typography, Dropdown, Switch, Tabs, Tooltip, Pagination } from 'antd';
 import type { MenuProps } from 'antd';
-import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, SearchOutlined } from '@ant-design/icons';
+import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, SearchOutlined, MoreOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
@@ -17,7 +17,8 @@ const { Text } = Typography;
 const { TextArea } = Input;
 
 export const RULE_SELECTION_COLUMN_WIDTH = 48;
-export const RULE_TABLE_SCROLL_X = 1950;
+export const RULE_TABLE_SCROLL_X = 1320;
+export const RULES_PAGE_SIZE = 20;
 
 function RuleEllipsis({ value, mono = true, tooltip = true }: { value: string; mono?: boolean; tooltip?: boolean }) {
   const content = <span className={`rp-rules-ellipsis${mono ? ' rp-mono' : ''}`} title={value}>{value}</span>;
@@ -206,6 +207,7 @@ export default function Rules() {
   // (owner-scoped) set, so searching needs no round-trip.
   const [ruleSearch, setRuleSearch] = useState('');
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([]);
+  const [currentPage, setCurrentPage] = useState(1);
   const backgroundRefreshInFlight = useRef(false);
 
   const ownerUid = filterOwnerUid ?? (isAdmin ? (user?.id ?? null) : null);
@@ -391,6 +393,34 @@ export default function Rules() {
       );
     });
   }, [rules, selectedGroup, ruleSearch]);
+
+  const totalPages = Math.max(1, Math.ceil(visibleRules.length / RULES_PAGE_SIZE));
+  useEffect(() => {
+    setCurrentPage(page => Math.min(page, totalPages));
+  }, [totalPages]);
+
+  const pagedRules = useMemo(() => {
+    const start = (currentPage - 1) * RULES_PAGE_SIZE;
+    return visibleRules.slice(start, start + RULES_PAGE_SIZE);
+  }, [currentPage, visibleRules]);
+
+  const visibleGroupCounts = useMemo(() => {
+    const counts = new Map<number, number>();
+    for (const rule of visibleRules) {
+      counts.set(rule.device_group_in, (counts.get(rule.device_group_in) ?? 0) + 1);
+    }
+    return counts;
+  }, [visibleRules]);
+
+  const groupedPagedRules = useMemo(() => {
+    const grouped = new Map<number, ForwardRule[]>();
+    for (const rule of pagedRules) {
+      const group = grouped.get(rule.device_group_in);
+      if (group) group.push(rule);
+      else grouped.set(rule.device_group_in, [rule]);
+    }
+    return Array.from(grouped.entries());
+  }, [pagedRules]);
 
   const handleCreate = async (values: {
     name: string; listen_port: number | null; protocol: string;
@@ -799,6 +829,37 @@ export default function Rules() {
     } catch { message.error(t('failedUpdateRule')); }
   };
 
+  const confirmDeleteRule = (r: ForwardRule) => {
+    Modal.confirm({
+      title: t('deleteRuleConfirm'),
+      okText: t('delete'),
+      cancelText: t('cancel'),
+      okButtonProps: { danger: true },
+      onOk: () => handleDelete(r.id),
+    });
+  };
+
+  const confirmRuntimeAction = (r: ForwardRule) => {
+    if (isRealityRule(r)) {
+      Modal.confirm({
+        title: t('reapplyConfirmTitle'),
+        content: t('reapplyConfirmDesc'),
+        okText: t('reapply'),
+        cancelText: t('cancel'),
+        onOk: () => handleReapply(r),
+      });
+      return;
+    }
+    Modal.confirm({
+      title: t('restartConfirmTitle'),
+      content: t('restartConfirmDesc'),
+      okText: t('restart'),
+      cancelText: t('cancel'),
+      okButtonProps: { danger: true },
+      onOk: () => handleRestart(r),
+    });
+  };
+
   const protoTags = (p: string) => {
     if (p === 'tcp_udp') return <><Tag color="blue">TCP</Tag><Tag color="purple">UDP</Tag></>;
     if (p === 'udp') return <Tag color="purple">UDP</Tag>;
@@ -810,54 +871,120 @@ export default function Rules() {
     return <Tag>{t('entryTransportRaw')}</Tag>;
   };
 
+  const renderStatus = (r: ForwardRule) => {
+    const stateTags = (
+      <Space size={4} className="rp-rules-status-flags">
+        {r.paused ? <Tag color="red">{t('paused')}</Tag> : null}
+        {!r.paused && ruleOverQuota(r) ? (
+          <Tooltip title={t('quotaExhaustedHint')}>
+            <Tag color="orange">{t('quotaExhausted')}</Tag>
+          </Tooltip>
+        ) : null}
+      </Space>
+    );
+    const traffic = <Text type="secondary" className="rp-rules-traffic">{t('traffic')} {formatBytes(r.traffic_used)}</Text>;
+    if (!isRealityRule(r)) {
+      return (
+        <div className="rp-rules-status-cell">
+          <Text type="secondary">{t('runtimeHealthy')}</Text>
+          {stateTags}
+          {traffic}
+        </div>
+      );
+    }
+
+    const view = deriveCamouflageStatus(r, nodeStatuses);
+    const dns = dnsStatusByRule.get(r.id);
+    const summary = compactRealityStatus(r, dns, view, t);
+    const dnsDetails = (
+      <DnsStatusCell status={dns} retrying={dnsRetrying === r.id} onRetry={() => handleDnsRetry(r.id)} t={t} />
+    );
+    const details = (
+      <Space orientation="vertical" size={8} style={{ minWidth: 320, maxWidth: 460 }}>
+        <Typography.Text strong>{t('dns')}</Typography.Text>
+        {dnsDetails}
+        <Typography.Text strong>{t('routeDetails')}</Typography.Text>
+        <Text>{t('activeRelays')}: {view.activeCount}/{view.totalCount}</Text>
+        {view.nodes.map(node => (
+          <Text key={`${node.relayIp ?? ''}:${node.nodeId ?? ''}`} type="secondary">
+            {node.relayIp ?? t('routeUnknown')} · {node.listenerState} · {node.siteState} · {node.certificateState}
+            {node.lastError ? ` · ${camouflageCertificateMessage(node.certificateState, node.lastError, t)}` : ''}
+          </Text>
+        ))}
+        <Typography.Text strong>{t('certificateDetails')}</Typography.Text>
+        {view.certificate?.issuer && <Text>{view.certificate.issuer}</Text>}
+        {view.certificate?.valid_until && <Text>{t('expires')}: {new Date(view.certificate.valid_until).toLocaleString()}</Text>}
+        {view.certificate?.last_success && <Text>{t('lastCertificateSuccess')}: {new Date(view.certificate.last_success).toLocaleString()}</Text>}
+        {view.certificate?.last_error && <Text type="warning">{camouflageCertificateMessage(view.certificate.certificate_status, view.certificate.last_error, t)}</Text>}
+      </Space>
+    );
+    const color = (value: string) => value === 'OK' || value.startsWith('OK ') ? 'green' : value === '-' ? 'default' : value === 'PREPARING' || value === 'PENDING' ? 'gold' : 'red';
+    return (
+      <div className="rp-rules-status-cell">
+        <Popover title={t('statusDetails')} content={details} trigger="click">
+          <Button type="text" size="small" className="rp-compact-status" aria-label={t('statusDetails')}>
+            <span><Tag color={color(summary.dns)}>DNS {summary.dns === 'OK' ? '✓' : summary.dns === '-' ? '-' : '✕'}{summary.dns !== 'OK' && summary.dns !== '-' ? ` ${summary.dns}` : ''}</Tag><Tag color={color(summary.route)}>路由 {summary.route === 'OK' ? '✓' : '✕'}</Tag></span>
+            <span><Tag color={color(summary.certificate)}>证书 {summary.certificate === 'OK' ? '✓' : summary.certificate.startsWith('OK ') ? `✓ ${summary.certificate.slice(3)}` : `✕ ${summary.certificate}`}</Tag></span>
+          </Button>
+        </Popover>
+        {stateTags}
+        {traffic}
+      </div>
+    );
+  };
+
+  const moreMenuItems = (r: ForwardRule): MenuProps['items'] => [
+    {
+      key: 'toggle',
+      label: r.paused ? t('resume') : t('pause'),
+      icon: r.paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />,
+      onClick: () => void handleTogglePause(r),
+    },
+    { key: 'copy', label: t('copy'), icon: <CopyOutlined />, onClick: () => handleCopy(r) },
+    { type: 'divider' },
+    {
+      key: 'runtime',
+      label: isRealityRule(r) ? t('reapply') : t('restart'),
+      icon: isRealityRule(r) ? <ReloadOutlined /> : <ThunderboltOutlined />,
+      disabled: r.paused,
+      onClick: () => confirmRuntimeAction(r),
+    },
+    { type: 'divider' },
+    { key: 'delete', label: t('delete'), icon: <DeleteOutlined />, danger: true, onClick: () => confirmDeleteRule(r) },
+  ];
+
   const allColumns = [
-    { title: t('id'), dataIndex: 'id', key: 'id', width: 60 },
-    // v0.4.9: inbound group name. Hidden on small screens (responsive md+) so
-    // the mobile view keeps the core columns. Lookup misses → "未知分组 (#ID)".
     {
-      title: t('groupName'), key: 'group_name', width: 120, responsive: ['md' as const],
+      title: t('ruleColumn'), key: 'rule', width: 220,
       render: (_: unknown, r: ForwardRule) => {
-        const g = groupInfo.get(r.device_group_in);
-        return g
-          ? <Tooltip title={g.name}><Tag className="rp-rules-group-tag">{g.name}</Tag></Tooltip>
-          : <Text type="secondary">{t('unknownGroup')} (#{r.device_group_in})</Text>;
+        const owner = userMap.get(r.uid) ?? `#${r.uid}`;
+        const meta = isAdmin ? `#${r.id} · ${owner}` : `#${r.id}`;
+        return (
+          <div className="rp-rules-rule-cell">
+            <RuleEllipsis value={r.name} mono={false} />
+            <Text type="secondary" className="rp-rules-rule-meta" title={meta}>{meta}</Text>
+          </div>
+        );
       },
     },
     {
-      title: t('name'), dataIndex: 'name', key: 'name', width: 190,
-      render: (value: string) => <RuleEllipsis value={value} mono={false} />,
-    },
-    {
-      title: t('listenIp'), key: 'listen_ip', width: 150,
+      title: t('ruleEntry'), key: 'entry', width: 210,
       render: (_: unknown, r: ForwardRule) => {
-        const host = groupInfo.get(r.device_group_in)?.connect_host ?? '';
-        return host
-          ? <RuleEllipsis value={host} />
-          : <Text type="secondary">{t('notConfigured')}</Text>;
+        const sni = normalizeSni(r.sni);
+        if (isRealityRule(r) && sni) return <RuleEllipsis value={`${sni}:${r.listen_port}`} />;
+        const host = groupInfo.get(r.device_group_in)?.connect_host?.trim() ?? '';
+        if (!isRealityRule(r) && host) return <RuleEllipsis value={`${host}:${r.listen_port}`} />;
+        return <Text className="rp-mono rp-rules-nowrap">{t('port')} {r.listen_port}</Text>;
       },
     },
-    { title: t('listenPort'), dataIndex: 'listen_port', key: 'listen_port', width: 90, render: (v: number) => <span className="rp-mono rp-rules-nowrap">{v}</span> },
     {
-      title: t('protocol'), dataIndex: 'protocol', key: 'protocol', width: 190,
+      title: t('protocolForward'), dataIndex: 'protocol', key: 'protocol', width: 190,
       render: (p: string, r: ForwardRule) => (
-        <Space size={4} className="rp-rules-nowrap">
-          {protoTags(p)}
-          {transportTag(r)}
-          {r.paused && <Tag color="red">{t('paused')}</Tag>}
-          {!r.paused && ruleOverQuota(r) && (
-            <Tooltip title={t('quotaExhaustedHint')}>
-              <Tag color="orange">{t('quotaExhausted')}</Tag>
-            </Tooltip>
-          )}
-        </Space>
+        <div className="rp-rules-protocol-cell">
+          <Space size={4} className="rp-rules-nowrap">{protoTags(p)}</Space>
+          <div>{transportTag(r)}</div>
+        </div>
       ),
-    },
-    {
-      title: t('sni'), dataIndex: 'sni', key: 'sni', width: 180,
-      render: (v: string | null | undefined, r: ForwardRule) =>
-        (r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni') && v
-          ? <RuleEllipsis value={v} />
-          : <Text type="secondary">-</Text>,
     },
     {
       title: t('target'), key: 'target', width: 220,
@@ -867,120 +994,37 @@ export default function Rules() {
         const all = ruleTargets(r).filter(t => t.enabled).map(t => `${t.host}:${t.port}`);
         const summary = <RuleEllipsis value={targetSummary(r)} tooltip={all.length <= 1} />;
         return (
-          <Space size={4} className="rp-rules-nowrap">
+          <div className="rp-rules-target-cell">
             {all.length > 1 ? (
               <Tooltip title={<div>{all.map((s, i) => <div key={i} className="rp-mono">{s}</div>)}</div>}>
-                {summary}
+                <span className="rp-rules-target-tooltip" data-target-pool={all.join(',')}>{summary}</span>
               </Tooltip>
             ) : summary}
             {r.load_balance_strategy && r.load_balance_strategy !== 'first' && (
-              <Tag color="cyan">{r.load_balance_strategy === 'round_robin' ? t('lbRoundRobin') : t('lbFailover')}</Tag>
+              <div><Tag color="cyan">{r.load_balance_strategy === 'round_robin' ? t('lbRoundRobin') : t('lbFailover')}</Tag></div>
             )}
-          </Space>
+          </div>
         );
       },
     },
     {
-      title: t('status'), key: 'status', width: 180,
-      render: (_: unknown, r: ForwardRule) => {
-        if (!isRealityRule(r)) return <Text type="secondary">{t('runtimeHealthy')}</Text>;
-        const view = deriveCamouflageStatus(r, nodeStatuses);
-        const dns = dnsStatusByRule.get(r.id);
-        const summary = compactRealityStatus(r, dns, view, t);
-        const dnsDetails = (
-          <DnsStatusCell status={dns} retrying={dnsRetrying === r.id} onRetry={() => handleDnsRetry(r.id)} t={t} />
-        );
-        const details = (
-          <Space orientation="vertical" size={8} style={{ minWidth: 320, maxWidth: 460 }}>
-            <Typography.Text strong>{t('dns')}</Typography.Text>
-            {dnsDetails}
-            <Typography.Text strong>{t('routeDetails')}</Typography.Text>
-            <Text>{t('activeRelays')}: {view.activeCount}/{view.totalCount}</Text>
-            {view.nodes.map(node => (
-              <Text key={`${node.relayIp ?? ''}:${node.nodeId ?? ''}`} type="secondary">
-                {node.relayIp ?? t('routeUnknown')} · {node.listenerState} · {node.siteState} · {node.certificateState}
-                {node.lastError ? ` · ${camouflageCertificateMessage(node.certificateState, node.lastError, t)}` : ''}
-              </Text>
-            ))}
-            <Typography.Text strong>{t('certificateDetails')}</Typography.Text>
-            {view.certificate?.issuer && <Text>{view.certificate.issuer}</Text>}
-            {view.certificate?.valid_until && <Text>{t('expires')}: {new Date(view.certificate.valid_until).toLocaleString()}</Text>}
-            {view.certificate?.last_success && <Text>{t('lastCertificateSuccess')}: {new Date(view.certificate.last_success).toLocaleString()}</Text>}
-            {view.certificate?.last_error && <Text type="warning">{camouflageCertificateMessage(view.certificate.certificate_status, view.certificate.last_error, t)}</Text>}
-          </Space>
-        );
-        const color = (value: string) => value === 'OK' || value.startsWith('OK ') ? 'green' : value === '-' ? 'default' : value === 'PREPARING' || value === 'PENDING' ? 'gold' : 'red';
-        return (
-          <Popover title={t('statusDetails')} content={details} trigger="click">
-            <Button type="text" size="small" className="rp-compact-status" aria-label={t('statusDetails')}>
-              <span><Tag color={color(summary.dns)}>DNS {summary.dns === 'OK' ? '✓' : summary.dns === '-' ? '-' : '✕'}{summary.dns !== 'OK' && summary.dns !== '-' ? ` ${summary.dns}` : ''}</Tag><Tag color={color(summary.route)}>路由 {summary.route === 'OK' ? '✓' : '✕'}</Tag></span>
-              <span><Tag color={color(summary.certificate)}>证书 {summary.certificate === 'OK' ? '✓' : summary.certificate.startsWith('OK ') ? `✓ ${summary.certificate.slice(3)}` : `✕ ${summary.certificate}`}</Tag></span>
-            </Button>
-          </Popover>
-        );
-      },
+      title: t('status'), key: 'status', width: 240,
+      render: (_: unknown, r: ForwardRule) => renderStatus(r),
     },
     {
-      // v0.4.14 PR3: owner is the rule's OWN uid — NOT the inbound group's uid.
-      // An admin can create a rule on behalf of a user, and a regular user can
-      // attach to an admin-owned shared group, so the rule owner and the group
-      // owner often differ. Resolve the username from the rule's uid; fall back
-      // to "#uid" when the user list isn't available.
-      title: t('owner'), key: 'owner', width: 100,
-      render: (_: unknown, r: ForwardRule) =>
-        <Text className="rp-rules-nowrap">{userMap.get(r.uid) ?? `#${r.uid}`}</Text>,
-    },
-    { title: t('traffic'), dataIndex: 'traffic_used', key: 'traffic_used', width: 90, render: (v: number) => <span className="rp-mono rp-rules-nowrap">{formatBytes(v)}</span> },
-    {
-      title: t('action'), key: 'action', width: 320, fixed: 'right' as const,
+      title: t('action'), key: 'action', width: 170, fixed: 'right' as const,
       render: (_: unknown, r: ForwardRule) => (
         <Space size={0} className="rp-rules-actions">
-          <Button
-            size="small" type="text"
-            icon={r.paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />}
-            onClick={() => handleTogglePause(r)}
-          >
-            {r.paused ? t('resume') : t('pause')}
-          </Button>
           <Button size="small" type="text" icon={<EditOutlined />} onClick={() => handleEdit(r)}>{t('edit')}</Button>
-          <Button size="small" type="text" icon={<CopyOutlined />} onClick={() => handleCopy(r)}>{t('copy')}</Button>
-          {/* v0.4.9: diagnosis is TCP-only — disable for pure-UDP rules. */}
           <Button size="small" type="text" icon={<MedicineBoxOutlined />} disabled={r.protocol === 'udp'} onClick={() => handleDiagnose(r)} title={r.protocol === 'udp' ? t('diagnoseUdpUnsupported') : t('diagnose')}>{t('diagnose')}</Button>
-          {isRealityRule(r) ? (
-            <Popconfirm
-              title={t('reapplyConfirmTitle')}
-              description={t('reapplyConfirmDesc')}
-              onConfirm={() => handleReapply(r)}
-              disabled={r.paused}
-            >
-              <Button size="small" type="text" icon={<ReloadOutlined />} disabled={r.paused} title={t('reapply')}>
-                {t('reapply')}
-              </Button>
-            </Popconfirm>
-          ) : (
-            <Popconfirm
-              title={t('restartConfirmTitle')}
-              description={t('restartConfirmDesc')}
-              onConfirm={() => handleRestart(r)}
-              okButtonProps={{ danger: true }}
-              disabled={r.paused}
-            >
-              <Button size="small" type="text" icon={<ThunderboltOutlined />} disabled={r.paused} title={r.paused ? t('restartPausedHint') : t('restart')}>
-                {t('restart')}
-              </Button>
-            </Popconfirm>
-          )}
-          <Popconfirm title={t('deleteRuleConfirm')} onConfirm={() => handleDelete(r.id)}>
-            <Button danger size="small" type="text">{t('delete')}</Button>
-          </Popconfirm>
+          <Dropdown menu={{ items: moreMenuItems(r) }} trigger={['click']}>
+            <Button size="small" type="text" icon={<MoreOutlined />} aria-label={t('moreActions')} title={t('moreActions')} />
+          </Dropdown>
         </Space>
       ),
     },
   ];
-  // v0.4.10: hide the owner column for regular users — they only ever own
-  // their own rules, and /admin/users is never fetched for them (so userMap
-  // is empty and the column would show "-" everywhere).
-  const columns = isAdmin ? allColumns : allColumns.filter(c => !['owner', 'dns'].includes(String(c.key)));
+  const columns = allColumns;
 
   const inGroups = groups.filter(g => g.group_type === 'in');
   // v0.4.12 PR1: inbound group selection. Admins pick from their OWN 'in'
@@ -1194,6 +1238,27 @@ export default function Rules() {
     { key: 'import', label: t('import'), icon: <UploadOutlined />, onClick: () => setImportOpen(true) },
   ];
 
+  const rowSelectionFor = (groupRules: ForwardRule[]) => ({
+    selectedRowKeys,
+    preserveSelectedRowKeys: true,
+    columnWidth: RULE_SELECTION_COLUMN_WIDTH,
+    onSelect: (record: ForwardRule, selected: boolean) => {
+      setSelectedRowKeys(current => selected
+        ? Array.from(new Set([...current, record.id]))
+        : current.filter(key => key !== record.id));
+    },
+    onSelectAll: (selected: boolean, _selectedRows: ForwardRule[], changedRows: ForwardRule[]) => {
+      const changedKeys = changedRows.map(rule => rule.id);
+      setSelectedRowKeys(current => selected
+        ? Array.from(new Set([...current, ...changedKeys]))
+        : current.filter(key => !changedKeys.includes(key)));
+    },
+    selections: false,
+    hideSelectAll: groupRules.length === 0,
+  });
+
+  const groupLabel = (groupId: number) => groupInfo.get(groupId)?.name ?? `${t('unknownGroup')} (#${groupId})`;
+
   return (
     <>
       <div className="rp-page-header rp-rules-header">
@@ -1214,7 +1279,7 @@ export default function Rules() {
             prefix={<SearchOutlined />}
             placeholder={t('searchRulePlaceholder')}
             value={ruleSearch}
-            onChange={(e) => { setRuleSearch(e.target.value); setSelectedRowKeys([]); }}
+            onChange={(e) => { setRuleSearch(e.target.value); setSelectedRowKeys([]); setCurrentPage(1); }}
             style={{ width: 220 }}
           />
           {/* v0.4.9: filter by inbound group. Only groups that actually have
@@ -1225,58 +1290,41 @@ export default function Rules() {
             allowClear
             placeholder={t('filterByGroup')}
             value={selectedGroup ?? undefined}
-            onChange={(v: number | undefined) => { setSelectedGroup(v ?? null); setSelectedRowKeys([]); }}
+            onChange={(v: number | undefined) => { setSelectedGroup(v ?? null); setSelectedRowKeys([]); setCurrentPage(1); }}
             options={Array.from(new Set(rules.map(r => r.device_group_in)))
               .map(gid => {
                 const g = groupMap.get(gid);
                 return { value: gid, label: g ? g.name : `${t('unknownGroup')} (#${gid})` };
               })}
           />
-          {selectedRowKeys.length > 0 && (
-            <Text type="secondary" className="rp-rules-selection-count">
-              {t('selectedCount').replace('{count}', String(selectedRowKeys.length))}
-            </Text>
-          )}
-          {selectedRowKeys.length > 0 && (
-            <Button icon={<DownloadOutlined />} onClick={handleExportSelected}>
-              {t('batchExport')} ({selectedRowKeys.length})
-            </Button>
-          )}
-          {selectedRowKeys.length > 0 && (
-            <Button icon={<PlayCircleOutlined />} onClick={() => handleBatchSetPaused(false)}>
-              {t('batchResume')} ({selectedRowKeys.length})
-            </Button>
-          )}
-          {selectedRowKeys.length > 0 && (
-            <Button icon={<PauseCircleOutlined />} onClick={() => handleBatchSetPaused(true)}>
-              {t('batchPause')} ({selectedRowKeys.length})
-            </Button>
-          )}
-          {selectedRowKeys.length > 0 && (
+        </Space>
+      </div>
+      {selectedRowKeys.length > 0 ? (
+        <div className="rp-rules-batchbar" data-testid="rules-batchbar" data-selected-count={selectedRowKeys.length}>
+          <Space size={8} wrap>
+            <Text strong>{t('selectedCount').replace('{count}', String(selectedRowKeys.length))}</Text>
+            <Button icon={<PlayCircleOutlined />} onClick={() => handleBatchSetPaused(false)}>{t('batchResume')}</Button>
+            <Button icon={<PauseCircleOutlined />} onClick={() => handleBatchSetPaused(true)}>{t('batchPause')}</Button>
             <Popconfirm
               title={t('batchRestartConfirm').replace('{count}', String(selectedRowKeys.length))}
               description={t('restartConfirmDesc')}
               onConfirm={handleBatchRestart}
               okButtonProps={{ danger: true }}
             >
-              <Button icon={<ThunderboltOutlined />}>
-                {t('batchRestart')} ({selectedRowKeys.length})
-              </Button>
+              <Button icon={<ThunderboltOutlined />}>{t('batchRestart')}</Button>
             </Popconfirm>
-          )}
-          {selectedRowKeys.length > 0 && (
+            <Button icon={<DownloadOutlined />} onClick={handleExportSelected}>{t('batchExport')}</Button>
             <Popconfirm
               title={t('batchDeleteConfirm').replace('{count}', String(selectedRowKeys.length))}
               onConfirm={handleBatchDelete}
               okButtonProps={{ danger: true }}
             >
-              <Button danger icon={<DeleteOutlined />}>
-                {t('batchDelete')} ({selectedRowKeys.length})
-              </Button>
+              <Button danger icon={<DeleteOutlined />}>{t('batchDelete')}</Button>
             </Popconfirm>
-          )}
-        </Space>
-      </div>
+          </Space>
+          <Button type="text" onClick={() => setSelectedRowKeys([])}>{t('cancelSelection')}</Button>
+        </div>
+      ) : null}
       {/* v0.4.20: admin viewing another user's rules — show who. */}
       {filterOwnerUid && (
         <Alert type="info" showIcon style={{ marginBottom: 12 }}
@@ -1295,15 +1343,46 @@ export default function Rules() {
           description={t('loadFailedRetry')}
         />
       )}
-      <Table
-        rowSelection={{
-          selectedRowKeys,
-          onChange: (keys) => setSelectedRowKeys(keys as number[]),
-          columnWidth: RULE_SELECTION_COLUMN_WIDTH,
-        }}
-        dataSource={visibleRules} columns={columns} rowKey="id" loading={loading}
-        pagination={{ pageSize: 20 }} className="rp-rules-table" scroll={{ x: RULE_TABLE_SCROLL_X }}
-      />
+      {groupedPagedRules.length === 0 ? (
+        <Table
+          rowSelection={rowSelectionFor([])}
+          dataSource={[]}
+          columns={columns}
+          rowKey="id"
+          loading={loading}
+          pagination={false}
+          className="rp-rules-table"
+          scroll={{ x: RULE_TABLE_SCROLL_X }}
+        />
+      ) : groupedPagedRules.map(([groupId, groupRules]) => (
+        <section className="rp-rules-group-section" data-testid={`rules-group-${groupId}`} key={groupId}>
+          <div className="rp-rules-group-header">
+            <Text strong className="rp-rules-group-title" title={groupLabel(groupId)}>{groupLabel(groupId)}</Text>
+            <Text type="secondary">{visibleGroupCounts.get(groupId) ?? groupRules.length} {t('rules')}</Text>
+          </div>
+          <Table
+            rowSelection={rowSelectionFor(groupRules)}
+            dataSource={groupRules}
+            columns={columns}
+            rowKey="id"
+            loading={loading}
+            pagination={false}
+            className="rp-rules-table"
+            scroll={{ x: RULE_TABLE_SCROLL_X }}
+          />
+        </section>
+      ))}
+      {visibleRules.length > RULES_PAGE_SIZE ? (
+        <div className="rp-rules-pagination" data-testid="rules-pagination">
+          <Pagination
+            current={currentPage}
+            pageSize={RULES_PAGE_SIZE}
+            total={visibleRules.length}
+            showSizeChanger={false}
+            onChange={setCurrentPage}
+          />
+        </div>
+      ) : null}
 
       <Modal title={t('addRule')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')} width={620}>
         <Form form={createForm} onFinish={handleCreate} layout="vertical" className="rp-rule-form">

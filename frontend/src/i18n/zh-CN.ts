@@ -856,6 +856,11 @@ export const zhCN = {
   batchPauseSuccess: '已暂停 {count} 条规则',
   batchPartial: '成功 {ok} 条，失败 {fail} 条（无权限的线路无法启动）',
   selectedCount: '已选 {count} 条',
+  ruleColumn: '规则',
+  ruleEntry: '入口',
+  protocolForward: '协议 / 转发',
+  moreActions: '更多操作',
+  cancelSelection: '取消选择',
 
   // ── v1.2.0: 流量历史 ──
   trafficHistory: '流量趋势',

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { mockGet, refreshCurrentUser } = vi.hoisted(() => ({
@@ -152,7 +152,7 @@ describe('Rules lightweight background refresh', () => {
     expect(screen.getByPlaceholderText('searchRulePlaceholder')).toHaveValue('alpha');
     expect(screen.getByRole('combobox').closest('.ant-select')).toHaveTextContent('relay-group');
     expect(document.querySelector('.rp-compact-status')).toHaveTextContent('PROPAGATED');
-    expect(screen.getByText('20 B')).toBeInTheDocument();
+    expect(screen.getByText('traffic 20 B')).toBeInTheDocument();
   });
 
   it('does not show table loading or overlap ticks while a background refresh is slow', async () => {
@@ -186,5 +186,47 @@ describe('Rules lightweight background refresh', () => {
     resolveNodes(ok([]));
     resolveDns(ok([dnsPropagated]));
     await flush();
+  });
+
+  it('preserves page, selection and an open edit modal during background refresh', async () => {
+    const manyRules = Array.from({ length: 21 }, (_, index) => ({
+      ...rule,
+      id: index + 1,
+      name: `rule-${index + 1}`,
+      sni: `q${index + 1}.example.com`,
+      targets: [{ ...rule.targets[0], id: index + 1, rule_id: index + 1 }],
+    }));
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/rules?owner_uid=1') return Promise.resolve(ok(manyRules));
+      if (url === '/groups') return Promise.resolve(ok([group]));
+      if (url === '/admin/users') return Promise.resolve(ok([]));
+      if (url === '/nodes') return Promise.resolve(ok([]));
+      if (url === '/admin/rules/dns-status') return Promise.resolve(ok([]));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+
+    render(<Rules />);
+    await flush();
+    fireEvent.click(screen.getByTitle('2'));
+    await flush();
+    const section = screen.getByTestId('rules-group-7');
+    const row = screen.getByText('rule-21').closest('tr') as HTMLElement;
+    fireEvent.click(within(section).getAllByRole('checkbox')[1]);
+    fireEvent.click(within(row).getByRole('button', { name: /edit/ }));
+    expect(screen.getByText('editRule')).toBeInTheDocument();
+    expect(screen.getByTestId('rules-batchbar')).toHaveAttribute('data-selected-count', '1');
+
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/rules?owner_uid=1') return Promise.resolve(ok(manyRules.map(item => ({ ...item, traffic_used: 20 }))));
+      if (url === '/nodes') return Promise.resolve(ok([]));
+      if (url === '/admin/rules/dns-status') return Promise.resolve(ok([]));
+      return Promise.reject(new Error(`static endpoint was polled: ${url}`));
+    });
+    await flush(10000);
+
+    expect(screen.getByTitle('2')).toHaveClass('ant-pagination-item-active');
+    expect(screen.getByText('rule-21')).toBeInTheDocument();
+    expect(screen.getByTestId('rules-batchbar')).toHaveAttribute('data-selected-count', '1');
+    expect(screen.getByText('editRule')).toBeInTheDocument();
   });
 });

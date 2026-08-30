@@ -859,6 +859,11 @@ export const enUS: Dict = {
   batchPauseSuccess: 'Paused {count} rules',
   batchPartial: '{ok} succeeded, {fail} failed (unauthorized lines can\'t be resumed)',
   selectedCount: '{count} selected',
+  ruleColumn: 'Rule',
+  ruleEntry: 'Entry',
+  protocolForward: 'Protocol / Forwarding',
+  moreActions: 'More actions',
+  cancelSelection: 'Clear selection',
 
   // ── v1.2.0: traffic history ──
   trafficHistory: 'Traffic',

@@ -247,6 +247,19 @@ html, body, #root {
   min-width: 0;
 }
 
+.rp-rules-batchbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--rp-border);
+  border-radius: var(--rp-radius-sm);
+  background: var(--rp-primary-bg);
+}
+
 .rp-rules-search {
   width: 220px;
 }
@@ -260,6 +273,30 @@ html, body, #root {
   white-space: nowrap;
 }
 
+.rp-rules-group-section {
+  margin-bottom: 18px;
+}
+
+.rp-rules-group-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 2px 4px 8px;
+  border-bottom: 1px solid var(--rp-border);
+}
+
+.rp-rules-group-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rp-rules-table .ant-table-cell {
+  padding-block: 6px;
+  vertical-align: middle;
+}
+
 .rp-rules-table .rp-rules-ellipsis {
   display: block;
   overflow: hidden;
@@ -267,18 +304,57 @@ html, body, #root {
   white-space: nowrap;
 }
 
-.rp-rules-table .rp-rules-group-tag {
-  display: inline-block;
-  max-width: 104px;
+.rp-rules-rule-cell,
+.rp-rules-protocol-cell,
+.rp-rules-target-cell,
+.rp-rules-status-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  min-width: 0;
+}
+
+.rp-rules-rule-meta {
+  display: block;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  vertical-align: bottom;
+}
+
+.rp-rules-protocol-cell .ant-tag,
+.rp-rules-target-cell .ant-tag,
+.rp-rules-status-cell .ant-tag {
+  margin-inline-end: 4px;
+}
+
+.rp-rules-target-tooltip {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.rp-rules-status-flags:empty {
+  display: none;
+}
+
+.rp-rules-traffic {
+  white-space: nowrap;
+  font-family: var(--rp-font-mono);
+  font-size: 12px;
+  line-height: 14px;
 }
 
 .rp-rules-table .rp-rules-actions {
   display: inline-flex;
   flex-wrap: nowrap;
+}
+
+.rp-rules-pagination {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
 }
 
 .rp-stat-card {
