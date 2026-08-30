@@ -372,7 +372,7 @@ describe('diagnosis runtime status', () => {
   it('renders dependency blocking as BLOCKED instead of FAIL', () => {
     expect(diagnosisStateDisplay('blocked', (key) => key)).toEqual({
       color: 'orange',
-      label: 'blocked',
+      label: 'diagnosisBlocked',
     });
   });
 

@@ -1,14 +1,14 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, act, fireEvent } from '@testing-library/react';
+import { render, screen, act, fireEvent, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { message } from 'antd';
 
 // Mock the api client + auth hook before importing the page under test.
-const { mockGet } = vi.hoisted(() => ({ mockGet: vi.fn() }));
+const { mockGet, mockPost } = vi.hoisted(() => ({ mockGet: vi.fn(), mockPost: vi.fn() }));
 const { mockUseAuth } = vi.hoisted(() => ({ mockUseAuth: vi.fn() }));
 
 vi.mock('../api/client', () => ({
-  default: { get: mockGet, post: vi.fn(), delete: vi.fn() },
+  default: { get: mockGet, post: mockPost, delete: vi.fn() },
 }));
 vi.mock('../auth/useAuth', () => ({ useAuth: mockUseAuth }));
 
@@ -43,6 +43,7 @@ const renderPage = () => render(<MemoryRouter><NodeStatus /></MemoryRouter>);
 
 beforeEach(() => {
   mockGet.mockReset();
+  mockPost.mockReset();
   mockUseAuth.mockReset();
   vi.useFakeTimers();
 });
@@ -192,6 +193,94 @@ describe('NodeStatus load-failure behavior', () => {
     await flush();
     await flush(5000);
     expect(mockGet.mock.calls.filter((call) => call[0] === '/nodes')).toHaveLength(2);
+  });
+});
+
+describe('NodeStatus targeted diagnosis entry point', () => {
+  const preference = (nodes = [
+    { node_id: 'n1', public_ipv4: '192.0.2.10', online: true, ready: true, ready_reasons: [], preferred: true },
+    { node_id: 'n2', public_ipv4: '192.0.2.11', online: true, ready: false, ready_reasons: ['CONTROL_CHANNEL_OFFLINE'], preferred: false },
+  ]) => ok({
+    group_id: 1,
+    preferred_node_id: 'n1',
+    preferred_node_public_ipv4: '192.0.2.10',
+    pending_node_id: null,
+    state: 'idle',
+    started_at: null,
+    last_error: null,
+    rollback_error: null,
+    dns_records: [],
+    nodes,
+  });
+
+  const rule = (id: number, protocol = 'tcp') => ({
+    id,
+    name: `rule-${id}`,
+    device_group_in: 1,
+    protocol,
+    listen_port: 443,
+    sni: 'q1.example.com',
+  });
+
+  function setup(rules: ReturnType<typeof rule>[]) {
+    mockUseAuth.mockReturnValue({ isAdmin: true });
+    mockPost.mockResolvedValue(ok({ request_id: 'request-1', rule_id: rules[0]?.id ?? 1, nodes: [] }));
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/nodes') return Promise.resolve(ok([adminNode]));
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      if (url === '/groups') return Promise.resolve(ok([{ id: 1, name: 'group-a', group_type: 'in' }]));
+      if (url === '/groups/1/relay-preference') return Promise.resolve(preference());
+      if (url === '/rules') return Promise.resolve(ok(rules));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+  }
+
+  it('shows diagnosis for the preferred node and keeps it enabled for a not-ready node', async () => {
+    setup([rule(1)]);
+    renderPage();
+    await flush();
+
+    const preferred = screen.getByTestId('relay-preference-node-n1');
+    const notReady = screen.getByTestId('relay-preference-node-n2');
+    expect(within(preferred).getByRole('button', { name: /diagnose/ })).toBeEnabled();
+    expect(within(notReady).getByRole('button', { name: /diagnose/ })).toBeEnabled();
+  });
+
+  it('targets the only TCP rule with the selected node id', async () => {
+    setup([rule(1)]);
+    renderPage();
+    await flush();
+    const row = screen.getByTestId('relay-preference-node-n1');
+    fireEvent.click(within(row).getByRole('button', { name: /diagnose/ }));
+    await flush();
+
+    expect(mockPost).toHaveBeenCalledWith('/rules/1/diagnose?node_id=n1');
+  });
+
+  it('opens a rule picker for multiple TCP rules and excludes UDP-only rules', async () => {
+    setup([rule(1), rule(2), rule(3, 'udp')]);
+    renderPage();
+    await flush();
+    const row = screen.getByTestId('relay-preference-node-n1');
+    fireEvent.click(within(row).getByRole('button', { name: /diagnose/ }));
+    await flush();
+
+    expect(screen.getByRole('dialog', { name: 'diagnosisSelectRule' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#1 rule-1/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /#2 rule-2/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /#3 rule-3/ })).toBeNull();
+    expect(mockPost).not.toHaveBeenCalled();
+  });
+
+  it('does not post when the node group has only UDP rules', async () => {
+    setup([rule(3, 'udp')]);
+    renderPage();
+    await flush();
+    const row = screen.getByTestId('relay-preference-node-n1');
+    fireEvent.click(within(row).getByRole('button', { name: /diagnose/ }));
+    await flush();
+
+    expect(mockPost).not.toHaveBeenCalled();
   });
 });
 

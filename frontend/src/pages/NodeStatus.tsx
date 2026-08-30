@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typography } from 'antd';
+import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typography, Space } from 'antd';
 import { CloudUploadOutlined, CopyOutlined, LineChartOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog } from '../api/types';
+import type { ApiEnvelope, DeviceGroup, ForwardRule, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog, RelayReadyNode } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
 import { NodeGroupSection } from '../components/nodes/NodeGroupSection';
 import { NodeDetailDrawer } from '../components/nodes/NodeDetailDrawer';
 import { stableGroupedRows } from '../components/nodes/sort';
+import { RuleDiagnosisModal } from '../components/diagnosis/RuleDiagnosisModal';
 
 type AnyNodeRow = NodeDisplayRow;
 
@@ -45,6 +46,10 @@ export default function NodeStatus() {
   const [activeOperation, setActiveOperation] = useState<NodeOperation | null>(null);
   const [uninstallRow, setUninstallRow] = useState<AnyNodeRow | null>(null);
   const [uninstallConfirmation, setUninstallConfirmation] = useState('');
+  const [nodeDiagnosisRule, setNodeDiagnosisRule] = useState<ForwardRule | null>(null);
+  const [nodeDiagnosisTarget, setNodeDiagnosisTarget] = useState<{ nodeId: string; nodeLabel: string } | null>(null);
+  const [nodeDiagnosisCandidates, setNodeDiagnosisCandidates] = useState<ForwardRule[]>([]);
+  const [nodeDiagnosisPickerOpen, setNodeDiagnosisPickerOpen] = useState(false);
   // Guards against overlapping polls: on a slow network (axios 10s timeout vs
   // 5s interval) a new tick could otherwise fire before the previous request
   // returned, stacking requests.
@@ -194,6 +199,32 @@ export default function NodeStatus() {
     });
   };
 
+  const handleDiagnoseNode = async (groupId: number, node: RelayReadyNode) => {
+    const nodeId = node.node_id.trim();
+    if (!nodeId) return;
+    try {
+      const response = await api.get<unknown, ApiEnvelope<ForwardRule[]>>('/rules');
+      if (response.code !== 0 || !response.data) {
+        message.error(response.message || t('diagnoseFailed'));
+        return;
+      }
+      const candidates = response.data.filter((rule) => rule.device_group_in === groupId && rule.protocol !== 'udp');
+      if (candidates.length === 0) {
+        message.info(t('diagnosisNoTcpRuleForNode'));
+        return;
+      }
+      setNodeDiagnosisTarget({ nodeId, nodeLabel: node.public_ipv4 ?? nodeId });
+      if (candidates.length === 1) {
+        setNodeDiagnosisRule(candidates[0]);
+      } else {
+        setNodeDiagnosisCandidates(candidates);
+        setNodeDiagnosisPickerOpen(true);
+      }
+    } catch {
+      message.error(t('diagnoseFailed'));
+    }
+  };
+
   const rows: AnyNodeRow[] | null = isAdmin ? adminRows : userRows;
   const groups = useMemo(() => (rows ? stableGroupedRows(rows) : null), [rows]);
 
@@ -265,6 +296,7 @@ export default function NodeStatus() {
           artifactVersions={artifactVersions}
           onDelete={isAdmin ? handleDelete : undefined}
           showRelayPreference={isAdmin && inboundGroupIds.has(gid)}
+          onDiagnoseNode={isAdmin ? handleDiagnoseNode : undefined}
         />
       ))}
       <NodeDetailDrawer
@@ -274,6 +306,40 @@ export default function NodeStatus() {
         isAdmin={isAdmin}
         panelProtocol={panelProtocol}
         onDeleted={refresh}
+      />
+      <Modal
+        title={t('diagnosisSelectRule')}
+        open={nodeDiagnosisPickerOpen}
+        onCancel={() => setNodeDiagnosisPickerOpen(false)}
+        footer={null}
+      >
+        <Space orientation="vertical" style={{ width: '100%' }}>
+          {nodeDiagnosisCandidates.map((rule) => (
+            <Button
+              key={rule.id}
+              block
+              onClick={() => {
+                setNodeDiagnosisRule(rule);
+                setNodeDiagnosisPickerOpen(false);
+              }}
+            >
+              #{rule.id} {rule.name} · :{rule.listen_port}{rule.sni ? ` · ${rule.sni}` : ''}
+            </Button>
+          ))}
+        </Space>
+      </Modal>
+      <RuleDiagnosisModal
+        rule={nodeDiagnosisRule}
+        open={nodeDiagnosisRule !== null && nodeDiagnosisTarget !== null}
+        onClose={() => {
+          setNodeDiagnosisRule(null);
+          setNodeDiagnosisTarget(null);
+          setNodeDiagnosisCandidates([]);
+        }}
+        isAdmin={isAdmin}
+        t={t}
+        nodeId={nodeDiagnosisTarget?.nodeId}
+        nodeLabel={nodeDiagnosisTarget?.nodeLabel}
       />
       <Drawer
         title={activeOperation ? t(`nodeOperation_${activeOperation.action}`) : t('nodeOperations')}

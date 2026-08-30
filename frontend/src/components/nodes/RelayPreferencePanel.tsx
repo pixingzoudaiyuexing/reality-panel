@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Button, Divider, Empty, Space, Spin, Tag, Tooltip, Typography, message } from 'antd';
-import { ReloadOutlined, SwapOutlined } from '@ant-design/icons';
+import { MedicineBoxOutlined, ReloadOutlined, SwapOutlined } from '@ant-design/icons';
 import api from '../../api/client';
 import type { ApiEnvelope, RelayPreferenceView, RelayReadyNode } from '../../api/types';
 import type { Tfn } from './types';
@@ -15,6 +15,7 @@ type LoadPreference = (showSpinner?: boolean, allowInitialRetry?: boolean) => Pr
 interface Props {
   groupId: number;
   t: Tfn;
+  onDiagnoseNode?: (node: RelayReadyNode) => void;
 }
 
 function readyReasonLabel(reason: string, t: Tfn): string {
@@ -88,7 +89,7 @@ function actionLabel(view: RelayPreferenceView, node: RelayReadyNode, t: Tfn): s
   return t('relayPreferenceSet');
 }
 
-export function RelayPreferencePanel({ groupId, t }: Props) {
+export function RelayPreferencePanel({ groupId, t, onDiagnoseNode }: Props) {
   const [view, setView] = useState<RelayPreferenceView | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
@@ -332,18 +333,29 @@ export function RelayPreferencePanel({ groupId, t }: Props) {
                     ) : null}
                   </Space>
                 </div>
-                {!isIdlePreferred ? (
-                  <Button
-                    size="small"
-                    type={view.state === 'failed' && node.ready ? 'default' : 'primary'}
-                    icon={<SwapOutlined />}
-                    disabled={disabled}
-                    loading={submittingNodeId === node.node_id}
-                    onClick={() => void setPreferred(node.node_id)}
-                  >
-                    {actionLabel(view, node, t)}
-                  </Button>
-                ) : null}
+                <Space size={4} wrap>
+                  {onDiagnoseNode ? (
+                    <Button
+                      size="small"
+                      icon={<MedicineBoxOutlined />}
+                      onClick={() => onDiagnoseNode(node)}
+                    >
+                      {t('diagnose')}
+                    </Button>
+                  ) : null}
+                  {!isIdlePreferred ? (
+                    <Button
+                      size="small"
+                      type={view.state === 'failed' && node.ready ? 'default' : 'primary'}
+                      icon={<SwapOutlined />}
+                      disabled={disabled}
+                      loading={submittingNodeId === node.node_id}
+                      onClick={() => void setPreferred(node.node_id)}
+                    >
+                      {actionLabel(view, node, t)}
+                    </Button>
+                  ) : null}
+                </Space>
               </div>
             );
           })}

@@ -1,7 +1,7 @@
  
 import { Tag, Typography, Collapse } from 'antd';
 import { ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
-import type { NodeDisplayRow } from '../../api/types';
+import type { NodeDisplayRow, RelayReadyNode } from '../../api/types';
 import type { NodeLifecycleHandler, Tfn } from './types';
 import { NodeDesktopTable } from './NodeDesktopTable';
 import { NodeMobileList } from './NodeMobileList';
@@ -27,6 +27,7 @@ interface Props {
   artifactVersions?: Record<string, string>;
   onDelete?: (row: NodeDisplayRow) => void;
   showRelayPreference?: boolean;
+  onDiagnoseNode?: (groupId: number, node: RelayReadyNode) => void;
 }
 
 /** Per-group summary: online/total (placeholders excluded) + aggregate live
@@ -45,7 +46,7 @@ function groupSummary(rows: NodeDisplayRow[]) {
 /** One group block: header bar (name · ID · online/total · aggregate ↑↓) +
  *  either a desktop table or mobile list. Collapsible. A group with only a
  *  placeholder row shows "no node reporting". */
-export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade, onLifecycle, artifactVersions, onDelete, showRelayPreference = false }: Props) {
+export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade, onLifecycle, artifactVersions, onDelete, showRelayPreference = false, onDiagnoseNode }: Props) {
   const head = rows[0];
   const { total, online, up, down } = groupSummary(rows);
   const region = head.region;
@@ -92,7 +93,7 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
   const body = (
     <>
       {nodeBody}
-      {showRelayPreference ? <RelayPreferencePanel groupId={head.group_id} t={t} /> : null}
+      {showRelayPreference ? <RelayPreferencePanel groupId={head.group_id} t={t} onDiagnoseNode={onDiagnoseNode ? (node) => onDiagnoseNode(head.group_id, node) : undefined} /> : null}
     </>
   );
 

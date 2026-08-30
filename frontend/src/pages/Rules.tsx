@@ -1,24 +1,17 @@
-import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Popover, Tag, Alert, Typography, Dropdown, Switch, Tabs, Spin, Tooltip } from 'antd';
+import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Popover, Tag, Alert, Typography, Dropdown, Switch, Tabs, Tooltip } from 'antd';
 import type { MenuProps } from 'antd';
 import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, SearchOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, DiagnoseResponse, NodeDiagnoseStatus, DiagnoseTargetResult, SharedGroupSummary, RestartResponse, ReapplyResponse, NodeStatus, RuleDnsStatus, RealityCheck, RealityDiagnosis } from '../api/types';
+import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, SharedGroupSummary, RestartResponse, ReapplyResponse, NodeStatus, RuleDnsStatus } from '../api/types';
 import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 import { useAuth } from '../auth/useAuth';
 import { asValidatedEntry, buildExportJSON, buildImportedRulePayload, ruleTargets, validateImportEntry } from '../utils/rulesIO';
-import {
-  camouflageCertificateMessage,
-  compactRealityStatus,
-  deriveCamouflageStatus,
-  diagnosisStateDisplay,
-  diagnoseRuntimeStatus,
-  isRealityRule,
-  normalizeSni,
-} from '../utils/realityRuleStatus';
+import { camouflageCertificateMessage, compactRealityStatus, deriveCamouflageStatus, isRealityRule, normalizeSni } from '../utils/realityRuleStatus';
+import { RuleDiagnosisModal } from '../components/diagnosis/RuleDiagnosisModal';
 
 const { Text } = Typography;
 const { TextArea } = Input;
@@ -198,8 +191,6 @@ export default function Rules() {
   const [editForm] = Form.useForm();
   // v0.4.8: rule diagnosis modal state.
   const [diagnosing, setDiagnosing] = useState<ForwardRule | null>(null);
-  const [diagnoseLoading, setDiagnoseLoading] = useState(false);
-  const [diagnoseResult, setDiagnoseResult] = useState<DiagnoseResponse | null>(null);
   // v0.4.9: group-name column + filter. selectedGroup === null means "all".
   // (Explicit null, not !selectedGroup, so a future id of 0 wouldn't be falsy.)
   const [selectedGroup, setSelectedGroup] = useState<number | null>(null);
@@ -784,25 +775,7 @@ export default function Rules() {
     }
   };
 
-  /** v0.4.8: run a diagnosis for a rule. The panel fans the probe out to the
-   *  rule's inbound-group nodes over WS and waits up to 8s for results. */
-  const handleDiagnose = async (r: ForwardRule) => {
-    setDiagnosing(r);
-    setDiagnoseResult(null);
-    setDiagnoseLoading(true);
-    try {
-      const res = await api.post<unknown, ApiEnvelope<DiagnoseResponse>>(`/rules/${r.id}/diagnose`);
-      if (res.code === 0 && res.data) {
-        setDiagnoseResult(res.data);
-      } else {
-        message.error(res.message || t('diagnoseFailed'));
-      }
-    } catch {
-      message.error(t('diagnoseFailed'));
-    } finally {
-      setDiagnoseLoading(false);
-    }
-  };
+  const handleDiagnose = (r: ForwardRule) => setDiagnosing(r);
 
   /** Toggle a rule's paused state via the dedicated paused field on the update
    *  API. Paused rules stay in the DB but the node stops forwarding (get_config
@@ -1488,157 +1461,13 @@ export default function Rules() {
         )}
       </Modal>
 
-      {/* v0.4.8: rule diagnosis modal — three sections: ingress node, target
-          egress, and panel dispatch summary. */}
-      <Modal
-        title={diagnosing ? `${t('diagnoseTitle')} · ${diagnosing.name} (#${diagnosing.id})` : t('diagnoseTitle')}
-        open={!!diagnosing}
-        onCancel={() => { setDiagnosing(null); setDiagnoseResult(null); }}
-        footer={<Button onClick={() => { setDiagnosing(null); setDiagnoseResult(null); }}>{t('close')}</Button>}
-        width={720}
-      >
-        {diagnoseLoading ? (
-          <div style={{ textAlign: 'center', padding: 32 }} aria-live="polite" aria-busy="true"><Spin tip={t('diagnoseRunning')} /></div>
-        ) : diagnoseResult ? (
-          <>
-            <Alert type="info" showIcon style={{ marginBottom: 16 }}
-              title={t('diagnoseScopeHint')} />
-            {diagnoseResult.dependencies && (
-              <>
-                {diagnoseResult.dependencies.blocking_chain.length > 0 && (
-                  <Alert
-                    type="warning"
-                    showIcon
-                    style={{ marginBottom: 16 }}
-                    title={t('diagnoseBlockingChain')}
-                    description={diagnoseResult.dependencies.blocking_chain.join(' -> ')}
-                  />
-                )}
-                <Typography.Title level={5}>{t('diagnoseDependencies')}</Typography.Title>
-                <Space orientation="vertical" size={6} style={{ width: '100%', marginBottom: 12 }}>
-                  <Text strong>{t('dnsmgr')}</Text><RealityCheckView check={diagnoseResult.dependencies.dnsmgr} t={t} />
-                  <Text strong>{t('dns')}</Text><RealityCheckView check={diagnoseResult.dependencies.dns_sync} t={t} />
-                  <Text strong>{t('certificateDetails')}</Text><RealityCheckView check={diagnoseResult.dependencies.certificate} t={t} />
-                  <Text strong>{t('routeDetails')}</Text><RealityCheckView check={diagnoseResult.dependencies.route} t={t} />
-                </Space>
-              </>
-            )}
-            {/* v0.4.14: only the relay-node's OWN TCP diagnosis is shown — the
-                node's listener status + its node→target TCP connectivity/latency.
-                The latency is the node→target TCP handshake time, NOT a client
-                end-to-end latency. */}
-            <Typography.Title level={5}>{t('diagnoseIngress')}</Typography.Title>
-            {diagnoseResult.nodes.length === 0 ? (
-              <Text type="secondary">{t('diagnoseNoNodes')}</Text>
-            ) : (
-              <Space orientation="vertical" style={{ width: '100%' }}>
-                {diagnoseResult.nodes.map((n, i) => (
-                  <DiagnoseNodeRow key={i} node={n} t={t} isAdmin={isAdmin} />
-                ))}
-              </Space>
-            )}
-          </>
-        ) : (
-          <Text type="secondary">{t('diagnoseIdle')}</Text>
-        )}
-      </Modal>
+      <RuleDiagnosisModal
+        rule={diagnosing}
+        open={diagnosing !== null}
+        onClose={() => setDiagnosing(null)}
+        isAdmin={isAdmin}
+        t={t}
+      />
     </>
   );
-}
-
-/** Render one node's diagnosis row. v0.4.15: the visible label is
- *  "分组名 · 公网IP" (or "分组名 · IP 未上报"), NEVER the raw node_id. node_id is
- *  admin-only (tooltip for troubleshooting); a regular user sees just the
- *  label. Same shape across all four statuses; the status tag + details differ. */
-function DiagnoseNodeRow({ node, t, isAdmin }: { node: NodeDiagnoseStatus; t: (k: string) => string; isAdmin: boolean }) {
-  const label = `${node.group_name || '-'} · ${node.public_ip || t('diagnoseIpMissing')}`;
-  const labelText = <Text strong>{label}</Text>;
-  // node_id is internal — only an admin gets the troubleshooting tooltip.
-  const labelWithId = isAdmin
-    ? <Tooltip title={t('diagnoseNodeIdLabel') + node.node_id}>{labelText}</Tooltip>
-    : labelText;
-  const runtimeStatus = node.status === 'result'
-    ? diagnoseRuntimeStatus(node.listener_running, node.reality)
-    : null;
-  return (
-    <div>
-      <Space wrap align="center">
-        {labelWithId}
-        {node.status === 'result' && (
-          <>
-            <Tag color={runtimeStatus?.healthy ? 'green' : 'red'}>
-              {t(runtimeStatus?.labelKey ?? 'diagnoseListenerStopped')}
-            </Tag>
-            {node.listen_port ? <Text type="secondary">:{node.listen_port}</Text> : null}
-            {node.protocol ? <Tag>{node.protocol}</Tag> : null}
-            {node.transport ? <Tag>{node.transport}</Tag> : null}
-          </>
-        )}
-        {node.status === 'unsupported' && (
-          <Text type="warning">{t('diagnoseUnsupportedPrefix')}{node.node_version}{t('diagnoseUnsupportedSuffix')}</Text>
-        )}
-        {node.status === 'control_channel_offline' && (
-          <Text type="secondary">{t('diagnoseOffline')}</Text>
-        )}
-        {node.status === 'timeout' && (
-          <Tag color="orange">{t('diagnoseTimeout')}</Tag>
-        )}
-      </Space>
-      {node.status === 'result' && node.reality ? (
-        <RealityDiagnosisView diagnosis={node.reality} t={t} />
-      ) : node.status === 'result' && node.results.length > 0 ? (
-        <Table<DiagnoseTargetResult> size="small" pagination={false} style={{ marginTop: 8 }}
-          dataSource={node.results} rowKey="address"
-          columns={[
-            { title: t('diagnoseTarget'), dataIndex: 'address', key: 'address', render: (v: string) => <span className="rp-mono">{v}</span> },
-            { title: t('diagnoseOutcome'), key: 'outcome', render: (_: unknown, r: DiagnoseTargetResult) => <ProbeOutcomeTag o={r.outcome} t={t} /> },
-          ]}
-        />
-      ) : null}
-    </div>
-  );
-}
-
-function RealityCheckView({ check, t }: { check: RealityCheck; t: (key: string) => string }) {
-  const display = diagnosisStateDisplay(check.state, t);
-  return (
-    <Space size={6} wrap>
-      <Tag color={display.color}>{display.label}</Tag>
-      {check.detail && <Text type="secondary">{check.detail}</Text>}
-    </Space>
-  );
-}
-
-function RealityDiagnosisView({ diagnosis, t }: { diagnosis: RealityDiagnosis; t: (key: string) => string }) {
-  const status = (check: RealityCheck) => <RealityCheckView check={check} t={t} />;
-  return (
-    <Space orientation="vertical" size={8} style={{ width: '100%', marginTop: 8 }}>
-      <Typography.Text strong>{t('realityConfigLayer')}</Typography.Text>{status(diagnosis.config.check)}
-      <Text type="secondary">SNI {diagnosis.config.sni ?? '-'} · :{diagnosis.config.listen_port} · PP {diagnosis.config.send_proxy_protocol ? 'ON' : 'OFF'}</Text>
-      <Typography.Text strong>{t('realityConvergence')}</Typography.Text>{status(diagnosis.convergence.check)}
-      <Text type="secondary">{t('realityDesiredSni')} {diagnosis.convergence.desired_sni ?? '-'} · {t('realityActiveSni')} {diagnosis.convergence.active_sni ?? '-'} · {t('realityRevision')} {diagnosis.convergence.desired_config_revision}/{diagnosis.convergence.active_config_revision}</Text>
-      <Typography.Text strong>{t('realityNginxLayer')}</Typography.Text>{status(diagnosis.nginx.check)}
-      <Text type="secondary">{diagnosis.nginx.config_valid ? 'nginx -t PASS' : 'nginx -t FAIL'} · {diagnosis.nginx.managed_file_matches ? t('configConsistent') : t('configDrifted')}</Text>
-      <Typography.Text strong>{t('realityRuntimeLayer')}</Typography.Text>{status(diagnosis.runtime.check)}
-      <Text type="secondary">:443 {diagnosis.runtime.listen_443 ? 'listening' : 'not listening'} · :8443 {diagnosis.runtime.listen_8443 ? 'listening' : 'not listening'}</Text>
-      <Typography.Text strong>{t('realityBackendLayer')}</Typography.Text>
-      {diagnosis.backends.map(backend => <Text key={backend.address} className="rp-mono">{backend.address} · {status(backend.check)}{backend.elapsed_ms != null ? ` · ${backend.elapsed_ms}ms` : ''}</Text>)}
-      <Typography.Text strong>{t('certificateDetails')}</Typography.Text>{status(diagnosis.certificate.check)}
-      <Text type="secondary">SAN {diagnosis.certificate.san_match ? 'PASS' : 'FAIL'} · cert/key {diagnosis.certificate.cert_key_match ? 'MATCH' : 'MISMATCH'} · {diagnosis.certificate.remaining_days ?? '-'}d</Text>
-      <Text type="secondary">TLS {status(diagnosis.certificate.tls_handshake)}</Text>
-      {diagnosis.certificate.renewal && <><Typography.Text strong>{t('certificateRenewal')}</Typography.Text>{status(diagnosis.certificate.renewal)}</>}
-      <Typography.Text strong>{t('camouflage')}</Typography.Text>{status(diagnosis.camouflage.check)}
-      <Text type="secondary">:8443 · {diagnosis.camouflage.local_backend}{diagnosis.camouflage.http_status ? ` · HTTP ${diagnosis.camouflage.http_status}` : ''}</Text>
-      <Typography.Text strong>{t('fallbackE2e')}</Typography.Text>{status(diagnosis.fallback.check)}
-      <Typography.Text strong>{t('vlessAuthentication')}</Typography.Text>{status(diagnosis.vless_authentication)}
-    </Space>
-  );
-}
-
-function ProbeOutcomeTag({ o, t }: { o: DiagnoseTargetResult['outcome']; t: (k: string) => string }) {
-  // v0.4.9: 'route_only' variant removed — diagnosis is TCP-only.
-  if (o === 'timeout') return <Tag color="orange">{t('diagnoseOutcomeTimeout')}</Tag>;
-  if ('reachable' in o) return <Tag color="green">{t('diagnoseOutcomeReachable')} {o.reachable.elapsed_ms}ms</Tag>;
-  if ('failed' in o) return <Tag color="red">{t('diagnoseOutcomeFailed')}: {o.failed.error}</Tag>;
-  return <Tag>?</Tag>;
 }

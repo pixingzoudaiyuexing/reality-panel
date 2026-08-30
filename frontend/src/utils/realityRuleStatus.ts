@@ -40,11 +40,11 @@ export function diagnoseRuntimeStatus(listenerRunning: boolean, reality?: Realit
 }
 
 export function diagnosisStateDisplay(state: string, t: (key: string) => string) {
-  if (state === 'pass') return { color: 'green', label: 'PASS' };
-  if (state === 'warning') return { color: 'gold', label: 'WARN' };
-  if (state === 'blocked') return { color: 'orange', label: t('blocked') };
-  if (state === 'not_tested') return { color: 'default', label: t('notTested') };
-  return { color: 'red', label: 'FAIL' };
+  if (state === 'pass') return { color: 'green', label: t('diagnosisPassed') };
+  if (state === 'warning') return { color: 'gold', label: t('diagnosisWarning') };
+  if (state === 'blocked') return { color: 'orange', label: t('diagnosisBlocked') };
+  if (state === 'not_tested') return { color: 'default', label: t('diagnosisNotTested') };
+  return { color: 'red', label: t('diagnosisFailedState') };
 }
 
 export function compactRealityStatus(
