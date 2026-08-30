@@ -1989,6 +1989,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_during_switch_and_rollback_resumes_from_persisted_journal() {
+        let (repo, connections, _) = switch_fixture().await;
+        start_relay_switch(&repo, &connections, 7, "node-b")
+            .await
+            .unwrap();
+        set_sync_state(&repo, 1, "PROPAGATED", None, None).await;
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::Pending
+        ));
+
+        // 模拟 Panel 在 target 只传播一半时重启：finalizer 不持有进程内事务，
+        // 必须从 KVS journal 与 durable sync rows 恢复同一 switching transaction。
+        let recovered_switch = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(recovered_switch.state, RelayPreferencePhase::Switching);
+        assert_eq!(recovered_switch.dns_records.len(), 2);
+        set_sync_state(&repo, 3, "CONFLICT", Some("DNS_CONFLICT"), None).await;
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::RollbackStarted { .. }
+        ));
+
+        crate::service::dnsmgr::refresh_all_desired(&repo)
+            .await
+            .unwrap();
+        set_sync_state(&repo, 1, "PROPAGATED", None, None).await;
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::Pending
+        ));
+
+        // 再次模拟重启发生在 rollback 传播一半时。旧 preferred 与 pending
+        // target 必须保留，下一 tick 继续 rollback，不能永久 Pending 或假成功。
+        let recovered_rollback = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(recovered_rollback.state, RelayPreferencePhase::RollingBack);
+        assert_eq!(
+            recovered_rollback.preferred_node_id.as_deref(),
+            Some("node-a")
+        );
+        assert_eq!(
+            recovered_rollback.pending_node_id.as_deref(),
+            Some("node-b")
+        );
+        set_sync_state(&repo, 3, "PROPAGATED", None, None).await;
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::RolledBack { .. }
+        ));
+        let terminal = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(terminal.state, RelayPreferencePhase::FailedRolledBack);
+        assert_eq!(terminal.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(terminal.pending_node_id.as_deref(), Some("node-b"));
+    }
+
+    #[tokio::test]
     async fn partial_target_failure_rolls_back_every_record_before_terminal_failure() {
         let (repo, connections, _) = switch_fixture().await;
         start_relay_switch(&repo, &connections, 7, "node-b")

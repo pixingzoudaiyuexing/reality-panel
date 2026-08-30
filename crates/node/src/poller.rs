@@ -1340,6 +1340,47 @@ mod tests {
         cleanup_cache(&paths);
     }
 
+    #[test]
+    fn fault_injection_restart_before_and_after_lkg_rename_preserves_authority() {
+        let paths = cache_paths_for_test("fault-lkg-rename");
+        let old = cache_config(1);
+        let new = cache_config(2);
+        commit_cache_with_metadata_at(
+            &old,
+            &paths,
+            10,
+            relay_shared::reconciliation::config_fingerprint(&old).as_str(),
+        )
+        .unwrap();
+
+        // 模拟新快照已经 durable 写入 tmp、但进程在 rename 前退出。tmp 不是
+        // 权威状态，重启必须继续加载旧 primary LKG，并清理未提交结果。
+        let new_fingerprint = relay_shared::reconciliation::config_fingerprint(&new);
+        let uncommitted = NodeConfigSnapshot {
+            config_revision: 11,
+            config_fingerprint: new_fingerprint.as_str().to_string(),
+            config: new.clone(),
+        };
+        std::fs::write(&paths.tmp, serde_json::to_vec_pretty(&uncommitted).unwrap()).unwrap();
+        let before_rename = load_cache_state_at(&paths).unwrap();
+        assert_eq!(before_rename.config.listeners[0].rule_id, 1);
+        assert_eq!(before_rename.config_revision, 10);
+        assert!(!paths.tmp.exists());
+
+        // 模拟 rename 与父目录 fsync 已完成后退出。重启必须加载新 primary，
+        // 同时保留旧 primary 作为 backup，而不是回退或进入 Unknown。
+        commit_cache_with_metadata_at(&new, &paths, 11, new_fingerprint.as_str()).unwrap();
+        let after_rename = load_cache_state_at(&paths).unwrap();
+        assert_eq!(after_rename.config.listeners[0].rule_id, 2);
+        assert_eq!(after_rename.config_revision, 11);
+        assert_eq!(
+            read_valid_cache(&paths.backup).unwrap().listeners[0].rule_id,
+            1
+        );
+        assert!(!paths.tmp.exists());
+        cleanup_cache(&paths);
+    }
+
     #[tokio::test]
     async fn runtime_apply_can_remain_healthy_when_lkg_commit_fails() {
         let paths = cache_paths_for_test("runtime-lkg-pending");

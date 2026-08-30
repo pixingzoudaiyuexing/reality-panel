@@ -2522,6 +2522,118 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn duplicate_and_out_of_order_panel_snapshots_keep_latest_revision_active() {
+        let dir = unique_runtime_dir("fault-config-order");
+        let paths = runtime_paths(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reservations = Vec::new();
+        for _ in 0..3 {
+            reservations.push(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        }
+        let ports = reservations
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().port())
+            .collect::<Vec<_>>();
+        drop(reservations);
+
+        let mut forwarders = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        forwarders.set_listen_addresses_for_test("127.0.0.1", "");
+        let manager = Arc::new(Mutex::new(forwarders));
+        let camouflage = Arc::new(Mutex::new(test_camouflage_manager(&dir)));
+        let mut reconciler = Reconciler::new();
+        let versioned = |config: NodeConfigResponse, revision: u64| {
+            let fingerprint = config_fingerprint(&config);
+            ReconciliationInput::validated_panel_snapshot(NodeConfigSnapshot {
+                config_revision: revision,
+                config_fingerprint: fingerprint.as_str().to_string(),
+                config,
+            })
+            .unwrap()
+        };
+
+        let p1 = raw_config(ports[0]);
+        let q1 = raw_config(ports[1]);
+        let q2 = raw_config(ports[2]);
+        assert_eq!(
+            reconciler
+                .reconcile_with_test_paths(
+                    &manager,
+                    &camouflage,
+                    versioned(p1.clone(), 20),
+                    paths.clone(),
+                )
+                .await
+                .state,
+            ReconciliationState::Converged
+        );
+        // duplicate WS/HTTP delivery is idempotent and remains converged.
+        assert_eq!(
+            reconciler
+                .reconcile_with_test_paths(
+                    &manager,
+                    &camouflage,
+                    versioned(p1.clone(), 20),
+                    paths.clone(),
+                )
+                .await
+                .state,
+            ReconciliationState::Converged
+        );
+        assert_eq!(
+            reconciler
+                .reconcile_with_test_paths(
+                    &manager,
+                    &camouflage,
+                    versioned(q1.clone(), 21),
+                    paths.clone(),
+                )
+                .await
+                .state,
+            ReconciliationState::Converged
+        );
+        assert_eq!(
+            reconciler
+                .reconcile_with_test_paths(
+                    &manager,
+                    &camouflage,
+                    versioned(q2.clone(), 22),
+                    paths.clone(),
+                )
+                .await
+                .state,
+            ReconciliationState::Converged
+        );
+
+        // q2 已提交后，迟到的 q1 以及复用 q2 revision 的不同 payload 都必须
+        // fail-safe 忽略，不能覆盖 runtime、LKG 或最新收敛状态。
+        for stale in [versioned(q1, 21), versioned(p1, 22)] {
+            assert_eq!(
+                reconciler
+                    .reconcile_with_test_paths(&manager, &camouflage, stale, paths.clone(),)
+                    .await
+                    .state,
+                ReconciliationState::StaleIgnored
+            );
+        }
+        let current = manager.lock().await.current_config().unwrap();
+        assert_eq!(current.listeners[0].port, ports[2]);
+        assert_eq!(
+            serde_json::to_value(poller::load_cache_at(&paths).unwrap()).unwrap(),
+            serde_json::to_value(q2).unwrap()
+        );
+        assert_eq!(
+            reconciler.status_snapshot().state,
+            ReconciliationStatusState::Converged
+        );
+
+        assert!(manager.lock().await.apply_config(&empty()).await);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn status_distinguishes_repair_withholding_and_recovery_sources() {
         let snapshot = TrustedSnapshot::validated_panel(desired()).unwrap();

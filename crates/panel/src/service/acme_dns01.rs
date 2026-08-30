@@ -1267,4 +1267,34 @@ mod tests {
         assert_eq!(state.cleanup_state, "CLEANED");
         handle.abort();
     }
+
+    #[tokio::test]
+    async fn active_txt_challenge_survives_panel_restart_and_cleans_from_persisted_state() {
+        let challenge = "restart-token-12345678";
+        let sni = "restart.example.com";
+        let (base_url, provider, handle) =
+            mock_provider("_acme-challenge.restart", vec!["unrelated-token".into()]).await;
+        let db = test_db(&base_url).await;
+        let request = request_for("node-restart", sni, challenge);
+
+        present_with_observer(&db, 10, &request, &FixedPropagation(true))
+            .await
+            .unwrap();
+        let (_, raw) = db.scan_prefix(STATE_PREFIX).await.unwrap().pop().unwrap();
+        let persisted: ChallengeState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted.cleanup_state, "ACTIVE");
+
+        // Panel 重启后进程内 SNI lock 不存在；cleanup 必须只依赖持久化的
+        // challenge identity/provider record identity 恢复，且不能误删其他 TXT。
+        SNI_OPERATIONS.lock().unwrap().clear();
+        cleanup(&db, 10, &request).await.unwrap();
+
+        let provider = provider.lock().await;
+        assert_eq!(provider.values, ["unrelated-token"]);
+        drop(provider);
+        let (_, raw) = db.scan_prefix(STATE_PREFIX).await.unwrap().pop().unwrap();
+        let persisted: ChallengeState = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted.cleanup_state, "CLEANED");
+        handle.abort();
+    }
 }
