@@ -21,6 +21,7 @@ mod provisioning;
 pub mod reapply;
 pub mod redeem;
 pub mod relay_preference;
+pub mod relay_schedule;
 pub mod restart;
 pub mod security_headers;
 pub mod site;
@@ -236,6 +237,22 @@ pub fn routes() -> Router<AppState> {
             "/groups/{group_id}/relay-preference",
             axum::routing::get(relay_preference::get_relay_preference)
                 .post(relay_preference::set_relay_preference),
+        )
+        .route(
+            "/admin/relay-schedules",
+            axum::routing::get(relay_schedule::list).post(relay_schedule::create),
+        )
+        .route(
+            "/admin/relay-schedules/{id}",
+            axum::routing::put(relay_schedule::update).delete(relay_schedule::delete),
+        )
+        .route(
+            "/admin/relay-schedules/{id}/enable",
+            axum::routing::post(relay_schedule::enable),
+        )
+        .route(
+            "/admin/relay-schedules/{id}/disable",
+            axum::routing::post(relay_schedule::disable),
         )
         // v0.4.11 PR3: shared infrastructure — regular users can discover and
         // bind rules to inbound groups owned by an admin.

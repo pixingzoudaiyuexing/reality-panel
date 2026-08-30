@@ -12,6 +12,7 @@ pub mod password;
 pub mod profiles;
 pub mod redeem;
 pub mod relay_preference;
+pub mod relay_schedule;
 pub mod rules;
 pub mod settings;
 pub mod site;
