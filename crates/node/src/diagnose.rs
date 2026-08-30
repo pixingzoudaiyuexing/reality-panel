@@ -539,7 +539,11 @@ fn inspect_certificate(
         let (_, cert) = x509_parser::prelude::X509Certificate::from_der(&pem.contents).ok()?;
         let san_match = cert.subject_alternative_name().ok().flatten().is_some_and(|san| {
             san.value.general_names.iter().any(|name| {
-                matches!(name, x509_parser::extensions::GeneralName::DNSName(value) if *value == domain)
+                matches!(
+                    name,
+                    x509_parser::extensions::GeneralName::DNSName(value)
+                        if relay_shared::reconciliation::certificate_domain_covers_sni(value, domain)
+                )
             })
         });
         let issuer = cert.issuer().to_string();
@@ -903,6 +907,50 @@ mod tests {
             assert_eq!(certificate.check.state, "fail");
             std::fs::remove_dir_all(case_dir).unwrap();
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn diagnosis_san_matching_uses_shared_wildcard_semantics() {
+        use time::{Duration as TimeDuration, OffsetDateTime};
+
+        let dir = diagnosis_test_dir("san-matching");
+        let now = OffsetDateTime::now_utc();
+        let cases = [
+            ("wildcard", "*.example.com", "q1.example.com", true),
+            ("exact", "q1.example.com", "q1.example.com", true),
+            ("apex", "*.example.com", "example.com", false),
+            (
+                "multiple-labels",
+                "*.example.com",
+                "deep.q1.example.com",
+                false,
+            ),
+            ("wrong-domain", "*.example.net", "q1.example.com", false),
+        ];
+
+        for (name, san, sni, expected) in cases {
+            let certificate = diagnosis_certificate(
+                &dir,
+                name,
+                san,
+                now - TimeDuration::days(1),
+                now + TimeDuration::days(90),
+            );
+            let site = CamouflageSite {
+                id: name.into(),
+                sni: sni.into(),
+                tls_listener_port: 8443,
+                local_backend: OPENLIST_BACKEND.into(),
+                certificate,
+            };
+            let (_, _, san_match, key_match, _, _, _, error) =
+                inspect_certificate(Some(&site), sni);
+            assert_eq!(san_match, expected, "SAN {san} against SNI {sni}");
+            assert!(key_match, "generated certificate and key must match");
+            assert_eq!(error.is_none(), expected, "SAN {san} against SNI {sni}");
+        }
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 
