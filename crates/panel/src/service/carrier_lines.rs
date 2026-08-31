@@ -266,6 +266,8 @@ fn validate_line_id(line_id: &str) -> Result<(), CarrierLineCatalogError> {
 
 fn settings_fingerprint(settings: &DnsMgrSettings) -> String {
     let mut digest = Sha256::new();
+    digest.update([u8::from(settings.enabled)]);
+    digest.update([0]);
     digest.update(settings.base_url.as_bytes());
     digest.update([0]);
     digest.update(settings.uid.to_be_bytes());
@@ -331,6 +333,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["X", "Y"]
         );
+    }
+
+    #[test]
+    fn cache_fingerprint_changes_with_every_dnsmgr_setting() {
+        let base = DnsMgrSettings {
+            enabled: true,
+            base_url: "https://dns.example.test".into(),
+            uid: 7,
+            api_key: "key-a".into(),
+        };
+        let fingerprint = settings_fingerprint(&base);
+        for changed in [
+            DnsMgrSettings {
+                enabled: false,
+                ..base.clone()
+            },
+            DnsMgrSettings {
+                base_url: "https://other.example.test".into(),
+                ..base.clone()
+            },
+            DnsMgrSettings {
+                uid: 8,
+                ..base.clone()
+            },
+            DnsMgrSettings {
+                api_key: "key-b".into(),
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(settings_fingerprint(&changed), fingerprint);
+        }
     }
 
     #[tokio::test]
