@@ -28,6 +28,7 @@ const DNS_SYNC_MAX_ATTEMPTS: i32 = 6;
 const DNS_SYNC_BASE_BACKOFF_SECS: u64 = 5;
 const DNS_SYNC_MAX_BACKOFF_SECS: u64 = 300;
 const PUBLIC_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PROVIDER_LINE_ID_BYTES: usize = 256;
 
 /// KVS key holding the single Panel-wide DNSMgr integration configuration.
 pub const DNSMGR_CONFIG_KEY: &str = "dns:dnsmgr";
@@ -148,7 +149,7 @@ impl ProviderLine {
         {
             "default".to_string()
         } else {
-            format!("provider:{raw_id}")
+            format!("dnsmgr:{raw_id}")
         };
         Self {
             raw_id,
@@ -465,6 +466,14 @@ pub(crate) struct EnsureRecordInput {
     pub line: ProviderLine,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeleteRecordInput {
+    pub rule_id: i64,
+    pub fqdn: String,
+    pub record_type: DnsRecordType,
+    pub line: ProviderLine,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnsureRecordConflict {
     Cname,
@@ -480,6 +489,7 @@ pub(crate) enum EnsureRecordFailure {
     Upstream(DnsMgrError),
     Database,
     PostWriteNotVerified,
+    OwnershipUnverified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -498,6 +508,14 @@ pub(crate) enum EnsureRecordResult {
         record_id: String,
     },
     Conflict(EnsureRecordConflict),
+    MutationOutcomeUnknown,
+    Failed(EnsureRecordFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeleteRecordResult {
+    Deleted { record_id: String },
+    AlreadyAbsent,
     MutationOutcomeUnknown,
     Failed(EnsureRecordFailure),
 }
@@ -534,6 +552,8 @@ struct DnsAuditTransition {
     fqdn: String,
     record_type: String,
     expected_value: String,
+    line_key: String,
+    desired_action: String,
     ownership: String,
     category: Option<String>,
 }
@@ -554,6 +574,8 @@ impl DnsAuditTransition {
                 .expected_value
                 .clone()
                 .unwrap_or_else(|| "<absent>".into()),
+            line_key: sync.line_key.clone(),
+            desired_action: sync.desired_action.clone(),
             ownership: ownership.to_string(),
             category: category.map(str::to_string),
         }
@@ -567,9 +589,11 @@ impl DnsAuditTransition {
             "rule",
             self.rule_id,
             &format!(
-                "fqdn={} record_type={} expected_value={} ownership={} category={}",
+                "fqdn={} record_type={} line_key={} desired_action={} expected_value={} ownership={} category={}",
                 self.fqdn,
                 self.record_type,
+                self.line_key,
+                self.desired_action,
                 self.expected_value,
                 self.ownership,
                 self.category.as_deref().unwrap_or("none"),
@@ -615,20 +639,12 @@ pub(crate) async fn ensure_record(
         Ok(ip) => ip,
         Err(error) => return EnsureRecordResult::Failed(EnsureRecordFailure::InvalidInput(error)),
     };
-    let desired = match derive_dns_desired(db, input.rule_id).await {
-        Ok(DnsDesiredResolution::Eligible(desired)) => desired,
-        Ok(
-            DnsDesiredResolution::NotEligible
-            | DnsDesiredResolution::Frozen
-            | DnsDesiredResolution::ConfigurationError { .. },
-        ) => return EnsureRecordResult::Failed(EnsureRecordFailure::InvalidRule),
+    match upsert_is_authorized(db, input, &fqdn).await {
+        Ok(true) => {}
+        Ok(false) => return EnsureRecordResult::Failed(EnsureRecordFailure::InvalidRule),
         Err(_) => return EnsureRecordResult::Failed(EnsureRecordFailure::Database),
-    };
-    if desired.fqdn != fqdn.as_str()
-        || desired.record_type != input.record_type
-        || desired.expected_value != input.expected_value
-        || desired.line.key != input.line.key
-    {
+    }
+    if canonical_provider_line(&input.line.raw_id).is_none_or(|line| line.key != input.line.key) {
         return EnsureRecordResult::Failed(EnsureRecordFailure::InvalidRule);
     }
     let zone = match resolve_zone(client, &fqdn).await {
@@ -666,6 +682,64 @@ pub(crate) async fn ensure_record(
     };
 
     let discovery = discover_records(client, &zone, input.record_type, &line).await;
+    if line.key != DEFAULT_LINE_KEY {
+        return match discovery {
+            RecordDiscovery::UpstreamFailure(error) => {
+                EnsureRecordResult::Failed(EnsureRecordFailure::Upstream(error))
+            }
+            RecordDiscovery::ConflictingRecordType(_) => {
+                EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+            }
+            RecordDiscovery::NoRecord => {
+                if let Some(binding) = binding.as_ref() {
+                    if set_binding_state(db, binding.id, "MISSING", None)
+                        .await
+                        .is_err()
+                    {
+                        return EnsureRecordResult::Failed(EnsureRecordFailure::Database);
+                    }
+                }
+                create_and_verify(
+                    db,
+                    client,
+                    input,
+                    &fqdn,
+                    &zone,
+                    &line,
+                    ttl,
+                    binding.as_ref(),
+                )
+                .await
+            }
+            RecordDiscovery::SingleMatchingRecord(record)
+                if binding_matches_record(
+                    binding.as_ref(),
+                    &fqdn,
+                    &zone,
+                    input.record_type,
+                    &record,
+                ) =>
+            {
+                handle_discovered_records(
+                    db,
+                    client,
+                    input,
+                    &fqdn,
+                    &zone,
+                    &line,
+                    ttl,
+                    expected_ip,
+                    binding.as_ref(),
+                    std::slice::from_ref(&record),
+                )
+                .await
+            }
+            RecordDiscovery::SingleMatchingRecord(_)
+            | RecordDiscovery::MultipleMatchingRecords(_) => {
+                EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+            }
+        };
+    }
     match discovery {
         RecordDiscovery::UpstreamFailure(error) => {
             EnsureRecordResult::Failed(EnsureRecordFailure::Upstream(error))
@@ -725,6 +799,207 @@ pub(crate) async fn ensure_record(
             .await
         }
     }
+}
+
+pub(crate) async fn ensure_record_absent(
+    db: &dyn Repository,
+    client: &DnsMgrClient,
+    input: &DeleteRecordInput,
+) -> DeleteRecordResult {
+    if input.rule_id <= 0 || !matches!(input.record_type, DnsRecordType::A | DnsRecordType::Aaaa) {
+        return DeleteRecordResult::Failed(EnsureRecordFailure::InvalidInput(
+            DnsDiscoveryError::UnsupportedRecordType(input.record_type),
+        ));
+    }
+    let fqdn = match normalize_fqdn(&input.fqdn) {
+        Ok(fqdn) => fqdn,
+        Err(error) => return DeleteRecordResult::Failed(EnsureRecordFailure::InvalidInput(error)),
+    };
+    match delete_is_authorized(db, input, &fqdn).await {
+        Ok(true) => {}
+        Ok(false) => return DeleteRecordResult::Failed(EnsureRecordFailure::InvalidRule),
+        Err(_) => return DeleteRecordResult::Failed(EnsureRecordFailure::Database),
+    }
+    let zone = match resolve_zone(client, &fqdn).await {
+        ZoneResolution::ZoneResolved(zone) => zone,
+        ZoneResolution::NoMatchingZone => {
+            return DeleteRecordResult::Failed(EnsureRecordFailure::NoMatchingZone)
+        }
+        ZoneResolution::UpstreamFailure(error) => {
+            return DeleteRecordResult::Failed(EnsureRecordFailure::Upstream(error))
+        }
+    };
+    let detail = match client.get_domain(zone.domain_id).await {
+        Ok(detail) => detail,
+        Err(error) => return DeleteRecordResult::Failed(EnsureRecordFailure::Upstream(error)),
+    };
+    let line = resolve_mutation_line(&input.line, &detail).unwrap_or_else(|| input.line.clone());
+    let binding = match db
+        .find_dns_record_binding_for_rule(
+            input.rule_id,
+            fqdn.as_str(),
+            input.record_type.as_str(),
+            &line.key,
+        )
+        .await
+    {
+        Ok(binding) => binding,
+        Err(_) => return DeleteRecordResult::Failed(EnsureRecordFailure::Database),
+    };
+    let discovery = discover_records(client, &zone, input.record_type, &line).await;
+    let records = match discovery {
+        RecordDiscovery::NoRecord => Vec::new(),
+        RecordDiscovery::SingleMatchingRecord(record) => vec![record],
+        RecordDiscovery::MultipleMatchingRecords(records) => records,
+        RecordDiscovery::ConflictingRecordType(_) => {
+            return DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+        }
+        RecordDiscovery::UpstreamFailure(error) => {
+            return DeleteRecordResult::Failed(EnsureRecordFailure::Upstream(error))
+        }
+    };
+    let Some(binding) = binding else {
+        return if records.is_empty() {
+            DeleteRecordResult::AlreadyAbsent
+        } else {
+            DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+        };
+    };
+    if records.len() > 1 {
+        return DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified);
+    }
+    if records.is_empty() {
+        return match set_binding_state(db, binding.id, "MISSING", None).await {
+            Ok(()) => DeleteRecordResult::AlreadyAbsent,
+            Err(()) => DeleteRecordResult::Failed(EnsureRecordFailure::Database),
+        };
+    }
+    let record = &records[0];
+    if record.record.record_id != binding.record_id {
+        return DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified);
+    }
+    if !binding_matches_record(Some(&binding), &fqdn, &zone, input.record_type, record) {
+        return DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified);
+    }
+
+    let ambiguous = match client
+        .delete_record(zone.domain_id, &binding.record_id)
+        .await
+    {
+        Ok(_) => false,
+        Err(error) if error.is_ambiguous_write() => true,
+        Err(error) => return DeleteRecordResult::Failed(EnsureRecordFailure::Upstream(error)),
+    };
+    let readback = discover_records(client, &zone, input.record_type, &line).await;
+    let line_record_remains = match readback {
+        RecordDiscovery::NoRecord => false,
+        RecordDiscovery::SingleMatchingRecord(_) | RecordDiscovery::MultipleMatchingRecords(_) => {
+            true
+        }
+        RecordDiscovery::ConflictingRecordType(_) => true,
+        RecordDiscovery::UpstreamFailure(_) => return DeleteRecordResult::MutationOutcomeUnknown,
+    };
+    if line_record_remains {
+        return if ambiguous {
+            DeleteRecordResult::MutationOutcomeUnknown
+        } else {
+            DeleteRecordResult::Failed(EnsureRecordFailure::PostWriteNotVerified)
+        };
+    }
+    if set_binding_state(db, binding.id, "MISSING", None)
+        .await
+        .is_err()
+    {
+        return DeleteRecordResult::MutationOutcomeUnknown;
+    }
+    DeleteRecordResult::Deleted {
+        record_id: binding.record_id,
+    }
+}
+
+async fn upsert_is_authorized(
+    db: &dyn Repository,
+    input: &EnsureRecordInput,
+    fqdn: &NormalizedFqdn,
+) -> Result<bool, crate::db::error::DbError> {
+    let Some(rule) =
+        RuleRepository::find_rule_by_id(db, input.rule_id, &ResourceScope::All).await?
+    else {
+        return Ok(false);
+    };
+    if !rule_is_dns_eligible(&rule)
+        || normalize_fqdn(rule.sni.as_deref().unwrap_or_default().trim())
+            .ok()
+            .as_ref()
+            != Some(fqdn)
+    {
+        return Ok(false);
+    }
+    if input.line.key == DEFAULT_LINE_KEY {
+        return Ok(matches!(
+            derive_dns_desired(db, input.rule_id).await?,
+            DnsDesiredResolution::Eligible(desired)
+                if desired.fqdn == fqdn.as_str()
+                    && desired.record_type == input.record_type
+                    && desired.expected_value == input.expected_value
+        ));
+    }
+    let Some(sync) = db
+        .find_dns_record_sync(input.rule_id, &input.line.key)
+        .await?
+    else {
+        return Ok(false);
+    };
+    Ok(sync.desired_action == "UPSERT"
+        && sync.fqdn == fqdn.as_str()
+        && sync.record_type == input.record_type.as_str()
+        && sync.expected_value.as_deref() == Some(input.expected_value.as_str())
+        && sync.line == input.line.raw_id)
+}
+
+async fn delete_is_authorized(
+    db: &dyn Repository,
+    input: &DeleteRecordInput,
+    fqdn: &NormalizedFqdn,
+) -> Result<bool, crate::db::error::DbError> {
+    let Some(rule) =
+        RuleRepository::find_rule_by_id(db, input.rule_id, &ResourceScope::All).await?
+    else {
+        return Ok(false);
+    };
+    if !rule_is_dns_eligible(&rule)
+        || normalize_fqdn(rule.sni.as_deref().unwrap_or_default().trim())
+            .ok()
+            .as_ref()
+            != Some(fqdn)
+        || input.line.key == DEFAULT_LINE_KEY
+    {
+        return Ok(false);
+    }
+    let Some(sync) = db
+        .find_dns_record_sync(input.rule_id, &input.line.key)
+        .await?
+    else {
+        return Ok(false);
+    };
+    Ok(sync.desired_action == "DELETE"
+        && sync.expected_value.is_none()
+        && sync.fqdn == fqdn.as_str()
+        && sync.record_type == input.record_type.as_str()
+        && sync.line == input.line.raw_id
+        && canonical_provider_line(&input.line.raw_id)
+            .is_some_and(|line| line.key == input.line.key))
+}
+
+fn canonical_provider_line(raw_id: &str) -> Option<ProviderLine> {
+    if raw_id.is_empty()
+        || raw_id != raw_id.trim()
+        || raw_id.len() > MAX_PROVIDER_LINE_ID_BYTES
+        || raw_id.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(ProviderLine::from_provider(raw_id, None))
 }
 
 pub(crate) fn resolve_mutation_line(
@@ -1121,6 +1396,15 @@ pub(crate) enum DnsDesiredResolution {
     },
 }
 
+#[allow(dead_code)] // RC9-S3 foundation; consumed by the Carrier Policy stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LineDesiredError {
+    Database,
+    InvalidRule,
+    InvalidLine,
+    InvalidValue,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PublicDnsObservation {
     ExpectedPresent,
@@ -1314,6 +1598,122 @@ async fn persist_desired(
     Ok(())
 }
 
+#[allow(dead_code)] // RC9-S3 foundation; consumed by the Carrier Policy stage.
+pub(crate) async fn schedule_line_upsert(
+    db: &dyn Repository,
+    rule_id: i64,
+    raw_line_id: &str,
+    expected_value: &str,
+) -> Result<(), LineDesiredError> {
+    let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
+    if line.key == DEFAULT_LINE_KEY {
+        return Err(LineDesiredError::InvalidLine);
+    }
+    let desired = line_desired_for_rule(db, rule_id, line, Some(expected_value)).await?;
+    persist_line_desired(db, &desired, "UPSERT", Some(expected_value)).await
+}
+
+#[allow(dead_code)] // RC9-S3 foundation; consumed by the Carrier Policy stage.
+pub(crate) async fn schedule_line_delete(
+    db: &dyn Repository,
+    rule_id: i64,
+    raw_line_id: &str,
+) -> Result<(), LineDesiredError> {
+    let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
+    if line.key == DEFAULT_LINE_KEY {
+        return Err(LineDesiredError::InvalidLine);
+    }
+    let desired = line_desired_for_rule(db, rule_id, line, None).await?;
+    persist_line_desired(db, &desired, "DELETE", None).await
+}
+
+#[allow(dead_code)]
+async fn line_desired_for_rule(
+    db: &dyn Repository,
+    rule_id: i64,
+    line: ProviderLine,
+    expected_value: Option<&str>,
+) -> Result<DnsDesiredRecord, LineDesiredError> {
+    let rule = RuleRepository::find_rule_by_id(db, rule_id, &ResourceScope::All)
+        .await
+        .map_err(|_| LineDesiredError::Database)?
+        .filter(rule_is_dns_eligible)
+        .ok_or(LineDesiredError::InvalidRule)?;
+    if let Some(value) = expected_value {
+        let ip = value
+            .parse::<Ipv4Addr>()
+            .map_err(|_| LineDesiredError::InvalidValue)?;
+        if ip.is_loopback() || ip.is_unspecified() {
+            return Err(LineDesiredError::InvalidValue);
+        }
+    }
+    let fqdn = normalize_fqdn(rule.sni.as_deref().unwrap_or_default().trim())
+        .map_err(|_| LineDesiredError::InvalidRule)?;
+    Ok(DnsDesiredRecord {
+        rule_id,
+        fqdn: fqdn.as_str().to_string(),
+        record_type: DnsRecordType::A,
+        expected_value: expected_value.unwrap_or_default().to_string(),
+        line,
+    })
+}
+
+#[allow(dead_code)]
+async fn persist_line_desired(
+    db: &dyn Repository,
+    desired: &DnsDesiredRecord,
+    desired_action: &str,
+    expected_value: Option<&str>,
+) -> Result<(), LineDesiredError> {
+    let now = utc_now();
+    let existing = db
+        .find_dns_record_sync(desired.rule_id, &desired.line.key)
+        .await
+        .map_err(|_| LineDesiredError::Database)?;
+    match existing {
+        None => db
+            .insert_dns_record_sync(&NewDnsRecordSync {
+                rule_id: desired.rule_id,
+                fqdn: desired.fqdn.clone(),
+                record_type: desired.record_type.as_str().into(),
+                expected_value: expected_value.map(str::to_string),
+                line: desired.line.raw_id.clone(),
+                line_key: desired.line.key.clone(),
+                desired_action: desired_action.into(),
+                state: "PENDING".into(),
+                ownership: "UNKNOWN".into(),
+                last_error_category: None,
+                next_attempt_at: Some(now.clone()),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .map_err(|_| LineDesiredError::Database),
+        Some(_) => db
+            .update_dns_record_sync_desired(
+                desired.rule_id,
+                &desired.fqdn,
+                desired.record_type.as_str(),
+                expected_value,
+                &desired.line.raw_id,
+                &desired.line.key,
+                desired_action,
+                "PENDING",
+                "UNKNOWN",
+                None,
+                Some(&now),
+                &now,
+            )
+            .await
+            .map_err(|_| LineDesiredError::Database)
+            .and_then(|updated| {
+                (updated == 1)
+                    .then_some(())
+                    .ok_or(LineDesiredError::Database)
+            }),
+    }
+}
+
 async fn persist_resolution(
     db: &dyn Repository,
     rule_id: i64,
@@ -1323,15 +1723,11 @@ async fn persist_resolution(
     match resolution {
         DnsDesiredResolution::Frozen => {}
         DnsDesiredResolution::NotEligible => {
-            if db
-                .find_dns_record_sync(rule_id, DEFAULT_LINE_KEY)
-                .await?
-                .is_some()
-            {
+            for sync in db.list_dns_record_syncs_for_rule(rule_id).await? {
                 let now = utc_now();
                 db.schedule_dns_record_sync(
                     rule_id,
-                    DEFAULT_LINE_KEY,
+                    &sync.line_key,
                     "NOT_ELIGIBLE",
                     "UNKNOWN",
                     Some("RULE_NOT_ELIGIBLE"),
@@ -1526,15 +1922,11 @@ pub async fn disable_all_syncs(db: &dyn Repository) -> Result<u64, crate::db::er
         ) {
             continue;
         }
-        if db
-            .find_dns_record_sync(rule.id, DEFAULT_LINE_KEY)
-            .await?
-            .is_some()
-        {
+        for sync in db.list_dns_record_syncs_for_rule(rule.id).await? {
             updated += db
                 .schedule_dns_record_sync(
                     rule.id,
-                    DEFAULT_LINE_KEY,
+                    &sync.line_key,
                     "DISABLED",
                     "UNKNOWN",
                     Some("DNSMGR_DISABLED"),
@@ -1559,34 +1951,35 @@ async fn resume_unfrozen_syncs_on_startup(
         ) {
             continue;
         }
-        let Some(sync) = db.find_dns_record_sync(rule.id, DEFAULT_LINE_KEY).await? else {
-            continue;
-        };
-        let resumed_state = match sync.state.as_str() {
-            "MUTATION_VERIFIED" | "PROPAGATING" => Some("PROPAGATING"),
-            "PENDING" | "SYNCING" => Some("PENDING"),
-            "FAILED"
-                if matches!(
-                    sync.last_error_category.as_deref(),
-                    Some("DNSMGR_TRANSPORT" | "DNSMGR_TIMEOUT" | "DNSMGR_TEMPORARY" | "DATABASE")
-                ) =>
-            {
-                Some("PENDING")
+        for sync in db.list_dns_record_syncs_for_rule(rule.id).await? {
+            let resumed_state = match sync.state.as_str() {
+                "MUTATION_VERIFIED" | "PROPAGATING" => Some("PROPAGATING"),
+                "PENDING" | "SYNCING" => Some("PENDING"),
+                "FAILED"
+                    if matches!(
+                        sync.last_error_category.as_deref(),
+                        Some(
+                            "DNSMGR_TRANSPORT" | "DNSMGR_TIMEOUT" | "DNSMGR_TEMPORARY" | "DATABASE"
+                        )
+                    ) =>
+                {
+                    Some("PENDING")
+                }
+                _ => None,
+            };
+            if let Some(resumed_state) = resumed_state {
+                updated += db
+                    .schedule_dns_record_sync(
+                        rule.id,
+                        &sync.line_key,
+                        resumed_state,
+                        &sync.ownership,
+                        sync.last_error_category.as_deref(),
+                        Some(&now),
+                        &now,
+                    )
+                    .await?;
             }
-            _ => None,
-        };
-        if let Some(resumed_state) = resumed_state {
-            updated += db
-                .schedule_dns_record_sync(
-                    rule.id,
-                    DEFAULT_LINE_KEY,
-                    resumed_state,
-                    &sync.ownership,
-                    sync.last_error_category.as_deref(),
-                    Some(&now),
-                    &now,
-                )
-                .await?;
         }
     }
     Ok(updated)
@@ -1619,7 +2012,8 @@ fn is_transient_failure(failure: &EnsureRecordFailure) -> bool {
         | EnsureRecordFailure::NoMatchingZone
         | EnsureRecordFailure::ProviderLineUnavailable
         | EnsureRecordFailure::TtlOutOfRange
-        | EnsureRecordFailure::PostWriteNotVerified => false,
+        | EnsureRecordFailure::PostWriteNotVerified
+        | EnsureRecordFailure::OwnershipUnverified => false,
     }
 }
 
@@ -1810,8 +2204,13 @@ async fn reconcile_one(
     sync: DnsRecordSync,
     client: &DnsMgrClient,
 ) -> Vec<DnsAuditTransition> {
+    if sync.desired_action == "DELETE" {
+        return reconcile_delete(db, sync, client).await;
+    }
     let mut audits = Vec::new();
-    if matches!(sync.state.as_str(), "PROPAGATING" | "MUTATION_VERIFIED") {
+    if sync.line_key == DEFAULT_LINE_KEY
+        && matches!(sync.state.as_str(), "PROPAGATING" | "MUTATION_VERIFIED")
+    {
         if let Some(audit) = observe_and_store(
             db,
             &sync,
@@ -1884,17 +2283,40 @@ async fn reconcile_one(
                         None,
                     ));
                 }
-                if let Some(audit) = observe_and_store(
+                if sync.line_key == DEFAULT_LINE_KEY {
+                    if let Some(audit) = observe_and_store(
+                        db,
+                        &sync,
+                        "MUTATION_VERIFIED",
+                        "PANEL",
+                        Some(&verified_at),
+                        0,
+                    )
+                    .await
+                    {
+                        audits.push(audit);
+                    }
+                } else if update_sync(
                     db,
                     &sync,
                     "MUTATION_VERIFIED",
+                    "PROPAGATED",
                     "PANEL",
                     Some(&verified_at),
+                    Some(&verified_at),
+                    Some(&verified_at),
+                    None,
                     0,
+                    None,
                 )
                 .await
                 {
-                    audits.push(audit);
+                    audits.push(DnsAuditTransition::from_sync(
+                        "DNS_PROPAGATED",
+                        &sync,
+                        "PANEL",
+                        None,
+                    ));
                 }
             }
         }
@@ -1992,6 +2414,7 @@ async fn reconcile_one(
                 },
                 EnsureRecordFailure::Database => "DATABASE",
                 EnsureRecordFailure::PostWriteNotVerified => "POST_WRITE_NOT_VERIFIED",
+                EnsureRecordFailure::OwnershipUnverified => "DNS_OWNERSHIP_UNVERIFIED",
             };
             let updated = update_sync(
                 db,
@@ -2008,6 +2431,136 @@ async fn reconcile_one(
             )
             .await;
             if updated && next_attempt.is_none() {
+                audits.push(DnsAuditTransition::from_sync(
+                    "DNS_SYNC_FAILED",
+                    &sync,
+                    "UNKNOWN",
+                    Some(category),
+                ));
+            }
+        }
+    }
+    audits
+}
+
+async fn reconcile_delete(
+    db: &dyn Repository,
+    sync: DnsRecordSync,
+    client: &DnsMgrClient,
+) -> Vec<DnsAuditTransition> {
+    let mut audits = Vec::new();
+    let attempt = sync.attempt_count.saturating_add(1);
+    let recovery_at = retry_timestamp(attempt);
+    if !update_sync(
+        db,
+        &sync,
+        &sync.state,
+        "SYNCING",
+        &sync.ownership,
+        sync.mutation_verified_at.as_deref(),
+        sync.last_observed_at.as_deref(),
+        sync.propagated_at.as_deref(),
+        None,
+        attempt,
+        Some(&recovery_at),
+    )
+    .await
+    {
+        return audits;
+    }
+
+    let input = DeleteRecordInput {
+        rule_id: sync.rule_id,
+        fqdn: sync.fqdn.clone(),
+        record_type: DnsRecordType::A,
+        line: ProviderLine::from_provider(&sync.line, None),
+    };
+    match ensure_record_absent(db, client, &input).await {
+        DeleteRecordResult::Deleted { .. } | DeleteRecordResult::AlreadyAbsent => {
+            let verified_at = utc_now();
+            if update_sync(
+                db,
+                &sync,
+                "SYNCING",
+                "PROPAGATED",
+                "PANEL",
+                Some(&verified_at),
+                Some(&verified_at),
+                Some(&verified_at),
+                None,
+                0,
+                None,
+            )
+            .await
+            {
+                audits.push(DnsAuditTransition::from_sync(
+                    "DNS_RECORD_DELETED",
+                    &sync,
+                    "PANEL",
+                    None,
+                ));
+            }
+        }
+        DeleteRecordResult::MutationOutcomeUnknown => {
+            if update_sync(
+                db,
+                &sync,
+                "SYNCING",
+                "MUTATION_OUTCOME_UNKNOWN",
+                "UNKNOWN",
+                None,
+                None,
+                None,
+                Some("MUTATION_UNKNOWN"),
+                attempt,
+                None,
+            )
+            .await
+            {
+                audits.push(DnsAuditTransition::from_sync(
+                    "DNS_MUTATION_OUTCOME_UNKNOWN",
+                    &sync,
+                    "UNKNOWN",
+                    Some("MUTATION_UNKNOWN"),
+                ));
+            }
+        }
+        DeleteRecordResult::Failed(failure) => {
+            let transient = is_transient_failure(&failure);
+            let next_attempt =
+                (transient && attempt < DNS_SYNC_MAX_ATTEMPTS).then(|| retry_timestamp(attempt));
+            let category = match &failure {
+                EnsureRecordFailure::InvalidInput(_) => "INVALID_INPUT",
+                EnsureRecordFailure::InvalidRule => "INVALID_RULE",
+                EnsureRecordFailure::NoMatchingZone => "NO_MATCHING_ZONE",
+                EnsureRecordFailure::ProviderLineUnavailable => "PROVIDER_LINE_UNAVAILABLE",
+                EnsureRecordFailure::TtlOutOfRange => "TTL_OUT_OF_RANGE",
+                EnsureRecordFailure::Upstream(error) => match error {
+                    DnsMgrError::Transport(_) => "DNSMGR_TRANSPORT",
+                    DnsMgrError::Timeout => "DNSMGR_TIMEOUT",
+                    DnsMgrError::RateLimitedOrTemporarilyUnavailable => "DNSMGR_TEMPORARY",
+                    _ => "DNSMGR_UPSTREAM",
+                },
+                EnsureRecordFailure::Database => "DATABASE",
+                EnsureRecordFailure::PostWriteNotVerified => "POST_WRITE_NOT_VERIFIED",
+                EnsureRecordFailure::OwnershipUnverified => "DNS_OWNERSHIP_UNVERIFIED",
+            };
+            if update_sync(
+                db,
+                &sync,
+                "SYNCING",
+                "FAILED",
+                "UNKNOWN",
+                None,
+                None,
+                None,
+                Some(category),
+                attempt,
+                next_attempt.as_deref(),
+            )
+            .await
+                && next_attempt.is_none()
+            {
                 audits.push(DnsAuditTransition::from_sync(
                     "DNS_SYNC_FAILED",
                     &sync,
@@ -2095,12 +2648,9 @@ async fn list_executable_due_syncs(
     db: &dyn Repository,
     now: &str,
 ) -> Result<Vec<DnsRecordSync>, crate::db::error::DbError> {
-    // There is at most one DNS sync per rule. Reading up to the rule count
-    // ensures frozen transactions cannot consume the executable batch slots.
-    let rule_count = db.list_rules(&ResourceScope::All).await?.len();
-    let due_limit = i64::try_from(rule_count)
-        .unwrap_or(i64::MAX)
-        .max(DNS_SYNC_MAX_BATCH);
+    // Read up to the persisted identity count so frozen lines cannot consume
+    // the bounded executable slots now that a Rule may own multiple syncs.
+    let due_limit = db.count_dns_record_syncs().await?.max(DNS_SYNC_MAX_BATCH);
     let due = db.list_due_dns_record_syncs(now, due_limit).await?;
     let mut executable = Vec::with_capacity(DNS_SYNC_MAX_BATCH as usize);
 
@@ -2247,7 +2797,7 @@ mod tests {
             assert_eq!(line.raw_id, raw);
         }
         let custom = ProviderLine::from_provider("line-42", Some("Premium"));
-        assert_eq!(custom.key, "provider:line-42");
+        assert_eq!(custom.key, "dnsmgr:line-42");
         assert_eq!(custom.raw_id, "line-42");
         assert_eq!(custom.name.as_deref(), Some("Premium"));
     }
@@ -2502,6 +3052,413 @@ mod tests {
             after.updated_at, "2000-01-01 00:00:00",
             "no-op must not churn binding"
         );
+    }
+
+    #[tokio::test]
+    async fn dynamic_line_upsert_uses_exact_raw_id_and_converges_by_provider_readback() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_upsert(&db, 100, "Dianxin_Shandong", "192.0.2.20")
+            .await
+            .unwrap();
+        let mock =
+            spawn_ensure_mock(Vec::new(), MutationBehavior::Apply, MutationBehavior::Apply).await;
+
+        let audits = reconcile_one(
+            &db,
+            db.find_dns_record_sync(100, "dnsmgr:Dianxin_Shandong")
+                .await
+                .unwrap()
+                .unwrap(),
+            &mock.client,
+        )
+        .await;
+        let sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin_Shandong")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sync.state, "PROPAGATED");
+        assert_eq!(sync.expected_value.as_deref(), Some("192.0.2.20"));
+        assert_eq!(mock.state.add_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mock.state
+                .last_add_form
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get("line")
+                .map(String::as_str),
+            Some("Dianxin_Shandong")
+        );
+        assert!(audits.iter().any(|audit| audit.action == "DNS_PROPAGATED"));
+        assert!(db
+            .find_dns_record_binding_for_rule(
+                100,
+                "op1.example.com",
+                "A",
+                "dnsmgr:Dianxin_Shandong"
+            )
+            .await
+            .unwrap()
+            .is_some());
+
+        let unavailable_db = ensure_db().await;
+        configure_eligible_rule(&unavailable_db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_upsert(&unavailable_db, 100, "Dianxin", "192.0.2.20")
+            .await
+            .unwrap();
+        let unavailable =
+            spawn_ensure_mock(Vec::new(), MutationBehavior::Apply, MutationBehavior::Apply).await;
+        unavailable
+            .state
+            .record_lines
+            .lock()
+            .unwrap()
+            .retain(|line| line.id != "Dianxin");
+        assert_eq!(
+            ensure_record(
+                &unavailable_db,
+                &unavailable.client,
+                &EnsureRecordInput {
+                    rule_id: 100,
+                    fqdn: "op1.example.com".into(),
+                    record_type: DnsRecordType::A,
+                    expected_value: "192.0.2.20".into(),
+                    line: ProviderLine::from_provider("Dianxin", None),
+                },
+            )
+            .await,
+            EnsureRecordResult::Failed(EnsureRecordFailure::ProviderLineUnavailable)
+        );
+        assert_eq!(unavailable.state.total_mutations(), 0);
+    }
+
+    #[tokio::test]
+    async fn dynamic_line_update_and_ambiguous_update_are_isolated_and_single_attempt() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_upsert(&db, 100, "Dianxin", "192.0.2.20")
+            .await
+            .unwrap();
+        insert_line_binding(&db, "Dianxin", "line-record", "192.0.2.19").await;
+        let updated = spawn_ensure_mock(
+            vec![record("line-record", "A", "192.0.2.19", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        let result = ensure_record(
+            &db,
+            &updated.client,
+            &EnsureRecordInput {
+                rule_id: 100,
+                fqdn: "op1.example.com".into(),
+                record_type: DnsRecordType::A,
+                expected_value: "192.0.2.20".into(),
+                line: ProviderLine::from_provider("Dianxin", None),
+            },
+        )
+        .await;
+        assert_eq!(
+            result,
+            EnsureRecordResult::Updated {
+                record_id: "line-record".into()
+            }
+        );
+        assert_eq!(updated.state.update_attempts.load(Ordering::SeqCst), 1);
+        assert!(db
+            .find_dns_record_sync(100, DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .is_none());
+
+        let ambiguous_db = ensure_db().await;
+        configure_eligible_rule(&ambiguous_db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_upsert(&ambiguous_db, 100, "Dianxin", "192.0.2.20")
+            .await
+            .unwrap();
+        insert_line_binding(&ambiguous_db, "Dianxin", "line-record", "192.0.2.19").await;
+        let ambiguous = spawn_ensure_mock(
+            vec![record("line-record", "A", "192.0.2.19", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::TransportAfterApply,
+        )
+        .await;
+        assert_eq!(
+            ensure_record(
+                &ambiguous_db,
+                &ambiguous.client,
+                &EnsureRecordInput {
+                    rule_id: 100,
+                    fqdn: "op1.example.com".into(),
+                    record_type: DnsRecordType::A,
+                    expected_value: "192.0.2.20".into(),
+                    line: ProviderLine::from_provider("Dianxin", None),
+                },
+            )
+            .await,
+            EnsureRecordResult::MutationOutcomeUnknown
+        );
+        assert_eq!(ambiguous.state.update_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ambiguous.state.records.lock().unwrap()[0].values,
+            ["192.0.2.20"]
+        );
+
+        let external_db = ensure_db().await;
+        configure_eligible_rule(&external_db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_upsert(&external_db, 100, "Dianxin", "192.0.2.20")
+            .await
+            .unwrap();
+        let external = spawn_ensure_mock(
+            vec![record("external", "A", "192.0.2.19", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert_eq!(
+            ensure_record(
+                &external_db,
+                &external.client,
+                &EnsureRecordInput {
+                    rule_id: 100,
+                    fqdn: "op1.example.com".into(),
+                    record_type: DnsRecordType::A,
+                    expected_value: "192.0.2.20".into(),
+                    line: ProviderLine::from_provider("Dianxin", None),
+                },
+            )
+            .await,
+            EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+        );
+        assert_eq!(external.state.total_mutations(), 0);
+    }
+
+    #[tokio::test]
+    async fn dynamic_line_failure_does_not_overwrite_default_status_or_retry() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        schedule_rule(&db, 100).await.unwrap();
+        let default_before = db
+            .find_dns_record_sync(100, DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        schedule_line_upsert(&db, 100, "Dianxin", "192.0.2.20")
+            .await
+            .unwrap();
+        let mock =
+            spawn_ensure_mock(Vec::new(), MutationBehavior::Apply, MutationBehavior::Apply).await;
+        mock.state
+            .record_lines
+            .lock()
+            .unwrap()
+            .retain(|line| line.id != "Dianxin");
+
+        reconcile_one(
+            &db,
+            db.find_dns_record_sync(100, "dnsmgr:Dianxin")
+                .await
+                .unwrap()
+                .unwrap(),
+            &mock.client,
+        )
+        .await;
+        let carrier = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        let default = db
+            .find_dns_record_sync(100, DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(carrier.state, "FAILED");
+        assert_eq!(
+            carrier.last_error_category.as_deref(),
+            Some("PROVIDER_LINE_UNAVAILABLE")
+        );
+        assert_eq!(carrier.next_attempt_at, None);
+        assert_eq!(default, default_before);
+    }
+
+    #[tokio::test]
+    async fn line_delete_removes_only_exact_owned_record_and_accepts_verified_absence() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_delete(&db, 100, "Dianxin").await.unwrap();
+        insert_line_binding(&db, "Dianxin", "owned", "192.0.2.20").await;
+        let mock = spawn_ensure_mock(
+            vec![
+                record("owned", "A", "192.0.2.20", "Dianxin"),
+                record("other-line", "A", "192.0.2.30", "Dianxin_Shandong"),
+            ],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+
+        assert_eq!(
+            ensure_record_absent(&db, &mock.client, &delete_input("Dianxin")).await,
+            DeleteRecordResult::Deleted {
+                record_id: "owned".into()
+            }
+        );
+        assert_eq!(mock.state.delete_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mock.state
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|record| record.record_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["other-line"]
+        );
+        assert_eq!(
+            ensure_record_absent(&db, &mock.client, &delete_input("Dianxin")).await,
+            DeleteRecordResult::AlreadyAbsent
+        );
+        assert_eq!(mock.state.delete_attempts.load(Ordering::SeqCst), 1);
+
+        let stale_catalog_db = ensure_db().await;
+        configure_eligible_rule(&stale_catalog_db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_delete(&stale_catalog_db, 100, "Dianxin")
+            .await
+            .unwrap();
+        insert_line_binding(&stale_catalog_db, "Dianxin", "stale-owned", "192.0.2.20").await;
+        let stale_catalog = spawn_ensure_mock(
+            vec![record("stale-owned", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        stale_catalog
+            .state
+            .record_lines
+            .lock()
+            .unwrap()
+            .retain(|line| line.id != "Dianxin");
+        assert_eq!(
+            ensure_record_absent(
+                &stale_catalog_db,
+                &stale_catalog.client,
+                &delete_input("Dianxin")
+            )
+            .await,
+            DeleteRecordResult::Deleted {
+                record_id: "stale-owned".into()
+            }
+        );
+        assert_eq!(
+            stale_catalog.state.delete_attempts.load(Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn line_delete_refuses_external_or_ambiguous_ownership_without_mutation() {
+        let external_db = ensure_db().await;
+        configure_eligible_rule(&external_db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_delete(&external_db, 100, "Dianxin")
+            .await
+            .unwrap();
+        let external = spawn_ensure_mock(
+            vec![record("external", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert_eq!(
+            ensure_record_absent(&external_db, &external.client, &delete_input("Dianxin")).await,
+            DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+        );
+        assert_eq!(external.state.delete_attempts.load(Ordering::SeqCst), 0);
+
+        let ambiguous_db = ensure_db().await;
+        configure_eligible_rule(&ambiguous_db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_delete(&ambiguous_db, 100, "Dianxin")
+            .await
+            .unwrap();
+        insert_line_binding(&ambiguous_db, "Dianxin", "owned", "192.0.2.20").await;
+        let ambiguous = spawn_ensure_mock(
+            vec![
+                record("owned", "A", "192.0.2.20", "Dianxin"),
+                record("duplicate", "A", "192.0.2.21", "Dianxin"),
+            ],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert_eq!(
+            ensure_record_absent(&ambiguous_db, &ambiguous.client, &delete_input("Dianxin")).await,
+            DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+        );
+        assert_eq!(ambiguous.state.delete_attempts.load(Ordering::SeqCst), 0);
+
+        let drift_db = ensure_db().await;
+        configure_eligible_rule(&drift_db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_delete(&drift_db, 100, "Dianxin")
+            .await
+            .unwrap();
+        insert_line_binding(&drift_db, "Dianxin", "old-owned", "192.0.2.20").await;
+        let drift = spawn_ensure_mock(
+            vec![record("replacement-external", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert_eq!(
+            ensure_record_absent(&drift_db, &drift.client, &delete_input("Dianxin")).await,
+            DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+        );
+        assert_eq!(drift.state.delete_attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_line_delete_uses_readback_and_is_never_blindly_retried() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_delete(&db, 100, "Dianxin").await.unwrap();
+        insert_line_binding(&db, "Dianxin", "owned", "192.0.2.20").await;
+        let mock = spawn_ensure_mock(
+            vec![record("owned", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        *mock.state.delete_behavior.lock().unwrap() = MutationBehavior::TransportAfterApply;
+
+        assert_eq!(
+            ensure_record_absent(&db, &mock.client, &delete_input("Dianxin")).await,
+            DeleteRecordResult::Deleted {
+                record_id: "owned".into()
+            }
+        );
+        assert_eq!(mock.state.delete_attempts.load(Ordering::SeqCst), 1);
+
+        let unknown_db = ensure_db().await;
+        configure_eligible_rule(&unknown_db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_delete(&unknown_db, 100, "Dianxin")
+            .await
+            .unwrap();
+        insert_line_binding(&unknown_db, "Dianxin", "still-owned", "192.0.2.20").await;
+        let unknown = spawn_ensure_mock(
+            vec![record("still-owned", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        *unknown.state.delete_behavior.lock().unwrap() = MutationBehavior::TransportWithoutApply;
+        assert_eq!(
+            ensure_record_absent(&unknown_db, &unknown.client, &delete_input("Dianxin")).await,
+            DeleteRecordResult::MutationOutcomeUnknown
+        );
+        assert_eq!(unknown.state.delete_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(unknown.state.records.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2926,14 +3883,18 @@ mod tests {
         Apply,
         AcceptWithoutApply,
         TransportAfterApply,
+        TransportWithoutApply,
     }
 
     struct MockDnsState {
         records: Mutex<Vec<DnsMgrRecord>>,
+        record_lines: Mutex<Vec<DnsMgrRecordLine>>,
         add_behavior: MutationBehavior,
         update_behavior: MutationBehavior,
+        delete_behavior: Mutex<MutationBehavior>,
         add_attempts: AtomicUsize,
         update_attempts: AtomicUsize,
+        delete_attempts: AtomicUsize,
         list_attempts: AtomicUsize,
         last_add_form: Mutex<Option<HashMap<String, String>>>,
         last_update_form: Mutex<Option<HashMap<String, String>>>,
@@ -2941,7 +3902,9 @@ mod tests {
 
     impl MockDnsState {
         fn total_mutations(&self) -> usize {
-            self.add_attempts.load(Ordering::SeqCst) + self.update_attempts.load(Ordering::SeqCst)
+            self.add_attempts.load(Ordering::SeqCst)
+                + self.update_attempts.load(Ordering::SeqCst)
+                + self.delete_attempts.load(Ordering::SeqCst)
         }
     }
 
@@ -2964,10 +3927,29 @@ mod tests {
     ) -> EnsureMock {
         let state = Arc::new(MockDnsState {
             records: Mutex::new(records),
+            record_lines: Mutex::new(vec![
+                DnsMgrRecordLine {
+                    id: "default_view".into(),
+                    name: "Global default".into(),
+                    parent: None,
+                },
+                DnsMgrRecordLine {
+                    id: "Dianxin".into(),
+                    name: "电信".into(),
+                    parent: None,
+                },
+                DnsMgrRecordLine {
+                    id: "Dianxin_Shandong".into(),
+                    name: "电信_山东".into(),
+                    parent: Some("Dianxin".into()),
+                },
+            ]),
             add_behavior,
             update_behavior,
+            delete_behavior: Mutex::new(MutationBehavior::Apply),
             add_attempts: AtomicUsize::new(0),
             update_attempts: AtomicUsize::new(0),
+            delete_attempts: AtomicUsize::new(0),
             list_attempts: AtomicUsize::new(0),
             last_add_form: Mutex::new(None),
             last_update_form: Mutex::new(None),
@@ -2978,6 +3960,7 @@ mod tests {
             .route("/api/record/data/7", post(mock_records))
             .route("/api/record/add/7", post(mock_add_record))
             .route("/api/record/update/7", post(mock_update_record))
+            .route("/api/record/delete/7", post(mock_delete_record))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -2998,7 +3981,14 @@ mod tests {
         }))
     }
 
-    async fn mock_domain_detail() -> Json<serde_json::Value> {
+    async fn mock_domain_detail(State(state): State<Arc<MockDnsState>>) -> Json<serde_json::Value> {
+        let record_lines = state
+            .record_lines
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|line| json!({"id": line.id, "name": line.name, "parent": line.parent}))
+            .collect::<Vec<_>>();
         Json(json!({
             "code": 0,
             "data": {
@@ -3006,7 +3996,7 @@ mod tests {
                 "name": "example.com",
                 "type": "provider",
                 "minTTL": 1200,
-                "recordLine": [{"id": "default_view", "name": "Global default", "parent": null}]
+                "recordLine": record_lines
             }
         }))
     }
@@ -3048,7 +4038,10 @@ mod tests {
     ) -> Response {
         state.update_attempts.fetch_add(1, Ordering::SeqCst);
         *state.last_update_form.lock().unwrap() = Some(form.clone());
-        if matches!(state.update_behavior, MutationBehavior::Apply) {
+        if matches!(
+            state.update_behavior,
+            MutationBehavior::Apply | MutationBehavior::TransportAfterApply
+        ) {
             let record_id = form.get("recordid").unwrap();
             if let Some(record) = state
                 .records
@@ -3063,8 +4056,31 @@ mod tests {
         mutation_response(state.update_behavior)
     }
 
+    async fn mock_delete_record(
+        State(state): State<Arc<MockDnsState>>,
+        Form(form): Form<HashMap<String, String>>,
+    ) -> Response {
+        state.delete_attempts.fetch_add(1, Ordering::SeqCst);
+        let behavior = *state.delete_behavior.lock().unwrap();
+        if matches!(
+            behavior,
+            MutationBehavior::Apply | MutationBehavior::TransportAfterApply
+        ) {
+            let record_id = form.get("recordid").unwrap();
+            state
+                .records
+                .lock()
+                .unwrap()
+                .retain(|record| &record.record_id != record_id);
+        }
+        mutation_response(behavior)
+    }
+
     fn mutation_response(behavior: MutationBehavior) -> Response {
-        if matches!(behavior, MutationBehavior::TransportAfterApply) {
+        if matches!(
+            behavior,
+            MutationBehavior::TransportAfterApply | MutationBehavior::TransportWithoutApply
+        ) {
             let stream = futures_util::stream::once(async {
                 Err::<String, io::Error>(io::Error::other("injected response body failure"))
             });
@@ -4175,6 +5191,41 @@ mod tests {
             expected_value: expected_value.into(),
             line: ProviderLine::default(),
         }
+    }
+
+    fn delete_input(raw_line_id: &str) -> DeleteRecordInput {
+        DeleteRecordInput {
+            rule_id: 100,
+            fqdn: "op1.example.com".into(),
+            record_type: DnsRecordType::A,
+            line: ProviderLine::from_provider(raw_line_id, None),
+        }
+    }
+
+    async fn insert_line_binding(
+        db: &SqliteRepository,
+        raw_line_id: &str,
+        record_id: &str,
+        desired_value: &str,
+    ) {
+        let line = ProviderLine::from_provider(raw_line_id, None);
+        db.insert_dns_record_binding(&NewDnsRecordBinding {
+            rule_id: Some(100),
+            fqdn: "op1.example.com".into(),
+            zone_id: 7,
+            zone_name: "example.com".into(),
+            host: "op1".into(),
+            record_type: "A".into(),
+            line: raw_line_id.into(),
+            line_key: line.key,
+            record_id: record_id.into(),
+            desired_value: desired_value.into(),
+            state: "BOUND".into(),
+            last_observed_at: None,
+            created_at: utc_now(),
+        })
+        .await
+        .unwrap();
     }
 
     fn domain(domain_id: u64, zone_name: &str) -> DnsMgrDomain {

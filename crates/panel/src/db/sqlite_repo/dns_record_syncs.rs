@@ -134,6 +134,12 @@ impl DnsRecordSyncRepository for SqliteRepository {
         )
     }
 
+    async fn count_dns_record_syncs(&self) -> Result<i64, DbError> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM dns_record_syncs")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
     async fn list_due_dns_record_syncs(
         &self,
         now: &str,

@@ -706,7 +706,7 @@ pub struct DnsRecordBinding {
     pub record_type: String,
     /// Exact provider line identity as observed when the binding was created.
     pub line: String,
-    /// Normalized comparison key (`default` or `provider:<raw id>`).
+    /// Stable desired identity (`default` or `dnsmgr:<opaque raw id>`).
     pub line_key: String,
     pub record_id: String,
     pub desired_value: String,
@@ -867,6 +867,8 @@ pub trait DnsRecordSyncRepository: Send + Sync {
     ) -> Result<u64, DbError>;
 
     async fn delete_dns_record_sync(&self, rule_id: i64, line_key: &str) -> Result<u64, DbError>;
+
+    async fn count_dns_record_syncs(&self) -> Result<i64, DbError>;
 
     async fn list_due_dns_record_syncs(
         &self,

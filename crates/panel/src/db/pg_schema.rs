@@ -1743,45 +1743,45 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
 
     if current < 34 {
         let mut tx = pool.begin().await?;
-        let has_desired_action: bool = sqlx::query_scalar(
-            "SELECT EXISTS (\
-                 SELECT 1 FROM information_schema.columns\
-                 WHERE table_schema = current_schema()\
-                   AND table_name = 'dns_record_syncs'\
-                   AND column_name = 'desired_action'\
-             )",
+        sqlx::query(
+            "ALTER TABLE dns_record_syncs\
+                 ADD COLUMN IF NOT EXISTS desired_action TEXT NOT NULL DEFAULT 'UPSERT'",
         )
-        .fetch_one(&mut *tx)
+        .execute(&mut *tx)
         .await?;
-        if !has_desired_action {
-            sqlx::query(
-                "ALTER TABLE dns_record_syncs\
-                     ADD COLUMN desired_action TEXT NOT NULL DEFAULT 'UPSERT'",
-            )
+        sqlx::query("ALTER TABLE dns_record_syncs ALTER COLUMN expected_value DROP NOT NULL")
             .execute(&mut *tx)
             .await?;
-            sqlx::query("ALTER TABLE dns_record_syncs ALTER COLUMN expected_value DROP NOT NULL")
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("ALTER TABLE dns_record_syncs DROP CONSTRAINT dns_record_syncs_pkey")
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("ALTER TABLE dns_record_syncs ADD PRIMARY KEY (rule_id, line_key)")
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query(
-                "ALTER TABLE dns_record_syncs ADD CONSTRAINT dns_record_syncs_action_check\
-                     CHECK (desired_action IN ('UPSERT','DELETE'))",
-            )
+        sqlx::query("ALTER TABLE dns_record_syncs DROP CONSTRAINT IF EXISTS dns_record_syncs_pkey")
             .execute(&mut *tx)
             .await?;
-            sqlx::query(
-                "ALTER TABLE dns_record_syncs ADD CONSTRAINT dns_record_syncs_value_check\
-                     CHECK (desired_action = 'DELETE' OR expected_value IS NOT NULL)",
-            )
+        sqlx::query("ALTER TABLE dns_record_syncs ADD PRIMARY KEY (rule_id, line_key)")
             .execute(&mut *tx)
             .await?;
-        }
+        sqlx::query(
+            "ALTER TABLE dns_record_syncs\
+                 DROP CONSTRAINT IF EXISTS dns_record_syncs_action_check",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE dns_record_syncs ADD CONSTRAINT dns_record_syncs_action_check\
+                 CHECK (desired_action IN ('UPSERT','DELETE'))",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE dns_record_syncs\
+                 DROP CONSTRAINT IF EXISTS dns_record_syncs_value_check",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE dns_record_syncs ADD CONSTRAINT dns_record_syncs_value_check\
+                 CHECK (desired_action = 'DELETE' OR expected_value IS NOT NULL)",
+        )
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO schema_version (version) VALUES (34) ON CONFLICT (version) DO NOTHING",
         )

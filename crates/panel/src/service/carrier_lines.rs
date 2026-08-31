@@ -255,6 +255,7 @@ fn intersect_catalogs(catalogs: Vec<BTreeMap<String, CarrierLine>>) -> Vec<Carri
 
 fn validate_line_id(line_id: &str) -> Result<(), CarrierLineCatalogError> {
     if line_id.is_empty()
+        || line_id != line_id.trim()
         || line_id.len() > MAX_LINE_ID_BYTES
         || line_id.chars().any(char::is_control)
     {
@@ -310,6 +311,7 @@ mod tests {
             ]
         );
         assert!(normalize_lines(vec![line("bad\nline", "bad", None)]).is_err());
+        assert!(normalize_lines(vec![line(" Dianxin", "bad", None)]).is_err());
     }
 
     #[test]
