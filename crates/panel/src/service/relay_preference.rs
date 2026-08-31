@@ -2352,6 +2352,17 @@ async fn finalize_switching_group(
     })
 }
 
+#[cfg(test)]
+pub(crate) async fn finalize_switching_group_for_test(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+) -> Result<(), RelayPreferenceError> {
+    finalize_switching_group(db, node_connections, group_id)
+        .await
+        .map(|_| ())
+}
+
 /// Observe persisted DNS transactions after each DNS worker tick. This is also
 /// restart recovery: switching preferences and sync rows are both durable.
 pub async fn finalize_switching_preferences(state: &crate::api::AppState) {

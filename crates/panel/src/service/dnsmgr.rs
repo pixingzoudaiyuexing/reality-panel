@@ -457,6 +457,19 @@ pub(crate) fn binding_matches_record(
         && (binding.line_key == "default" || binding.line == record.line.raw_id)
 }
 
+fn binding_still_owns_exact_value(
+    binding: Option<&DnsRecordBinding>,
+    record_type: DnsRecordType,
+    record: &DiscoveredRecord,
+) -> bool {
+    let Some(binding) = binding else {
+        return false;
+    };
+    validate_ip_family(record_type, &binding.desired_value)
+        .ok()
+        .is_some_and(|expected| record_value_matches(&record.record.values, expected))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EnsureRecordInput {
     pub rule_id: i64,
@@ -879,6 +892,9 @@ pub(crate) async fn ensure_record_absent(
         return DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified);
     }
     if !binding_matches_record(Some(&binding), &fqdn, &zone, input.record_type, record) {
+        return DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified);
+    }
+    if !binding_still_owns_exact_value(Some(&binding), input.record_type, record) {
         return DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified);
     }
 
@@ -1761,7 +1777,7 @@ pub(crate) async fn inspect_line_record(
                 &zone,
                 DnsRecordType::A,
                 &record,
-            ) =>
+            ) && binding_still_owns_exact_value(binding.as_ref(), DnsRecordType::A, &record) =>
         {
             let [value] = record.record.values.as_slice() else {
                 return Err(LineRecordSnapshotError::OwnershipUnverified);
@@ -3413,6 +3429,29 @@ mod tests {
         );
         assert_eq!(owned.state.total_mutations(), 0);
 
+        for values in [
+            vec!["192.0.2.99"],
+            vec!["192.0.2.20", "192.0.2.99"],
+            vec!["not-an-ip"],
+        ] {
+            let drift_db = ensure_db().await;
+            configure_eligible_rule(&drift_db, "op1.example.com", "192.0.2.10").await;
+            insert_line_binding(&drift_db, "Dianxin", "owned", "192.0.2.20").await;
+            let mut drifted = record("owned", "A", values[0], "Dianxin");
+            drifted.values = values.into_iter().map(str::to_string).collect();
+            let drift = spawn_ensure_mock(
+                vec![drifted],
+                MutationBehavior::Apply,
+                MutationBehavior::Apply,
+            )
+            .await;
+            assert!(matches!(
+                inspect_line_record(&drift_db, &drift.client, 100, "Dianxin").await,
+                Err(LineRecordSnapshotError::OwnershipUnverified)
+            ));
+            assert_eq!(drift.state.total_mutations(), 0);
+        }
+
         let external_db = ensure_db().await;
         configure_eligible_rule(&external_db, "op1.example.com", "192.0.2.10").await;
         let external = spawn_ensure_mock(
@@ -3444,6 +3483,169 @@ mod tests {
             Err(LineRecordSnapshotError::OwnershipUnverified)
         ));
         assert_eq!(duplicate.state.total_mutations(), 0);
+    }
+
+    #[tokio::test]
+    async fn carrier_removal_preflight_rejects_same_id_value_drift_before_transaction() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&db, "Dianxin", "owned", "192.0.2.20").await;
+        let mock = spawn_ensure_mock(
+            vec![record("owned", "A", "192.0.2.99", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        db.set(
+            DNSMGR_CONFIG_KEY,
+            &serde_json::json!({
+                "enabled": true,
+                "base_url": mock.base_url.clone(),
+                "uid": 7,
+                "api_key": "key"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        db.set(
+            "relay_preference:10",
+            &serde_json::json!({
+                "preferred_node_id": null,
+                "pending_node_id": null,
+                "state": "idle",
+                "started_at": null,
+                "last_error": null,
+                "carrier_policy": {
+                    "bindings": [{
+                        "line_id": "Dianxin",
+                        "mode": "follow_default"
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            crate::service::relay_preference::start_carrier_policy_apply(
+                &db,
+                &crate::api::ws::NodeConnections::new(),
+                10,
+                crate::service::relay_preference::CarrierPolicy::default(),
+            )
+            .await,
+            Err(crate::service::relay_preference::CarrierPolicyApplyError::OwnershipUnverified {
+                rule_id: 100,
+                line_id,
+            }) if line_id == "Dianxin"
+        ));
+        let stored: crate::service::relay_preference::RelayPreferenceState =
+            serde_json::from_str(&db.get("relay_preference:10").await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            stored.state,
+            crate::service::relay_preference::RelayPreferencePhase::Idle
+        );
+        assert_eq!(stored.pending_carrier_policy, None);
+        assert_eq!(stored.transaction_kind, None);
+        assert!(stored.dns_records.is_empty());
+        assert_eq!(stored.carrier_policy.bindings.len(), 1);
+        assert_eq!(mock.state.total_mutations(), 0);
+    }
+
+    #[tokio::test]
+    async fn rollback_delete_value_drift_fails_closed_and_requires_manual_intervention() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&db, "Dianxin", "created-owned", "192.0.2.20").await;
+        let mock = spawn_ensure_mock(
+            vec![record("created-owned", "A", "192.0.2.99", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        db.set(
+            DNSMGR_CONFIG_KEY,
+            &serde_json::json!({
+                "enabled": true,
+                "base_url": mock.base_url.clone(),
+                "uid": 7,
+                "api_key": "key"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        db.set(
+            "relay_preference:10",
+            &serde_json::json!({
+                "preferred_node_id": null,
+                "pending_node_id": null,
+                "state": "rolling_back",
+                "started_at": "2026-08-31T00:00:00Z",
+                "last_error": "DNS_RECORD_CONFLICT",
+                "carrier_policy": {"bindings": []},
+                "pending_carrier_policy": {
+                    "bindings": [{
+                        "line_id": "Dianxin",
+                        "mode": "follow_default"
+                    }]
+                },
+                "transaction_kind": "carrier_policy_apply",
+                "dns_records": [{
+                    "rule_id": 100,
+                    "fqdn": "op1.example.com",
+                    "line_id": "Dianxin",
+                    "line_key": "dnsmgr:Dianxin",
+                    "target_action": "UPSERT",
+                    "target_value": "192.0.2.20",
+                    "rollback_action": "DELETE",
+                    "rollback_value": null,
+                    "target_record_id": "created-owned"
+                }]
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        schedule_transaction_line(&db, 100, "op1.example.com", "Dianxin", "DELETE", None)
+            .await
+            .unwrap();
+
+        let sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_one(&db, sync, &mock.client).await;
+        assert_eq!(mock.state.delete_attempts.load(Ordering::SeqCst), 0);
+        let failed = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, "FAILED");
+        assert_eq!(
+            failed.last_error_category.as_deref(),
+            Some("DNS_OWNERSHIP_UNVERIFIED")
+        );
+        assert_eq!(failed.next_attempt_at, None);
+
+        crate::service::relay_preference::finalize_switching_group_for_test(
+            &db,
+            &crate::api::ws::NodeConnections::new(),
+            10,
+        )
+        .await
+        .unwrap();
+        let stored: crate::service::relay_preference::RelayPreferenceState =
+            serde_json::from_str(&db.get("relay_preference:10").await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            stored.state,
+            crate::service::relay_preference::RelayPreferencePhase::FailedManualIntervention
+        );
+        assert_eq!(mock.state.delete_attempts.load(Ordering::SeqCst), 0);
     }
 
     async fn carrier_projection_db() -> SqliteRepository {
@@ -3908,6 +4110,81 @@ mod tests {
             DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
         );
         assert_eq!(drift.state.delete_attempts.load(Ordering::SeqCst), 0);
+
+        for values in [
+            vec!["192.0.2.99"],
+            vec!["192.0.2.20", "192.0.2.99"],
+            vec!["not-an-ip"],
+        ] {
+            let value_drift_db = ensure_db().await;
+            configure_eligible_rule(&value_drift_db, "op1.example.com", "192.0.2.10").await;
+            schedule_line_delete(&value_drift_db, 100, "Dianxin")
+                .await
+                .unwrap();
+            insert_line_binding(&value_drift_db, "Dianxin", "same-owned-id", "192.0.2.20").await;
+            let mut drifted = record("same-owned-id", "A", values[0], "Dianxin");
+            drifted.values = values.into_iter().map(str::to_string).collect();
+            let value_drift = spawn_ensure_mock(
+                vec![drifted],
+                MutationBehavior::Apply,
+                MutationBehavior::Apply,
+            )
+            .await;
+            assert_eq!(
+                ensure_record_absent(
+                    &value_drift_db,
+                    &value_drift.client,
+                    &delete_input("Dianxin")
+                )
+                .await,
+                DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+            );
+            assert_eq!(value_drift.state.delete_attempts.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_upsert_repairs_same_id_value_drift() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_upsert(&db, 100, "Dianxin", "192.0.2.20")
+            .await
+            .unwrap();
+        insert_line_binding(&db, "Dianxin", "owned", "192.0.2.20").await;
+        let mock = spawn_ensure_mock(
+            vec![record("owned", "A", "192.0.2.99", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+
+        assert_eq!(
+            ensure_record(
+                &db,
+                &mock.client,
+                &EnsureRecordInput {
+                    rule_id: 100,
+                    fqdn: "op1.example.com".into(),
+                    record_type: DnsRecordType::A,
+                    expected_value: "192.0.2.20".into(),
+                    line: ProviderLine::from_provider("Dianxin", None),
+                },
+            )
+            .await,
+            EnsureRecordResult::Updated {
+                record_id: "owned".into()
+            }
+        );
+        assert_eq!(mock.state.update_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.state.records.lock().unwrap()[0].values, ["192.0.2.20"]);
+        assert_eq!(
+            db.find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+                .await
+                .unwrap()
+                .unwrap()
+                .desired_value,
+            "192.0.2.20"
+        );
     }
 
     #[tokio::test]
@@ -4402,6 +4679,7 @@ mod tests {
 
     struct EnsureMock {
         client: DnsMgrClient,
+        base_url: String,
         state: Arc<MockDnsState>,
         handle: tokio::task::JoinHandle<()>,
     }
@@ -4461,6 +4739,7 @@ mod tests {
             DnsMgrClient::new(DnsMgrClientConfig::new(&base_url, 7, "key").unwrap()).unwrap();
         EnsureMock {
             client,
+            base_url,
             state,
             handle,
         }
