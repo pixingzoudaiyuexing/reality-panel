@@ -369,6 +369,7 @@ pub enum StartRelaySwitchError {
     TargetNotReady(Vec<String>),
     TargetPublicIpv4Invalid,
     DnsMgrUnavailable,
+    CarrierDnsPreflightFailed(String),
     NoEligibleDnsRules,
     SwitchInProgress { pending_node_id: Option<String> },
     DnsSchedulingFailed(DbError),
@@ -446,6 +447,9 @@ impl std::fmt::Display for StartRelaySwitchError {
             }
             Self::TargetPublicIpv4Invalid => write!(f, "target node public IPv4 is invalid"),
             Self::DnsMgrUnavailable => write!(f, "DNSMgr is disabled or not configured"),
+            Self::CarrierDnsPreflightFailed(error) => {
+                write!(f, "carrier DNS preflight failed: {error}")
+            }
             Self::NoEligibleDnsRules => write!(f, "group has no eligible Reality DNS rules"),
             Self::SwitchInProgress { pending_node_id } => write!(
                 f,
@@ -1008,17 +1012,15 @@ pub(crate) async fn carrier_line_desired_for_rule(
         }
     }
 
-    if preference.transaction_kind == Some(RelayTransactionKind::CarrierPolicyApply)
+    if preference.transaction_kind.is_some()
         && matches!(
             preference.state,
             RelayPreferencePhase::Switching | RelayPreferencePhase::RollingBack
         )
     {
-        for record in preference
-            .dns_records
-            .iter()
-            .filter(|record| record.rule_id == rule_id)
-        {
+        for record in preference.dns_records.iter().filter(|record| {
+            record.rule_id == rule_id && record.line_key != crate::service::dnsmgr::DEFAULT_LINE_KEY
+        }) {
             configured_lines.insert(record.line_id.clone());
             let (action, value) = if preference.state == RelayPreferencePhase::RollingBack {
                 (record.rollback_action, record.rollback_value.clone())
@@ -1376,6 +1378,68 @@ async fn build_dns_transaction_records(
     Ok(records)
 }
 
+async fn append_follow_default_transaction_records(
+    db: &dyn Repository,
+    client: &crate::integrations::dnsmgr::DnsMgrClient,
+    carrier_policy: &CarrierPolicy,
+    eligible_rule_ids: &[i64],
+    target_value: &str,
+    records: &mut Vec<RelayDnsTransactionRecord>,
+) -> Result<(), StartRelaySwitchError> {
+    let follow_lines = carrier_policy
+        .bindings
+        .iter()
+        .filter(|binding| binding.mode == CarrierLineMode::FollowDefault)
+        .map(|binding| binding.line_id.clone())
+        .collect::<Vec<_>>();
+    for rule_id in eligible_rule_ids {
+        let Some(rule) = RuleRepository::find_rule_by_id(db, *rule_id, &ResourceScope::All).await?
+        else {
+            continue;
+        };
+        let fqdn = rule
+            .sni
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        for line_id in &follow_lines {
+            let snapshot =
+                crate::service::dnsmgr::inspect_line_record(db, client, *rule_id, line_id)
+                    .await
+                    .map_err(|error| {
+                        StartRelaySwitchError::CarrierDnsPreflightFailed(format!(
+                            "rule {rule_id} line {line_id}: {error:?}"
+                        ))
+                    })?;
+            let (rollback_action, rollback_value, rollback_record_id) = match snapshot {
+                crate::service::dnsmgr::LineRecordSnapshot::Absent => {
+                    (RelayDnsAction::Delete, None, None)
+                }
+                crate::service::dnsmgr::LineRecordSnapshot::PanelOwned { value, record_id } => {
+                    (RelayDnsAction::Upsert, Some(value), Some(record_id))
+                }
+            };
+            records.push(RelayDnsTransactionRecord {
+                rule_id: *rule_id,
+                fqdn: fqdn.clone(),
+                line_id: line_id.clone(),
+                line_key: format!("dnsmgr:{line_id}"),
+                target_action: RelayDnsAction::Upsert,
+                target_value: Some(target_value.into()),
+                rollback_action,
+                rollback_value,
+                target_record_id: None,
+                rollback_record_id,
+                target_state: None,
+                target_error: None,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn transition_to_rollback(preference: &mut RelayPreferenceState, error: &str) {
     preference.last_error = Some(error.to_string());
     if !preference.dns_records.is_empty()
@@ -1482,6 +1546,26 @@ pub async fn start_relay_switch(
         &target_public_ipv4,
     )
     .await?;
+    if preference
+        .carrier_policy
+        .bindings
+        .iter()
+        .any(|binding| binding.mode == CarrierLineMode::FollowDefault)
+    {
+        let client = crate::service::dnsmgr::load_client(db)
+            .await
+            .map_err(|error| StartRelaySwitchError::CarrierDnsPreflightFailed(error.to_string()))?
+            .ok_or(StartRelaySwitchError::DnsMgrUnavailable)?;
+        append_follow_default_transaction_records(
+            db,
+            &client,
+            &preference.carrier_policy,
+            &eligible_rule_ids,
+            &target_public_ipv4,
+            &mut preference.dns_records,
+        )
+        .await?;
+    }
     preference.pending_node_id = Some(target_node_id.to_string());
     preference.transaction_kind = Some(RelayTransactionKind::PreferredSwitch);
     preference.state = RelayPreferencePhase::Switching;
@@ -1741,32 +1825,6 @@ async fn finalize_rollback(
                 rollback_error: "ROLLBACK_RULE_NOT_ELIGIBLE".into(),
             });
         }
-        if record.rollback_action != RelayDnsAction::Upsert {
-            preference.state = RelayPreferencePhase::FailedManualIntervention;
-            preference.rollback_error = Some("ROLLBACK_ACTION_UNSUPPORTED".into());
-            store_preference(db, group_id, &preference).await?;
-            return Ok(FinalizeOutcome::ManualIntervention {
-                from_node_id: preference.preferred_node_id,
-                to_node_id: target_node_id,
-                error: preference
-                    .last_error
-                    .unwrap_or_else(|| "RELAY_SWITCH_FAILED".into()),
-                rollback_error: "ROLLBACK_ACTION_UNSUPPORTED".into(),
-            });
-        }
-        let Some(rollback_value) = record.rollback_value.as_deref() else {
-            preference.state = RelayPreferencePhase::FailedManualIntervention;
-            preference.rollback_error = Some("ROLLBACK_VALUE_UNAVAILABLE".into());
-            store_preference(db, group_id, &preference).await?;
-            return Ok(FinalizeOutcome::ManualIntervention {
-                from_node_id: preference.preferred_node_id,
-                to_node_id: target_node_id,
-                error: preference
-                    .last_error
-                    .unwrap_or_else(|| "RELAY_SWITCH_FAILED".into()),
-                rollback_error: "ROLLBACK_VALUE_UNAVAILABLE".into(),
-            });
-        };
         let Some(sync) = db
             .find_dns_record_sync(record.rule_id, &record.line_key)
             .await?
@@ -1774,7 +1832,11 @@ async fn finalize_rollback(
             all_propagated = false;
             continue;
         };
-        if sync.expected_value.as_deref() != Some(rollback_value) {
+        if !sync_matches_action(
+            &sync,
+            record.rollback_action,
+            record.rollback_value.as_deref(),
+        ) {
             all_propagated = false;
             continue;
         }
@@ -2013,6 +2075,21 @@ async fn finalize_switching_group(
     }
 
     if preference.dns_records.is_empty() {
+        if preference
+            .carrier_policy
+            .bindings
+            .iter()
+            .any(|binding| binding.mode == CarrierLineMode::FollowDefault)
+        {
+            return begin_rollback(
+                db,
+                group_id,
+                preference,
+                target_node_id,
+                "DNS_TRANSACTION_JOURNAL_MISSING",
+            )
+            .await;
+        }
         preference.dns_records =
             build_dns_transaction_records(db, group_id, &preference, &rule_ids, &target_ipv4)
                 .await?;
@@ -2065,9 +2142,7 @@ async fn finalize_switching_group(
             all_propagated = false;
             continue;
         };
-        if sync.desired_action != "UPSERT"
-            || sync.expected_value.as_deref() != record.target_value.as_deref()
-        {
+        if !sync_matches_action(&sync, record.target_action, record.target_value.as_deref()) {
             all_propagated = false;
             continue;
         }
@@ -3568,6 +3643,239 @@ mod tests {
             .unwrap();
         assert_eq!(sync.desired_action, "UPSERT");
         assert_eq!(sync.expected_value.as_deref(), Some("203.0.113.6"));
+    }
+
+    #[tokio::test]
+    async fn preferred_switch_journal_moves_default_and_follow_default_only() {
+        let (repo, connections, _) = switch_fixture().await;
+        let policy = CarrierPolicy {
+            bindings: vec![
+                carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-b")),
+                carrier_binding("Dianxin_Shandong", CarrierLineMode::FollowDefault, None),
+                carrier_binding("Liantong", CarrierLineMode::FollowDefault, None),
+            ],
+        };
+        let mut records = build_dns_transaction_records(
+            &repo,
+            7,
+            &RelayPreferenceState {
+                preferred_node_id: Some("node-a".into()),
+                ..RelayPreferenceState::default()
+            },
+            &[1, 3],
+            "203.0.113.7",
+        )
+        .await
+        .unwrap();
+        for rule_id in [1, 3] {
+            records.push(carrier_record(
+                rule_id,
+                "Dianxin_Shandong",
+                RelayDnsAction::Upsert,
+                Some("203.0.113.7"),
+                RelayDnsAction::Upsert,
+                Some("203.0.113.5"),
+            ));
+            records.push(carrier_record(
+                rule_id,
+                "Liantong",
+                RelayDnsAction::Upsert,
+                Some("203.0.113.7"),
+                RelayDnsAction::Upsert,
+                Some("203.0.113.5"),
+            ));
+        }
+        store_preference(
+            &repo,
+            7,
+            &RelayPreferenceState {
+                preferred_node_id: Some("node-a".into()),
+                pending_node_id: Some("node-c".into()),
+                carrier_policy: policy,
+                transaction_kind: Some(RelayTransactionKind::PreferredSwitch),
+                state: RelayPreferencePhase::Switching,
+                dns_records: records,
+                ..RelayPreferenceState::default()
+            },
+        )
+        .await
+        .unwrap();
+        crate::service::dnsmgr::schedule_group_eligible(&repo, 7, &[1, 3])
+            .await
+            .unwrap();
+        for rule_id in [1, 3] {
+            assert_eq!(
+                repo.find_dns_record_sync(rule_id, "default")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expected_value
+                    .as_deref(),
+                Some("203.0.113.7")
+            );
+            for line in ["Dianxin_Shandong", "Liantong"] {
+                assert_eq!(
+                    repo.find_dns_record_sync(rule_id, &format!("dnsmgr:{line}"))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .expected_value
+                        .as_deref(),
+                    Some("203.0.113.7")
+                );
+            }
+            assert_eq!(
+                repo.find_dns_record_sync(rule_id, "dnsmgr:Dianxin")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expected_value
+                    .as_deref(),
+                Some("203.0.113.6")
+            );
+        }
+
+        for rule_id in [1, 3] {
+            set_sync_state(&repo, rule_id, "PROPAGATED", None, None).await;
+            set_line_sync_state(
+                &repo,
+                rule_id,
+                "dnsmgr:Dianxin_Shandong",
+                "PROPAGATED",
+                None,
+            )
+            .await;
+            set_line_sync_state(&repo, rule_id, "dnsmgr:Liantong", "PROPAGATED", None).await;
+        }
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::Committed { .. }
+        ));
+        assert_eq!(
+            load_preference(&repo, 7)
+                .await
+                .unwrap()
+                .preferred_node_id
+                .as_deref(),
+            Some("node-c")
+        );
+    }
+
+    #[tokio::test]
+    async fn preferred_rollback_restores_default_and_follow_default_without_touching_explicit() {
+        let (repo, connections, _) = switch_fixture().await;
+        let mut records = build_dns_transaction_records(
+            &repo,
+            7,
+            &RelayPreferenceState {
+                preferred_node_id: Some("node-a".into()),
+                ..RelayPreferenceState::default()
+            },
+            &[1, 3],
+            "203.0.113.7",
+        )
+        .await
+        .unwrap();
+        for rule_id in [1, 3] {
+            records.push(carrier_record(
+                rule_id,
+                "Dianxin_Shandong",
+                RelayDnsAction::Upsert,
+                Some("203.0.113.7"),
+                RelayDnsAction::Upsert,
+                Some("203.0.113.5"),
+            ));
+        }
+        let policy = CarrierPolicy {
+            bindings: vec![
+                carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-b")),
+                carrier_binding("Dianxin_Shandong", CarrierLineMode::FollowDefault, None),
+            ],
+        };
+        let preference = RelayPreferenceState {
+            preferred_node_id: Some("node-a".into()),
+            pending_node_id: Some("node-c".into()),
+            carrier_policy: policy,
+            transaction_kind: Some(RelayTransactionKind::PreferredSwitch),
+            state: RelayPreferencePhase::Switching,
+            dns_records: records,
+            ..RelayPreferenceState::default()
+        };
+        store_preference(&repo, 7, &preference).await.unwrap();
+        crate::service::dnsmgr::schedule_group_eligible(&repo, 7, &[1, 3])
+            .await
+            .unwrap();
+        set_sync_state(&repo, 1, "FAILED", Some("DNS_CONFLICT"), None).await;
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::RollbackStarted { .. }
+        ));
+        for rule_id in [1, 3] {
+            assert_eq!(
+                repo.find_dns_record_sync(rule_id, "default")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expected_value
+                    .as_deref(),
+                Some("203.0.113.5")
+            );
+            assert_eq!(
+                repo.find_dns_record_sync(rule_id, "dnsmgr:Dianxin_Shandong")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expected_value
+                    .as_deref(),
+                Some("203.0.113.5")
+            );
+            assert_eq!(
+                repo.find_dns_record_sync(rule_id, "dnsmgr:Dianxin")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expected_value
+                    .as_deref(),
+                Some("203.0.113.6")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_apply_is_busy_for_preferred_and_already_preferred_stays_noop() {
+        let (repo, connections, _) = switch_fixture().await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.carrier_policy = CarrierPolicy {
+            bindings: vec![carrier_binding(
+                "Dianxin",
+                CarrierLineMode::FollowDefault,
+                None,
+            )],
+        };
+        store_preference(&repo, 7, &preference).await.unwrap();
+        assert_eq!(
+            start_relay_switch(&repo, &connections, 7, "node-a")
+                .await
+                .unwrap(),
+            StartRelaySwitchOutcome::AlreadyPreferred
+        );
+        assert_eq!(
+            load_preference(&repo, 7).await.unwrap().state,
+            RelayPreferencePhase::Idle
+        );
+
+        preference.state = RelayPreferencePhase::Switching;
+        preference.transaction_kind = Some(RelayTransactionKind::CarrierPolicyApply);
+        preference.pending_carrier_policy = Some(preference.carrier_policy.clone());
+        store_preference(&repo, 7, &preference).await.unwrap();
+        assert!(matches!(
+            start_relay_switch(&repo, &connections, 7, "node-c").await,
+            Err(StartRelaySwitchError::SwitchInProgress { .. })
+        ));
     }
 
     #[tokio::test]

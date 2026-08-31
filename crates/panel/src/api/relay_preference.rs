@@ -83,6 +83,14 @@ pub async fn set_relay_preference(
                 | StartRelaySwitchError::NoEligibleDnsRules => {
                     (StatusCode::UNPROCESSABLE_ENTITY, 422, error.to_string())
                 }
+                StartRelaySwitchError::CarrierDnsPreflightFailed(_) => {
+                    tracing::warn!(group_id, "relay carrier DNS preflight failed: {error}");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        503,
+                        "carrier DNS preflight is unavailable".into(),
+                    )
+                }
                 StartRelaySwitchError::SwitchInProgress { .. } => {
                     (StatusCode::CONFLICT, 409, error.to_string())
                 }
