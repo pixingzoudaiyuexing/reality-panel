@@ -2,7 +2,7 @@
 
 Reality Panel uses one release tag and one compatibility version for the Panel
 and Node. The current stable release is `v1.0.1`; the current 1.1 development
-candidate is `v1.1.0-rc.8`. The wire protocol remains
+candidate is `v1.1.0-rc.9`. The wire protocol remains
 `CONFIG_PROTOCOL_VERSION = 10`.
 
 ## Release assets
@@ -37,7 +37,7 @@ is a production update source.
 Run before tagging:
 
 ```bash
-bash scripts/release-check.sh 1.1.0-rc.8
+bash scripts/release-check.sh 1.1.0-rc.9
 ```
 
 The default updater resolves the latest non-prerelease `v*` Release. An

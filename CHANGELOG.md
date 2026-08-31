@@ -7,6 +7,57 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.0-rc.9] - 2026-09-01
+
+Release candidate for DNS provider Carrier Affinity and line-aware Relay
+routing.
+
+### Added
+
+- Carrier Affinity dynamically reads the DNSMgr line catalog and lets an
+  inbound Group leave a line unconfigured, follow the default Relay, or use a
+  specific Ready Relay.
+- One Reality Rule can maintain independent default and Carrier-line DNS
+  records. Preferred Relay switches automatically move FollowDefault lines
+  while explicit Relay bindings remain isolated.
+- Carrier policy application has persisted transaction state, provider
+  readback, rollback, and a dedicated settings UI.
+
+### Improved
+
+- DNS synchronization identity is now `(rule_id, line_key)` in SQLite and
+  PostgreSQL, so one Rule can reconcile multiple provider lines safely.
+- Rule pause/resume restores line-aware desired state, Group deletion cleans
+  scheduled Relay switches, and split DNS freezes new topology mutations.
+
+### Safety
+
+- Ambiguous DNS mutations are not blindly retried by background refresh.
+- Carrier commit rechecks Relay readiness, public IPv4, and the participating
+  Rule set; unsafe changes roll back instead of committing stale topology.
+- DELETE requires exact Panel ownership and provider readback. A same-record-ID
+  value drift is rejected without deleting the external value, and
+  `FailedManualIntervention` keeps topology changes frozen.
+
+### Upgrade
+
+- Back up the Panel database before upgrading. RC9 changes
+  `dns_record_syncs` identity from `rule_id` to `(rule_id, line_key)` through
+  SQLite migration 50 and PostgreSQL migration 34.
+- PostgreSQL 16 migration from RC8 to RC9 was validated. To downgrade to RC8,
+  restore the database backup taken before the RC9 upgrade rather than opening
+  an RC9 database with the RC8 binary.
+
+### Validation
+
+- Real Huawei DNSMgr provider control-plane acceptance passed for
+  FollowDefault, explicit Relay, multiple lines per Rule, Preferred switching,
+  safe Carrier DELETE, same-ID value-drift protection, and Panel outage safety.
+- Carrier data-plane selection is not yet verified from trusted China Telecom,
+  China Unicom, or China Mobile networks. **REAL PROVIDER SEMANTICS TO VERIFY:**
+  Huawei parent, child, and default precedence through real carrier recursive
+  DNS resolvers. This is not an RC9 release blocker.
+
 ## [1.1.0-rc.8] - 2026-08-31
 
 Release candidate for scheduled Relay operations and Panel-centralized

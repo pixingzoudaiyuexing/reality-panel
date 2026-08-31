@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.0-rc.9] - 2026-09-01
+
+Unified Reality Panel release alignment. Carrier Affinity is implemented by
+the Panel and DNSMgr integration and does not change the relay-node runtime or
+wire contract. Config Protocol remains 10 and Lifecycle Protocol remains 1.
+
 ## [1.1.0-rc.8] - 2026-08-31
 
 Reality relay-node release candidate with Config Protocol 10 and Lifecycle

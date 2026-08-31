@@ -45,6 +45,24 @@ Node artifact root are under `/opt/relay-panel/current`; the root is exposed to
 the application as `/opt/relay-panel/node-assets`. Bootstrap and lifecycle
 upgrade use this same root.
 
+### Carrier Affinity
+
+RC9 adds Group-level Carrier Affinity for eligible Reality Rules. The Panel
+reads the DNSMgr line catalog and presents three states for each provider line:
+
+- **Not configured separately:** DNSMgr decides how the default or parent
+  records apply. Reality Panel does not claim provider inheritance semantics.
+- **Follow default:** the line uses the Group's preferred Relay and moves with
+  a successful Preferred Relay switch.
+- **Specific Relay:** the line uses the selected Ready Relay and remains
+  isolated from Preferred Relay switches.
+
+The Huawei DNSMgr provider control plane has been tested with parent and child
+records, multiple lines per Rule, updates, safe deletion, and Panel outages.
+Actual parent/child/default precedence is still pending validation from trusted
+China Telecom, China Unicom, and China Mobile recursive networks; public DNS
+resolvers are not sufficient evidence for that data-plane behavior.
+
 ### 集中证书
 
 Panel在`/var/lib/relay-panel/certificates`中保存每个inbound group当前需要的
@@ -69,6 +87,18 @@ Release; the second selects an exact tag, including an RC. The updater verifies
 the complete release before an atomic switch, preserves
 data/configuration/secrets and runtime state, and restores the previous release
 when the new health check fails.
+
+### RC9 database compatibility
+
+Back up the Panel database before upgrading to `v1.1.0-rc.9`. RC9 changes the
+`dns_record_syncs` identity from `rule_id` to `(rule_id, line_key)` using SQLite
+migration 50 and PostgreSQL migration 34. The PostgreSQL 16 upgrade path from
+RC8 to RC9 has been verified.
+
+Once RC9 Carrier rows exist, an RC8 binary is not guaranteed to understand the
+upgraded database. A downgrade to RC8 must restore the database backup created
+before the RC9 upgrade. There is no downgrade migration, dual-write mode, or
+compatibility layer.
 
 ## Uninstall
 
