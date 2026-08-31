@@ -15,6 +15,12 @@ pub struct SetRelayPreferenceRequest {
     pub node_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SetCarrierAffinityRequest {
+    #[serde(default)]
+    pub bindings: Vec<crate::service::relay_preference::CarrierLineBinding>,
+}
+
 pub async fn get_relay_preference(
     _admin: AdminOnly,
     State(state): State<AppState>,
@@ -149,6 +155,117 @@ pub async fn set_relay_preference(
                 group_id,
                 error
             );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn get_carrier_affinity(
+    _admin: AdminOnly,
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+) -> Response {
+    match crate::service::relay_preference::get_carrier_affinity(
+        state.db.as_ref(),
+        &state.node_connections,
+        group_id,
+    )
+    .await
+    {
+        Ok(view) => Json(ApiResponse::success(view)).into_response(),
+        Err(crate::service::relay_preference::RelayPreferenceError::Database(
+            crate::db::error::DbError::NotFound,
+        )) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<()>::error(404, "Inbound group not found")),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(group_id, "get carrier affinity failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn set_carrier_affinity(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+    Json(request): Json<SetCarrierAffinityRequest>,
+) -> Response {
+    use crate::service::relay_preference::CarrierPolicyApplyError;
+    let policy = crate::service::relay_preference::CarrierPolicy {
+        bindings: request.bindings,
+    };
+    let outcome = match crate::service::relay_preference::start_carrier_policy_apply(
+        state.db.as_ref(),
+        &state.node_connections,
+        group_id,
+        policy,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let (status, code, message) = match &error {
+                CarrierPolicyApplyError::InboundGroupNotFound => {
+                    (StatusCode::NOT_FOUND, 404, error.to_string())
+                }
+                CarrierPolicyApplyError::TransactionInProgress => {
+                    (StatusCode::CONFLICT, 409, error.to_string())
+                }
+                CarrierPolicyApplyError::InvalidPolicy(_)
+                | CarrierPolicyApplyError::LineUnavailable(_)
+                | CarrierPolicyApplyError::NodeNotInGroup(_)
+                | CarrierPolicyApplyError::TargetNotReady { .. }
+                | CarrierPolicyApplyError::TargetPublicIpv4Invalid(_)
+                | CarrierPolicyApplyError::OwnershipUnverified { .. } => {
+                    (StatusCode::UNPROCESSABLE_ENTITY, 422, error.to_string())
+                }
+                CarrierPolicyApplyError::CatalogUnavailable
+                | CarrierPolicyApplyError::CatalogStale
+                | CarrierPolicyApplyError::DnsMgrUnavailable
+                | CarrierPolicyApplyError::ProviderPreflight(_) => {
+                    tracing::warn!(group_id, "carrier policy preflight unavailable: {error}");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        503,
+                        "carrier policy preflight is unavailable".into(),
+                    )
+                }
+                CarrierPolicyApplyError::Database(_)
+                | CarrierPolicyApplyError::InvalidPreference(_)
+                | CarrierPolicyApplyError::DnsSchedulingFailed => {
+                    tracing::error!(group_id, "set carrier affinity failed: {error}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        500,
+                        "carrier policy could not be applied".into(),
+                    )
+                }
+            };
+            return (status, Json(ApiResponse::<()>::error(code, &message))).into_response();
+        }
+    };
+    crate::service::audit::record(
+        &state,
+        Some(admin.user_id),
+        "CARRIER_POLICY_REQUESTED",
+        "device_group",
+        group_id,
+        &format!("group_id={group_id} outcome={outcome:?}"),
+    )
+    .await;
+    match crate::service::relay_preference::get_carrier_affinity(
+        state.db.as_ref(),
+        &state.node_connections,
+        group_id,
+    )
+    .await
+    {
+        Ok(view) => Json(ApiResponse::success(view)).into_response(),
+        Err(error) => {
+            tracing::error!(group_id, "carrier affinity response failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

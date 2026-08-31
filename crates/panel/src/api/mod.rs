@@ -244,6 +244,11 @@ pub fn routes() -> Router<AppState> {
             axum::routing::get(carrier_lines::get_group_carrier_lines),
         )
         .route(
+            "/groups/{group_id}/carrier-affinity",
+            axum::routing::get(relay_preference::get_carrier_affinity)
+                .put(relay_preference::set_carrier_affinity),
+        )
+        .route(
             "/admin/relay-schedules",
             axum::routing::get(relay_schedule::list).post(relay_schedule::create),
         )

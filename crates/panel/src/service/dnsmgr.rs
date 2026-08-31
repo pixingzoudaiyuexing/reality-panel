@@ -1405,6 +1405,22 @@ pub(crate) enum LineDesiredError {
     InvalidValue,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LineRecordSnapshot {
+    Absent,
+    PanelOwned { value: String, record_id: String },
+}
+
+#[derive(Debug)]
+pub(crate) enum LineRecordSnapshotError {
+    Database,
+    InvalidRule,
+    InvalidLine,
+    NoMatchingZone,
+    Provider(DnsMgrError),
+    OwnershipUnverified,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PublicDnsObservation {
     ExpectedPresent,
@@ -1627,6 +1643,74 @@ pub(crate) async fn schedule_line_delete(
     persist_line_desired(db, &desired, "DELETE", None).await
 }
 
+pub(crate) async fn inspect_line_record(
+    db: &dyn Repository,
+    client: &DnsMgrClient,
+    rule_id: i64,
+    raw_line_id: &str,
+) -> Result<LineRecordSnapshot, LineRecordSnapshotError> {
+    let requested =
+        canonical_provider_line(raw_line_id).ok_or(LineRecordSnapshotError::InvalidLine)?;
+    if requested.key == DEFAULT_LINE_KEY {
+        return Err(LineRecordSnapshotError::InvalidLine);
+    }
+    let rule = RuleRepository::find_rule_by_id(db, rule_id, &ResourceScope::All)
+        .await
+        .map_err(|_| LineRecordSnapshotError::Database)?
+        .filter(rule_is_dns_eligible)
+        .ok_or(LineRecordSnapshotError::InvalidRule)?;
+    let fqdn = normalize_fqdn(rule.sni.as_deref().unwrap_or_default().trim())
+        .map_err(|_| LineRecordSnapshotError::InvalidRule)?;
+    let zone = match resolve_zone(client, &fqdn).await {
+        ZoneResolution::ZoneResolved(zone) => zone,
+        ZoneResolution::NoMatchingZone => return Err(LineRecordSnapshotError::NoMatchingZone),
+        ZoneResolution::UpstreamFailure(error) => {
+            return Err(LineRecordSnapshotError::Provider(error))
+        }
+    };
+    let detail = client
+        .get_domain(zone.domain_id)
+        .await
+        .map_err(LineRecordSnapshotError::Provider)?;
+    let line = resolve_mutation_line(&requested, &detail).unwrap_or(requested);
+    let binding = db
+        .find_dns_record_binding_for_rule(rule_id, fqdn.as_str(), "A", &line.key)
+        .await
+        .map_err(|_| LineRecordSnapshotError::Database)?;
+    match discover_records(client, &zone, DnsRecordType::A, &line).await {
+        RecordDiscovery::NoRecord => Ok(LineRecordSnapshot::Absent),
+        RecordDiscovery::SingleMatchingRecord(record)
+            if binding_matches_record(
+                binding.as_ref(),
+                &fqdn,
+                &zone,
+                DnsRecordType::A,
+                &record,
+            ) =>
+        {
+            let [value] = record.record.values.as_slice() else {
+                return Err(LineRecordSnapshotError::OwnershipUnverified);
+            };
+            let ip = value
+                .parse::<Ipv4Addr>()
+                .map_err(|_| LineRecordSnapshotError::OwnershipUnverified)?;
+            if ip.is_loopback() || ip.is_unspecified() {
+                return Err(LineRecordSnapshotError::OwnershipUnverified);
+            }
+            Ok(LineRecordSnapshot::PanelOwned {
+                value: ip.to_string(),
+                record_id: record.record.record_id,
+            })
+        }
+        RecordDiscovery::SingleMatchingRecord(_)
+        | RecordDiscovery::MultipleMatchingRecords(_)
+        | RecordDiscovery::ConflictingRecordType(_) => {
+            Err(LineRecordSnapshotError::OwnershipUnverified)
+        }
+        RecordDiscovery::UpstreamFailure(error) => Err(LineRecordSnapshotError::Provider(error)),
+    }
+}
+
 #[allow(dead_code)]
 async fn line_desired_for_rule(
     db: &dyn Repository,
@@ -1739,6 +1823,7 @@ async fn persist_resolution(
         }
         DnsDesiredResolution::Eligible(desired) => {
             persist_desired(db, &desired, force_schedule).await?;
+            persist_carrier_desired(db, rule_id).await?;
         }
         DnsDesiredResolution::ConfigurationError { desired, category } => {
             if let Some(desired) = desired {
@@ -1783,6 +1868,35 @@ async fn persist_resolution(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+async fn persist_carrier_desired(
+    db: &dyn Repository,
+    rule_id: i64,
+) -> Result<(), crate::db::error::DbError> {
+    for desired in
+        crate::service::relay_preference::carrier_line_desired_for_rule(db, rule_id).await?
+    {
+        let result = match desired.action {
+            crate::service::relay_preference::RelayDnsAction::Upsert => {
+                let Some(value) = desired.value.as_deref() else {
+                    return Err(crate::db::error::DbError::Other(sqlx::Error::Protocol(
+                        "carrier UPSERT desired value is missing".into(),
+                    )));
+                };
+                schedule_line_upsert(db, rule_id, &desired.line_id, value).await
+            }
+            crate::service::relay_preference::RelayDnsAction::Delete => {
+                schedule_line_delete(db, rule_id, &desired.line_id).await
+            }
+        };
+        result.map_err(|error| {
+            crate::db::error::DbError::Other(sqlx::Error::Protocol(format!(
+                "carrier line desired projection failed: {error:?}"
+            )))
+        })?;
     }
     Ok(())
 }
@@ -3133,6 +3247,73 @@ mod tests {
             EnsureRecordResult::Failed(EnsureRecordFailure::ProviderLineUnavailable)
         );
         assert_eq!(unavailable.state.total_mutations(), 0);
+    }
+
+    #[tokio::test]
+    async fn carrier_preflight_snapshots_only_absent_or_exact_panel_owned_records() {
+        let absent_db = ensure_db().await;
+        configure_eligible_rule(&absent_db, "op1.example.com", "192.0.2.10").await;
+        let absent =
+            spawn_ensure_mock(Vec::new(), MutationBehavior::Apply, MutationBehavior::Apply).await;
+        assert_eq!(
+            inspect_line_record(&absent_db, &absent.client, 100, "Dianxin")
+                .await
+                .unwrap(),
+            LineRecordSnapshot::Absent
+        );
+        assert_eq!(absent.state.total_mutations(), 0);
+
+        let owned_db = ensure_db().await;
+        configure_eligible_rule(&owned_db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&owned_db, "Dianxin", "owned", "192.0.2.20").await;
+        let owned = spawn_ensure_mock(
+            vec![record("owned", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert_eq!(
+            inspect_line_record(&owned_db, &owned.client, 100, "Dianxin")
+                .await
+                .unwrap(),
+            LineRecordSnapshot::PanelOwned {
+                value: "192.0.2.20".into(),
+                record_id: "owned".into(),
+            }
+        );
+        assert_eq!(owned.state.total_mutations(), 0);
+
+        let external_db = ensure_db().await;
+        configure_eligible_rule(&external_db, "op1.example.com", "192.0.2.10").await;
+        let external = spawn_ensure_mock(
+            vec![record("external", "A", "192.0.2.30", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert!(matches!(
+            inspect_line_record(&external_db, &external.client, 100, "Dianxin").await,
+            Err(LineRecordSnapshotError::OwnershipUnverified)
+        ));
+        assert_eq!(external.state.total_mutations(), 0);
+
+        let duplicate_db = ensure_db().await;
+        configure_eligible_rule(&duplicate_db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&duplicate_db, "Dianxin", "owned", "192.0.2.20").await;
+        let duplicate = spawn_ensure_mock(
+            vec![
+                record("owned", "A", "192.0.2.20", "Dianxin"),
+                record("duplicate", "A", "192.0.2.20", "Dianxin"),
+            ],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert!(matches!(
+            inspect_line_record(&duplicate_db, &duplicate.client, 100, "Dianxin").await,
+            Err(LineRecordSnapshotError::OwnershipUnverified)
+        ));
+        assert_eq!(duplicate.state.total_mutations(), 0);
     }
 
     #[tokio::test]
