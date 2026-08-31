@@ -150,11 +150,7 @@ impl Config {
     }
 
     pub fn certificate_check_interval_secs(&self) -> u64 {
-        std::env::var("PANEL_CERTIFICATE_CHECK_INTERVAL_SECS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value| *value >= 60)
-            .unwrap_or(43_200)
+        certificate_check_interval_secs(std::env::var("PANEL_CERTIFICATE_CHECK_INTERVAL_SECS").ok())
     }
 
     pub fn certbot_binary_path(&self) -> String {
@@ -163,6 +159,12 @@ impl Config {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "/usr/bin/certbot".to_string())
     }
+}
+
+fn certificate_check_interval_secs(raw: Option<String>) -> u64 {
+    raw.and_then(|value| value.parse().ok())
+        .filter(|value| *value >= 60)
+        .unwrap_or(60)
 }
 
 fn configured_jwt_secret(raw: Option<String>) -> String {
@@ -190,7 +192,19 @@ fn parse_geoip_enabled(raw: Option<String>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{configured_jwt_secret, parse_geoip_enabled, INSECURE_JWT_SECRET};
+    use super::{
+        certificate_check_interval_secs, configured_jwt_secret, parse_geoip_enabled,
+        INSECURE_JWT_SECRET,
+    };
+
+    #[test]
+    fn certificate_check_interval_defaults_to_one_minute_and_keeps_minimum() {
+        assert_eq!(certificate_check_interval_secs(None), 60);
+        assert_eq!(certificate_check_interval_secs(Some("59".into())), 60);
+        assert_eq!(certificate_check_interval_secs(Some("invalid".into())), 60);
+        assert_eq!(certificate_check_interval_secs(Some("60".into())), 60);
+        assert_eq!(certificate_check_interval_secs(Some("300".into())), 300);
+    }
 
     #[test]
     fn jwt_secret_is_explicit_and_restart_stable() {

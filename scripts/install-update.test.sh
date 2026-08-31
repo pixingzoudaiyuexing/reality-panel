@@ -155,5 +155,6 @@ grep -Fq 'ca-certificates certbot curl file iproute2 openssl sqlite3 tar' "$ROOT
 grep -Fq 'install -d -o relay-panel -g relay-panel -m 0700 "$DATA_ROOT/certificates"' "$ROOT/deploy.sh"
 grep -Fq 'PANEL_CERTIFICATE_STATE_DIR=$DATA_ROOT/certificates' "$ROOT/deploy.sh"
 grep -Fq 'PANEL_CERTBOT_BINARY_PATH=/usr/bin/certbot' "$ROOT/deploy.sh"
+grep -Fq 'PANEL_CERTIFICATE_CHECK_INTERVAL_SECS=60' "$ROOT/deploy.sh"
 
 printf 'installer entrypoint contract: PASS\n'
