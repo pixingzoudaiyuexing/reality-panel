@@ -5,6 +5,7 @@ import api from '../../api/client';
 import type { ApiEnvelope, RelayPreferenceView, RelayReadyNode } from '../../api/types';
 import type { Tfn } from './types';
 import { RelaySchedulePanel } from './RelaySchedulePanel';
+import { CarrierAffinityPanel } from './CarrierAffinityPanel';
 
 const { Text } = Typography;
 
@@ -215,7 +216,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode }: Props) {
 
       {loading && !view ? <div style={{ textAlign: 'center', padding: 16 }}><Spin size="small" /></div> : null}
       {loadError && !view ? <Alert type="warning" showIcon title={t('relayPreferenceLoadFailed')} /> : null}
-      {view?.state === 'switching' ? (
+      {view?.state === 'switching' && view.pending_node_id ? (
         <Alert
           type="info"
           showIcon
@@ -261,7 +262,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode }: Props) {
         />
       ) : null}
 
-      {view && view.state !== 'idle' && (view.dns_records ?? []).length > 0 ? (
+      {view && view.pending_node_id && view.state !== 'idle' && (view.dns_records ?? []).length > 0 ? (
         <div data-testid="relay-preference-dns-records" style={{ marginBottom: 10 }}>
           <Text strong>{t('relayPreferenceDnsRecords')}</Text>
           {(view.dns_records ?? []).map((record) => {
@@ -361,6 +362,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode }: Props) {
           })}
         </div>
       ) : null}
+      <CarrierAffinityPanel groupId={groupId} nodes={view?.nodes ?? []} t={t} />
       <RelaySchedulePanel groupId={groupId} nodes={view?.nodes ?? []} t={t} />
     </div>
   );

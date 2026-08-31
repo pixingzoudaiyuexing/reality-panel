@@ -17,6 +17,10 @@ vi.mock('./RelaySchedulePanel', () => ({
   RelaySchedulePanel: () => null,
 }));
 
+vi.mock('./CarrierAffinityPanel', () => ({
+  CarrierAffinityPanel: () => null,
+}));
+
 import { RelayPreferencePanel } from './RelayPreferencePanel';
 
 const t = ((key: string) => key) as unknown as Tfn;

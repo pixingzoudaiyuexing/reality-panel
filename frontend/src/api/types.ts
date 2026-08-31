@@ -429,6 +429,53 @@ export interface RelayPreferenceView {
   nodes: RelayReadyNode[];
 }
 
+export type CarrierLineMode = 'follow_default' | 'node';
+export type RelayTransactionKind = 'preferred_switch' | 'carrier_policy_apply';
+
+export interface CarrierLineBinding {
+  line_id: string;
+  mode: CarrierLineMode;
+  node_id?: string | null;
+}
+
+export interface CarrierPolicy {
+  bindings: CarrierLineBinding[];
+}
+
+export interface CarrierLineCatalogItem {
+  id: string;
+  name: string;
+  parent: string | null;
+}
+
+export interface CarrierLineCatalog {
+  lines: CarrierLineCatalogItem[];
+  stale: boolean;
+}
+
+export interface CarrierAffinityBindingView extends CarrierLineBinding {
+  effective_node_id: string | null;
+  relay_health: 'ready' | 'abnormal' | 'offline' | null;
+  catalog_available: boolean;
+  dns_state: 'effective' | 'applying' | 'failed' | 'pending' | string;
+}
+
+export interface CarrierAffinityView {
+  group_id: number;
+  default_node_id: string | null;
+  active_policy: CarrierPolicy;
+  pending_policy: CarrierPolicy | null;
+  transaction: {
+    kind: RelayTransactionKind | null;
+    state: RelayPreferencePhase;
+    started_at: string | null;
+    last_error: string | null;
+    rollback_error: string | null;
+  };
+  bindings: CarrierAffinityBindingView[];
+  catalog_stale: boolean;
+}
+
 export type RelayScheduleType = 'one_time' | 'daily' | 'weekly';
 
 export interface RelaySchedule {

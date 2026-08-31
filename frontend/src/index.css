@@ -1,1 +1,12 @@
 @import './styles/theme.css';
+
+@media (max-width: 720px) {
+  .rp-carrier-binding-row {
+    grid-template-columns: minmax(0, 1fr) auto !important;
+  }
+
+  .rp-carrier-binding-row > :nth-child(2),
+  .rp-carrier-binding-row > :nth-child(3) {
+    grid-column: 1 / -1;
+  }
+}
