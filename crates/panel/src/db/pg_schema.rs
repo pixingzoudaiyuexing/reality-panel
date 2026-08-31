@@ -1743,10 +1743,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
 
     if current < 34 {
         let mut tx = pool.begin().await?;
-        sqlx::query(
-            "ALTER TABLE dns_record_syncs\
-                 ADD COLUMN IF NOT EXISTS desired_action TEXT NOT NULL DEFAULT 'UPSERT'",
-        )
+        sqlx::query("ALTER TABLE dns_record_syncs ADD COLUMN IF NOT EXISTS desired_action TEXT NOT NULL DEFAULT 'UPSERT'")
         .execute(&mut *tx)
         .await?;
         sqlx::query("ALTER TABLE dns_record_syncs ALTER COLUMN expected_value DROP NOT NULL")
@@ -1759,27 +1756,19 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            "ALTER TABLE dns_record_syncs\
-                 DROP CONSTRAINT IF EXISTS dns_record_syncs_action_check",
+            "ALTER TABLE dns_record_syncs DROP CONSTRAINT IF EXISTS dns_record_syncs_action_check",
         )
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            "ALTER TABLE dns_record_syncs ADD CONSTRAINT dns_record_syncs_action_check\
-                 CHECK (desired_action IN ('UPSERT','DELETE'))",
-        )
+        sqlx::query("ALTER TABLE dns_record_syncs ADD CONSTRAINT dns_record_syncs_action_check CHECK (desired_action IN ('UPSERT','DELETE'))")
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "ALTER TABLE dns_record_syncs\
-                 DROP CONSTRAINT IF EXISTS dns_record_syncs_value_check",
+            "ALTER TABLE dns_record_syncs DROP CONSTRAINT IF EXISTS dns_record_syncs_value_check",
         )
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            "ALTER TABLE dns_record_syncs ADD CONSTRAINT dns_record_syncs_value_check\
-                 CHECK (desired_action = 'DELETE' OR expected_value IS NOT NULL)",
-        )
+        sqlx::query("ALTER TABLE dns_record_syncs ADD CONSTRAINT dns_record_syncs_value_check CHECK (desired_action = 'DELETE' OR expected_value IS NOT NULL)")
         .execute(&mut *tx)
         .await?;
         sqlx::query(

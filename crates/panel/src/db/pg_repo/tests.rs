@@ -48,7 +48,7 @@ fn replace_db_in_url(url: &str, new_db: &str) -> String {
 /// its own database (test_pr2_{suffix}) for full isolation — no
 /// search_path tricks, no shared-schema collisions. The database is
 /// dropped at the start of the next run with the same suffix.
-async fn repo(suffix: &str) -> Option<PgRepository> {
+async fn fresh_pool(suffix: &str) -> Option<sqlx::PgPool> {
     let url = pg_url()?;
 
     // Parse the admin URL to derive the "postgres" maintenance database
@@ -80,13 +80,19 @@ async fn repo(suffix: &str) -> Option<PgRepository> {
         .expect("create test db");
     admin.close().await;
 
-    // Connect to the fresh test database and apply the schema.
+    // Connect to the fresh test database. Callers decide whether to apply the
+    // current schema or construct a historical migration fixture.
     let test_url = replace_db_in_url(&url, &db_name);
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&test_url)
         .await
         .expect("connect test db");
+    Some(pool)
+}
+
+async fn repo(suffix: &str) -> Option<PgRepository> {
+    let pool = fresh_pool(suffix).await?;
     apply_pg_schema(&pool).await.expect("apply schema");
     run_pg_migrations(&pool).await.expect("run migrations");
 
@@ -408,6 +414,191 @@ async fn pg_apply_schema_seeds_baseline_version() {
     crate::db::pg_schema::run_pg_migrations(&db.pool)
         .await
         .expect("baseline migrations must be a no-op");
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_migration_34_preserves_rc8_sync_and_enables_composite_identity() {
+    let Some(pool) = fresh_pool("dns_sync_migration_34").await else {
+        return;
+    };
+    for statement in [
+        "CREATE TABLE schema_version (version INTEGER PRIMARY KEY)",
+        "INSERT INTO schema_version (version) VALUES (33)",
+        "CREATE TABLE users (id BIGINT PRIMARY KEY)",
+        "INSERT INTO users (id) VALUES (1)",
+        "CREATE TABLE device_groups (id BIGINT PRIMARY KEY, uid BIGINT NOT NULL REFERENCES users(id))",
+        "INSERT INTO device_groups (id, uid) VALUES (10, 1)",
+        "CREATE TABLE forward_rules (id BIGINT PRIMARY KEY, uid BIGINT NOT NULL REFERENCES users(id), device_group_in BIGINT NOT NULL REFERENCES device_groups(id))",
+        "INSERT INTO forward_rules (id, uid, device_group_in) VALUES (100, 1, 10)",
+        "CREATE TABLE dns_record_syncs (\
+             rule_id BIGINT PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,\
+             fqdn TEXT NOT NULL, record_type TEXT NOT NULL, expected_value TEXT NOT NULL,\
+             line TEXT NOT NULL, line_key TEXT NOT NULL, state TEXT NOT NULL, ownership TEXT NOT NULL,\
+             mutation_verified_at TEXT, last_observed_at TEXT, propagated_at TEXT,\
+             last_error_category TEXT, attempt_count INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT,\
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL\
+         )",
+        "INSERT INTO dns_record_syncs VALUES (\
+             100, 'op1.example.com', 'A', '192.0.2.10', 'default', 'default',\
+             'PROPAGATING', 'PANEL', '2026-08-31 00:00:00', '2026-08-31 00:01:00', NULL,\
+             'PUBLIC_DNS_NOT_YET_PROPAGATED', 3, '2026-08-31 00:02:00',\
+             '2026-08-31 00:00:00', '2026-08-31 00:01:00'\
+         )",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+
+    run_pg_migrations(&pool).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i32>("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        34
+    );
+    let preserved: DnsRecordSync = sqlx::query_as(
+        "SELECT * FROM dns_record_syncs WHERE rule_id = 100 AND line_key = 'default'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(preserved.rule_id, 100);
+    assert_eq!(preserved.fqdn, "op1.example.com");
+    assert_eq!(preserved.record_type, "A");
+    assert_eq!(preserved.expected_value.as_deref(), Some("192.0.2.10"));
+    assert_eq!(preserved.line, "default");
+    assert_eq!(preserved.line_key, "default");
+    assert_eq!(preserved.desired_action, "UPSERT");
+    assert_eq!(preserved.state, "PROPAGATING");
+    assert_eq!(preserved.ownership, "PANEL");
+    assert_eq!(
+        preserved.mutation_verified_at.as_deref(),
+        Some("2026-08-31 00:00:00")
+    );
+    assert_eq!(
+        preserved.last_observed_at.as_deref(),
+        Some("2026-08-31 00:01:00")
+    );
+    assert_eq!(preserved.propagated_at, None);
+    assert_eq!(
+        preserved.last_error_category.as_deref(),
+        Some("PUBLIC_DNS_NOT_YET_PROPAGATED")
+    );
+    assert_eq!(preserved.attempt_count, 3);
+    assert_eq!(
+        preserved.next_attempt_at.as_deref(),
+        Some("2026-08-31 00:02:00")
+    );
+    assert_eq!(preserved.created_at, "2026-08-31 00:00:00");
+    assert_eq!(preserved.updated_at, "2026-08-31 00:01:00");
+    let db = PgRepository::new(pool.clone());
+    db.insert_dns_record_sync(&NewDnsRecordSync {
+        rule_id: 100,
+        fqdn: "op1.example.com".into(),
+        record_type: "A".into(),
+        expected_value: Some("192.0.2.20".into()),
+        line: "Dianxin".into(),
+        line_key: "dnsmgr:Dianxin".into(),
+        desired_action: "UPSERT".into(),
+        state: "PENDING".into(),
+        ownership: "UNKNOWN".into(),
+        last_error_category: None,
+        next_attempt_at: Some("2026-08-31 00:03:00".into()),
+        created_at: "2026-08-31 00:03:00".into(),
+        updated_at: "2026-08-31 00:03:00".into(),
+    })
+    .await
+    .unwrap();
+    let stale_carrier = db
+        .find_dns_record_sync(100, "dnsmgr:Dianxin")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.update_dns_record_sync_desired(
+            100,
+            "op1.example.com",
+            "A",
+            Some("192.0.2.21"),
+            "Dianxin",
+            "dnsmgr:Dianxin",
+            "UPSERT",
+            "PENDING",
+            "UNKNOWN",
+            None,
+            Some("2026-08-31 00:04:00"),
+            "2026-08-31 00:04:00",
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.update_dns_record_sync_observation(
+            &stale_carrier,
+            "PENDING",
+            "PROPAGATED",
+            "PANEL",
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            "2026-08-31 00:05:00",
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.find_dns_record_sync(100, "default")
+            .await
+            .unwrap()
+            .unwrap()
+            .expected_value
+            .as_deref(),
+        Some("192.0.2.10")
+    );
+    assert_eq!(
+        db.delete_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .is_some());
+
+    let pk = sqlx::query_scalar::<_, String>(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'dns_record_syncs'::regclass AND contype = 'p'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pk, "PRIMARY KEY (rule_id, line_key)");
+    assert!(sqlx::query(
+        "INSERT INTO dns_record_syncs\
+         (rule_id, fqdn, record_type, expected_value, line, line_key, desired_action, state, ownership, attempt_count, created_at, updated_at)\
+         VALUES (100, 'op1.example.com', 'A', NULL, 'Bad', 'dnsmgr:Bad', 'UPSERT', 'PENDING', 'UNKNOWN', 0, 'now', 'now')",
+    )
+    .execute(&pool)
+    .await
+    .is_err());
+    assert!(sqlx::query(
+        "INSERT INTO dns_record_syncs\
+         (rule_id, fqdn, record_type, expected_value, line, line_key, desired_action, state, ownership, attempt_count, created_at, updated_at)\
+         VALUES (100, 'op1.example.com', 'A', NULL, 'Bad', 'dnsmgr:Bad', 'INVALID', 'PENDING', 'UNKNOWN', 0, 'now', 'now')",
+    )
+    .execute(&pool)
+    .await
+    .is_err());
+    run_pg_migrations(&pool)
+        .await
+        .expect("migration 34 second run must be a no-op");
     cleanup(&db).await;
 }
 

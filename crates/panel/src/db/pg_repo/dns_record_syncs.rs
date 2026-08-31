@@ -175,7 +175,7 @@ impl DnsRecordSyncRepository for PgRepository {
             "UPDATE dns_record_syncs SET state = $1, ownership = $2,\
                  mutation_verified_at = $3, last_observed_at = $4, propagated_at = $5,\
                  last_error_category = $6, attempt_count = $7, next_attempt_at = $8, updated_at = $9 \
-             WHERE rule_id = $10 AND fqdn = $11 AND record_type = $12\
+             WHERE rule_id = $10 AND fqdn = $11 AND record_type = $12 \
                AND expected_value IS NOT DISTINCT FROM $13 \
                AND line = $14 AND line_key = $15 AND desired_action = $16 AND state = $17",
         )
