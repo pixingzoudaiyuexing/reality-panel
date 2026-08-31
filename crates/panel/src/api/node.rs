@@ -124,6 +124,65 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     }
 }
 
+pub async fn get_certificates(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(token) = extract_node_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if extract_node_id(&headers).is_none() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let group = match state.db.find_by_token(&token).await {
+        Ok(Some(group)) if group.group_type == "in" => group,
+        Ok(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            tracing::warn!("get_certificates: group lookup failed: {error}");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let manager = match crate::service::panel_certificate::PanelCertificateManager::new(
+        state.db.clone(),
+        &state.config,
+    ) {
+        Ok(manager) => manager,
+        Err(error) => {
+            tracing::error!("get_certificates: manager unavailable: {error}");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let manifest = match manager.group_manifest(group.id).await {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            tracing::warn!(group_id = group.id, "get_certificates failed: {error}");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let not_modified = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == manifest.etag);
+    let Ok(etag) = axum::http::HeaderValue::from_str(&manifest.etag) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if not_modified {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+                (axum::http::header::ETAG, etag.to_str().unwrap_or_default()),
+            ],
+        )
+            .into_response();
+    }
+    (
+        [
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::ETAG, etag.to_str().unwrap_or_default()),
+        ],
+        Json(manifest.response),
+    )
+        .into_response()
+}
+
 pub async fn present_acme_dns01(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -160,26 +219,23 @@ async fn acme_dns01_operation(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let config = match crate::service::node_config::build_node_config_for_node(
+    let scopes = match crate::service::node_config::certificate_scopes_for_group(
         state.db.as_ref(),
         group.id,
-        Some(node_id),
     )
     .await
     {
-        Ok(config) => config,
+        Ok(scopes) => scopes,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let requested_domain = request.sni.trim_end_matches('.');
-    let authorized = config.camouflage_sites.iter().any(|site| {
-        let certificate_domain = site.certificate.domain.trim_end_matches('.');
+    let authorized = scopes.iter().any(|scope| {
+        let certificate_domain = scope.domain.trim_end_matches('.');
         let certificate_authorized = certificate_domain.eq_ignore_ascii_case(requested_domain)
             || certificate_domain
                 .strip_prefix("*.")
                 .is_some_and(|base| base.eq_ignore_ascii_case(requested_domain));
-        site.enabled
-            && certificate_authorized
-            && site.certificate.challenge_method == AcmeChallengeMethod::Dns01
+        certificate_authorized
     });
     if !authorized {
         return (
@@ -1016,6 +1072,53 @@ mod tests {
         let (state, _pool) = seeded_state().await;
         let resp = get_config(State(state.clone()), config_headers(None)).await;
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn certificate_endpoint_requires_node_identity_and_is_no_store_etagged() {
+        let (state, _pool) = seeded_state().await;
+        assert_eq!(
+            get_certificates(State(state.clone()), HeaderMap::new())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_certificates(State(state.clone()), auth_headers("tok-A"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut headers = auth_headers("tok-A");
+        headers.insert("X-Node-ID", "node-a".parse().unwrap());
+        let response = get_certificates(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(axum::http::header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store"))
+        );
+        let etag = response
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .clone();
+        let body = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .unwrap();
+        let payload: NodeCertificatesResponse = serde_json::from_slice(&body).unwrap();
+        assert!(payload.certificates.is_empty());
+        assert!(payload.missing_domains.is_empty());
+
+        let (state, _pool) = seeded_state().await;
+        let mut headers = auth_headers("tok-A");
+        headers.insert("X-Node-ID", "node-a".parse().unwrap());
+        headers.insert(axum::http::header::IF_NONE_MATCH, etag);
+        let response = get_certificates(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            response.headers().get(axum::http::header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store"))
+        );
     }
 
     #[tokio::test]

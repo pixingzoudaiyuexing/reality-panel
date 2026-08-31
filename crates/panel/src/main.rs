@@ -22,6 +22,15 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if service::panel_certificate::is_hook_command(&args) {
+        match service::panel_certificate::run_hook(&args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("ACME DNS-01 hook failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     // Version/help are metadata-only commands. They must work before an
     // installation has a configuration file so release installers can verify
     // a downloaded binary without starting the service or requiring secrets.
@@ -129,6 +138,8 @@ async fn main() {
             std::collections::HashSet::new(),
         )),
     };
+    let addr: SocketAddr = config.listen.parse().expect("Invalid listen address");
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
     // v1.2.0: scheduled rule restarts. Shares the AppState (and therefore the
     // same node WS registry) with the HTTP handlers, so a scheduled restart goes
@@ -148,17 +159,19 @@ async fn main() {
     // v1.2.x: Panel-only DNS desired-state reconciliation. DNS failures remain
     // control-plane state and never alter Relay runtime configuration.
     service::dnsmgr::spawn(state.clone());
+    service::panel_certificate::spawn(
+        service::panel_certificate::PanelCertificateManager::new(state.db.clone(), &config)
+            .expect("Failed to initialize Panel certificate manager"),
+    );
 
     let app = app.with_state(state);
 
-    let addr: SocketAddr = config.listen.parse().expect("Invalid listen address");
     tracing::info!(
         "Reality Panel listening on {} (public dir: {})",
         addr,
         config.public_dir
     );
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 

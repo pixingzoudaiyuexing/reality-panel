@@ -5,13 +5,15 @@
 //! used by dedicated REALITY servers as their fallback target.
 
 use super::certificate_lifecycle::{
-    certificate_scope_key, inspect_certificate, CertificateLifecycle, CertificateLifecycleConfig,
+    certificate_scope_key, inspect_certificate, install_panel_candidate,
+    read_panel_certificate_source, CertificateLifecycle, CertificateLifecycleConfig,
     CertificateLifecyclePolicy, LifecycleAction, LifecycleReconcileReport, RenewalGate,
     ACME_RETRY_DEFERRED,
 };
 use super::nginx_sni::{self, NginxSniConfig};
 use relay_shared::protocol::{
     CamouflageLocalBackend, CamouflageSiteDesired, CamouflageSiteStatus, NodeConfigResponse,
+    PanelCertificateBundle,
 };
 use relay_shared::reconciliation::{config_fingerprint, fingerprint_bytes, ConfigFingerprint};
 use serde::{Deserialize, Serialize};
@@ -76,6 +78,7 @@ pub struct CamouflageRuntimeObservation {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // 旧Node-local ACME字段暂留，生产主路径已改为Panel证书。
 pub struct CamouflageSiteManager {
     config: CamouflageSiteConfig,
     active: Option<CamouflageSitesManifest>,
@@ -104,6 +107,7 @@ pub struct CamouflageSiteManager {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct CertificateReconcileSnapshot {
     generation: u64,
     fingerprint: ConfigFingerprint,
@@ -118,11 +122,13 @@ struct CertificateReconcileSnapshot {
     allowed_acme_scope_keys: HashSet<String>,
 }
 
+#[allow(dead_code)]
 struct CertificateReconcileResult {
     snapshot: CertificateReconcileSnapshot,
     outcome: Result<CertificateReconcileOutcome, String>,
 }
 
+#[allow(dead_code)]
 struct CertificateReconcileOutcome {
     candidate: CamouflageSitesManifest,
     actions: HashMap<String, LifecycleAction>,
@@ -131,6 +137,15 @@ struct CertificateReconcileOutcome {
     attempted_scope_keys: HashSet<String>,
     successful_scope_keys: HashSet<String>,
     failed_scope_keys: HashSet<String>,
+}
+
+struct PreparedPanelCertificateInstall {
+    candidate: CamouflageSitesManifest,
+    created_generations: Vec<PathBuf>,
+    last_errors: HashMap<String, String>,
+    renewal_warnings: HashMap<String, (String, String)>,
+    changed: bool,
+    retry_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,6 +175,7 @@ enum PersistedDesiredAcmeRetryFile {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum ReconcileCommit {
     Applied,
     Failed,
@@ -167,6 +183,7 @@ enum ReconcileCommit {
     Stale,
 }
 
+#[allow(dead_code)] // 保留旧Node-local ACME实现供过渡期回归，生产入口不再调用。
 impl CamouflageSiteManager {
     pub fn new(config: CamouflageSiteConfig) -> Self {
         let (acme_retries, legacy_acme_retry) = load_desired_acme_retry(&config.state_dir);
@@ -1174,6 +1191,7 @@ impl CamouflageSiteManager {
     }
 }
 
+#[allow(dead_code)]
 const RECONCILE_IN_FLIGHT: &str = "camouflage certificate renewal already in progress";
 const DESIRED_ACME_RETRY_FILE: &str = "desired-acme-retry.json";
 
@@ -1328,6 +1346,7 @@ fn camouflage_desired_fingerprint(desired: &[CamouflageSiteDesired]) -> ConfigFi
     })
 }
 
+#[allow(dead_code)]
 fn run_certificate_reconcile(
     config: &CamouflageSiteConfig,
     renewal_gate: &Arc<RenewalGate>,
@@ -1372,6 +1391,7 @@ fn run_certificate_reconcile(
         .reconcile_scoped(&manifest, allowed_acme_scopes)
 }
 
+#[allow(dead_code)]
 fn run_snapshot(snapshot: CertificateReconcileSnapshot) -> CertificateReconcileResult {
     tracing::info!(
         generation = snapshot.generation,
@@ -1409,6 +1429,7 @@ fn run_snapshot(snapshot: CertificateReconcileSnapshot) -> CertificateReconcileR
     CertificateReconcileResult { snapshot, outcome }
 }
 
+#[allow(dead_code)]
 fn run_desired_certificate_reconcile(
     snapshot: &CertificateReconcileSnapshot,
 ) -> CertificateReconcileOutcome {
@@ -1486,6 +1507,7 @@ fn activate_candidate_external(
     detached.apply_candidate(candidate)
 }
 
+#[allow(dead_code)]
 async fn commit_snapshot(
     shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
     result: CertificateReconcileResult,
@@ -1669,6 +1691,359 @@ async fn commit_snapshot(
     }
 }
 
+/// 将一次Panel响应中的所有可更新scope合并成一个完整camouflage候选。
+/// 同scope的全部SNI必须先完成本地generation准备，之后才允许进入一次
+/// Nginx/LKG事务，任何一个site失败都不会产生该scope的半提交。
+pub async fn install_panel_certificates_shared(
+    shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
+    bundles: Vec<PanelCertificateBundle>,
+    missing_domains: Vec<String>,
+) -> Result<(), String> {
+    let snapshot = shared.lock().await.clone();
+    let desired_generation = snapshot.desired_generation;
+    let desired_fingerprint = snapshot.desired_fingerprint.clone();
+    let active = snapshot.active.clone();
+    let apply_gate = Arc::clone(&snapshot.apply_gate);
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_panel_certificate_install(&snapshot, bundles, missing_domains)
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+
+    let _apply_lease = apply_gate.lock().await;
+    {
+        let current = shared.lock().await;
+        if current.desired_generation != desired_generation
+            || current.desired_fingerprint != desired_fingerprint
+            || current.active != active
+        {
+            drop(current);
+            cleanup_panel_generations(&prepared.created_generations);
+            return Err("Panel certificate desired state changed during installation".into());
+        }
+    }
+
+    if !prepared.changed {
+        let mut current = shared.lock().await;
+        current.last_errors = prepared.last_errors;
+        current.renewal_warnings = prepared.renewal_warnings;
+        return prepared.retry_error.map_or(Ok(()), Err);
+    }
+
+    let config = {
+        let current = shared.lock().await;
+        current.config.clone()
+    };
+    let candidate = prepared.candidate.clone();
+    let active_for_apply = active.clone();
+    let activated = tokio::task::spawn_blocking(move || {
+        activate_candidate_external(config, active_for_apply, candidate)
+    })
+    .await
+    .unwrap_or(false);
+    if !activated {
+        cleanup_panel_generations(&prepared.created_generations);
+        let mut current = shared.lock().await;
+        for desired in current.desired.clone() {
+            if current.active_site_for_sni(&desired.sni).is_some() {
+                current.renewal_warnings.insert(
+                    desired.site_id,
+                    (
+                        chrono::Utc::now().to_rfc3339(),
+                        "Panel certificate installation failed; retained active generation".into(),
+                    ),
+                );
+            } else {
+                current.last_errors.insert(
+                    desired.site_id,
+                    "Panel certificate installation failed; no active generation available".into(),
+                );
+            }
+        }
+        return Err("Panel certificate runtime validation or LKG commit failed".into());
+    }
+
+    let mut current = shared.lock().await;
+    if current.desired_generation != desired_generation
+        || current.desired_fingerprint != desired_fingerprint
+        || current.active != active
+    {
+        return Err("Panel certificate state changed while apply gate was held".into());
+    }
+    current.active = Some(prepared.candidate);
+    current.last_errors = prepared.last_errors;
+    current.renewal_warnings = prepared.renewal_warnings;
+    current.runtime_revision = current.runtime_revision.wrapping_add(1);
+    current.dependency_notify.notify_one();
+    prepared.retry_error.map_or(Ok(()), Err)
+}
+
+pub async fn panel_sources_complete_shared(
+    shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
+) -> bool {
+    let current = shared.lock().await;
+    current.desired.iter().all(|desired| {
+        current
+            .active_site_for_sni(&desired.sni)
+            .and_then(|site| {
+                read_panel_certificate_source(&site.certificate)
+                    .ok()
+                    .flatten()
+            })
+            .is_some()
+    })
+}
+
+fn prepare_panel_certificate_install(
+    manager: &CamouflageSiteManager,
+    bundles: Vec<PanelCertificateBundle>,
+    missing_domains: Vec<String>,
+) -> Result<PreparedPanelCertificateInstall, String> {
+    let mut bundle_by_domain = HashMap::new();
+    for mut bundle in bundles {
+        bundle.domain = normalize_certificate_domain(&bundle.domain)?;
+        if bundle.generation == 0
+            || bundle.fullchain_pem.len() > 512 * 1024
+            || bundle.privkey_pem.len() > 128 * 1024
+            || bundle_by_domain
+                .insert(bundle.domain.clone(), bundle)
+                .is_some()
+        {
+            return Err("invalid or duplicate Panel certificate bundle".into());
+        }
+    }
+    let missing_domains = missing_domains
+        .into_iter()
+        .map(|domain| normalize_certificate_domain(&domain))
+        .collect::<Result<HashSet<_>, _>>()?;
+    if missing_domains
+        .iter()
+        .any(|domain| bundle_by_domain.contains_key(domain))
+    {
+        return Err("Panel certificate response marks one scope present and missing".into());
+    }
+
+    let mut by_scope = std::collections::BTreeMap::<String, Vec<CamouflageSiteDesired>>::new();
+    for desired in &manager.desired {
+        let domain = normalize_certificate_domain(&desired.certificate.domain)?;
+        by_scope.entry(domain).or_default().push(desired.clone());
+    }
+    let required_domains = by_scope.keys().cloned().collect::<HashSet<_>>();
+    if bundle_by_domain
+        .keys()
+        .chain(missing_domains.iter())
+        .any(|domain| !required_domains.contains(domain))
+    {
+        return Err("Panel certificate response contains an unauthorized scope".into());
+    }
+    let mut candidate = manager
+        .active
+        .clone()
+        .unwrap_or(CamouflageSitesManifest { sites: Vec::new() });
+    let mut created_generations = Vec::new();
+    let mut last_errors = manager.last_errors.clone();
+    let mut renewal_warnings = manager.renewal_warnings.clone();
+    let mut changed = false;
+    let mut retry_error = None;
+
+    for (domain, sites) in by_scope {
+        let Some(bundle) = bundle_by_domain.get(&domain) else {
+            if !missing_domains.contains(&domain) {
+                cleanup_panel_generations(&created_generations);
+                return Err(format!(
+                    "Panel certificate response omitted required scope {domain}"
+                ));
+            }
+            record_panel_scope_failure(
+                manager,
+                &sites,
+                "Panel certificate is not available yet",
+                &mut last_errors,
+                &mut renewal_warnings,
+            );
+            continue;
+        };
+
+        let mut update_required = false;
+        let mut scope_error = None;
+        for desired in &sites {
+            let active = manager.active_site_for_sni(&desired.sni);
+            let Some(active) = active else {
+                update_required = true;
+                continue;
+            };
+            let active_domain = active
+                .certificate
+                .lifecycle
+                .as_ref()
+                .and_then(|policy| normalize_certificate_domain(&policy.domain).ok());
+            if active_domain.as_deref() != Some(domain.as_str()) {
+                update_required = true;
+                continue;
+            }
+            match read_panel_certificate_source(&active.certificate) {
+                Ok(Some(source)) if source.panel_generation > bundle.generation => {
+                    scope_error =
+                        Some("Panel certificate generation rollback rejected".to_string());
+                }
+                Ok(Some(source))
+                    if source.panel_generation == bundle.generation
+                        && !source.fingerprint.eq_ignore_ascii_case(&bundle.fingerprint) =>
+                {
+                    scope_error = Some(
+                        "Panel certificate generation fingerprint conflict rejected".to_string(),
+                    );
+                }
+                Ok(Some(source))
+                    if source.panel_generation == bundle.generation
+                        && source.fingerprint.eq_ignore_ascii_case(&bundle.fingerprint) => {}
+                Ok(Some(_)) | Ok(None) | Err(_) => update_required = true,
+            }
+        }
+        if let Some(error) = scope_error {
+            record_panel_scope_failure(
+                manager,
+                &sites,
+                &error,
+                &mut last_errors,
+                &mut renewal_warnings,
+            );
+            retry_error.get_or_insert(error);
+            continue;
+        }
+        if !update_required {
+            for desired in &sites {
+                last_errors.remove(&desired.site_id);
+                renewal_warnings.remove(&desired.site_id);
+            }
+            continue;
+        }
+
+        let mut scope_sites = Vec::new();
+        let mut scope_generations = Vec::new();
+        let scope_result = (|| {
+            for desired in &sites {
+                validate_desired(desired)?;
+                let policy = CertificateLifecyclePolicy {
+                    domain: domain.clone(),
+                    email: None,
+                    expected_public_ip: desired.certificate.expected_public_ip.clone(),
+                    renew_before_days: desired.certificate.renew_before_days,
+                    challenge_method: desired.certificate.challenge_method,
+                };
+                let certificate = install_panel_candidate(
+                    bundle.fullchain_pem.as_bytes(),
+                    bundle.privkey_pem.as_bytes(),
+                    &manager.config.certificate_lifecycle.state_dir,
+                    &desired.site_id,
+                    &policy,
+                    bundle.generation,
+                    &bundle.fingerprint,
+                )?;
+                scope_generations.push(
+                    certificate
+                        .cert_path
+                        .parent()
+                        .ok_or("Panel certificate generation path is unavailable")?
+                        .to_path_buf(),
+                );
+                scope_sites.push(CamouflageSite {
+                    id: desired.site_id.clone(),
+                    sni: desired.sni.clone(),
+                    tls_listener_port: desired.tls_listener_port,
+                    local_backend: OPENLIST_BACKEND.to_string(),
+                    certificate,
+                });
+            }
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = scope_result {
+            cleanup_panel_generations(&scope_generations);
+            record_panel_scope_failure(
+                manager,
+                &sites,
+                &error,
+                &mut last_errors,
+                &mut renewal_warnings,
+            );
+            retry_error.get_or_insert(error);
+            continue;
+        }
+
+        for site in &scope_sites {
+            candidate
+                .sites
+                .retain(|current| current.id != site.id && current.sni != site.sni);
+        }
+        candidate.sites.extend(scope_sites);
+        created_generations.extend(scope_generations);
+        for desired in &sites {
+            last_errors.remove(&desired.site_id);
+            renewal_warnings.remove(&desired.site_id);
+        }
+        changed = true;
+    }
+
+    Ok(PreparedPanelCertificateInstall {
+        candidate,
+        created_generations,
+        last_errors,
+        renewal_warnings,
+        changed,
+        retry_error,
+    })
+}
+
+fn record_panel_scope_failure(
+    manager: &CamouflageSiteManager,
+    sites: &[CamouflageSiteDesired],
+    error: &str,
+    last_errors: &mut HashMap<String, String>,
+    renewal_warnings: &mut HashMap<String, (String, String)>,
+) {
+    let attempted_at = chrono::Utc::now().to_rfc3339();
+    for desired in sites {
+        if manager
+            .active_site_for_sni(&desired.sni)
+            .is_some_and(|active| CertificateLifecycle::is_usable(&active.certificate, &active.sni))
+        {
+            last_errors.remove(&desired.site_id);
+            renewal_warnings.insert(
+                desired.site_id.clone(),
+                (attempted_at.clone(), sanitize_error(error)),
+            );
+        } else {
+            renewal_warnings.remove(&desired.site_id);
+            last_errors.insert(desired.site_id.clone(), sanitize_error(error));
+        }
+    }
+}
+
+fn normalize_certificate_domain(domain: &str) -> Result<String, String> {
+    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    let labels = domain.strip_prefix("*.").unwrap_or(&domain);
+    if labels.is_empty()
+        || labels.split('.').count() < 2
+        || labels.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err("invalid Panel certificate domain".into());
+    }
+    Ok(domain)
+}
+
+fn cleanup_panel_generations(generations: &[PathBuf]) {
+    for generation in generations {
+        remove_private_directory(generation);
+    }
+}
+
+#[allow(dead_code)]
 pub async fn reconcile_active_shared(shared: &Arc<AsyncMutex<CamouflageSiteManager>>) -> bool {
     let snapshot = {
         let current = shared.lock().await;
@@ -1694,6 +2069,35 @@ pub async fn reconcile_active_shared(shared: &Arc<AsyncMutex<CamouflageSiteManag
 }
 
 pub async fn prepare_desired_shared(
+    shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
+    desired: &[CamouflageSiteDesired],
+    panel_authoritative: bool,
+) -> HashSet<String> {
+    let apply_gate = {
+        let current = shared.lock().await;
+        Arc::clone(&current.apply_gate)
+    };
+    {
+        let _apply_lease = apply_gate.lock().await;
+        let mut current = shared.lock().await;
+        current.update_desired(desired, panel_authoritative);
+        // 新Node的唯一证书主路径由Panel bundle驱动。本地ACME状态只属于旧
+        // 二进制，不能让升级前遗留的retry继续触发新生产调用链。
+        current.desired_reconcile_pending = false;
+        current.reconcile_retry_attempt = 0;
+        current.reconcile_retry_at = None;
+        if !current.acme_retries.is_empty() || current.legacy_acme_retry.is_some() {
+            current.acme_retries.clear();
+            current.legacy_acme_retry = None;
+            current.persist_acme_retries();
+        }
+    }
+    active_snis_shared(shared).await
+}
+
+/// 旧Node-local ACME实现仅保留给现有回归测试，生产入口不再调用。
+#[cfg(test)]
+async fn prepare_desired_local_acme_shared(
     shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
     desired: &[CamouflageSiteDesired],
     panel_authoritative: bool,
@@ -2818,6 +3222,517 @@ mod tests {
         }
     }
 
+    fn wildcard_desired_site(site_id: &str, sni: &str) -> CamouflageSiteDesired {
+        let mut desired = desired_site(site_id, sni);
+        desired.certificate.domain = "*.example.com".into();
+        desired
+    }
+
+    fn panel_bundle(
+        reference: &CertificateReference,
+        domain: &str,
+        generation: u64,
+    ) -> PanelCertificateBundle {
+        PanelCertificateBundle {
+            domain: domain.into(),
+            generation,
+            expires_at: "test-metadata-is-validated-from-pem".into(),
+            fingerprint: crate::forwarder::certificate_lifecycle::certificate_leaf_fingerprint(
+                &reference.cert_path,
+            )
+            .unwrap(),
+            fullchain_pem: fs::read_to_string(&reference.cert_path).unwrap(),
+            privkey_pem: fs::read_to_string(&reference.key_path).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn panel_scope_installs_all_snis_in_one_local_generation_transaction() {
+        let dir = unique_dir("panel-multi-sni");
+        let mut state = manager(&dir, "true", "true");
+        state.config.certificate_lifecycle.enabled = true;
+        let desired = vec![
+            wildcard_desired_site("op1", "op1.example.com"),
+            wildcard_desired_site("op2", "op2.example.com"),
+        ];
+        let shared = Arc::new(AsyncMutex::new(state));
+        assert!(prepare_desired_shared(&shared, &desired, true)
+            .await
+            .is_empty());
+        let certificate = real_certificate(&dir, "panel-16", "*.example.com", 90);
+        let bundle = panel_bundle(&certificate, "*.example.com", 16);
+
+        install_panel_certificates_shared(&shared, vec![bundle.clone()], vec![])
+            .await
+            .unwrap();
+        let first_paths = {
+            let state = shared.lock().await;
+            let active = state.active.as_ref().unwrap();
+            assert_eq!(active.sites.len(), 2);
+            assert!(state.active_snis().contains("op1.example.com"));
+            assert!(state.active_snis().contains("op2.example.com"));
+            let local_generation = state.status_snapshot()[0]
+                .active_generation
+                .clone()
+                .unwrap();
+            assert!(local_generation.starts_with("generation-"));
+            assert_ne!(local_generation, "16");
+            active
+                .sites
+                .iter()
+                .map(|site| {
+                    assert!(site
+                        .certificate
+                        .cert_path
+                        .parent()
+                        .unwrap()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("generation-"));
+                    assert_eq!(
+                        read_panel_certificate_source(&site.certificate)
+                            .unwrap()
+                            .unwrap()
+                            .panel_generation,
+                        16
+                    );
+                    site.certificate.cert_path.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        install_panel_certificates_shared(&shared, vec![bundle], vec![])
+            .await
+            .unwrap();
+        let state = shared.lock().await;
+        assert_eq!(
+            state
+                .active
+                .as_ref()
+                .unwrap()
+                .sites
+                .iter()
+                .map(|site| site.certificate.cert_path.clone())
+                .collect::<Vec<_>>(),
+            first_paths
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn panel_response_rejects_extra_scope_and_scope_change_uses_lkg_domain() {
+        let dir = unique_dir("panel-scope-boundary");
+        let mut state = manager(&dir, "true", "true");
+        state.config.certificate_lifecycle.enabled = true;
+        let shared = Arc::new(AsyncMutex::new(state));
+        let desired_exact = desired_site("op1", "op1.example.com");
+        prepare_desired_shared(&shared, &[desired_exact], true).await;
+        let exact = real_certificate(&dir, "exact", "op1.example.com", 60);
+        install_panel_certificates_shared(
+            &shared,
+            vec![panel_bundle(&exact, "op1.example.com", 1)],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let extra = real_certificate(&dir, "extra", "other.example.com", 90);
+        assert!(install_panel_certificates_shared(
+            &shared,
+            vec![panel_bundle(&extra, "other.example.com", 1)],
+            vec![],
+        )
+        .await
+        .is_err());
+
+        prepare_desired_shared(
+            &shared,
+            &[wildcard_desired_site("op1", "op1.example.com")],
+            true,
+        )
+        .await;
+        let wildcard = real_certificate(&dir, "wildcard", "*.example.com", 90);
+        install_panel_certificates_shared(
+            &shared,
+            vec![panel_bundle(&wildcard, "*.example.com", 1)],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let state = shared.lock().await;
+        let active = &state.active.as_ref().unwrap().sites[0].certificate;
+        assert_eq!(active.lifecycle.as_ref().unwrap().domain, "*.example.com");
+        assert_eq!(
+            read_panel_certificate_source(active)
+                .unwrap()
+                .unwrap()
+                .panel_generation,
+            1
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn panel_generation_upgrade_skips_intermediate_and_rejects_rollback_or_conflict() {
+        let dir = unique_dir("panel-generation-order");
+        let mut state = manager(&dir, "true", "true");
+        state.config.certificate_lifecycle.enabled = true;
+        let desired = wildcard_desired_site("op1", "op1.example.com");
+        let shared = Arc::new(AsyncMutex::new(state));
+        prepare_desired_shared(&shared, &[desired], true).await;
+        let certificate16 = real_certificate(&dir, "panel-16", "*.example.com", 60);
+        let certificate17 = real_certificate(&dir, "panel-17", "*.example.com", 75);
+        let certificate20 = real_certificate(&dir, "panel-20", "*.example.com", 90);
+        let bundle16 = panel_bundle(&certificate16, "*.example.com", 16);
+        let bundle17 = panel_bundle(&certificate17, "*.example.com", 17);
+        let bundle20 = panel_bundle(&certificate20, "*.example.com", 20);
+        install_panel_certificates_shared(&shared, vec![bundle16.clone()], vec![])
+            .await
+            .unwrap();
+        install_panel_certificates_shared(&shared, vec![bundle17], vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_panel_certificate_source(
+                &shared.lock().await.active.as_ref().unwrap().sites[0].certificate
+            )
+            .unwrap()
+            .unwrap()
+            .panel_generation,
+            17
+        );
+        install_panel_certificates_shared(&shared, vec![bundle20.clone()], vec![])
+            .await
+            .unwrap();
+        let active20 = shared.lock().await.active.as_ref().unwrap().sites[0]
+            .certificate
+            .cert_path
+            .clone();
+        assert_eq!(
+            read_panel_certificate_source(
+                &shared.lock().await.active.as_ref().unwrap().sites[0].certificate
+            )
+            .unwrap()
+            .unwrap()
+            .panel_generation,
+            20
+        );
+
+        assert!(
+            install_panel_certificates_shared(&shared, vec![bundle16], vec![])
+                .await
+                .is_err()
+        );
+        let conflicting = PanelCertificateBundle {
+            generation: 20,
+            ..panel_bundle(&certificate16, "*.example.com", 20)
+        };
+        assert!(
+            install_panel_certificates_shared(&shared, vec![conflicting], vec![])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            shared.lock().await.active.as_ref().unwrap().sites[0]
+                .certificate
+                .cert_path,
+            active20
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn missing_or_corrupt_source_reinstalls_without_removing_active_runtime() {
+        let dir = unique_dir("panel-source-recovery");
+        let mut state = manager(&dir, "true", "true");
+        state.config.certificate_lifecycle.enabled = true;
+        let shared = Arc::new(AsyncMutex::new(state));
+        prepare_desired_shared(
+            &shared,
+            &[wildcard_desired_site("op1", "op1.example.com")],
+            true,
+        )
+        .await;
+        let certificate = real_certificate(&dir, "panel-current", "*.example.com", 90);
+        let bundle = panel_bundle(&certificate, "*.example.com", 17);
+        install_panel_certificates_shared(&shared, vec![bundle.clone()], vec![])
+            .await
+            .unwrap();
+        let first = shared.lock().await.active.as_ref().unwrap().sites[0]
+            .certificate
+            .clone();
+        fs::remove_file(first.cert_path.parent().unwrap().join("source.json")).unwrap();
+        assert!(shared
+            .lock()
+            .await
+            .active_snis()
+            .contains("op1.example.com"));
+        install_panel_certificates_shared(&shared, vec![bundle.clone()], vec![])
+            .await
+            .unwrap();
+        let second = shared.lock().await.active.as_ref().unwrap().sites[0]
+            .certificate
+            .clone();
+        assert_ne!(first.cert_path, second.cert_path);
+
+        fs::write(
+            second.cert_path.parent().unwrap().join("source.json"),
+            b"broken",
+        )
+        .unwrap();
+        assert!(shared
+            .lock()
+            .await
+            .active_snis()
+            .contains("op1.example.com"));
+        install_panel_certificates_shared(&shared, vec![bundle], vec![])
+            .await
+            .unwrap();
+        assert_ne!(
+            shared.lock().await.active.as_ref().unwrap().sites[0]
+                .certificate
+                .cert_path,
+            second.cert_path
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_panel_generation_from_active_lkg_source() {
+        let dir = unique_dir("panel-source-restart");
+        let mut state = manager(&dir, "true", "true");
+        state.config.certificate_lifecycle.enabled = true;
+        let config = state.config.clone();
+        let desired = wildcard_desired_site("op1", "op1.example.com");
+        let shared = Arc::new(AsyncMutex::new(state));
+        prepare_desired_shared(&shared, std::slice::from_ref(&desired), true).await;
+        let certificate = real_certificate(&dir, "panel-current", "*.example.com", 90);
+        install_panel_certificates_shared(
+            &shared,
+            vec![panel_bundle(&certificate, "*.example.com", 17)],
+            vec![],
+        )
+        .await
+        .unwrap();
+        drop(shared);
+
+        let mut restarted = CamouflageSiteManager::new(config);
+        assert!(restarted.restore_and_apply());
+        let restarted = Arc::new(AsyncMutex::new(restarted));
+        prepare_desired_shared(&restarted, &[desired], true).await;
+        assert!(panel_sources_complete_shared(&restarted).await);
+        let state = restarted.lock().await;
+        let active = &state.active.as_ref().unwrap().sites[0].certificate;
+        assert_eq!(
+            read_panel_certificate_source(active)
+                .unwrap()
+                .unwrap()
+                .panel_generation,
+            17
+        );
+        assert!(state.active_snis().contains("op1.example.com"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn one_scope_site_prepare_failure_keeps_complete_previous_lkg() {
+        let dir = unique_dir("panel-scope-atomic-failure");
+        let mut state = manager(&dir, "true", "true");
+        state.config.certificate_lifecycle.enabled = true;
+        let shared = Arc::new(AsyncMutex::new(state));
+        let initial = vec![
+            wildcard_desired_site("op1", "op1.example.com"),
+            wildcard_desired_site("op2", "op2.example.com"),
+        ];
+        prepare_desired_shared(&shared, &initial, true).await;
+        let old = real_certificate(&dir, "panel-old", "*.example.com", 60);
+        install_panel_certificates_shared(
+            &shared,
+            vec![panel_bundle(&old, "*.example.com", 16)],
+            vec![],
+        )
+        .await
+        .unwrap();
+        let old_manifest = shared.lock().await.active.clone().unwrap();
+
+        let mut next = initial;
+        next.push(wildcard_desired_site("op3", "op3.example.com"));
+        prepare_desired_shared(&shared, &next, true).await;
+        let broken_root = shared
+            .lock()
+            .await
+            .config
+            .certificate_lifecycle
+            .state_dir
+            .join("generations/op3");
+        fs::create_dir_all(broken_root.parent().unwrap()).unwrap();
+        fs::write(&broken_root, b"not-a-directory").unwrap();
+        let new = real_certificate(&dir, "panel-new", "*.example.com", 90);
+        assert!(install_panel_certificates_shared(
+            &shared,
+            vec![panel_bundle(&new, "*.example.com", 17)],
+            vec![],
+        )
+        .await
+        .is_err());
+        assert_eq!(shared.lock().await.active, Some(old_manifest));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn corrupt_panel_pem_or_mismatched_key_never_replaces_active_lkg() {
+        let dir = unique_dir("panel-corrupt-candidate");
+        let mut state = manager(&dir, "true", "true");
+        state.config.certificate_lifecycle.enabled = true;
+        let shared = Arc::new(AsyncMutex::new(state));
+        prepare_desired_shared(
+            &shared,
+            &[wildcard_desired_site("op1", "op1.example.com")],
+            true,
+        )
+        .await;
+        let old = real_certificate(&dir, "panel-old", "*.example.com", 60);
+        let old_bundle = panel_bundle(&old, "*.example.com", 16);
+        install_panel_certificates_shared(&shared, vec![old_bundle.clone()], vec![])
+            .await
+            .unwrap();
+        let old_manifest = shared.lock().await.active.clone().unwrap();
+
+        let mut corrupt = old_bundle.clone();
+        corrupt.generation = 17;
+        corrupt.fingerprint = "0".repeat(64);
+        corrupt.fullchain_pem = "not a certificate".into();
+        assert!(
+            install_panel_certificates_shared(&shared, vec![corrupt], vec![])
+                .await
+                .is_err()
+        );
+        assert_eq!(shared.lock().await.active, Some(old_manifest.clone()));
+
+        let candidate = real_certificate(&dir, "panel-new", "*.example.com", 90);
+        let other = real_certificate(&dir, "other-key", "*.example.com", 90);
+        let mut mismatch = panel_bundle(&candidate, "*.example.com", 17);
+        mismatch.privkey_pem = fs::read_to_string(other.key_path).unwrap();
+        assert!(
+            install_panel_certificates_shared(&shared, vec![mismatch], vec![])
+                .await
+                .is_err()
+        );
+        let state = shared.lock().await;
+        assert_eq!(state.active, Some(old_manifest));
+        assert_eq!(state.status_snapshot()[0].site_status, "active");
+        assert_eq!(
+            state.status_snapshot()[0].certificate_status,
+            "renewal_warning"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn panel_install_nginx_reload_and_lkg_failures_preserve_old_runtime() {
+        for failure in ["nginx-test", "reload", "lkg"] {
+            let dir = unique_dir(&format!("panel-{failure}-failure"));
+            let mut state = manager(&dir, "true", "true");
+            state.config.certificate_lifecycle.enabled = true;
+            let shared = Arc::new(AsyncMutex::new(state));
+            prepare_desired_shared(
+                &shared,
+                &[wildcard_desired_site("op1", "op1.example.com")],
+                true,
+            )
+            .await;
+            let old = real_certificate(&dir, "panel-old", "*.example.com", 60);
+            install_panel_certificates_shared(
+                &shared,
+                vec![panel_bundle(&old, "*.example.com", 16)],
+                vec![],
+            )
+            .await
+            .unwrap();
+            let old_manifest = shared.lock().await.active.clone().unwrap();
+            let old_runtime = {
+                let state = shared.lock().await;
+                fs::read(&state.config.nginx.conf_path).unwrap()
+            };
+            {
+                let mut state = shared.lock().await;
+                match failure {
+                    "nginx-test" => state.config.nginx.test_cmd = "false".into(),
+                    "reload" => {
+                        let path = state.config.nginx.conf_path.clone();
+                        state.config.nginx.reload_cmd = format!(
+                            "if grep -q generation- {}; then exit 1; else exit 0; fi",
+                            path.display()
+                        );
+                    }
+                    "lkg" => {
+                        let path = state.lkg_path();
+                        fs::remove_file(&path).unwrap();
+                        fs::create_dir(&path).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let new = real_certificate(&dir, "panel-new", "*.example.com", 90);
+            assert!(install_panel_certificates_shared(
+                &shared,
+                vec![panel_bundle(&new, "*.example.com", 17)],
+                vec![],
+            )
+            .await
+            .is_err());
+            let state = shared.lock().await;
+            assert_eq!(state.active, Some(old_manifest), "{failure}");
+            assert_eq!(
+                fs::read(&state.config.nginx.conf_path).unwrap(),
+                old_runtime,
+                "{failure}"
+            );
+            assert_eq!(state.status_snapshot()[0].site_status, "active");
+            drop(state);
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn four_nodes_independently_install_one_panel_generation() {
+        let source_dir = unique_dir("panel-four-node-source");
+        let certificate = real_certificate(&source_dir, "panel-17", "*.example.com", 90);
+        let bundle = panel_bundle(&certificate, "*.example.com", 17);
+        let mut local_paths = HashSet::new();
+        for index in 0..4 {
+            let dir = unique_dir(&format!("panel-node-{index}"));
+            let mut state = manager(&dir, "true", "true");
+            state.config.certificate_lifecycle.enabled = true;
+            let shared = Arc::new(AsyncMutex::new(state));
+            prepare_desired_shared(
+                &shared,
+                &[wildcard_desired_site("op1", "op1.example.com")],
+                true,
+            )
+            .await;
+            install_panel_certificates_shared(&shared, vec![bundle.clone()], vec![])
+                .await
+                .unwrap();
+            let state = shared.lock().await;
+            let active = state.active.as_ref().unwrap().sites[0].certificate.clone();
+            assert!(state.active_snis().contains("op1.example.com"));
+            assert_eq!(
+                read_panel_certificate_source(&active)
+                    .unwrap()
+                    .unwrap()
+                    .panel_generation,
+                17
+            );
+            local_paths.insert(active.cert_path);
+            drop(state);
+            let _ = fs::remove_dir_all(dir);
+        }
+        assert_eq!(local_paths.len(), 4);
+        let _ = fs::remove_dir_all(source_dir);
+    }
+
     #[test]
     fn authoritative_desired_update_clears_obsolete_site_diagnostics() {
         let dir = unique_dir("diagnostic-ghost-cleanup");
@@ -3002,12 +3917,12 @@ mod tests {
         let desired = desired_site("q1", "q1.example.com");
         let shared = Arc::new(AsyncMutex::new(state));
 
-        prepare_desired_shared(&shared, std::slice::from_ref(&desired), true).await;
+        prepare_desired_local_acme_shared(&shared, std::slice::from_ref(&desired), true).await;
         wait_for_desired_worker(&shared).await;
         assert_eq!(certbot_invocation_count(&counter), 1);
 
         for _ in 0..20 {
-            prepare_desired_shared(&shared, std::slice::from_ref(&desired), true).await;
+            prepare_desired_local_acme_shared(&shared, std::slice::from_ref(&desired), true).await;
         }
         assert_eq!(certbot_invocation_count(&counter), 1);
         {
@@ -3023,11 +3938,11 @@ mod tests {
         assert_eq!(retry_for_desired(&restarted, &desired).unwrap().attempt, 1);
         assert!(!restarted.acme_scope_is_due(&desired_certificate_scope_key(&desired).unwrap()));
         let restarted = Arc::new(AsyncMutex::new(restarted));
-        prepare_desired_shared(&restarted, std::slice::from_ref(&desired), true).await;
+        prepare_desired_local_acme_shared(&restarted, std::slice::from_ref(&desired), true).await;
         assert_eq!(certbot_invocation_count(&counter), 1);
 
         tokio::time::sleep(Duration::from_millis(1_050)).await;
-        prepare_desired_shared(&restarted, &[desired], true).await;
+        prepare_desired_local_acme_shared(&restarted, &[desired], true).await;
         wait_for_desired_worker(&restarted).await;
         assert_eq!(certbot_invocation_count(&counter), 2);
         let _ = fs::remove_dir_all(dir);
@@ -3460,7 +4375,7 @@ mod tests {
         }));
         let shared = Arc::new(AsyncMutex::new(state));
 
-        let active = prepare_desired_shared(&shared, &[desired], true).await;
+        let active = prepare_desired_local_acme_shared(&shared, &[desired], true).await;
         assert!(active.contains("op1.example.com"));
         let status = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
@@ -3502,7 +4417,7 @@ mod tests {
         let desired = desired_site("op1", "op1.example.com");
         let active = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            prepare_desired_shared(&shared, &[desired], true),
+            prepare_desired_local_acme_shared(&shared, &[desired], true),
         )
         .await
         .expect("desired reconciliation must not wait for ACME");
@@ -3531,6 +4446,37 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_desired_path_never_invokes_node_local_certbot() {
+        let dir = unique_dir("panel-path-no-local-certbot");
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("local-certbot-was-called");
+        let certbot = dir.join("certbot-marker");
+        fs::write(
+            &certbot,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&certbot, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut state = manager(&dir, "true", "true");
+        state.config.certificate_lifecycle.enabled = true;
+        state.config.certificate_lifecycle.certbot_binary = certbot;
+        let shared = Arc::new(AsyncMutex::new(state));
+
+        assert!(prepare_desired_shared(
+            &shared,
+            &[wildcard_desired_site("op1", "op1.example.com")],
+            true,
+        )
+        .await
+        .is_empty());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!marker.exists());
+        assert!(!shared.lock().await.desired_worker_in_flight);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn repeated_identical_desired_does_not_queue_duplicate_certificate_jobs() {
         let dir = unique_dir("identical-desired-single-worker");
@@ -3553,18 +4499,18 @@ mod tests {
 
         let desired = desired_site("same_site", "op1.example.com");
         assert!(
-            prepare_desired_shared(&shared, std::slice::from_ref(&desired), true)
+            prepare_desired_local_acme_shared(&shared, std::slice::from_ref(&desired), true)
                 .await
                 .is_empty()
         );
         let first_attempt = shared.lock().await.last_attempts["same_site"].clone();
         assert!(
-            prepare_desired_shared(&shared, std::slice::from_ref(&desired), true)
+            prepare_desired_local_acme_shared(&shared, std::slice::from_ref(&desired), true)
                 .await
                 .is_empty()
         );
         assert!(
-            prepare_desired_shared(&shared, std::slice::from_ref(&desired), true)
+            prepare_desired_local_acme_shared(&shared, std::slice::from_ref(&desired), true)
                 .await
                 .is_empty()
         );

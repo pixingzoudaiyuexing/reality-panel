@@ -175,6 +175,27 @@ pub struct NodeConfigSnapshot {
     pub config: NodeConfigResponse,
 }
 
+/// Panel 当前向一个 inbound group 发布的证书集合。该模型属于独立 HTTP
+/// 资源，不进入 NodeConfig，也不参与配置协议指纹或版本门禁。
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeCertificatesResponse {
+    pub certificates: Vec<PanelCertificateBundle>,
+    #[serde(default)]
+    pub missing_domains: Vec<String>,
+}
+
+/// 一个证书 scope 的当前 Panel generation。PEM 只在经过 Node token 认证的
+/// certificate endpoint 中传输，不进入状态上报或日志。
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PanelCertificateBundle {
+    pub domain: String,
+    pub generation: u64,
+    pub expires_at: String,
+    pub fingerprint: String,
+    pub fullchain_pem: String,
+    pub privkey_pem: String,
+}
+
 impl std::ops::Deref for NodeConfigSnapshot {
     type Target = NodeConfigResponse;
 

@@ -98,6 +98,12 @@ pub(crate) struct CertificateMetadata {
     pub valid_until: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PanelCertificateSource {
+    pub panel_generation: u64,
+    pub fingerprint: String,
+}
+
 pub(crate) fn inspect_certificate(path: &Path) -> Result<CertificateMetadata, String> {
     let data = fs::read(path).map_err(|_| "certificate is unavailable")?;
     let (_, pem) = parse_x509_pem(&data).map_err(|_| "invalid certificate PEM")?;
@@ -121,15 +127,18 @@ pub(crate) fn inspect_certificate(path: &Path) -> Result<CertificateMetadata, St
 /// Local-only guard for scheduler work. Keys are canonical certificate domains,
 /// so many sites sharing one wildcard cannot invoke Certbot concurrently.
 #[derive(Debug, Default)]
+#[allow(dead_code)] // 旧Node-local ACME互斥器暂留，集中证书主路径不再调度它。
 pub(crate) struct RenewalGate {
     running: Mutex<HashSet<String>>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct RenewalLease<'a> {
     gate: &'a RenewalGate,
     scope_keys: Vec<String>,
 }
 
+#[allow(dead_code)]
 impl RenewalGate {
     pub(crate) fn try_acquire(&self, scope_keys: Vec<String>) -> Option<RenewalLease<'_>> {
         let mut running = self.running.lock().ok()?;
@@ -1200,6 +1209,128 @@ fn install_candidate(
         key_path,
         lifecycle: Some(policy.clone()),
     })
+}
+
+/// 将Panel下载的PEM安装为现有Node-local timestamp generation。Panel
+/// generation只写入同目录source.json，不改变generation目录或status语义。
+pub(crate) fn install_panel_candidate(
+    fullchain_pem: &[u8],
+    privkey_pem: &[u8],
+    state_dir: &Path,
+    site_id: &str,
+    policy: &CertificateLifecyclePolicy,
+    panel_generation: u64,
+    expected_fingerprint: &str,
+) -> Result<CertificateReference, String> {
+    if panel_generation == 0
+        || expected_fingerprint.len() != 64
+        || !expected_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("invalid Panel certificate source metadata".into());
+    }
+    if !is_safe_id(site_id) {
+        return Err("invalid camouflage site id".into());
+    }
+    let generations = state_dir.join("generations").join(site_id);
+    ensure_private_dir(&generations)?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before Unix epoch")?
+        .as_nanos();
+    let generation = generations.join(format!("generation-{stamp}"));
+    ensure_private_dir(&generation)?;
+    let result = (|| {
+        let cert_path = generation.join("fullchain.pem");
+        let key_path = generation.join("privkey.pem");
+        write_private_file(&cert_path, fullchain_pem)?;
+        write_private_file(&key_path, privkey_pem)?;
+        let reference = CertificateReference {
+            cert_path,
+            key_path,
+            lifecycle: Some(policy.clone()),
+        };
+        validate_candidate(&reference, &policy.domain, 0, &SystemCommandRunner, false)?;
+        let fingerprint = certificate_leaf_fingerprint(&reference.cert_path)?;
+        if !fingerprint.eq_ignore_ascii_case(expected_fingerprint) {
+            return Err("Panel certificate fingerprint mismatch".into());
+        }
+        write_private_file(
+            &generation.join("source.json"),
+            &serde_json::to_vec_pretty(&PanelCertificateSource {
+                panel_generation,
+                fingerprint: fingerprint.clone(),
+            })
+            .map_err(|error| error.to_string())?,
+        )?;
+        let source = read_panel_certificate_source(&reference)?
+            .ok_or("Panel certificate source metadata is unavailable")?;
+        if source.panel_generation != panel_generation
+            || !source
+                .fingerprint
+                .eq_ignore_ascii_case(expected_fingerprint)
+        {
+            return Err("Panel certificate source metadata validation failed".into());
+        }
+        Ok(reference)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&generation);
+    }
+    result
+}
+
+pub(crate) fn read_panel_certificate_source(
+    reference: &CertificateReference,
+) -> Result<Option<PanelCertificateSource>, String> {
+    let generation = reference
+        .cert_path
+        .parent()
+        .ok_or("certificate generation directory is unavailable")?;
+    if reference.key_path.parent() != Some(generation) {
+        return Err("certificate and key are not in one generation".into());
+    }
+    let path = generation.join("source.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let source: PanelCertificateSource =
+        serde_json::from_slice(&bytes).map_err(|_| "invalid Panel certificate source metadata")?;
+    if source.panel_generation == 0
+        || source.fingerprint.len() != 64
+        || !source
+            .fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("invalid Panel certificate source metadata".into());
+    }
+    let actual = certificate_leaf_fingerprint(&reference.cert_path)?;
+    if !actual.eq_ignore_ascii_case(&source.fingerprint) {
+        return Err("Panel source fingerprint does not match active certificate".into());
+    }
+    Ok(Some(source))
+}
+
+pub(crate) fn certificate_leaf_fingerprint(path: &Path) -> Result<String, String> {
+    let data = fs::read(path).map_err(|_| "certificate is unavailable")?;
+    let (_, pem) = parse_x509_pem(&data).map_err(|_| "invalid certificate PEM")?;
+    X509Certificate::from_der(&pem.contents).map_err(|_| "invalid certificate DER")?;
+    use sha2::{Digest, Sha256};
+    Ok(hex_encode(&Sha256::digest(&pem.contents)))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn copy_private_file(source: &Path, destination: &Path) -> Result<(), String> {

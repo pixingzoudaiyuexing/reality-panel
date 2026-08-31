@@ -3,6 +3,7 @@ mod config;
 mod diagnose;
 mod forwarder;
 mod lifecycle;
+mod panel_certificate;
 mod poller;
 mod reapply;
 mod reconciler;
@@ -294,23 +295,6 @@ async fn run() {
         );
     }
     if config.camouflage_sites_enabled && config.certificate_lifecycle_enabled {
-        let active_camouflage_sites = camouflage_sites.clone();
-        let interval_secs = config.certificate_lifecycle_check_interval_secs;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                if !forwarder::camouflage_site::reconcile_active_shared(&active_camouflage_sites)
-                    .await
-                {
-                    tracing::warn!(
-                        "camouflage certificate lifecycle check failed; keeping active runtime"
-                    );
-                }
-            }
-        });
-
         let camouflage_sites = camouflage_sites.clone();
         let manager = manager.clone();
         let reconciler = reconciler.clone();
@@ -407,6 +391,8 @@ async fn run() {
     // node-id file, so the panel can tell multiple nodes sharing one group
     // token apart (otherwise their status entries overwrite each other).
     let node_id = poller::get_or_create_node_id();
+    let mut panel_certificate_sync = panel_certificate::PanelCertificateSync::new()
+        .expect("failed to initialize Panel certificate HTTP client");
 
     // --- Fork 1: WebSocket control channel (real-time config push) ---
     {
@@ -491,6 +477,15 @@ async fn run() {
                 }
                 run_local_recovery_tick(&manager, &camouflage_sites, &reconciler).await;
             }
+        }
+
+        if let Err(error) = panel_certificate_sync
+            .sync(&config, &node_id, &camouflage_sites)
+            .await
+        {
+            tracing::warn!(
+                "Panel certificate sync failed; retaining active certificate and LKG: {error}"
+            );
         }
 
         // Report traffic + status (failures are logged but don't crash).

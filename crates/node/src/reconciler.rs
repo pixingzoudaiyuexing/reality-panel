@@ -904,14 +904,14 @@ fn recovery_source(result: &ReconciliationResult) -> ReconciliationRecoverySourc
 mod tests {
     use super::*;
     use crate::forwarder::camouflage_site::{
-        CamouflageSite, CamouflageSiteConfig, CamouflageSitesManifest, CertificateReference,
-        OPENLIST_BACKEND,
+        install_panel_certificates_shared, CamouflageSite, CamouflageSiteConfig,
+        CamouflageSitesManifest, CertificateReference, OPENLIST_BACKEND,
     };
     use crate::forwarder::certificate_lifecycle::CertificateLifecycleConfig;
     use crate::forwarder::nginx_sni::NginxSniConfig;
     use relay_shared::protocol::{
         CamouflageCertificatePolicy, CamouflageLocalBackend, CamouflageSiteDesired, ListenerConfig,
-        LoadBalanceStrategy, NodeTransport, Protocol,
+        LoadBalanceStrategy, NodeTransport, PanelCertificateBundle, Protocol,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -1098,6 +1098,28 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn panel_bundle(dir: &Path, generation: u64) -> PanelCertificateBundle {
+        use rcgen::{CertificateParams, KeyPair};
+        let key = KeyPair::generate().unwrap();
+        let certificate = CertificateParams::new(vec!["op1.example.com".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cert_path = dir.join("panel-source.pem");
+        std::fs::write(&cert_path, certificate.pem()).unwrap();
+        PanelCertificateBundle {
+            domain: "op1.example.com".into(),
+            generation,
+            expires_at: "unused-by-node-validation".into(),
+            fingerprint: crate::forwarder::certificate_lifecycle::certificate_leaf_fingerprint(
+                &cert_path,
+            )
+            .unwrap(),
+            fullchain_pem: certificate.pem(),
+            privkey_pem: key.serialize_pem(),
+        }
     }
 
     #[test]
@@ -1517,6 +1539,47 @@ mod tests {
             1
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn four_nodes_install_one_panel_generation_and_all_converge() {
+        for index in 0..4 {
+            let dir = unique_runtime_dir(&format!("four-panel-nodes-{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut forwarders = ForwarderManager::new(
+                Arc::new(crate::reporter::TrafficCounter::new()),
+                Arc::new(crate::reporter::ConnectionTracker::new()),
+            );
+            forwarders.set_nginx_sni_config_for_test(test_nginx_config(&dir));
+            let forwarders = Arc::new(Mutex::new(forwarders));
+            let camouflage = Arc::new(Mutex::new(compatibility_camouflage_manager(&dir)));
+            let mut reconciler = Reconciler::new();
+            let input = ReconciliationInput::validated_panel(desired()).unwrap();
+            let paths = runtime_paths(&dir);
+
+            let withheld = reconciler
+                .reconcile_with_test_paths(&forwarders, &camouflage, input.clone(), paths.clone())
+                .await;
+            assert_eq!(withheld.state, ReconciliationState::DependencyWithheld);
+            install_panel_certificates_shared(&camouflage, vec![panel_bundle(&dir, 17)], vec![])
+                .await
+                .unwrap();
+            let converged = reconciler
+                .reconcile_with_test_paths(&forwarders, &camouflage, input, paths)
+                .await;
+            assert_eq!(converged.state, ReconciliationState::Converged);
+            assert_eq!(
+                forwarders
+                    .lock()
+                    .await
+                    .current_config()
+                    .unwrap()
+                    .listeners
+                    .len(),
+                1
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[tokio::test]

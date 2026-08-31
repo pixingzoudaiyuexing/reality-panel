@@ -1918,6 +1918,7 @@ dependencies = [
  "lettre",
  "md-5",
  "once_cell",
+ "rcgen",
  "relay-shared",
  "reqwest",
  "semver",
@@ -1928,12 +1929,14 @@ dependencies = [
  "ssh2",
  "subtle",
  "tar",
+ "time",
  "tokio",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser 0.16.0",
 ]
 
 [[package]]

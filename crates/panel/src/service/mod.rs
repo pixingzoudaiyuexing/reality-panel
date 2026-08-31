@@ -8,6 +8,7 @@ pub mod history_prune;
 pub mod node_config;
 pub mod node_watch;
 pub mod notify;
+pub mod panel_certificate;
 pub mod password;
 pub mod profiles;
 pub mod redeem;

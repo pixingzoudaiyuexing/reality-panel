@@ -25,7 +25,7 @@ use relay_shared::protocol::{
     CamouflageLocalBackend, CamouflageSiteDesired, NodeConfigResponse, NodeConfigSnapshot,
 };
 use relay_shared::reconciliation::certificate_domain_covers_sni;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
@@ -44,6 +44,12 @@ pub enum NodeConfigBuildError {
     GroupNotFound,
     NotInboundGroup,
     InvalidConfig(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupCertificateScope {
+    pub domain: String,
+    pub snis: Vec<String>,
 }
 
 impl std::fmt::Display for NodeConfigBuildError {
@@ -135,40 +141,9 @@ pub async fn build_node_config_for_node(
         // If a bound profile no longer exists (deleted out from under the rule,
         // or a stale FK), we skip the rule's listeners rather than emit a
         // half-resolved config. The admin sees no listener for that rule.
-        let mut effective_rule = rule.clone();
-        if let Some(pid) = rule.tunnel_profile_id {
-            // v0.4.10: profile lookup here is a system-internal config build (no
-            // user context), so it uses ProfileScope::All to resolve the real
-            // binding. The dirty-data migration + list_active_for_config filter
-            // (this PR) ensure a regular user's rule can't reach this point bound
-            // to a non-builtin profile.
-            match TunnelProfileRepository::find_profile_by_id(db, pid, &ProfileScope::All).await? {
-                Some(profile) => {
-                    // Profile transport vocab: "direct" → node "raw"; "ws" → "ws";
-                    // "tls_simple" → "tls_simple".
-                    let node_transport = match profile.transport.as_str() {
-                        "direct" => "raw",
-                        "ws" => "ws",
-                        "tls_simple" => "tls_simple",
-                        other => other,
-                    };
-                    effective_rule.node_transport = node_transport.to_string();
-                    effective_rule.ws_path = if profile.transport == "ws" {
-                        Some(profile.ws_path.clone())
-                    } else {
-                        None
-                    };
-                }
-                None => {
-                    tracing::warn!(
-                        "rule {} bound to missing tunnel_profile_id {}; skipping (rebind or pause the rule)",
-                        rule.id,
-                        pid
-                    );
-                    continue;
-                }
-            }
-        }
+        let Some(effective_rule) = effective_rule_for_config(db, rule).await? else {
+            continue;
+        };
         let targets = resolve_targets(db, rule).await?;
         listeners.extend(relay_shared::protocol::build_listeners_for_rule(
             &effective_rule,
@@ -221,6 +196,90 @@ pub async fn build_node_config_for_node(
         listeners,
         camouflage_sites: camouflage_by_sni.into_values().collect(),
     })
+}
+
+/// 返回一个 inbound group 当前实际需要的证书 scope。该函数与 Node config
+/// 共用 active-rule、profile transport 和 DNS ownership 解析，避免 Panel
+/// certificate worker、download API 与 Node desired 产生三套不同语义。
+pub async fn certificate_scopes_for_group(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<Vec<GroupCertificateScope>, NodeConfigBuildError> {
+    let group = GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await?;
+    match group {
+        Some(group) if group.group_type == "in" => {}
+        Some(_) => return Err(NodeConfigBuildError::NotInboundGroup),
+        None => return Err(NodeConfigBuildError::GroupNotFound),
+    }
+
+    let mut scopes = BTreeMap::<String, BTreeSet<String>>::new();
+    for rule in db.list_active_for_config(group_id).await? {
+        let Some(rule) = effective_rule_for_config(db, &rule).await? else {
+            continue;
+        };
+        if !rule.camouflage_enabled || rule.node_transport != "nginx_sni" {
+            continue;
+        }
+        let Some(sni) = rule
+            .sni
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+        else {
+            continue;
+        };
+        let domain = certificate_domain_for_rule(db, rule.id, &sni).await?;
+        if !certificate_domain_covers_sni(&domain, &sni) {
+            return Err(NodeConfigBuildError::InvalidConfig(format!(
+                "certificate domain {domain} does not cover camouflage SNI {sni}"
+            )));
+        }
+        scopes.entry(domain).or_default().insert(sni);
+    }
+
+    Ok(group_certificate_scopes(scopes))
+}
+
+fn group_certificate_scopes(
+    scopes: BTreeMap<String, BTreeSet<String>>,
+) -> Vec<GroupCertificateScope> {
+    scopes
+        .into_iter()
+        .map(|(domain, snis)| GroupCertificateScope {
+            domain,
+            snis: snis.into_iter().collect(),
+        })
+        .collect()
+}
+
+async fn effective_rule_for_config(
+    db: &dyn Repository,
+    rule: &ForwardRule,
+) -> Result<Option<ForwardRule>, DbError> {
+    let mut effective_rule = rule.clone();
+    let Some(profile_id) = rule.tunnel_profile_id else {
+        return Ok(Some(effective_rule));
+    };
+    let Some(profile) =
+        TunnelProfileRepository::find_profile_by_id(db, profile_id, &ProfileScope::All).await?
+    else {
+        tracing::warn!(
+            "rule {} bound to missing tunnel_profile_id {}; skipping (rebind or pause the rule)",
+            rule.id,
+            profile_id
+        );
+        return Ok(None);
+    };
+    effective_rule.node_transport = match profile.transport.as_str() {
+        "direct" => "raw",
+        "ws" => "ws",
+        "tls_simple" => "tls_simple",
+        other => other,
+    }
+    .to_string();
+    effective_rule.ws_path = (profile.transport == "ws").then_some(profile.ws_path);
+    Ok(Some(effective_rule))
 }
 
 /// Build the Panel-authoritative snapshot shared by HTTP and WS delivery.
@@ -500,6 +559,29 @@ mod tests {
         assert_eq!(
             wildcard_domain_for_managed_sni("evil-example.com", "example.com"),
             None
+        );
+    }
+
+    #[test]
+    fn one_wildcard_scope_deduplicates_multiple_snis() {
+        let scopes = group_certificate_scopes(BTreeMap::from([(
+            "*.13886.xyz".to_string(),
+            BTreeSet::from([
+                "op1.13886.xyz".to_string(),
+                "op2.13886.xyz".to_string(),
+                "op3.13886.xyz".to_string(),
+            ]),
+        )]));
+        assert_eq!(
+            scopes,
+            vec![GroupCertificateScope {
+                domain: "*.13886.xyz".into(),
+                snis: vec![
+                    "op1.13886.xyz".into(),
+                    "op2.13886.xyz".into(),
+                    "op3.13886.xyz".into(),
+                ],
+            }]
         );
     }
 

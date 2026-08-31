@@ -35,6 +35,7 @@ pub struct NodeConfig {
     pub camouflage_sites_state_dir: String,
     pub camouflage_wrapper_conf_path: String,
     pub certificate_lifecycle_enabled: bool,
+    #[allow(dead_code)] // 旧Node-local ACME调度配置暂留，集中证书主路径不再读取。
     pub certificate_lifecycle_check_interval_secs: u64,
     pub certbot_binary_path: String,
     pub certbot_live_dir: String,

@@ -419,6 +419,10 @@ pub fn routes() -> Router<AppState> {
         // Node (polled by relay-node binary)
         .route("/node/config", axum::routing::get(node::get_config))
         .route(
+            "/node/certificates",
+            axum::routing::get(node::get_certificates),
+        )
+        .route(
             "/node/acme-dns01/present",
             axum::routing::post(node::present_acme_dns01),
         )

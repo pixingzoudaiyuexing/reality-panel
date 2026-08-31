@@ -140,6 +140,29 @@ impl Config {
             std::process::exit(1);
         }
     }
+
+    /// Panel集中证书只读取固定环境契约，不把证书状态混入业务Config模型。
+    pub fn certificate_state_dir(&self) -> String {
+        std::env::var("PANEL_CERTIFICATE_STATE_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "/var/lib/relay-panel/certificates".to_string())
+    }
+
+    pub fn certificate_check_interval_secs(&self) -> u64 {
+        std::env::var("PANEL_CERTIFICATE_CHECK_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value >= 60)
+            .unwrap_or(43_200)
+    }
+
+    pub fn certbot_binary_path(&self) -> String {
+        std::env::var("PANEL_CERTBOT_BINARY_PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "/usr/bin/certbot".to_string())
+    }
 }
 
 fn configured_jwt_secret(raw: Option<String>) -> String {
