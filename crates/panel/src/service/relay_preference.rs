@@ -620,11 +620,13 @@ async fn build_dns_transaction_records(
         else {
             continue;
         };
-        let sync = db.find_dns_record_sync(*rule_id).await?;
+        let sync = db
+            .find_dns_record_sync(*rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await?;
         let rollback_value = preferred_value.clone().or_else(|| {
             sync.as_ref()
                 .filter(|sync| sync.state == "PROPAGATED")
-                .and_then(|sync| valid_public_ipv4(Some(&sync.expected_value)))
+                .and_then(|sync| valid_public_ipv4(sync.expected_value.as_deref()))
         });
         records.push(RelayDnsTransactionRecord {
             rule_id: *rule_id,
@@ -828,7 +830,10 @@ async fn capture_target_outcomes(
     preference: &mut RelayPreferenceState,
 ) -> Result<(), DbError> {
     for record in &mut preference.dns_records {
-        if let Some(sync) = db.find_dns_record_sync(record.rule_id).await? {
+        if let Some(sync) = db
+            .find_dns_record_sync(record.rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await?
+        {
             record.target_state = Some(sync.state);
             record.target_error = sync.last_error_category;
         }
@@ -922,11 +927,14 @@ async fn finalize_rollback(
                 rollback_error: "ROLLBACK_VALUE_UNAVAILABLE".into(),
             });
         };
-        let Some(sync) = db.find_dns_record_sync(record.rule_id).await? else {
+        let Some(sync) = db
+            .find_dns_record_sync(record.rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await?
+        else {
             all_propagated = false;
             continue;
         };
-        if sync.expected_value != rollback_value {
+        if sync.expected_value.as_deref() != Some(rollback_value) {
             all_propagated = false;
             continue;
         }
@@ -1077,11 +1085,14 @@ async fn finalize_switching_group(
     let mut all_propagated = true;
     let mut terminal_error = None;
     for record in &preference.dns_records {
-        let Some(sync) = db.find_dns_record_sync(record.rule_id).await? else {
+        let Some(sync) = db
+            .find_dns_record_sync(record.rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await?
+        else {
             all_propagated = false;
             continue;
         };
-        if sync.expected_value != record.target_value {
+        if sync.expected_value.as_deref() != Some(record.target_value.as_str()) {
             all_propagated = false;
             continue;
         }
@@ -1270,11 +1281,13 @@ pub async fn get_relay_preference(
     let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
     let mut dns_records = Vec::with_capacity(preference.dns_records.len());
     for record in &preference.dns_records {
-        let sync = db.find_dns_record_sync(record.rule_id).await?;
+        let sync = db
+            .find_dns_record_sync(record.rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await?;
         let propagated_value = sync
             .as_ref()
             .filter(|sync| sync.state == "PROPAGATED" && sync.last_error_category.is_none())
-            .map(|sync| sync.expected_value.as_str());
+            .and_then(|sync| sync.expected_value.as_deref());
         let position = if propagated_value == record.rollback_value.as_deref() {
             RelayDnsRecordPosition::Rollback
         } else if propagated_value == Some(record.target_value.as_str())
@@ -1293,7 +1306,7 @@ pub async fn get_relay_preference(
             fqdn: record.fqdn.clone(),
             rollback_value: record.rollback_value.clone(),
             target_value: record.target_value.clone(),
-            expected_value: sync.as_ref().map(|sync| sync.expected_value.clone()),
+            expected_value: sync.as_ref().and_then(|sync| sync.expected_value.clone()),
             sync_state: sync.as_ref().map(|sync| sync.state.clone()),
             position,
             last_error: sync
@@ -1798,7 +1811,11 @@ mod tests {
         error: Option<&str>,
         next_attempt_at: Option<&str>,
     ) {
-        let sync = db.find_dns_record_sync(rule_id).await.unwrap().unwrap();
+        let sync = db
+            .find_dns_record_sync(rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
         db.update_dns_record_sync_observation(
             &sync,
             &sync.state,
@@ -1838,18 +1855,27 @@ mod tests {
         assert_eq!(view.pending_node_id.as_deref(), Some("node-c"));
         assert_eq!(view.state, RelayPreferencePhase::Switching);
 
-        let sync = repo.find_dns_record_sync(1).await.unwrap().unwrap();
-        assert_eq!(sync.expected_value, "203.0.113.7");
+        let sync = repo
+            .find_dns_record_sync(1, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sync.expected_value.as_deref(), Some("203.0.113.7"));
         assert_eq!(sync.state, "PENDING");
         assert_eq!(
-            repo.find_dns_record_sync(3)
+            repo.find_dns_record_sync(3, crate::service::dnsmgr::DEFAULT_LINE_KEY)
                 .await
                 .unwrap()
                 .unwrap()
-                .expected_value,
-            "203.0.113.7"
+                .expected_value
+                .as_deref(),
+            Some("203.0.113.7")
         );
-        assert!(repo.find_dns_record_sync(2).await.unwrap().is_none());
+        assert!(repo
+            .find_dns_record_sync(2, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .is_none());
         assert!(matches!(
             observed_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -1893,7 +1919,11 @@ mod tests {
         assert_eq!(preference.preferred_node_id.as_deref(), Some("node-a"));
         assert_eq!(preference.pending_node_id, None);
         assert_eq!(preference.state, RelayPreferencePhase::Idle);
-        assert!(repo.find_dns_record_sync(1).await.unwrap().is_none());
+        assert!(repo
+            .find_dns_record_sync(1, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .is_none());
 
         repo.set("node_status:7:node-c", &switch_status("127.0.0.1"))
             .await
@@ -1913,7 +1943,11 @@ mod tests {
             start_relay_switch(&repo, &connections, 7, "node-c").await,
             Err(StartRelaySwitchError::DnsMgrUnavailable)
         ));
-        assert!(repo.find_dns_record_sync(1).await.unwrap().is_none());
+        assert!(repo
+            .find_dns_record_sync(1, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .is_none());
 
         repo.set(
             crate::service::dnsmgr::DNSMGR_CONFIG_KEY,
@@ -2017,8 +2051,16 @@ mod tests {
         assert_eq!(preference.preferred_node_id.as_deref(), Some("node-a"));
         assert_eq!(preference.pending_node_id, None);
         assert_eq!(preference.state, RelayPreferencePhase::Idle);
-        assert!(repo.find_dns_record_sync(1).await.unwrap().is_none());
-        assert!(repo.find_dns_record_sync(3).await.unwrap().is_none());
+        assert!(repo
+            .find_dns_record_sync(1, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .find_dns_record_sync(3, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -2178,8 +2220,12 @@ mod tests {
             .await
             .unwrap();
         for rule_id in [1, 3] {
-            let sync = repo.find_dns_record_sync(rule_id).await.unwrap().unwrap();
-            assert_eq!(sync.expected_value, "203.0.113.5");
+            let sync = repo
+                .find_dns_record_sync(rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sync.expected_value.as_deref(), Some("203.0.113.5"));
             assert_eq!(sync.state, "PENDING");
             set_sync_state(&repo, rule_id, "PROPAGATED", None, None).await;
         }
@@ -2219,7 +2265,11 @@ mod tests {
                 .unwrap(),
             StartRelaySwitchOutcome::AlreadyPreferred
         );
-        assert!(repo.find_dns_record_sync(1).await.unwrap().is_none());
+        assert!(repo
+            .find_dns_record_sync(1, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .is_none());
 
         start_relay_switch(&repo, &connections, 7, "node-b")
             .await
@@ -2274,12 +2324,13 @@ mod tests {
         assert_eq!(switching_a.pending_node_id.as_deref(), Some("node-a"));
         assert_eq!(switching_a.state, RelayPreferencePhase::Switching);
         assert_eq!(
-            repo.find_dns_record_sync(1)
+            repo.find_dns_record_sync(1, crate::service::dnsmgr::DEFAULT_LINE_KEY)
                 .await
                 .unwrap()
                 .unwrap()
-                .expected_value,
-            "203.0.113.5"
+                .expected_value
+                .as_deref(),
+            Some("203.0.113.5")
         );
     }
 
@@ -2308,12 +2359,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.find_dns_record_sync(1)
+            repo.find_dns_record_sync(1, crate::service::dnsmgr::DEFAULT_LINE_KEY)
                 .await
                 .unwrap()
                 .unwrap()
-                .expected_value,
-            "203.0.113.5"
+                .expected_value
+                .as_deref(),
+            Some("203.0.113.5")
         );
 
         let (repo, connections, _) = switch_fixture().await;

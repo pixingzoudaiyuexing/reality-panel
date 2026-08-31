@@ -312,12 +312,13 @@ CREATE INDEX IF NOT EXISTS idx_dns_record_bindings_rule_id
 -- from dns_record_bindings: pending and externally-owned records are not
 -- Panel ownership evidence.
 CREATE TABLE IF NOT EXISTS dns_record_syncs (
-    rule_id BIGINT PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
+    rule_id BIGINT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
     fqdn TEXT NOT NULL,
     record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),
-    expected_value TEXT NOT NULL,
+    expected_value TEXT,
     line TEXT NOT NULL,
     line_key TEXT NOT NULL,
+    desired_action TEXT NOT NULL DEFAULT 'UPSERT' CHECK (desired_action IN ('UPSERT','DELETE')),
     state TEXT NOT NULL CHECK (state IN (
         'PENDING','SYNCING','MUTATION_VERIFIED','PROPAGATING','PROPAGATED',
         'CONFLICT','FAILED','MUTATION_OUTCOME_UNKNOWN','DISABLED','NOT_ELIGIBLE'
@@ -330,7 +331,9 @@ CREATE TABLE IF NOT EXISTS dns_record_syncs (
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     next_attempt_at TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (rule_id, line_key),
+    CHECK (desired_action = 'DELETE' OR expected_value IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS idx_dns_record_syncs_due
     ON dns_record_syncs(state, next_attempt_at);
@@ -468,7 +471,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 33;
+pub const PG_SCHEMA_VERSION: i32 = 34;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1681,12 +1684,13 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         let mut tx = pool.begin().await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS dns_record_syncs (\
-                 rule_id BIGINT PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,\
+                 rule_id BIGINT NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,\
                  fqdn TEXT NOT NULL,\
                  record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),\
-                 expected_value TEXT NOT NULL,\
+                 expected_value TEXT,\
                  line TEXT NOT NULL,\
                  line_key TEXT NOT NULL,\
+                 desired_action TEXT NOT NULL DEFAULT 'UPSERT' CHECK (desired_action IN ('UPSERT','DELETE')),\
                  state TEXT NOT NULL CHECK (state IN (\
                      'PENDING','SYNCING','MUTATION_VERIFIED','PROPAGATING','PROPAGATED',\
                      'CONFLICT','FAILED','MUTATION_OUTCOME_UNKNOWN','DISABLED','NOT_ELIGIBLE'\
@@ -1699,7 +1703,9 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
                  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),\
                  next_attempt_at TEXT,\
                  created_at TEXT NOT NULL,\
-                 updated_at TEXT NOT NULL\
+                 updated_at TEXT NOT NULL,\
+                 PRIMARY KEY (rule_id, line_key),\
+                 CHECK (desired_action = 'DELETE' OR expected_value IS NOT NULL)\
              )",
         )
         .execute(&mut *tx)
@@ -1733,6 +1739,56 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         .await?;
         tx.commit().await?;
         tracing::info!("PG migration 33: forward_rules.send_proxy_protocol present");
+    }
+
+    if current < 34 {
+        let mut tx = pool.begin().await?;
+        let has_desired_action: bool = sqlx::query_scalar(
+            "SELECT EXISTS (\
+                 SELECT 1 FROM information_schema.columns\
+                 WHERE table_schema = current_schema()\
+                   AND table_name = 'dns_record_syncs'\
+                   AND column_name = 'desired_action'\
+             )",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if !has_desired_action {
+            sqlx::query(
+                "ALTER TABLE dns_record_syncs\
+                     ADD COLUMN desired_action TEXT NOT NULL DEFAULT 'UPSERT'",
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("ALTER TABLE dns_record_syncs ALTER COLUMN expected_value DROP NOT NULL")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("ALTER TABLE dns_record_syncs DROP CONSTRAINT dns_record_syncs_pkey")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("ALTER TABLE dns_record_syncs ADD PRIMARY KEY (rule_id, line_key)")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "ALTER TABLE dns_record_syncs ADD CONSTRAINT dns_record_syncs_action_check\
+                     CHECK (desired_action IN ('UPSERT','DELETE'))",
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "ALTER TABLE dns_record_syncs ADD CONSTRAINT dns_record_syncs_value_check\
+                     CHECK (desired_action = 'DELETE' OR expected_value IS NOT NULL)",
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (34) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 34: dns_record_syncs uses composite line identity");
     }
 
     Ok(())
@@ -1795,7 +1851,7 @@ mod tests {
 
     #[test]
     fn pg_schema_version_matches_latest_migration() {
-        assert_eq!(PG_SCHEMA_VERSION, 33);
+        assert_eq!(PG_SCHEMA_VERSION, 34);
     }
 
     #[test]
@@ -1821,6 +1877,9 @@ mod tests {
         assert!(PG_SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS dns_record_syncs"));
         assert!(PG_SCHEMA_SQL.contains("idx_dns_record_syncs_due"));
         assert!(PG_SCHEMA_SQL.contains("ON DELETE CASCADE"));
+        assert!(PG_SCHEMA_SQL.contains("PRIMARY KEY (rule_id, line_key)"));
+        assert!(PG_SCHEMA_SQL.contains("desired_action TEXT NOT NULL DEFAULT 'UPSERT'"));
+        assert!(PG_SCHEMA_SQL.contains("desired_action = 'DELETE' OR expected_value IS NOT NULL"));
     }
 
     #[test]

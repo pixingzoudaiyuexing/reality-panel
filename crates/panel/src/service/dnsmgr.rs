@@ -31,6 +31,7 @@ const PUBLIC_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// KVS key holding the single Panel-wide DNSMgr integration configuration.
 pub const DNSMGR_CONFIG_KEY: &str = "dns:dnsmgr";
+pub const DEFAULT_LINE_KEY: &str = "default";
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -549,7 +550,10 @@ impl DnsAuditTransition {
             rule_id: sync.rule_id,
             fqdn: sync.fqdn.clone(),
             record_type: sync.record_type.clone(),
-            expected_value: sync.expected_value.clone(),
+            expected_value: sync
+                .expected_value
+                .clone()
+                .unwrap_or_else(|| "<absent>".into()),
             ownership: ownership.to_string(),
             category: category.map(str::to_string),
         }
@@ -1238,7 +1242,8 @@ fn desired_matches_sync(desired: &DnsDesiredRecord, sync: &DnsRecordSync) -> boo
     desired.rule_id == sync.rule_id
         && desired.fqdn == sync.fqdn
         && desired.record_type.as_str() == sync.record_type
-        && desired.expected_value == sync.expected_value
+        && sync.desired_action == "UPSERT"
+        && sync.expected_value.as_deref() == Some(desired.expected_value.as_str())
         && desired.line.raw_id == sync.line
         && desired.line.key == sync.line_key
 }
@@ -1253,16 +1258,19 @@ async fn persist_desired(
     force_schedule: bool,
 ) -> Result<(), crate::db::error::DbError> {
     let now = utc_now();
-    let existing = db.find_dns_record_sync(desired.rule_id).await?;
+    let existing = db
+        .find_dns_record_sync(desired.rule_id, &desired.line.key)
+        .await?;
     match existing {
         None => {
             db.insert_dns_record_sync(&NewDnsRecordSync {
                 rule_id: desired.rule_id,
                 fqdn: desired.fqdn.clone(),
                 record_type: desired.record_type.as_str().to_string(),
-                expected_value: desired.expected_value.clone(),
+                expected_value: Some(desired.expected_value.clone()),
                 line: desired.line.raw_id.clone(),
                 line_key: desired.line.key.clone(),
+                desired_action: "UPSERT".into(),
                 state: "PENDING".into(),
                 ownership: "UNKNOWN".into(),
                 last_error_category: None,
@@ -1277,9 +1285,10 @@ async fn persist_desired(
                 desired.rule_id,
                 &desired.fqdn,
                 desired.record_type.as_str(),
-                &desired.expected_value,
+                Some(&desired.expected_value),
                 &desired.line.raw_id,
                 &desired.line.key,
+                "UPSERT",
                 "PENDING",
                 "UNKNOWN",
                 None,
@@ -1291,6 +1300,7 @@ async fn persist_desired(
         Some(sync) if force_schedule || sync.state == "DISABLED" => {
             db.schedule_dns_record_sync(
                 desired.rule_id,
+                &desired.line.key,
                 "PENDING",
                 "UNKNOWN",
                 None,
@@ -1313,10 +1323,15 @@ async fn persist_resolution(
     match resolution {
         DnsDesiredResolution::Frozen => {}
         DnsDesiredResolution::NotEligible => {
-            if db.find_dns_record_sync(rule_id).await?.is_some() {
+            if db
+                .find_dns_record_sync(rule_id, DEFAULT_LINE_KEY)
+                .await?
+                .is_some()
+            {
                 let now = utc_now();
                 db.schedule_dns_record_sync(
                     rule_id,
+                    DEFAULT_LINE_KEY,
                     "NOT_ELIGIBLE",
                     "UNKNOWN",
                     Some("RULE_NOT_ELIGIBLE"),
@@ -1332,16 +1347,17 @@ async fn persist_resolution(
         DnsDesiredResolution::ConfigurationError { desired, category } => {
             if let Some(desired) = desired {
                 let now = utc_now();
-                let existing = db.find_dns_record_sync(rule_id).await?;
+                let existing = db.find_dns_record_sync(rule_id, &desired.line.key).await?;
                 match existing {
                     None => {
                         db.insert_dns_record_sync(&NewDnsRecordSync {
                             rule_id,
                             fqdn: desired.fqdn,
                             record_type: desired.record_type.as_str().into(),
-                            expected_value: desired.expected_value,
+                            expected_value: Some(desired.expected_value),
                             line: desired.line.raw_id,
                             line_key: desired.line.key,
+                            desired_action: "UPSERT".into(),
                             state: "FAILED".into(),
                             ownership: "UNKNOWN".into(),
                             last_error_category: Some(category.into()),
@@ -1393,11 +1409,15 @@ pub async fn schedule_rule(
         .map(|raw| DnsMgrSettings::from_json(Some(&raw)))
         .unwrap_or_default();
     if (!settings.enabled || !settings.configured())
-        && db.find_dns_record_sync(rule_id).await?.is_some()
+        && db
+            .find_dns_record_sync(rule_id, DEFAULT_LINE_KEY)
+            .await?
+            .is_some()
     {
         let now = utc_now();
         db.schedule_dns_record_sync(
             rule_id,
+            DEFAULT_LINE_KEY,
             "DISABLED",
             "UNKNOWN",
             Some("DNSMGR_DISABLED"),
@@ -1413,7 +1433,11 @@ pub async fn schedule_rule(
 /// is deliberately separate from scheduling so internal refresh ticks never
 /// create audit noise.
 pub async fn audit_sync_scheduled(state: &AppState, actor_id: Option<i64>, rule_id: i64) {
-    let Ok(Some(sync)) = state.db.find_dns_record_sync(rule_id).await else {
+    let Ok(Some(sync)) = state
+        .db
+        .find_dns_record_sync(rule_id, DEFAULT_LINE_KEY)
+        .await
+    else {
         return;
     };
     if sync.state != "PENDING" {
@@ -1427,7 +1451,10 @@ pub async fn audit_sync_scheduled(state: &AppState, actor_id: Option<i64>, rule_
         rule_id,
         &format!(
             "fqdn={} record_type={} expected_value={} state={}",
-            sync.fqdn, sync.record_type, sync.expected_value, sync.state,
+            sync.fqdn,
+            sync.record_type,
+            sync.expected_value.as_deref().unwrap_or("<absent>"),
+            sync.state,
         ),
     )
     .await;
@@ -1499,10 +1526,15 @@ pub async fn disable_all_syncs(db: &dyn Repository) -> Result<u64, crate::db::er
         ) {
             continue;
         }
-        if db.find_dns_record_sync(rule.id).await?.is_some() {
+        if db
+            .find_dns_record_sync(rule.id, DEFAULT_LINE_KEY)
+            .await?
+            .is_some()
+        {
             updated += db
                 .schedule_dns_record_sync(
                     rule.id,
+                    DEFAULT_LINE_KEY,
                     "DISABLED",
                     "UNKNOWN",
                     Some("DNSMGR_DISABLED"),
@@ -1527,7 +1559,7 @@ async fn resume_unfrozen_syncs_on_startup(
         ) {
             continue;
         }
-        let Some(sync) = db.find_dns_record_sync(rule.id).await? else {
+        let Some(sync) = db.find_dns_record_sync(rule.id, DEFAULT_LINE_KEY).await? else {
             continue;
         };
         let resumed_state = match sync.state.as_str() {
@@ -1547,6 +1579,7 @@ async fn resume_unfrozen_syncs_on_startup(
             updated += db
                 .schedule_dns_record_sync(
                     rule.id,
+                    DEFAULT_LINE_KEY,
                     resumed_state,
                     &sync.ownership,
                     sync.last_error_category.as_deref(),
@@ -1671,7 +1704,10 @@ async fn observe_and_store(
     mutation_verified_at: Option<&str>,
     attempts: i32,
 ) -> Option<DnsAuditTransition> {
-    let Ok(expected) = sync.expected_value.parse::<Ipv4Addr>() else {
+    let Some(expected_value) = sync.expected_value.as_deref() else {
+        return None;
+    };
+    let Ok(expected) = expected_value.parse::<Ipv4Addr>() else {
         let updated = update_sync(
             db,
             sync,
@@ -1815,7 +1851,7 @@ async fn reconcile_one(
         rule_id: sync.rule_id,
         fqdn: sync.fqdn.clone(),
         record_type: DnsRecordType::A,
-        expected_value: sync.expected_value.clone(),
+        expected_value: sync.expected_value.clone().unwrap_or_default(),
         line: ProviderLine::from_provider(&sync.line, None),
     };
     match ensure_record(db, client, &input).await {
@@ -3311,8 +3347,12 @@ mod tests {
             "192.0.2.30"
         );
         schedule_rule(&db, 100).await.unwrap();
-        let pending_b = db.find_dns_record_sync(100).await.unwrap().unwrap();
-        assert_eq!(pending_b.expected_value, "192.0.2.30");
+        let pending_b = db
+            .find_dns_record_sync(100, DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_b.expected_value.as_deref(), Some("192.0.2.30"));
 
         db.set(
             &key,
@@ -3338,7 +3378,10 @@ mod tests {
         disable_all_syncs(&db).await.unwrap();
         resume_unfrozen_syncs_on_startup(&db).await.unwrap();
         assert_eq!(
-            db.find_dns_record_sync(100).await.unwrap().unwrap(),
+            db.find_dns_record_sync(100, DEFAULT_LINE_KEY)
+                .await
+                .unwrap()
+                .unwrap(),
             pending_b,
             "failed Relay transactions must freeze desired value and sync state"
         );
@@ -3437,9 +3480,13 @@ mod tests {
         .await
         .unwrap();
         schedule_rule(&db, 100).await.unwrap();
-        let first = db.find_dns_record_sync(100).await.unwrap().unwrap();
+        let first = db
+            .find_dns_record_sync(100, DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(first.state, "PENDING");
-        assert_eq!(first.expected_value, "192.0.2.10");
+        assert_eq!(first.expected_value.as_deref(), Some("192.0.2.10"));
 
         RuleRepository::update_rule_fields(
             &db,
@@ -3465,7 +3512,11 @@ mod tests {
         .await
         .unwrap();
         schedule_rule(&db, 100).await.unwrap();
-        let edited = db.find_dns_record_sync(100).await.unwrap().unwrap();
+        let edited = db
+            .find_dns_record_sync(100, DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(edited.fqdn, "op2.example.com");
         assert_eq!(edited.state, "PENDING");
         assert_eq!(edited.attempt_count, 0);
@@ -3498,7 +3549,10 @@ mod tests {
         .unwrap();
         configure_eligible_rule(&db, "op1.example.com", "192.0.2.5").await;
         schedule_rule(&db, 100).await.unwrap();
-        assert_eq!(sync_row(&db).await.expected_value, "192.0.2.5");
+        assert_eq!(
+            sync_row(&db).await.expected_value.as_deref(),
+            Some("192.0.2.5")
+        );
 
         GroupRepository::update_group_fields(
             &db,
@@ -3515,7 +3569,7 @@ mod tests {
         .unwrap();
         schedule_all_eligible(&db).await.unwrap();
         let scheduled = sync_row(&db).await;
-        assert_eq!(scheduled.expected_value, "192.0.2.10");
+        assert_eq!(scheduled.expected_value.as_deref(), Some("192.0.2.10"));
         assert_eq!(scheduled.state, "PENDING");
 
         let mock = spawn_ensure_mock(
@@ -3586,7 +3640,11 @@ mod tests {
         let db = ensure_db().await;
         configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
         schedule_rule(&db, 100).await.unwrap();
-        let sync = db.find_dns_record_sync(100).await.unwrap().unwrap();
+        let sync = db
+            .find_dns_record_sync(100, DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(sync.state, "DISABLED");
         assert_eq!(sync.last_error_category.as_deref(), Some("DNSMGR_DISABLED"));
         assert!(db
@@ -3642,7 +3700,15 @@ mod tests {
         insert_sync(&conflict_db).await;
         let now = utc_now();
         conflict_db
-            .schedule_dns_record_sync(100, "PENDING", "EXTERNAL", None, Some(&now), &now)
+            .schedule_dns_record_sync(
+                100,
+                DEFAULT_LINE_KEY,
+                "PENDING",
+                "EXTERNAL",
+                None,
+                Some(&now),
+                &now,
+            )
             .await
             .unwrap();
         let conflict = spawn_ensure_mock(
@@ -3761,9 +3827,10 @@ mod tests {
             100,
             "op2.example.com",
             "A",
-            "192.0.2.11",
+            Some("192.0.2.11"),
             "default",
             "default",
+            "UPSERT",
             "PENDING",
             "UNKNOWN",
             None,
@@ -3779,7 +3846,7 @@ mod tests {
 
         let current = sync_row(&db).await;
         assert_eq!(current.fqdn, "op2.example.com");
-        assert_eq!(current.expected_value, "192.0.2.11");
+        assert_eq!(current.expected_value.as_deref(), Some("192.0.2.11"));
         assert_eq!(current.state, "PENDING");
         assert_eq!(mock.state.total_mutations(), 0);
 
@@ -3808,9 +3875,10 @@ mod tests {
             100,
             "localhost",
             "A",
-            "192.0.2.10",
+            Some("192.0.2.10"),
             "default",
             "default",
+            "UPSERT",
             "PROPAGATING",
             "PANEL",
             None,
@@ -3912,9 +3980,10 @@ mod tests {
             rule_id: 100,
             fqdn: "op1.example.com".into(),
             record_type: "A".into(),
-            expected_value: "192.0.2.10".into(),
+            expected_value: Some("192.0.2.10".into()),
             line: "default".into(),
             line_key: "default".into(),
+            desired_action: "UPSERT".into(),
             state: "PENDING".into(),
             ownership: "UNKNOWN".into(),
             last_error_category: None,
@@ -3927,7 +3996,10 @@ mod tests {
     }
 
     async fn sync_row(db: &SqliteRepository) -> DnsRecordSync {
-        db.find_dns_record_sync(100).await.unwrap().unwrap()
+        db.find_dns_record_sync(100, DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     async fn due_queue_db(frozen_count: i64, executable_count: i64) -> SqliteRepository {
@@ -3995,9 +4067,10 @@ mod tests {
                 rule_id: 100 + offset,
                 fqdn: format!("frozen-{offset}.example.com"),
                 record_type: "A".into(),
-                expected_value: "192.0.2.30".into(),
+                expected_value: Some("192.0.2.30".into()),
                 line: "default".into(),
                 line_key: "default".into(),
+                desired_action: "UPSERT".into(),
                 state: "FAILED".into(),
                 ownership: "PANEL".into(),
                 last_error_category: Some("DNS_RECORD_CONFLICT".into()),
@@ -4013,9 +4086,10 @@ mod tests {
                 rule_id: 1000 + offset,
                 fqdn: format!("active-{offset}.example.com"),
                 record_type: "A".into(),
-                expected_value: "192.0.2.40".into(),
+                expected_value: Some("192.0.2.40".into()),
                 line: "default".into(),
                 line_key: "default".into(),
+                desired_action: "UPSERT".into(),
                 state: "PENDING".into(),
                 ownership: "UNKNOWN".into(),
                 last_error_category: None,
@@ -4033,7 +4107,7 @@ mod tests {
         let mut rows = Vec::new();
         for offset in 0..count {
             rows.push(
-                db.find_dns_record_sync(100 + offset)
+                db.find_dns_record_sync(100 + offset, DEFAULT_LINE_KEY)
                     .await
                     .unwrap()
                     .unwrap(),

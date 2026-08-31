@@ -788,9 +788,10 @@ pub struct DnsRecordSync {
     pub rule_id: i64,
     pub fqdn: String,
     pub record_type: String,
-    pub expected_value: String,
+    pub expected_value: Option<String>,
     pub line: String,
     pub line_key: String,
+    pub desired_action: String,
     pub state: String,
     pub ownership: String,
     pub mutation_verified_at: Option<String>,
@@ -808,9 +809,10 @@ pub struct NewDnsRecordSync {
     pub rule_id: i64,
     pub fqdn: String,
     pub record_type: String,
-    pub expected_value: String,
+    pub expected_value: Option<String>,
     pub line: String,
     pub line_key: String,
+    pub desired_action: String,
     pub state: String,
     pub ownership: String,
     pub last_error_category: Option<String>,
@@ -824,7 +826,16 @@ pub struct NewDnsRecordSync {
 pub trait DnsRecordSyncRepository: Send + Sync {
     async fn insert_dns_record_sync(&self, sync: &NewDnsRecordSync) -> Result<(), DbError>;
 
-    async fn find_dns_record_sync(&self, rule_id: i64) -> Result<Option<DnsRecordSync>, DbError>;
+    async fn find_dns_record_sync(
+        &self,
+        rule_id: i64,
+        line_key: &str,
+    ) -> Result<Option<DnsRecordSync>, DbError>;
+
+    async fn list_dns_record_syncs_for_rule(
+        &self,
+        rule_id: i64,
+    ) -> Result<Vec<DnsRecordSync>, DbError>;
 
     /// Update desired state only when the desired record changed. The caller
     /// supplies a fresh pending state for an explicit rule/settings trigger.
@@ -833,9 +844,10 @@ pub trait DnsRecordSyncRepository: Send + Sync {
         rule_id: i64,
         fqdn: &str,
         record_type: &str,
-        expected_value: &str,
+        expected_value: Option<&str>,
         line: &str,
         line_key: &str,
+        desired_action: &str,
         state: &str,
         ownership: &str,
         last_error_category: Option<&str>,
@@ -846,12 +858,15 @@ pub trait DnsRecordSyncRepository: Send + Sync {
     async fn schedule_dns_record_sync(
         &self,
         rule_id: i64,
+        line_key: &str,
         state: &str,
         ownership: &str,
         last_error_category: Option<&str>,
         next_attempt_at: Option<&str>,
         updated_at: &str,
     ) -> Result<u64, DbError>;
+
+    async fn delete_dns_record_sync(&self, rule_id: i64, line_key: &str) -> Result<u64, DbError>;
 
     async fn list_due_dns_record_syncs(
         &self,

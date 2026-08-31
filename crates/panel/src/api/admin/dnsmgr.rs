@@ -259,7 +259,8 @@ fn status_from_sync(
     let matching = sync.filter(|sync| {
         sync.fqdn == desired.fqdn
             && sync.record_type == desired.record_type.as_str()
-            && sync.expected_value == desired.expected_value
+            && sync.desired_action == "UPSERT"
+            && sync.expected_value.as_deref() == Some(desired.expected_value.as_str())
             && sync.line_key == desired.line.key
     });
     let ownership = matching
@@ -341,7 +342,7 @@ fn status_from_frozen_sync(
         automation_enabled,
         fqdn: sync.as_ref().map(|sync| sync.fqdn.clone()),
         record_type: sync.as_ref().map(|sync| sync.record_type.clone()),
-        expected_value: sync.as_ref().map(|sync| sync.expected_value.clone()),
+        expected_value: sync.as_ref().and_then(|sync| sync.expected_value.clone()),
         ownership,
         sync_state: sync
             .as_ref()
@@ -380,11 +381,17 @@ pub(crate) async fn project_rule_dns_status(
             warning_category: None,
         }),
         crate::service::dnsmgr::DnsDesiredResolution::Frozen => {
-            let sync = state.db.find_dns_record_sync(rule_id).await?;
+            let sync = state
+                .db
+                .find_dns_record_sync(rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+                .await?;
             Ok(status_from_frozen_sync(rule_id, automation_enabled, sync))
         }
         crate::service::dnsmgr::DnsDesiredResolution::Eligible(desired) => {
-            let sync = state.db.find_dns_record_sync(rule_id).await?;
+            let sync = state
+                .db
+                .find_dns_record_sync(rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+                .await?;
             Ok(status_from_sync(
                 rule_id,
                 automation_enabled,
@@ -483,7 +490,11 @@ pub async fn retry_rule_dns_sync(
             return Json(err(500, "数据库错误"));
         }
     }
-    let existing = match state.db.find_dns_record_sync(rule_id).await {
+    let existing = match state
+        .db
+        .find_dns_record_sync(rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+        .await
+    {
         Ok(sync) => sync,
         Err(error) => {
             tracing::error!("retry_rule_dns_sync: sync lookup failed: {error}");
@@ -1075,7 +1086,7 @@ mod tests {
         assert_eq!(
             state
                 .db
-                .find_dns_record_sync(100)
+                .find_dns_record_sync(100, crate::service::dnsmgr::DEFAULT_LINE_KEY)
                 .await
                 .unwrap()
                 .unwrap()

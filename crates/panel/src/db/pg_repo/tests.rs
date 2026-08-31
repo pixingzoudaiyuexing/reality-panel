@@ -5858,9 +5858,10 @@ async fn pg_dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
         rule_id: 100,
         fqdn: "op1.example.com".into(),
         record_type: "A".into(),
-        expected_value: "192.0.2.10".into(),
+        expected_value: Some("192.0.2.10".into()),
         line: "default".into(),
         line_key: "default".into(),
+        desired_action: "UPSERT".into(),
         state: "PENDING".into(),
         ownership: "UNKNOWN".into(),
         last_error_category: None,
@@ -5870,6 +5871,27 @@ async fn pg_dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
     })
     .await
     .unwrap();
+    db.insert_dns_record_sync(&NewDnsRecordSync {
+        rule_id: 100,
+        fqdn: "op1.example.com".into(),
+        record_type: "A".into(),
+        expected_value: Some("192.0.2.20".into()),
+        line: "Dianxin".into(),
+        line_key: "dnsmgr:Dianxin".into(),
+        desired_action: "UPSERT".into(),
+        state: "PENDING".into(),
+        ownership: "UNKNOWN".into(),
+        last_error_category: None,
+        next_attempt_at: Some("2026-08-26 00:00:00".into()),
+        created_at: "2026-08-26 00:00:00".into(),
+        updated_at: "2026-08-26 00:00:00".into(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        db.list_dns_record_syncs_for_rule(100).await.unwrap().len(),
+        2
+    );
 
     let due = db
         .list_due_dns_record_syncs("2026-08-26 00:01:00", 1)
@@ -5894,12 +5916,17 @@ async fn pg_dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
         .unwrap(),
         1
     );
-    let saved = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    let saved = db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(saved.state, "PROPAGATING");
     assert_eq!(saved.ownership, "PANEL");
 
     db.schedule_dns_record_sync(
         100,
+        "default",
         "MUTATION_OUTCOME_UNKNOWN",
         "UNKNOWN",
         Some("MUTATION_UNKNOWN"),
@@ -5911,21 +5938,44 @@ async fn pg_dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
     db.resume_dns_record_syncs_on_startup("2026-08-26 00:04:00")
         .await
         .unwrap();
-    let terminal = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    let terminal = db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(terminal.state, "MUTATION_OUTCOME_UNKNOWN");
     assert_eq!(terminal.next_attempt_at, None);
 
     db.mark_all_dns_record_syncs_disabled("2026-08-26 00:05:00", "DNSMGR_DISABLED")
         .await
         .unwrap();
-    let disabled = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    let disabled = db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(disabled.state, "DISABLED");
+    assert_eq!(
+        db.delete_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .is_some());
 
     sqlx::query("DELETE FROM forward_rules WHERE id = 100")
         .execute(&db.pool)
         .await
         .unwrap();
-    assert!(db.find_dns_record_sync(100).await.unwrap().is_none());
+    assert!(db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .is_none());
     cleanup(&db).await;
 }
 

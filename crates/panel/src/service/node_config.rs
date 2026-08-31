@@ -387,7 +387,10 @@ async fn certificate_domain_for_rule(
     sni: &str,
 ) -> Result<String, DbError> {
     let exact = sni.trim_end_matches('.').to_ascii_lowercase();
-    let Some(sync) = db.find_dns_record_sync(rule_id).await? else {
+    let Some(sync) = db
+        .find_dns_record_sync(rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+        .await?
+    else {
         return Ok(exact);
     };
     if !sync.fqdn.trim_end_matches('.').eq_ignore_ascii_case(&exact) {

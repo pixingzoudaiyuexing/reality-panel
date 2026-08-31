@@ -5729,9 +5729,10 @@ async fn dns_record_bindings_preserve_exact_ownership_and_enforce_uniqueness() {
         rule_id: 100,
         fqdn: "op1.example.com".into(),
         record_type: "A".into(),
-        expected_value: "192.0.2.11".into(),
+        expected_value: Some("192.0.2.11".into()),
         line: "0".into(),
         line_key: "default".into(),
+        desired_action: "UPSERT".into(),
         state: "PROPAGATED".into(),
         ownership: "PANEL".into(),
         last_error_category: None,
@@ -5756,7 +5757,10 @@ async fn dns_record_bindings_preserve_exact_ownership_and_enforce_uniqueness() {
         "rule deletion preserves ownership history"
     );
     assert!(
-        db.find_dns_record_sync(100).await.unwrap().is_none(),
+        db.find_dns_record_sync(100, "default")
+            .await
+            .unwrap()
+            .is_none(),
         "rule deletion removes only the rule-scoped reconciliation row"
     );
 }
@@ -5778,9 +5782,10 @@ async fn dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
         rule_id: 100,
         fqdn: "op1.example.com".into(),
         record_type: "A".into(),
-        expected_value: "192.0.2.10".into(),
+        expected_value: Some("192.0.2.10".into()),
         line: "default".into(),
         line_key: "default".into(),
+        desired_action: "UPSERT".into(),
         state: "PENDING".into(),
         ownership: "UNKNOWN".into(),
         last_error_category: None,
@@ -5816,7 +5821,11 @@ async fn dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
         .unwrap(),
         1
     );
-    let saved = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    let saved = db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(saved.state, "PROPAGATING");
     assert_eq!(saved.ownership, "PANEL");
     assert_eq!(saved.attempt_count, 1);
@@ -5824,17 +5833,33 @@ async fn dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
     db.mark_all_dns_record_syncs_disabled("2026-08-26 00:03:00", "DNSMGR_DISABLED")
         .await
         .unwrap();
-    let disabled = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    let disabled = db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(disabled.state, "DISABLED");
     assert_eq!(disabled.next_attempt_at, None);
 
-    db.schedule_dns_record_sync(100, "SYNCING", "UNKNOWN", None, None, "2026-08-26 00:04:00")
-        .await
-        .unwrap();
+    db.schedule_dns_record_sync(
+        100,
+        "default",
+        "SYNCING",
+        "UNKNOWN",
+        None,
+        None,
+        "2026-08-26 00:04:00",
+    )
+    .await
+    .unwrap();
     db.resume_dns_record_syncs_on_startup("2026-08-26 00:05:00")
         .await
         .unwrap();
-    let resumed = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    let resumed = db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(resumed.state, "PENDING");
     assert_eq!(
         resumed.next_attempt_at.as_deref(),
@@ -5843,6 +5868,7 @@ async fn dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
 
     db.schedule_dns_record_sync(
         100,
+        "default",
         "MUTATION_OUTCOME_UNKNOWN",
         "UNKNOWN",
         Some("MUTATION_UNKNOWN"),
@@ -5854,12 +5880,17 @@ async fn dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
     db.resume_dns_record_syncs_on_startup("2026-08-26 00:07:00")
         .await
         .unwrap();
-    let unknown = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    let unknown = db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(unknown.state, "MUTATION_OUTCOME_UNKNOWN");
     assert_eq!(unknown.next_attempt_at, None);
 
     db.schedule_dns_record_sync(
         100,
+        "default",
         "CONFLICT",
         "UNKNOWN",
         Some("DNS_CONFLICT"),
@@ -5871,12 +5902,17 @@ async fn dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
     db.resume_dns_record_syncs_on_startup("2026-08-26 00:09:00")
         .await
         .unwrap();
-    let conflict = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    let conflict = db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(conflict.state, "CONFLICT");
     assert_eq!(conflict.next_attempt_at, None);
 
     db.schedule_dns_record_sync(
         100,
+        "default",
         "FAILED",
         "UNKNOWN",
         Some("DNSMGR_TIMEOUT"),
@@ -5888,7 +5924,11 @@ async fn dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
     db.resume_dns_record_syncs_on_startup("2026-08-26 00:11:00")
         .await
         .unwrap();
-    let transient = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    let transient = db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(transient.state, "PENDING");
     assert_eq!(
         transient.next_attempt_at.as_deref(),
@@ -5897,6 +5937,7 @@ async fn dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
 
     db.schedule_dns_record_sync(
         100,
+        "default",
         "FAILED",
         "UNKNOWN",
         Some("NO_MATCHING_ZONE"),
@@ -5908,12 +5949,17 @@ async fn dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
     db.resume_dns_record_syncs_on_startup("2026-08-26 00:13:00")
         .await
         .unwrap();
-    let terminal = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    let terminal = db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(terminal.state, "FAILED");
     assert_eq!(terminal.next_attempt_at, None);
 
     db.schedule_dns_record_sync(
         100,
+        "default",
         "FAILED",
         "UNKNOWN",
         Some("POST_WRITE_NOT_VERIFIED"),
@@ -5925,7 +5971,11 @@ async fn dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
     db.resume_dns_record_syncs_on_startup("2026-08-26 00:15:00")
         .await
         .unwrap();
-    let unverified_write = db.find_dns_record_sync(100).await.unwrap().unwrap();
+    let unverified_write = db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(unverified_write.state, "FAILED");
     assert_eq!(unverified_write.next_attempt_at, None);
 
@@ -5937,7 +5987,127 @@ async fn dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
         .execute(&db.pool)
         .await
         .unwrap();
-    assert!(db.find_dns_record_sync(100).await.unwrap().is_none());
+    assert!(db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn dns_record_sync_composite_identity_isolates_update_delete_cas_and_due_rows() {
+    let db = repo().await;
+    seed_group(&db, 10).await;
+    sqlx::query(
+        "INSERT INTO forward_rules\
+         (id, name, uid, listen_port, device_group_in, target_addr, target_port)\
+         VALUES (100, 'rule-100', 1, 21000, 10, '127.0.0.1', 80)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    for (line_key, line, expected_value, desired_action) in [
+        ("default", "default_view", Some("192.0.2.10"), "UPSERT"),
+        ("dnsmgr:X", "X", Some("192.0.2.11"), "UPSERT"),
+        ("dnsmgr:Y", "Y", None, "DELETE"),
+    ] {
+        db.insert_dns_record_sync(&NewDnsRecordSync {
+            rule_id: 100,
+            fqdn: "op1.example.com".into(),
+            record_type: "A".into(),
+            expected_value: expected_value.map(str::to_string),
+            line: line.into(),
+            line_key: line_key.into(),
+            desired_action: desired_action.into(),
+            state: "PENDING".into(),
+            ownership: "UNKNOWN".into(),
+            last_error_category: None,
+            next_attempt_at: Some("2026-08-31 00:00:00".into()),
+            created_at: "2026-08-31 00:00:00".into(),
+            updated_at: "2026-08-31 00:00:00".into(),
+        })
+        .await
+        .unwrap();
+    }
+
+    let stale_x = db
+        .find_dns_record_sync(100, "dnsmgr:X")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.update_dns_record_sync_desired(
+            100,
+            "op1.example.com",
+            "A",
+            Some("192.0.2.99"),
+            "X",
+            "dnsmgr:X",
+            "UPSERT",
+            "PENDING",
+            "UNKNOWN",
+            None,
+            Some("2026-08-31 00:01:00"),
+            "2026-08-31 00:01:00",
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.update_dns_record_sync_observation(
+            &stale_x,
+            "PENDING",
+            "PROPAGATED",
+            "PANEL",
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            "2026-08-31 00:02:00",
+        )
+        .await
+        .unwrap(),
+        0,
+        "stale CAS must not overwrite the edited line"
+    );
+
+    let rows = db.list_dns_record_syncs_for_rule(100).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.line_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["default", "dnsmgr:X", "dnsmgr:Y"]
+    );
+    assert_eq!(rows[0].expected_value.as_deref(), Some("192.0.2.10"));
+    assert_eq!(rows[1].expected_value.as_deref(), Some("192.0.2.99"));
+    assert_eq!(rows[2].desired_action, "DELETE");
+    assert_eq!(rows[2].expected_value, None);
+
+    let due = db
+        .list_due_dns_record_syncs("2026-08-31 00:03:00", 10)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 3);
+    assert_eq!(db.delete_dns_record_sync(100, "dnsmgr:Y").await.unwrap(), 1);
+    assert!(db
+        .find_dns_record_sync(100, "dnsmgr:Y")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .find_dns_record_sync(100, "default")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(db
+        .find_dns_record_sync(100, "dnsmgr:X")
+        .await
+        .unwrap()
+        .is_some());
 }
 
 fn new_dns_binding(rule_id: i64, record_id: &str) -> NewDnsRecordBinding {

@@ -430,12 +430,13 @@ CREATE INDEX IF NOT EXISTS idx_dns_record_bindings_rule_id
 -- from dns_record_bindings: pending and externally-owned records are not
 -- Panel ownership evidence.
 CREATE TABLE IF NOT EXISTS dns_record_syncs (
-    rule_id INTEGER PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,
+    rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,
     fqdn TEXT NOT NULL,
     record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),
-    expected_value TEXT NOT NULL,
+    expected_value TEXT,
     line TEXT NOT NULL,
     line_key TEXT NOT NULL,
+    desired_action TEXT NOT NULL DEFAULT 'UPSERT' CHECK (desired_action IN ('UPSERT','DELETE')),
     state TEXT NOT NULL CHECK (state IN (
         'PENDING','SYNCING','MUTATION_VERIFIED','PROPAGATING','PROPAGATED',
         'CONFLICT','FAILED','MUTATION_OUTCOME_UNKNOWN','DISABLED','NOT_ELIGIBLE'
@@ -448,7 +449,9 @@ CREATE TABLE IF NOT EXISTS dns_record_syncs (
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     next_attempt_at TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (rule_id, line_key),
+    CHECK (desired_action = 'DELETE' OR expected_value IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS idx_dns_record_syncs_due
     ON dns_record_syncs(state, next_attempt_at);
@@ -2052,12 +2055,13 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     // ── Migration 48: durable DNS reconciliation desired state ──
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS dns_record_syncs (\
-             rule_id INTEGER PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,\
+             rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,\
              fqdn TEXT NOT NULL,\
              record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),\
-             expected_value TEXT NOT NULL,\
+             expected_value TEXT,\
              line TEXT NOT NULL,\
              line_key TEXT NOT NULL,\
+             desired_action TEXT NOT NULL DEFAULT 'UPSERT' CHECK (desired_action IN ('UPSERT','DELETE')),\
              state TEXT NOT NULL CHECK (state IN (\
                  'PENDING','SYNCING','MUTATION_VERIFIED','PROPAGATING','PROPAGATED',\
                  'CONFLICT','FAILED','MUTATION_OUTCOME_UNKNOWN','DISABLED','NOT_ELIGIBLE'\
@@ -2070,7 +2074,9 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
              attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),\
              next_attempt_at TEXT,\
              created_at TEXT NOT NULL,\
-             updated_at TEXT NOT NULL\
+             updated_at TEXT NOT NULL,\
+             PRIMARY KEY (rule_id, line_key),\
+             CHECK (desired_action = 'DELETE' OR expected_value IS NOT NULL)\
          )",
     )
     .execute(pool)
@@ -2092,6 +2098,89 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     )
     .await?;
     tracing::info!("Migration 49: forward_rules.send_proxy_protocol present");
+
+    // ── Migration 50: line-aware DNS reconciliation identity ──
+    let has_desired_action: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM pragma_table_info('dns_record_syncs') WHERE name='desired_action'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_desired_action.0 == 0 {
+        let mut tx = pool.begin().await?;
+        sqlx::query("DROP TABLE IF EXISTS dns_record_syncs_rc9")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE dns_record_syncs_rc9 (\
+                 rule_id INTEGER NOT NULL REFERENCES forward_rules(id) ON DELETE CASCADE,\
+                 fqdn TEXT NOT NULL,\
+                 record_type TEXT NOT NULL CHECK (record_type IN ('A','AAAA')),\
+                 expected_value TEXT,\
+                 line TEXT NOT NULL,\
+                 line_key TEXT NOT NULL,\
+                 desired_action TEXT NOT NULL DEFAULT 'UPSERT' CHECK (desired_action IN ('UPSERT','DELETE')),\
+                 state TEXT NOT NULL CHECK (state IN (\
+                     'PENDING','SYNCING','MUTATION_VERIFIED','PROPAGATING','PROPAGATED',\
+                     'CONFLICT','FAILED','MUTATION_OUTCOME_UNKNOWN','DISABLED','NOT_ELIGIBLE'\
+                 )),\
+                 ownership TEXT NOT NULL CHECK (ownership IN ('UNKNOWN','PANEL','EXTERNAL')),\
+                 mutation_verified_at TEXT,\
+                 last_observed_at TEXT,\
+                 propagated_at TEXT,\
+                 last_error_category TEXT,\
+                 attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),\
+                 next_attempt_at TEXT,\
+                 created_at TEXT NOT NULL,\
+                 updated_at TEXT NOT NULL,\
+                 PRIMARY KEY (rule_id, line_key),\
+                 CHECK (desired_action = 'DELETE' OR expected_value IS NOT NULL)\
+             )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            r#"INSERT INTO dns_record_syncs_rc9 (
+                   rule_id, fqdn, record_type, expected_value, line, line_key, desired_action,
+                   state, ownership, mutation_verified_at, last_observed_at, propagated_at,
+                   last_error_category, attempt_count, next_attempt_at, created_at, updated_at
+               )
+               SELECT old_sync.rule_id, old_sync.fqdn, old_sync.record_type,
+                      old_sync.expected_value, old_sync.line, old_sync.line_key, 'UPSERT',
+                      old_sync.state, old_sync.ownership, old_sync.mutation_verified_at,
+                      old_sync.last_observed_at, old_sync.propagated_at,
+                      old_sync.last_error_category, old_sync.attempt_count,
+                      old_sync.next_attempt_at, old_sync.created_at, old_sync.updated_at
+               FROM dns_record_syncs AS old_sync"#,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| sqlx::Error::Protocol(format!("Migration 50 copy failed: {error}")))?;
+        let old_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM dns_record_syncs")
+            .fetch_one(&mut *tx)
+            .await?;
+        let new_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM dns_record_syncs_rc9")
+            .fetch_one(&mut *tx)
+            .await?;
+        if old_count.0 != new_count.0 {
+            return Err(sqlx::Error::Protocol(format!(
+                "Migration 50 row count mismatch: old={} new={}",
+                old_count.0, new_count.0
+            )));
+        }
+        sqlx::query("DROP TABLE dns_record_syncs")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("ALTER TABLE dns_record_syncs_rc9 RENAME TO dns_record_syncs")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "CREATE INDEX idx_dns_record_syncs_due ON dns_record_syncs(state, next_attempt_at)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+    tracing::info!("Migration 50: dns_record_syncs uses (rule_id, line_key) identity");
 
     Ok(())
 }
@@ -2433,7 +2522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_48_creates_dns_record_sync_state_schema() {
+    async fn migration_50_creates_line_aware_dns_record_sync_schema() {
         let pool = fresh_pool().await;
         let columns: Vec<String> = sqlx::query_scalar(
             "SELECT name FROM pragma_table_info('dns_record_syncs') ORDER BY cid",
@@ -2446,6 +2535,8 @@ mod tests {
             "fqdn",
             "record_type",
             "expected_value",
+            "line_key",
+            "desired_action",
             "state",
             "ownership",
             "mutation_verified_at",
@@ -2468,7 +2559,108 @@ mod tests {
             .any(|name| name == "idx_dns_record_syncs_due"));
         run_migrations(&pool)
             .await
-            .expect("migration 48 is idempotent");
+            .expect("migration 50 is idempotent");
+        let primary_key: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT name, pk FROM pragma_table_info('dns_record_syncs') WHERE pk > 0 ORDER BY pk",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            primary_key,
+            vec![("rule_id".into(), 1), ("line_key".into(), 2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_50_preserves_rc8_default_sync_rows() {
+        let pool = fresh_pool().await;
+        sqlx::query("DROP TABLE dns_record_syncs")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE dns_record_syncs (\
+                 rule_id INTEGER PRIMARY KEY REFERENCES forward_rules(id) ON DELETE CASCADE,\
+                 fqdn TEXT NOT NULL, record_type TEXT NOT NULL, expected_value TEXT NOT NULL,\
+                 line TEXT NOT NULL, line_key TEXT NOT NULL, state TEXT NOT NULL,\
+                 ownership TEXT NOT NULL, mutation_verified_at TEXT, last_observed_at TEXT,\
+                 propagated_at TEXT, last_error_category TEXT, attempt_count INTEGER NOT NULL,\
+                 next_attempt_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL\
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid)\
+             VALUES (700, 'migration-group', 'in', 'migration-token', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules\
+                 (id, name, uid, listen_port, device_group_in, target_addr, target_port)\
+             VALUES (701, 'migration-rule', 1, 27001, 700, '127.0.0.1', 80)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO dns_record_syncs VALUES\
+             (701, 'op.example.com', 'A', '192.0.2.70', 'default_view', 'default',\
+              'PROPAGATING', 'PANEL', '2026-08-31 00:00:00', '2026-08-31 00:01:00',\
+              NULL, 'PUBLIC_DNS_NOT_YET_PROPAGATED', 3, '2026-08-31 00:02:00',\
+              '2026-08-31 00:00:00', '2026-08-31 00:01:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let old_columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('dns_record_syncs')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(old_columns.iter().any(|column| column == "rule_id"));
+
+        run_migrations(&pool).await.unwrap();
+        let row: (
+            i64,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT rule_id, line_key, desired_action, expected_value, state, ownership,\
+                        last_error_category, attempt_count FROM dns_record_syncs",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                701,
+                "default".into(),
+                "UPSERT".into(),
+                Some("192.0.2.70".into()),
+                "PROPAGATING".into(),
+                "PANEL".into(),
+                "PUBLIC_DNS_NOT_YET_PROPAGATED".into(),
+                3,
+            )
+        );
+        run_migrations(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM dns_record_syncs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     /// An "old" database that predates v0.3.0 (has forward_rules + device_groups
