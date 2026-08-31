@@ -401,6 +401,21 @@ pub async fn delete_schedule(db: &dyn Repository, id: &str) -> Result<bool, Rela
     Ok(true)
 }
 
+pub async fn delete_schedules_for_group(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<usize, RelayScheduleError> {
+    let _guard = RELAY_SCHEDULE_MUTATION_LOCK.lock().await;
+    let mut schedules = load_schedules(db).await?;
+    let original_len = schedules.len();
+    schedules.retain(|schedule| schedule.group_id != group_id);
+    let removed_count = original_len - schedules.len();
+    if removed_count > 0 {
+        save_schedules(db, &schedules).await?;
+    }
+    Ok(removed_count)
+}
+
 pub async fn set_schedule_enabled(
     db: &dyn Repository,
     id: &str,
@@ -816,6 +831,15 @@ mod tests {
         .unwrap();
     }
 
+    async fn put_schedules(repo: &SqliteRepository, schedules: &[RelaySchedule]) {
+        repo.set(
+            RELAY_SWITCH_SCHEDULES_KEY,
+            &serde_json::to_string(schedules).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
     fn recording_starter(
         calls: std::sync::Arc<std::sync::Mutex<Vec<(i64, String)>>>,
         result: SwitchResult,
@@ -1077,6 +1101,38 @@ mod tests {
         .await
         .unwrap();
         assert!(list_schedules(&repo).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_group_schedules_keeps_other_groups() {
+        let repo = test_repo().await;
+        let mut first = one_time_schedule("2026-08-30T12:00:00Z");
+        first.id = "group-10-a".into();
+        first.group_id = 10;
+        let mut second = one_time_schedule("2026-08-30T13:00:00Z");
+        second.id = "group-10-b".into();
+        second.group_id = 10;
+        let mut other = one_time_schedule("2026-08-30T14:00:00Z");
+        other.id = "group-20".into();
+        other.group_id = 20;
+        put_schedules(&repo, &[first, second, other.clone()]).await;
+
+        assert_eq!(delete_schedules_for_group(&repo, 10).await.unwrap(), 2);
+        assert_eq!(list_schedules(&repo).await.unwrap(), vec![other]);
+    }
+
+    #[tokio::test]
+    async fn deleting_missing_group_schedules_does_not_rewrite_kvs() {
+        let repo = test_repo().await;
+        let schedule = one_time_schedule("2026-08-30T12:00:00Z");
+        put_schedule(&repo, &schedule).await;
+        let before = repo.get(RELAY_SWITCH_SCHEDULES_KEY).await.unwrap().unwrap();
+
+        assert_eq!(delete_schedules_for_group(&repo, 999).await.unwrap(), 0);
+        assert_eq!(
+            repo.get(RELAY_SWITCH_SCHEDULES_KEY).await.unwrap(),
+            Some(before)
+        );
     }
 
     #[tokio::test]

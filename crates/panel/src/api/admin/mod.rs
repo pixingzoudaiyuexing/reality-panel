@@ -975,6 +975,14 @@ mod tests {
             )
             .await
             .unwrap();
+        state
+            .db
+            .set(
+                crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY,
+                r#"[{"id":"delete-me","group_id":20,"target_node_id":"node-a","schedule_type":"one_time","enabled":true,"created_at":"2026-08-31T00:00:00Z","updated_at":"2026-08-31T00:00:00Z","execute_at":"2026-09-01T00:00:00Z","time":null,"utc_offset_minutes":null,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null},{"id":"keep-me","group_id":21,"target_node_id":"node-b","schedule_type":"one_time","enabled":true,"created_at":"2026-08-31T00:00:00Z","updated_at":"2026-08-31T00:00:00Z","execute_at":"2026-09-01T00:00:00Z","time":null,"utc_offset_minutes":null,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null}]"#,
+            )
+            .await
+            .unwrap();
 
         let Json(resp) =
             super::delete_group(AdminOnly { user_id: 1 }, State(state.clone()), Path(20)).await;
@@ -984,6 +992,14 @@ mod tests {
             resp.message
         );
         assert!(state.db.get("relay_preference:20").await.unwrap().is_none());
+        let schedules = state
+            .db
+            .get(crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!schedules.contains("delete-me"));
+        assert!(schedules.contains("keep-me"));
     }
 
     /// v1.0.4: count_rules_by_group detects rule references correctly.
