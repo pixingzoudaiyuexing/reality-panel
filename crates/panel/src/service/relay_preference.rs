@@ -15,8 +15,8 @@ use relay_shared::protocol::{
     CamouflageSiteStatus, ListenerError, ReconciliationStatus, ReconciliationStatusState,
     CONFIG_PROTOCOL_VERSION,
 };
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::Ipv4Addr;
 
 pub const RELAY_PREFERENCE_KEY_PREFIX: &str = "relay_preference:";
@@ -38,19 +38,124 @@ pub enum RelayPreferencePhase {
     FailedManualIntervention,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CarrierLineMode {
+    FollowDefault,
+    Node,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CarrierLineBinding {
+    pub line_id: String,
+    pub mode: CarrierLineMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CarrierPolicy {
+    #[serde(default)]
+    pub bindings: Vec<CarrierLineBinding>,
+}
+
+#[allow(dead_code)] // RC9-S4 persisted model; consumed by the Carrier Policy API in S5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CarrierPolicyValidationError {
+    InvalidLineId,
+    DuplicateLineId,
+    UnexpectedNodeId,
+    MissingNodeId,
+}
+
+impl CarrierPolicy {
+    #[allow(dead_code)] // RC9-S4 persisted model; consumed by the Carrier Policy API in S5.
+    pub fn normalize(mut self) -> Result<Self, CarrierPolicyValidationError> {
+        let mut seen = BTreeSet::new();
+        for binding in &mut self.bindings {
+            if binding.line_id.is_empty()
+                || binding.line_id != binding.line_id.trim()
+                || binding.line_id.len() > 255
+                || binding.line_id.chars().any(char::is_control)
+            {
+                return Err(CarrierPolicyValidationError::InvalidLineId);
+            }
+            if !seen.insert(binding.line_id.clone()) {
+                return Err(CarrierPolicyValidationError::DuplicateLineId);
+            }
+            match binding.mode {
+                CarrierLineMode::FollowDefault if binding.node_id.is_some() => {
+                    return Err(CarrierPolicyValidationError::UnexpectedNodeId)
+                }
+                CarrierLineMode::FollowDefault => {}
+                CarrierLineMode::Node => {
+                    let Some(node_id) = binding.node_id.as_mut() else {
+                        return Err(CarrierPolicyValidationError::MissingNodeId);
+                    };
+                    *node_id = node_id.trim().to_string();
+                    if node_id.is_empty() {
+                        return Err(CarrierPolicyValidationError::MissingNodeId);
+                    }
+                }
+            }
+        }
+        self.bindings
+            .sort_by(|left, right| left.line_id.cmp(&right.line_id));
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayTransactionKind {
+    PreferredSwitch,
+    CarrierPolicyApply,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum RelayDnsAction {
+    Upsert,
+    Delete,
+}
+
+impl Default for RelayDnsAction {
+    fn default() -> Self {
+        Self::Upsert
+    }
+}
+
+fn default_dns_line() -> String {
+    crate::service::dnsmgr::DEFAULT_LINE_KEY.to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayDnsTransactionRecord {
     pub rule_id: i64,
     pub fqdn: String,
+    #[serde(default = "default_dns_line")]
+    pub line_id: String,
+    #[serde(default = "default_dns_line")]
+    pub line_key: String,
+    #[serde(default)]
+    pub target_action: RelayDnsAction,
+    #[serde(default)]
+    pub target_value: Option<String>,
+    #[serde(default)]
+    pub rollback_action: RelayDnsAction,
+    #[serde(default)]
     pub rollback_value: Option<String>,
-    pub target_value: String,
+    #[serde(default)]
+    pub target_record_id: Option<String>,
+    #[serde(default)]
+    pub rollback_record_id: Option<String>,
     #[serde(default)]
     pub target_state: Option<String>,
     #[serde(default)]
     pub target_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RelayPreferenceState {
     pub preferred_node_id: Option<String>,
     pub pending_node_id: Option<String>,
@@ -61,6 +166,56 @@ pub struct RelayPreferenceState {
     pub rollback_error: Option<String>,
     #[serde(default)]
     pub dns_records: Vec<RelayDnsTransactionRecord>,
+    #[serde(default)]
+    pub carrier_policy: CarrierPolicy,
+    #[serde(default)]
+    pub pending_carrier_policy: Option<CarrierPolicy>,
+    #[serde(default)]
+    pub transaction_kind: Option<RelayTransactionKind>,
+}
+
+#[derive(Deserialize)]
+struct RelayPreferenceStateWire {
+    preferred_node_id: Option<String>,
+    pending_node_id: Option<String>,
+    state: RelayPreferencePhase,
+    started_at: Option<String>,
+    last_error: Option<String>,
+    #[serde(default)]
+    rollback_error: Option<String>,
+    #[serde(default)]
+    dns_records: Vec<RelayDnsTransactionRecord>,
+    #[serde(default)]
+    carrier_policy: CarrierPolicy,
+    #[serde(default)]
+    pending_carrier_policy: Option<CarrierPolicy>,
+    #[serde(default)]
+    transaction_kind: Option<RelayTransactionKind>,
+}
+
+impl<'de> Deserialize<'de> for RelayPreferenceState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RelayPreferenceStateWire::deserialize(deserializer)?;
+        let transaction_kind = wire.transaction_kind.or_else(|| {
+            (wire.state != RelayPreferencePhase::Idle)
+                .then_some(RelayTransactionKind::PreferredSwitch)
+        });
+        Ok(Self {
+            preferred_node_id: wire.preferred_node_id,
+            pending_node_id: wire.pending_node_id,
+            state: wire.state,
+            started_at: wire.started_at,
+            last_error: wire.last_error,
+            rollback_error: wire.rollback_error,
+            dns_records: wire.dns_records,
+            carrier_policy: wire.carrier_policy,
+            pending_carrier_policy: wire.pending_carrier_policy,
+            transaction_kind,
+        })
+    }
 }
 
 impl Default for RelayPreferenceState {
@@ -73,6 +228,9 @@ impl Default for RelayPreferenceState {
             last_error: None,
             rollback_error: None,
             dns_records: Vec::new(),
+            carrier_policy: CarrierPolicy::default(),
+            pending_carrier_policy: None,
+            transaction_kind: None,
         }
     }
 }
@@ -470,12 +628,13 @@ pub async fn resolve_dns_target_for_rule(
         RelayPreferencePhase::Switching => {
             if let Some(value) = rule_id
                 .and_then(|rule_id| {
-                    preference
-                        .dns_records
-                        .iter()
-                        .find(|record| record.rule_id == rule_id)
+                    preference.dns_records.iter().find(|record| {
+                        record.rule_id == rule_id
+                            && record.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY
+                            && record.target_action == RelayDnsAction::Upsert
+                    })
                 })
-                .map(|record| record.target_value.as_str())
+                .and_then(|record| record.target_value.as_deref())
             {
                 return Ok(match valid_public_ipv4(Some(value)) {
                     Some(value) => RelayDnsTarget::Resolved(value),
@@ -487,10 +646,11 @@ pub async fn resolve_dns_target_for_rule(
         RelayPreferencePhase::RollingBack => {
             let rollback_value = rule_id
                 .and_then(|rule_id| {
-                    preference
-                        .dns_records
-                        .iter()
-                        .find(|record| record.rule_id == rule_id)
+                    preference.dns_records.iter().find(|record| {
+                        record.rule_id == rule_id
+                            && record.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY
+                            && record.rollback_action == RelayDnsAction::Upsert
+                    })
                 })
                 .and_then(|record| record.rollback_value.as_deref());
             return Ok(match valid_public_ipv4(rollback_value) {
@@ -637,8 +797,14 @@ async fn build_dns_transaction_records(
                 .trim()
                 .trim_end_matches('.')
                 .to_ascii_lowercase(),
+            line_id: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
+            line_key: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
+            target_action: RelayDnsAction::Upsert,
+            target_value: Some(target_value.to_string()),
+            rollback_action: RelayDnsAction::Upsert,
             rollback_value,
-            target_value: target_value.to_string(),
+            target_record_id: None,
+            rollback_record_id: None,
             target_state: None,
             target_error: None,
         });
@@ -652,7 +818,10 @@ fn transition_to_rollback(preference: &mut RelayPreferenceState, error: &str) {
         && preference
             .dns_records
             .iter()
-            .all(|record| record.rollback_value.is_some())
+            .all(|record| match record.rollback_action {
+                RelayDnsAction::Upsert => record.rollback_value.is_some(),
+                RelayDnsAction::Delete => record.rollback_value.is_none(),
+            })
     {
         preference.state = RelayPreferencePhase::RollingBack;
         preference.rollback_error = None;
@@ -750,6 +919,7 @@ pub async fn start_relay_switch(
     )
     .await?;
     preference.pending_node_id = Some(target_node_id.to_string());
+    preference.transaction_kind = Some(RelayTransactionKind::PreferredSwitch);
     preference.state = RelayPreferencePhase::Switching;
     preference.started_at = Some(Utc::now().to_rfc3339());
     preference.last_error = None;
@@ -831,7 +1001,7 @@ async fn capture_target_outcomes(
 ) -> Result<(), DbError> {
     for record in &mut preference.dns_records {
         if let Some(sync) = db
-            .find_dns_record_sync(record.rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .find_dns_record_sync(record.rule_id, &record.line_key)
             .await?
         {
             record.target_state = Some(sync.state);
@@ -914,6 +1084,19 @@ async fn finalize_rollback(
                 rollback_error: "ROLLBACK_RULE_NOT_ELIGIBLE".into(),
             });
         }
+        if record.rollback_action != RelayDnsAction::Upsert {
+            preference.state = RelayPreferencePhase::FailedManualIntervention;
+            preference.rollback_error = Some("ROLLBACK_ACTION_UNSUPPORTED".into());
+            store_preference(db, group_id, &preference).await?;
+            return Ok(FinalizeOutcome::ManualIntervention {
+                from_node_id: preference.preferred_node_id,
+                to_node_id: target_node_id,
+                error: preference
+                    .last_error
+                    .unwrap_or_else(|| "RELAY_SWITCH_FAILED".into()),
+                rollback_error: "ROLLBACK_ACTION_UNSUPPORTED".into(),
+            });
+        }
         let Some(rollback_value) = record.rollback_value.as_deref() else {
             preference.state = RelayPreferencePhase::FailedManualIntervention;
             preference.rollback_error = Some("ROLLBACK_VALUE_UNAVAILABLE".into());
@@ -928,7 +1111,7 @@ async fn finalize_rollback(
             });
         };
         let Some(sync) = db
-            .find_dns_record_sync(record.rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .find_dns_record_sync(record.rule_id, &record.line_key)
             .await?
         else {
             all_propagated = false;
@@ -1044,11 +1227,10 @@ async fn finalize_switching_group(
                 .await?;
         store_preference(db, group_id, &preference).await?;
     }
-    if preference
-        .dns_records
-        .iter()
-        .any(|record| record.target_value != target_ipv4)
-    {
+    if preference.dns_records.iter().any(|record| {
+        record.target_action != RelayDnsAction::Upsert
+            || record.target_value.as_deref() != Some(target_ipv4.as_str())
+    }) {
         return begin_rollback(
             db,
             group_id,
@@ -1086,13 +1268,15 @@ async fn finalize_switching_group(
     let mut terminal_error = None;
     for record in &preference.dns_records {
         let Some(sync) = db
-            .find_dns_record_sync(record.rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .find_dns_record_sync(record.rule_id, &record.line_key)
             .await?
         else {
             all_propagated = false;
             continue;
         };
-        if sync.expected_value.as_deref() != Some(record.target_value.as_str()) {
+        if sync.desired_action != "UPSERT"
+            || sync.expected_value.as_deref() != record.target_value.as_deref()
+        {
             all_propagated = false;
             continue;
         }
@@ -1140,6 +1324,7 @@ async fn finalize_switching_group(
     preference.last_error = None;
     preference.rollback_error = None;
     preference.dns_records.clear();
+    preference.transaction_kind = None;
     store_preference(db, group_id, &preference).await?;
     Ok(FinalizeOutcome::Committed {
         from_node_id,
@@ -1282,7 +1467,7 @@ pub async fn get_relay_preference(
     let mut dns_records = Vec::with_capacity(preference.dns_records.len());
     for record in &preference.dns_records {
         let sync = db
-            .find_dns_record_sync(record.rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .find_dns_record_sync(record.rule_id, &record.line_key)
             .await?;
         let propagated_value = sync
             .as_ref()
@@ -1290,7 +1475,7 @@ pub async fn get_relay_preference(
             .and_then(|sync| sync.expected_value.as_deref());
         let position = if propagated_value == record.rollback_value.as_deref() {
             RelayDnsRecordPosition::Rollback
-        } else if propagated_value == Some(record.target_value.as_str())
+        } else if propagated_value == record.target_value.as_deref()
             || (matches!(
                 preference.state,
                 RelayPreferencePhase::RollingBack | RelayPreferencePhase::FailedManualIntervention
@@ -1305,7 +1490,7 @@ pub async fn get_relay_preference(
             rule_id: record.rule_id,
             fqdn: record.fqdn.clone(),
             rollback_value: record.rollback_value.clone(),
-            target_value: record.target_value.clone(),
+            target_value: record.target_value.clone().unwrap_or_default(),
             expected_value: sync.as_ref().and_then(|sync| sync.expected_value.clone()),
             sync_state: sync.as_ref().map(|sync| sync.state.clone()),
             position,
@@ -1455,6 +1640,192 @@ mod tests {
             HashSet::new()
         };
         evaluate_node("node-a".into(), Some(raw), Utc::now(), &ids, rules).info
+    }
+
+    #[test]
+    fn rc8_relay_preference_json_remains_compatible() {
+        let idle: RelayPreferenceState = serde_json::from_value(serde_json::json!({
+            "preferred_node_id": "node-a",
+            "pending_node_id": null,
+            "state": "idle",
+            "started_at": null,
+            "last_error": null,
+            "rollback_error": null,
+            "dns_records": []
+        }))
+        .unwrap();
+        assert_eq!(idle.carrier_policy, CarrierPolicy::default());
+        assert_eq!(idle.pending_carrier_policy, None);
+        assert_eq!(idle.transaction_kind, None);
+
+        for phase in ["switching", "rolling_back"] {
+            let legacy: RelayPreferenceState = serde_json::from_value(serde_json::json!({
+                "preferred_node_id": "node-a",
+                "pending_node_id": "node-b",
+                "state": phase,
+                "started_at": "2026-08-31T00:00:00Z",
+                "last_error": null,
+                "dns_records": [{
+                    "rule_id": 7,
+                    "fqdn": "op1.example.com",
+                    "rollback_value": "192.0.2.10",
+                    "target_value": "192.0.2.20"
+                }]
+            }))
+            .unwrap();
+            assert_eq!(
+                legacy.transaction_kind,
+                Some(RelayTransactionKind::PreferredSwitch)
+            );
+            assert_eq!(legacy.dns_records[0].line_id, "default");
+            assert_eq!(legacy.dns_records[0].line_key, "default");
+            assert_eq!(legacy.dns_records[0].target_action, RelayDnsAction::Upsert);
+            assert_eq!(
+                legacy.dns_records[0].rollback_action,
+                RelayDnsAction::Upsert
+            );
+        }
+    }
+
+    #[test]
+    fn carrier_policy_normalizes_and_roundtrips_without_display_data() {
+        let policy = CarrierPolicy {
+            bindings: vec![
+                CarrierLineBinding {
+                    line_id: "Dianxin_Shandong".into(),
+                    mode: CarrierLineMode::FollowDefault,
+                    node_id: None,
+                },
+                CarrierLineBinding {
+                    line_id: "Dianxin".into(),
+                    mode: CarrierLineMode::Node,
+                    node_id: Some(" node-b ".into()),
+                },
+            ],
+        }
+        .normalize()
+        .unwrap();
+        assert_eq!(policy.bindings[0].line_id, "Dianxin");
+        assert_eq!(policy.bindings[0].node_id.as_deref(), Some("node-b"));
+        assert_eq!(policy.bindings[1].line_id, "Dianxin_Shandong");
+        assert_eq!(
+            serde_json::from_str::<CarrierPolicy>(&serde_json::to_string(&policy).unwrap())
+                .unwrap(),
+            policy
+        );
+
+        let case_sensitive = CarrierPolicy {
+            bindings: vec![
+                CarrierLineBinding {
+                    line_id: "Dianxin".into(),
+                    mode: CarrierLineMode::FollowDefault,
+                    node_id: None,
+                },
+                CarrierLineBinding {
+                    line_id: "dianxin".into(),
+                    mode: CarrierLineMode::FollowDefault,
+                    node_id: None,
+                },
+            ],
+        };
+        assert!(case_sensitive.normalize().is_ok());
+    }
+
+    #[test]
+    fn carrier_policy_rejects_duplicate_and_invalid_mode_payloads() {
+        let duplicate = CarrierPolicy {
+            bindings: vec![
+                CarrierLineBinding {
+                    line_id: "Dianxin".into(),
+                    mode: CarrierLineMode::FollowDefault,
+                    node_id: None,
+                },
+                CarrierLineBinding {
+                    line_id: "Dianxin".into(),
+                    mode: CarrierLineMode::Node,
+                    node_id: Some("node-a".into()),
+                },
+            ],
+        };
+        assert_eq!(
+            duplicate.normalize(),
+            Err(CarrierPolicyValidationError::DuplicateLineId)
+        );
+        assert_eq!(
+            CarrierPolicy {
+                bindings: vec![CarrierLineBinding {
+                    line_id: "Dianxin".into(),
+                    mode: CarrierLineMode::FollowDefault,
+                    node_id: Some("node-a".into()),
+                }]
+            }
+            .normalize(),
+            Err(CarrierPolicyValidationError::UnexpectedNodeId)
+        );
+        assert_eq!(
+            CarrierPolicy {
+                bindings: vec![CarrierLineBinding {
+                    line_id: "Dianxin".into(),
+                    mode: CarrierLineMode::Node,
+                    node_id: None,
+                }]
+            }
+            .normalize(),
+            Err(CarrierPolicyValidationError::MissingNodeId)
+        );
+    }
+
+    #[test]
+    fn dynamic_dns_journal_roundtrips_upsert_and_delete_rollback() {
+        let state = RelayPreferenceState {
+            transaction_kind: Some(RelayTransactionKind::CarrierPolicyApply),
+            pending_carrier_policy: Some(CarrierPolicy {
+                bindings: vec![CarrierLineBinding {
+                    line_id: "Dianxin".into(),
+                    mode: CarrierLineMode::Node,
+                    node_id: Some("node-b".into()),
+                }],
+            }),
+            dns_records: vec![
+                RelayDnsTransactionRecord {
+                    rule_id: 7,
+                    fqdn: "op1.example.com".into(),
+                    line_id: "Dianxin".into(),
+                    line_key: "dnsmgr:Dianxin".into(),
+                    target_action: RelayDnsAction::Upsert,
+                    target_value: Some("192.0.2.20".into()),
+                    rollback_action: RelayDnsAction::Delete,
+                    rollback_value: None,
+                    target_record_id: Some("record-new".into()),
+                    rollback_record_id: None,
+                    target_state: Some("PROPAGATED".into()),
+                    target_error: None,
+                },
+                RelayDnsTransactionRecord {
+                    rule_id: 8,
+                    fqdn: "op2.example.com".into(),
+                    line_id: "Liantong".into(),
+                    line_key: "dnsmgr:Liantong".into(),
+                    target_action: RelayDnsAction::Delete,
+                    target_value: None,
+                    rollback_action: RelayDnsAction::Upsert,
+                    rollback_value: Some("192.0.2.30".into()),
+                    target_record_id: None,
+                    rollback_record_id: Some("record-old".into()),
+                    target_state: None,
+                    target_error: None,
+                },
+            ],
+            ..RelayPreferenceState::default()
+        };
+        let decoded: RelayPreferenceState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(decoded, state);
+        assert_eq!(
+            decoded.dns_records[0].rollback_action,
+            RelayDnsAction::Delete
+        );
+        assert_eq!(decoded.dns_records[1].target_action, RelayDnsAction::Delete);
     }
 
     #[test]
