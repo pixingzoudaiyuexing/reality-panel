@@ -178,7 +178,6 @@ impl PanelCertificateManager {
 
         let certificate_name = format!("reality-panel-g{group_id}-{}", &scope_id(domain)[..16]);
         let actor = format!("panel-certificate-g{group_id}-{}", &scope_id(domain)[..16]);
-        let hook = quote_hook_command(&self.hook_binary)?;
         let mut args = vec![
             "certonly".to_string(),
             "--non-interactive".to_string(),
@@ -187,9 +186,9 @@ impl PanelCertificateManager {
             "--preferred-challenges".to_string(),
             "dns".to_string(),
             "--manual-auth-hook".to_string(),
-            format!("{hook} {HOOK_COMMAND} auth"),
+            panel_certbot_hook_command(&self.hook_binary, "auth")?,
             "--manual-cleanup-hook".to_string(),
-            format!("{hook} {HOOK_COMMAND} cleanup"),
+            panel_certbot_hook_command(&self.hook_binary, "cleanup")?,
             "--cert-name".to_string(),
             certificate_name.clone(),
             "-d".to_string(),
@@ -748,6 +747,16 @@ fn quote_hook_command(path: &Path) -> Result<String, String> {
     Ok(format!("'{}'", value.replace('\'', "'\\''")))
 }
 
+fn panel_certbot_hook_command(path: &Path, action: &str) -> Result<String, String> {
+    if !matches!(action, "auth" | "cleanup") {
+        return Err("invalid hook action".into());
+    }
+    Ok(format!(
+        "/usr/bin/env {} {HOOK_COMMAND} {action}",
+        quote_hook_command(path)?
+    ))
+}
+
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
@@ -929,5 +938,25 @@ mod tests {
             internal_panel_url("[::]:18888").unwrap(),
             "http://[::1]:18888"
         );
+    }
+
+    #[test]
+    fn certbot_hooks_start_with_env_and_preserve_shell_quoting() {
+        let simple = Path::new("/opt/relay-panel/current/relay-panel");
+        assert_eq!(
+            panel_certbot_hook_command(simple, "auth").unwrap(),
+            "/usr/bin/env '/opt/relay-panel/current/relay-panel' acme-dns01-hook auth"
+        );
+        assert_eq!(
+            panel_certbot_hook_command(simple, "cleanup").unwrap(),
+            "/usr/bin/env '/opt/relay-panel/current/relay-panel' acme-dns01-hook cleanup"
+        );
+
+        let quoted = Path::new("/opt/Reality Panel/panel's binary");
+        assert_eq!(
+            panel_certbot_hook_command(quoted, "auth").unwrap(),
+            "/usr/bin/env '/opt/Reality Panel/panel'\\''s binary' acme-dns01-hook auth"
+        );
+        assert!(panel_certbot_hook_command(simple, "unexpected").is_err());
     }
 }
