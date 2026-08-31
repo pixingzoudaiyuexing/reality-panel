@@ -1493,6 +1493,11 @@ pub async fn start_relay_switch(
             pending_node_id: preference.pending_node_id,
         });
     }
+    if preference.state == RelayPreferencePhase::FailedManualIntervention {
+        return Err(StartRelaySwitchError::SwitchInProgress {
+            pending_node_id: preference.pending_node_id,
+        });
+    }
 
     let evaluated = evaluate_group_nodes(db, node_connections, group_id)
         .await
@@ -3876,6 +3881,20 @@ mod tests {
             start_relay_switch(&repo, &connections, 7, "node-c").await,
             Err(StartRelaySwitchError::SwitchInProgress { .. })
         ));
+
+        preference.state = RelayPreferencePhase::FailedManualIntervention;
+        preference.pending_node_id = Some("node-c".into());
+        preference.last_error = Some("DNS_RECORD_CONFLICT".into());
+        preference.rollback_error = Some("DNS_OWNERSHIP_UNVERIFIED".into());
+        store_preference(&repo, 7, &preference).await.unwrap();
+        assert!(matches!(
+            start_relay_switch(&repo, &connections, 7, "node-c").await,
+            Err(StartRelaySwitchError::SwitchInProgress { .. })
+        ));
+        assert_eq!(
+            load_preference(&repo, 7).await.unwrap().state,
+            RelayPreferencePhase::FailedManualIntervention
+        );
     }
 
     #[tokio::test]
