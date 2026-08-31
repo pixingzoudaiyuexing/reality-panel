@@ -1450,7 +1450,7 @@ pub async fn schedule_all_eligible(db: &dyn Repository) -> Result<(), crate::db:
     Ok(())
 }
 
-fn rule_is_dns_eligible(rule: &relay_shared::models::ForwardRule) -> bool {
+pub(crate) fn rule_is_dns_eligible(rule: &relay_shared::models::ForwardRule) -> bool {
     !rule.paused
         && rule.camouflage_enabled
         && rule.node_transport == "nginx_sni"

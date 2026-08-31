@@ -8,6 +8,7 @@ pub mod admin;
 pub mod announcements;
 pub mod audit;
 pub mod auth;
+pub mod carrier_lines;
 pub mod diagnose;
 pub mod geoip;
 pub mod groups;
@@ -237,6 +238,10 @@ pub fn routes() -> Router<AppState> {
             "/groups/{group_id}/relay-preference",
             axum::routing::get(relay_preference::get_relay_preference)
                 .post(relay_preference::set_relay_preference),
+        )
+        .route(
+            "/groups/{group_id}/carrier-lines",
+            axum::routing::get(carrier_lines::get_group_carrier_lines),
         )
         .route(
             "/admin/relay-schedules",

@@ -2,6 +2,7 @@ pub mod acme_dns01;
 pub mod announcements;
 pub mod audit;
 pub mod auto_restart;
+pub mod carrier_lines;
 pub mod dnsmgr;
 pub mod groups;
 pub mod history_prune;
