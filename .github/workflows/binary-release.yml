@@ -54,7 +54,7 @@ jobs:
             VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/panel/Cargo.toml | head -n1)"
             RELEASE_TAG="v$VERSION"
           fi
-          bash scripts/release-version-contract.sh "$RELEASE_TAG"
+          bash scripts/release-check.sh "${RELEASE_TAG#v}"
           printf 'RELEASE_TAG=%s\n' "$RELEASE_TAG" >> "$GITHUB_ENV"
           printf 'VERSION=%s\n' "${RELEASE_TAG#v}" >> "$GITHUB_ENV"
           printf 'version=%s\n' "${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"

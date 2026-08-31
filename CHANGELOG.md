@@ -7,6 +7,38 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.0-rc.8] - 2026-08-31
+
+Release candidate for scheduled Relay operations and Panel-centralized
+certificate delivery.
+
+### Added
+
+- Scheduled Relay Switch with persisted plans, restart recovery, and reuse of
+  the existing Relay Preference transaction and rollback path.
+- Panel-owned wildcard certificate issuance and automatic distribution to all
+  Relays in the inbound group.
+- Targeted rule diagnosis plus clearer Node Status, diagnosis, and compact
+  grouped Rules management views.
+
+### Fixed
+
+- Stale desired certificate completion no longer leaves multi-Relay nodes
+  permanently `DEPENDENCY_WITHHELD`.
+- Panel certificate scope discovery, Certbot DNS-01 hook execution, nested
+  Tokio runtime handling, and controlled Certbot `live` symlink resolution.
+
+### Safety
+
+- Panel outages and failed centralized certificate updates preserve existing
+  Relay forwarding, certificate, camouflage, listener, and LKG state.
+- Public production deployments using centralized certificate delivery should
+  use an HTTPS `PUBLIC_PANEL_URL`, because the response contains private key
+  material. Plain HTTP support remains an accepted rc.8 deployment limitation.
+- Real CA renewal from Panel generation 1 to generation 2 was not repeated to
+  avoid consuming certificate authority quota; focused generation tests cover
+  the transition.
+
 ## [1.1.0-rc.7] - 2026-08-30
 
 Release candidate for the hardened multi-Relay Reality lifecycle.

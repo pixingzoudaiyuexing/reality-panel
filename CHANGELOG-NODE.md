@@ -7,6 +7,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.0-rc.8] - 2026-08-31
+
+Reality relay-node release candidate with Config Protocol 10 and Lifecycle
+Protocol 1 compatibility.
+
+### Added
+
+- Automatic synchronization of Panel-centralized certificates through the
+  authenticated certificate endpoint.
+- Node-local source metadata that tracks the Panel generation and certificate
+  fingerprint without changing the existing timestamp generation semantics.
+
+### Fixed
+
+- Stale desired completion remains pending for reconciliation instead of
+  leaving the Node permanently `DEPENDENCY_WITHHELD`.
+- Centralized certificate application, restart recovery, and Nginx/LKG failure
+  paths preserve the previous valid certificate and runtime.
+
 ## [1.1.0-rc.7] - 2026-08-30
 
 Reality relay-node release candidate with Config Protocol 10 and Lifecycle
