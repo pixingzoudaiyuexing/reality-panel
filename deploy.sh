@@ -86,6 +86,7 @@ node_version="$($release_dir/reality-node-linux-amd64 --version | awk '{print $N
 id relay-panel >/dev/null 2>&1 || useradd --system --home-dir "$DATA_ROOT" --shell /usr/sbin/nologin relay-panel
 install -d -m 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/releases"
 install -d -o relay-panel -g relay-panel -m 0750 "$DATA_ROOT"
+install -d -o relay-panel -g relay-panel -m 0700 "$DATA_ROOT/certificates"
 install -d -m 0750 "$CONFIG_ROOT"
 
 env_file="$CONFIG_ROOT/relay-panel.env"
@@ -106,6 +107,9 @@ PUBLIC_PANEL_URL=$public_url
 JWT_SECRET=$jwt_secret
 PANEL_KEY=$panel_key
 REGISTRATION_ENABLED=0
+PANEL_CERTIFICATE_STATE_DIR=$DATA_ROOT/certificates
+PANEL_CERTBOT_BINARY_PATH=/usr/bin/certbot
+PANEL_CERTIFICATE_CHECK_INTERVAL_SECS=43200
 EOF
     chown root:relay-panel "$env_file"
     chmod 0640 "$env_file"

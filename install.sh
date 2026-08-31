@@ -199,7 +199,7 @@ env_file="$CONFIG_ROOT/relay-panel.env"
 if [ "${REALITY_PANEL_TEST_PARSE_ONLY:-0}" != 1 ]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq ca-certificates curl file iproute2 openssl sqlite3 tar >/dev/null
+    apt-get install -y -qq ca-certificates certbot curl file iproute2 openssl sqlite3 tar >/dev/null
 fi
 
 if [ ! -e "$env_file" ] && ss -H -ltn "sport = :$panel_port" 2>/dev/null | grep -q .; then

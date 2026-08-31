@@ -893,16 +893,11 @@ apt-get install -y -qq ca-certificates curl iproute2
 preflight_managed_ports
 # Docker 在启用 AppArmor 的精简系统上不会总是自动补齐解析器；显式安装，
 # 避免 daemon 正常但容器启动时报 docker-default profile 无法加载。
-apt-get install -y -qq docker.io nginx libnginx-mod-stream openssl certbot apparmor
+apt-get install -y -qq docker.io nginx libnginx-mod-stream openssl apparmor
 step_ok
 
 step transaction-snapshot
 capture_transaction
-step_ok
-
-step certbot-base
-ensure_certbot_base
-install -d -m 0755 "$CERTIFICATE_HTTP01_WEBROOT/.well-known/acme-challenge"
 step_ok
 
 step docker

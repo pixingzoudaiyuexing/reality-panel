@@ -6,7 +6,11 @@ SCRIPT="$ROOT/scripts/relay-node-bootstrap.sh"
 TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 
-grep -Fq 'docker.io nginx libnginx-mod-stream openssl certbot apparmor' "$SCRIPT"
+grep -Fq 'docker.io nginx libnginx-mod-stream openssl apparmor' "$SCRIPT"
+if grep -Fq 'docker.io nginx libnginx-mod-stream openssl certbot apparmor' "$SCRIPT"; then
+  echo "new Node bootstrap must not require local Certbot" >&2
+  exit 1
+fi
 grep -Fq 'command -v apparmor_parser' "$SCRIPT"
 
 make_nginx_root() {

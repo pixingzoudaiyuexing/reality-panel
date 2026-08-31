@@ -45,6 +45,17 @@ Node artifact root are under `/opt/relay-panel/current`; the root is exposed to
 the application as `/opt/relay-panel/node-assets`. Bootstrap and lifecycle
 upgrade use this same root.
 
+### 集中证书
+
+Panel在`/var/lib/relay-panel/certificates`中保存每个inbound group当前需要的
+wildcard证书、一个安全恢复副本和最小ACME退避状态。目录由`relay-panel`用户
+以`0700`权限持有，不属于数据库或发布目录，Panel升级时会保留。
+
+启用该能力的升级顺序是先Panel、后逐台Node。新Node只从现有`PANEL_URL`的
+authenticated HTTP(S) endpoint获取证书，不回退到Node-local ACME；尚未升级的
+旧Node仍可使用Panel保留的DNS-01接口。`PANEL_URL=http://...`时private key会沿
+当前control transport明文传输，使用公网或不可信网络时应配置HTTPS。
+
 ## Upgrade
 
 ```bash
