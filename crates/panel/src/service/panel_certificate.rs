@@ -245,7 +245,7 @@ pub fn is_hook_command(args: &[String]) -> bool {
     args.first().is_some_and(|value| value == HOOK_COMMAND)
 }
 
-pub fn run_hook(args: &[String]) -> Result<(), String> {
+pub async fn run_hook(args: &[String]) -> Result<(), String> {
     let action = match args.get(1).map(String::as_str) {
         Some("auth") => "present",
         Some("cleanup") => "cleanup",
@@ -268,50 +268,44 @@ pub fn run_hook(args: &[String]) -> Result<(), String> {
         "{}/api/v1/node/acme-dns01/{action}",
         panel_url.trim_end_matches('/')
     );
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(150))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|_| "hook runtime is unavailable")?;
-    runtime.block_on(async move {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(150))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| "hook HTTP client is unavailable")?;
-        let response = client
-            .post(endpoint)
-            .bearer_auth(token)
-            .header("X-Node-ID", &node_id)
-            .json(&AcmeDns01Request {
-                node_id,
-                sni,
-                value,
-            })
-            .send()
-            .await
-            .map_err(|_| "Panel challenge request failed")?;
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|_| "Panel challenge response is unavailable")?;
-        if body.len() > MAX_HOOK_RESPONSE_BYTES {
-            return Err("Panel challenge response is too large".into());
-        }
-        if status.is_success() {
-            Ok(())
-        } else {
-            let code = serde_json::from_slice::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|value| value.get("code")?.as_str().map(str::to_string))
-                .unwrap_or_else(|| "UNKNOWN".to_string());
-            Err(format!(
-                "Panel challenge request returned HTTP {} code {code}",
-                status.as_u16()
-            ))
-        }
-    })
+        .map_err(|_| "hook HTTP client is unavailable")?;
+    let response = client
+        .post(endpoint)
+        .bearer_auth(token)
+        .header("X-Node-ID", &node_id)
+        .json(&AcmeDns01Request {
+            node_id,
+            sni,
+            value,
+        })
+        .send()
+        .await
+        .map_err(|_| "Panel challenge request failed")?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|_| "Panel challenge response is unavailable")?;
+    if body.len() > MAX_HOOK_RESPONSE_BYTES {
+        return Err("Panel challenge response is too large".into());
+    }
+    if status.is_success() {
+        Ok(())
+    } else {
+        let code = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("code")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| "UNKNOWN".to_string());
+        Err(format!(
+            "Panel challenge request returned HTTP {} code {code}",
+            status.as_u16()
+        ))
+    }
 }
 
 fn internal_panel_url(listen: &str) -> Result<String, String> {
@@ -827,7 +821,100 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use ::time::{Duration as TimeDuration, OffsetDateTime};
+    use axum::extract::{Path as AxumPath, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::post;
+    use axum::{Json, Router};
     use rcgen::{CertificateParams, KeyPair};
+    use std::ffi::OsString;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    static HOOK_ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+    const HOOK_ENV_KEYS: [&str; 5] = [
+        "RELAY_PANEL_INTERNAL_URL",
+        "RELAY_PANEL_NODE_TOKEN",
+        "RELAY_PANEL_CERTIFICATE_ACTOR",
+        "CERTBOT_DOMAIN",
+        "CERTBOT_VALIDATION",
+    ];
+
+    struct HookEnvGuard {
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl HookEnvGuard {
+        fn set(panel_url: &str) -> Self {
+            let previous = HOOK_ENV_KEYS
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            std::env::set_var("RELAY_PANEL_INTERNAL_URL", panel_url);
+            std::env::set_var("RELAY_PANEL_NODE_TOKEN", "test-node-token");
+            std::env::set_var("RELAY_PANEL_CERTIFICATE_ACTOR", "panel-certificate-test");
+            std::env::set_var("CERTBOT_DOMAIN", "*.i4ktv.top");
+            std::env::set_var("CERTBOT_VALIDATION", "validation-token-123456");
+            Self { previous }
+        }
+    }
+
+    impl Drop for HookEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.previous {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct CapturedHookRequest {
+        action: String,
+        authorization: Option<String>,
+        node_header: Option<String>,
+        node_id: String,
+        sni: String,
+        value: String,
+    }
+
+    #[derive(Clone)]
+    struct HookMockResponse {
+        status: StatusCode,
+        body: String,
+    }
+
+    #[derive(Clone)]
+    struct HookMockState {
+        requests: Arc<AsyncMutex<Vec<CapturedHookRequest>>>,
+        response: Arc<AsyncMutex<HookMockResponse>>,
+    }
+
+    async fn hook_mock_handler(
+        AxumPath(action): AxumPath<String>,
+        State(state): State<HookMockState>,
+        headers: HeaderMap,
+        Json(request): Json<AcmeDns01Request>,
+    ) -> Response {
+        state.requests.lock().await.push(CapturedHookRequest {
+            action,
+            authorization: headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            node_header: headers
+                .get("X-Node-ID")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            node_id: request.node_id,
+            sni: request.sni,
+            value: request.value,
+        });
+        let response = state.response.lock().await.clone();
+        (response.status, response.body).into_response()
+    }
 
     fn unique_dir(label: &str) -> PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -958,5 +1045,74 @@ mod tests {
             "/usr/bin/env '/opt/Reality Panel/panel'\\''s binary' acme-dns01-hook auth"
         );
         assert!(panel_certbot_hook_command(simple, "unexpected").is_err());
+    }
+
+    #[tokio::test]
+    async fn run_hook_uses_existing_runtime_and_preserves_http_contract() {
+        let _env_lock = HOOK_ENV_LOCK.lock().await;
+        let state = HookMockState {
+            requests: Arc::new(AsyncMutex::new(Vec::new())),
+            response: Arc::new(AsyncMutex::new(HookMockResponse {
+                status: StatusCode::OK,
+                body: r#"{"code":"OK"}"#.into(),
+            })),
+        };
+        let app = Router::new()
+            .route("/api/v1/node/acme-dns01/{action}", post(hook_mock_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let panel_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _env = HookEnvGuard::set(&panel_url);
+
+        run_hook(&[HOOK_COMMAND.into(), "auth".into()])
+            .await
+            .unwrap();
+        run_hook(&[HOOK_COMMAND.into(), "cleanup".into()])
+            .await
+            .unwrap();
+
+        let requests = state.requests.lock().await.clone();
+        assert_eq!(requests.len(), 2);
+        for (request, action) in requests.iter().zip(["present", "cleanup"]) {
+            assert_eq!(request.action, action);
+            assert_eq!(
+                request.authorization.as_deref(),
+                Some("Bearer test-node-token")
+            );
+            assert_eq!(
+                request.node_header.as_deref(),
+                Some("panel-certificate-test")
+            );
+            assert_eq!(request.node_id, "panel-certificate-test");
+            assert_eq!(request.sni, "i4ktv.top");
+            assert_eq!(request.value, "validation-token-123456");
+        }
+
+        *state.response.lock().await = HookMockResponse {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: r#"{"code":"MOCK_UNAVAILABLE"}"#.into(),
+        };
+        let error = run_hook(&[HOOK_COMMAND.into(), "auth".into()])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "Panel challenge request returned HTTP 503 code MOCK_UNAVAILABLE"
+        );
+
+        *state.response.lock().await = HookMockResponse {
+            status: StatusCode::OK,
+            body: "x".repeat(MAX_HOOK_RESPONSE_BYTES + 1),
+        };
+        assert_eq!(
+            run_hook(&[HOOK_COMMAND.into(), "cleanup".into()])
+                .await
+                .unwrap_err(),
+            "Panel challenge response is too large"
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 }

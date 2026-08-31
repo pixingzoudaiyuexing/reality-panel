@@ -23,7 +23,7 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if service::panel_certificate::is_hook_command(&args) {
-        match service::panel_certificate::run_hook(&args) {
+        match service::panel_certificate::run_hook(&args).await {
             Ok(()) => return,
             Err(error) => {
                 eprintln!("ACME DNS-01 hook failed: {error}");
