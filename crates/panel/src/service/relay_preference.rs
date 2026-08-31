@@ -271,6 +271,8 @@ pub enum RelayDnsRecordPosition {
 pub struct RelayDnsRecordView {
     pub rule_id: i64,
     pub fqdn: String,
+    pub line_id: String,
+    pub line_key: String,
     pub rollback_value: Option<String>,
     pub target_value: String,
     pub expected_value: Option<String>,
@@ -2507,6 +2509,8 @@ pub async fn get_relay_preference(
         dns_records.push(RelayDnsRecordView {
             rule_id: record.rule_id,
             fqdn: record.fqdn.clone(),
+            line_id: record.line_id.clone(),
+            line_key: record.line_key.clone(),
             rollback_value: record.rollback_value.clone(),
             target_value: record.target_value.clone().unwrap_or_default(),
             expected_value: sync.as_ref().and_then(|sync| sync.expected_value.clone()),
@@ -5090,6 +5094,13 @@ mod tests {
             Some("PUBLIC_DNS_MULTIPLE_ANSWERS")
         );
         let view = get_relay_preference(&repo, &connections, 7).await.unwrap();
+        let default_record = view
+            .dns_records
+            .iter()
+            .find(|record| record.rule_id == 1)
+            .unwrap();
+        assert_eq!(default_record.line_id, "default");
+        assert_eq!(default_record.line_key, "default");
         assert_eq!(
             view.dns_records
                 .iter()

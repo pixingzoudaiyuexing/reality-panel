@@ -333,8 +333,8 @@ describe('RelayPreferencePanel', () => {
         pending_node_id: 'node-b',
         last_error: 'DNS_RECORD_CONFLICT',
         dns_records: [
-          { rule_id: 1, fqdn: 'q1.example.com', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'PENDING', position: 'target', last_error: null },
-          { rule_id: 2, fqdn: 'q2.example.com', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'PROPAGATED', position: 'rollback', last_error: null },
+          { rule_id: 1, fqdn: 'q1.example.com', line_id: 'default', line_key: 'default', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'PENDING', position: 'target', last_error: null },
+          { rule_id: 2, fqdn: 'q2.example.com', line_id: 'default', line_key: 'default', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'PROPAGATED', position: 'rollback', last_error: null },
         ],
       })))
       .mockResolvedValueOnce(ok(preference({ state: 'failed_rolled_back' })));
@@ -343,8 +343,8 @@ describe('RelayPreferencePanel', () => {
     await act(async () => { await Promise.resolve(); });
 
     expect(screen.getByText('relayPreferenceRollingBack')).toBeInTheDocument();
-    expect(within(screen.getByTestId('relay-dns-record-1')).getByText('relayPreferenceDnsAtTarget')).toBeInTheDocument();
-    expect(within(screen.getByTestId('relay-dns-record-2')).getByText('relayPreferenceDnsAtPrevious')).toBeInTheDocument();
+    expect(within(screen.getByTestId('relay-dns-record-1-default')).getByText('relayPreferenceDnsAtTarget')).toBeInTheDocument();
+    expect(within(screen.getByTestId('relay-dns-record-2-default')).getByText('relayPreferenceDnsAtPrevious')).toBeInTheDocument();
     expect(within(rowFor('node-a')).getByRole('button')).toBeDisabled();
     expect(within(rowFor('node-b')).getByRole('button')).toBeDisabled();
 
@@ -356,24 +356,47 @@ describe('RelayPreferencePanel', () => {
   });
 
   it('shows split DNS and rollback error when manual intervention is required', async () => {
+    const diagnose = vi.fn();
     mockGet.mockResolvedValue(ok(preference({
       state: 'failed_manual_intervention',
       pending_node_id: 'node-b',
       last_error: 'DNS_RECORD_CONFLICT',
       rollback_error: 'ROLLBACK_SCHEDULING_FAILED',
       dns_records: [
-        { rule_id: 1, fqdn: 'q1.example.com', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'PROPAGATED', position: 'rollback', last_error: null },
-        { rule_id: 2, fqdn: 'q2.example.com', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'CONFLICT', position: 'target', last_error: 'ROLLBACK_PROVIDER_CONFLICT' },
+        { rule_id: 1, fqdn: 'q1.example.com', line_id: 'default', line_key: 'default', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'PROPAGATED', position: 'rollback', last_error: null },
+        { rule_id: 2, fqdn: 'q2.example.com', line_id: 'default', line_key: 'default', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'CONFLICT', position: 'target', last_error: 'ROLLBACK_PROVIDER_CONFLICT' },
       ],
     })));
 
-    render(<RelayPreferencePanel groupId={10} t={t} />);
+    render(<RelayPreferencePanel groupId={10} t={t} onDiagnoseNode={diagnose} />);
     await screen.findByText('relayPreferenceManualIntervention');
 
     expect(screen.getByText(/relaySwitchErrorRollbackScheduling/)).toBeInTheDocument();
-    expect(within(screen.getByTestId('relay-dns-record-1')).getByText('relayPreferenceDnsAtPrevious')).toBeInTheDocument();
-    expect(within(screen.getByTestId('relay-dns-record-2')).getByText('relayPreferenceDnsAtTarget')).toBeInTheDocument();
-    expect(within(rowFor('node-a')).getByRole('button', { name: /relayPreferenceReconfirm/ })).toBeEnabled();
+    expect(within(screen.getByTestId('relay-dns-record-1-default')).getByText('relayPreferenceDnsAtPrevious')).toBeInTheDocument();
+    expect(within(screen.getByTestId('relay-dns-record-2-default')).getByText('relayPreferenceDnsAtTarget')).toBeInTheDocument();
+    expect(within(rowFor('node-a')).getByRole('button', { name: /relayPreferenceReconfirm/ })).toBeDisabled();
+    expect(within(rowFor('node-b')).getByRole('button', { name: /relayPreferenceRetry/ })).toBeDisabled();
+    fireEvent.click(within(rowFor('node-a')).getByRole('button', { name: /diagnose/ }));
+    expect(diagnose).toHaveBeenCalledWith(expect.objectContaining({ node_id: 'node-a' }));
+    expect(screen.getByRole('button', { name: 'refresh' })).toBeEnabled();
+  });
+
+  it('renders unique line-aware DNS rows for one rule across default and FollowDefault lines', async () => {
+    mockGet.mockResolvedValue(ok(preference({
+      state: 'rolling_back',
+      pending_node_id: 'node-b',
+      dns_records: [
+        { rule_id: 1, fqdn: 'q1.example.com', line_id: 'default', line_key: 'default', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'PENDING', position: 'target', last_error: null },
+        { rule_id: 1, fqdn: 'q1.example.com', line_id: 'Dianxin_Shandong', line_key: 'dnsmgr:Dianxin_Shandong', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'PENDING', position: 'target', last_error: null },
+        { rule_id: 1, fqdn: 'q1.example.com', line_id: 'Liantong', line_key: 'dnsmgr:Liantong', rollback_value: '203.0.113.10', target_value: '203.0.113.11', expected_value: '203.0.113.10', sync_state: 'PENDING', position: 'target', last_error: null },
+      ] as RelayPreferenceView['dns_records'],
+    })));
+
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    expect(await screen.findByTestId('relay-dns-record-1-default')).toHaveTextContent('relayPreferenceDefaultLine');
+    expect(screen.getByTestId('relay-dns-record-1-dnsmgr-Dianxin_Shandong')).toHaveTextContent('Dianxin_Shandong');
+    expect(screen.getByTestId('relay-dns-record-1-dnsmgr-Liantong')).toHaveTextContent('Liantong');
+    expect(screen.getByTestId('relay-preference-dns-records').children).toHaveLength(4);
   });
 
   it('maps known Ready reasons with details and preserves unknown codes', async () => {

@@ -360,6 +360,7 @@ export const zhCN = {
   relayPreferenceRolledBack: '切换失败，DNS 已完成回滚',
   relayPreferenceManualIntervention: 'DNS 已分裂，需要人工处理',
   relayPreferenceDnsRecords: 'DNS 事务记录',
+  relayPreferenceDefaultLine: '默认线路',
   relayPreferenceDnsAtPrevious: '原优选 Relay',
   relayPreferenceDnsAtTarget: '目标 Relay',
   relayPreferenceDnsUnknown: '未知',

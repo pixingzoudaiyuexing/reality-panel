@@ -90,6 +90,10 @@ function actionLabel(view: RelayPreferenceView, node: RelayReadyNode, t: Tfn): s
   return t('relayPreferenceSet');
 }
 
+function safeLineKey(lineKey: string): string {
+  return lineKey.replace(/[^A-Za-z0-9_-]/g, '-');
+}
+
 export function RelayPreferencePanel({ groupId, t, onDiagnoseNode }: Props) {
   const [view, setView] = useState<RelayPreferenceView | null>(null);
   const [loading, setLoading] = useState(true);
@@ -266,6 +270,9 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode }: Props) {
         <div data-testid="relay-preference-dns-records" style={{ marginBottom: 10 }}>
           <Text strong>{t('relayPreferenceDnsRecords')}</Text>
           {(view.dns_records ?? []).map((record) => {
+            const lineLabel = record.line_key === 'default'
+              ? t('relayPreferenceDefaultLine')
+              : record.line_id;
             const positionLabel = record.position === 'rollback'
               ? t('relayPreferenceDnsAtPrevious')
               : record.position === 'target'
@@ -278,11 +285,12 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode }: Props) {
                 : record.expected_value;
             return (
               <div
-                key={record.rule_id}
-                data-testid={`relay-dns-record-${record.rule_id}`}
+                key={`${record.rule_id}:${record.line_key}`}
+                data-testid={`relay-dns-record-${record.rule_id}-${safeLineKey(record.line_key)}`}
                 style={{ display: 'flex', flexWrap: 'wrap', gap: 8, padding: '6px 0', borderBottom: '1px solid var(--rp-border)' }}
               >
                 <Text code>{record.fqdn}</Text>
+                <Tag>{lineLabel}</Tag>
                 <Tag color={record.position === 'rollback' ? 'green' : record.position === 'target' ? 'orange' : 'red'}>
                   {positionLabel}
                 </Tag>
@@ -300,7 +308,11 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode }: Props) {
         <div>
           {view.nodes.map((node) => {
             const isIdlePreferred = view.state === 'idle' && node.node_id === view.preferred_node_id;
-            const disabled = busy || !node.ready || view.state === 'switching' || view.state === 'rolling_back';
+            const disabled = busy
+              || !node.ready
+              || view.state === 'switching'
+              || view.state === 'rolling_back'
+              || view.state === 'failed_manual_intervention';
             return (
               <div
                 key={node.node_id}

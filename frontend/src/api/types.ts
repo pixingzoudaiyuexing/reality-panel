@@ -399,6 +399,8 @@ export type RelayPreferencePhase =
 export interface RelayDnsRecordView {
   rule_id: number;
   fqdn: string;
+  line_id: string;
+  line_key: string;
   rollback_value: string | null;
   target_value: string;
   expected_value: string | null;

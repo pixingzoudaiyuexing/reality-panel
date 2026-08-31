@@ -363,6 +363,7 @@ export const enUS: Dict = {
   relayPreferenceRolledBack: 'Switch failed and DNS was rolled back',
   relayPreferenceManualIntervention: 'DNS is split and requires manual intervention',
   relayPreferenceDnsRecords: 'DNS transaction records',
+  relayPreferenceDefaultLine: 'Default line',
   relayPreferenceDnsAtPrevious: 'Previous Relay',
   relayPreferenceDnsAtTarget: 'Target Relay',
   relayPreferenceDnsUnknown: 'Unknown',
