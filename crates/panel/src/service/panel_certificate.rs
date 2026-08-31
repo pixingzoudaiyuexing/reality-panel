@@ -221,9 +221,9 @@ impl PanelCertificateManager {
         let live = config_dir.join("live").join(certificate_name);
         let cert_path = live.join("fullchain.pem");
         let key_path = live.join("privkey.pem");
-        validate_certbot_source(&cert_path, &config_dir)?;
-        validate_certbot_source(&key_path, &config_dir)?;
-        publish_candidate(&self.state_dir, group_id, domain, &cert_path, &key_path)
+        let cert_source = resolve_certbot_source(&cert_path, &config_dir)?;
+        let key_source = resolve_certbot_source(&key_path, &config_dir)?;
+        publish_candidate(&self.state_dir, group_id, domain, &cert_source, &key_source)
     }
 }
 
@@ -715,13 +715,13 @@ fn clear_retry(root: &Path) {
     remove_regular_file(&root.join("retry.json"));
 }
 
-fn validate_certbot_source(path: &Path, config_dir: &Path) -> Result<(), String> {
+fn resolve_certbot_source(path: &Path, config_dir: &Path) -> Result<PathBuf, String> {
     let resolved = fs::canonicalize(path).map_err(|_| "Certbot candidate is unavailable")?;
     let config = fs::canonicalize(config_dir).map_err(|_| "Certbot config is unavailable")?;
     if !path.starts_with(config_dir) || !resolved.starts_with(config) {
         return Err("Certbot candidate escaped configured certificate directory".into());
     }
-    Ok(())
+    Ok(resolved)
 }
 
 fn challenge_domain(domain: &str) -> Result<String, String> {
@@ -828,6 +828,8 @@ mod tests {
     use axum::{Json, Router};
     use rcgen::{CertificateParams, KeyPair};
     use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tokio::sync::Mutex as AsyncMutex;
 
     static HOOK_ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
@@ -995,6 +997,115 @@ mod tests {
                 .generation,
             1
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn certbot_live_symlinks_resolve_to_archive_and_publish_regular_generation() {
+        let dir = unique_dir("certbot-live-symlink");
+        let source = candidate(&dir, "source", "*.example.com", 90);
+        let config_dir = dir.join("config");
+        let archive_dir = config_dir.join("archive/test");
+        let live_dir = config_dir.join("live/test");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::create_dir_all(&live_dir).unwrap();
+        let archive_cert = archive_dir.join("fullchain1.pem");
+        let archive_key = archive_dir.join("privkey1.pem");
+        fs::copy(&source.0, &archive_cert).unwrap();
+        fs::copy(&source.1, &archive_key).unwrap();
+        let live_cert = live_dir.join("fullchain.pem");
+        let live_key = live_dir.join("privkey.pem");
+        symlink("../../archive/test/fullchain1.pem", &live_cert).unwrap();
+        symlink("../../archive/test/privkey1.pem", &live_key).unwrap();
+
+        let cert_source = resolve_certbot_source(&live_cert, &config_dir).unwrap();
+        let key_source = resolve_certbot_source(&live_key, &config_dir).unwrap();
+        assert_eq!(cert_source, fs::canonicalize(&archive_cert).unwrap());
+        assert_eq!(key_source, fs::canonicalize(&archive_key).unwrap());
+        assert!(cert_source.is_file());
+        assert!(key_source.is_file());
+
+        assert!(publish_candidate(&dir, 7, "*.example.com", &cert_source, &key_source,).unwrap());
+        let root = scope_root(&dir, 7, "*.example.com");
+        let current = recover_current(&root, "*.example.com").unwrap().unwrap();
+        let generation = root
+            .join("generations")
+            .join(current.generation.to_string());
+        let published_cert = generation.join("fullchain.pem");
+        let published_key = generation.join("privkey.pem");
+        assert!(published_cert.is_file());
+        assert!(published_key.is_file());
+        assert!(!fs::symlink_metadata(&published_cert)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!fs::symlink_metadata(&published_key)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read(&published_cert).unwrap(),
+            fs::read(&archive_cert).unwrap()
+        );
+        assert_eq!(
+            fs::read(&published_key).unwrap(),
+            fs::read(&archive_key).unwrap()
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn certbot_source_escape_and_broken_symlinks_are_rejected() {
+        let dir = unique_dir("certbot-source-boundary");
+        let config_dir = dir.join("config");
+        let live_dir = config_dir.join("live/test");
+        fs::create_dir_all(&live_dir).unwrap();
+        let outside = dir.join("outside.pem");
+        fs::write(&outside, b"outside").unwrap();
+        let escape = live_dir.join("escape.pem");
+        symlink(&outside, &escape).unwrap();
+        assert_eq!(
+            resolve_certbot_source(&escape, &config_dir).unwrap_err(),
+            "Certbot candidate escaped configured certificate directory"
+        );
+
+        let broken = live_dir.join("broken.pem");
+        symlink("../../archive/test/missing.pem", &broken).unwrap();
+        assert_eq!(
+            resolve_certbot_source(&broken, &config_dir).unwrap_err(),
+            "Certbot candidate is unavailable"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn panel_generation_symlink_remains_rejected_after_certbot_fix() {
+        let dir = unique_dir("panel-generation-symlink");
+        let source = candidate(&dir, "source", "*.example.com", 90);
+        publish_candidate(&dir, 8, "*.example.com", &source.0, &source.1).unwrap();
+        let root = scope_root(&dir, 8, "*.example.com");
+        let current = recover_current(&root, "*.example.com").unwrap().unwrap();
+        let generation = root
+            .join("generations")
+            .join(current.generation.to_string());
+        let outside = dir.join("outside.pem");
+        fs::write(
+            &outside,
+            fs::read(&generation.join("fullchain.pem")).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(generation.join("fullchain.pem")).unwrap();
+        symlink(&outside, generation.join("fullchain.pem")).unwrap();
+        assert!(validate_bundle_paths(
+            &generation.join("fullchain.pem"),
+            &generation.join("privkey.pem"),
+            "*.example.com"
+        )
+        .is_err());
+        assert!(recover_current(&root, "*.example.com").unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
 
