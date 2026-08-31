@@ -927,15 +927,15 @@ async fn upsert_is_authorized(
     else {
         return Ok(false);
     };
-    if !rule_is_dns_eligible(&rule)
-        || normalize_fqdn(rule.sni.as_deref().unwrap_or_default().trim())
-            .ok()
-            .as_ref()
-            != Some(fqdn)
-    {
-        return Ok(false);
-    }
     if input.line.key == DEFAULT_LINE_KEY {
+        if !rule_is_dns_eligible(&rule)
+            || normalize_fqdn(rule.sni.as_deref().unwrap_or_default().trim())
+                .ok()
+                .as_ref()
+                != Some(fqdn)
+        {
+            return Ok(false);
+        }
         return Ok(matches!(
             derive_dns_desired(db, input.rule_id).await?,
             DnsDesiredResolution::Eligible(desired)
@@ -943,6 +943,23 @@ async fn upsert_is_authorized(
                     && desired.record_type == input.record_type
                     && desired.expected_value == input.expected_value
         ));
+    }
+    if (!rule_is_dns_eligible(&rule)
+        || normalize_fqdn(rule.sni.as_deref().unwrap_or_default().trim())
+            .ok()
+            .as_ref()
+            != Some(fqdn))
+        && !crate::service::relay_preference::dns_transaction_authorizes(
+            db,
+            input.rule_id,
+            fqdn.as_str(),
+            &input.line.key,
+            "UPSERT",
+            Some(&input.expected_value),
+        )
+        .await?
+    {
+        return Ok(false);
     }
     let Some(sync) = db
         .find_dns_record_sync(input.rule_id, &input.line.key)
@@ -967,12 +984,23 @@ async fn delete_is_authorized(
     else {
         return Ok(false);
     };
-    if !rule_is_dns_eligible(&rule)
+    if input.line.key == DEFAULT_LINE_KEY {
+        return Ok(false);
+    }
+    if (!rule_is_dns_eligible(&rule)
         || normalize_fqdn(rule.sni.as_deref().unwrap_or_default().trim())
             .ok()
             .as_ref()
-            != Some(fqdn)
-        || input.line.key == DEFAULT_LINE_KEY
+            != Some(fqdn))
+        && !crate::service::relay_preference::dns_transaction_authorizes(
+            db,
+            input.rule_id,
+            fqdn.as_str(),
+            &input.line.key,
+            "DELETE",
+            None,
+        )
+        .await?
     {
         return Ok(false);
     }
@@ -1626,7 +1654,7 @@ pub(crate) async fn schedule_line_upsert(
         return Err(LineDesiredError::InvalidLine);
     }
     let desired = line_desired_for_rule(db, rule_id, line, Some(expected_value)).await?;
-    persist_line_desired(db, &desired, "UPSERT", Some(expected_value)).await
+    persist_line_desired(db, &desired, "UPSERT", Some(expected_value), true).await
 }
 
 #[allow(dead_code)] // RC9-S3 foundation; consumed by the Carrier Policy stage.
@@ -1640,7 +1668,54 @@ pub(crate) async fn schedule_line_delete(
         return Err(LineDesiredError::InvalidLine);
     }
     let desired = line_desired_for_rule(db, rule_id, line, None).await?;
-    persist_line_desired(db, &desired, "DELETE", None).await
+    persist_line_desired(db, &desired, "DELETE", None, true).await
+}
+
+pub(crate) async fn schedule_transaction_line(
+    db: &dyn Repository,
+    rule_id: i64,
+    fqdn: &str,
+    raw_line_id: &str,
+    action: &str,
+    value: Option<&str>,
+) -> Result<(), LineDesiredError> {
+    let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
+    if line.key == DEFAULT_LINE_KEY || !matches!(action, "UPSERT" | "DELETE") {
+        return Err(LineDesiredError::InvalidLine);
+    }
+    let fqdn = normalize_fqdn(fqdn).map_err(|_| LineDesiredError::InvalidRule)?;
+    if !crate::service::relay_preference::dns_transaction_authorizes(
+        db,
+        rule_id,
+        fqdn.as_str(),
+        &line.key,
+        action,
+        value,
+    )
+    .await
+    .map_err(|_| LineDesiredError::Database)?
+    {
+        return Err(LineDesiredError::InvalidRule);
+    }
+    if action == "UPSERT" {
+        let value = value.ok_or(LineDesiredError::InvalidValue)?;
+        let ip = value
+            .parse::<Ipv4Addr>()
+            .map_err(|_| LineDesiredError::InvalidValue)?;
+        if ip.is_loopback() || ip.is_unspecified() {
+            return Err(LineDesiredError::InvalidValue);
+        }
+    } else if value.is_some() {
+        return Err(LineDesiredError::InvalidValue);
+    }
+    let desired = DnsDesiredRecord {
+        rule_id,
+        fqdn: fqdn.as_str().to_string(),
+        record_type: DnsRecordType::A,
+        expected_value: value.unwrap_or_default().to_string(),
+        line,
+    };
+    persist_line_desired(db, &desired, action, value, true).await
 }
 
 pub(crate) async fn inspect_line_record(
@@ -1748,6 +1823,7 @@ async fn persist_line_desired(
     desired: &DnsDesiredRecord,
     desired_action: &str,
     expected_value: Option<&str>,
+    force_schedule: bool,
 ) -> Result<(), LineDesiredError> {
     let now = utc_now();
     let existing = db
@@ -1773,8 +1849,15 @@ async fn persist_line_desired(
             })
             .await
             .map_err(|_| LineDesiredError::Database),
-        Some(_) => db
-            .update_dns_record_sync_desired(
+        Some(sync)
+            if sync.fqdn != desired.fqdn
+                || sync.record_type != desired.record_type.as_str()
+                || sync.expected_value.as_deref() != expected_value
+                || sync.line != desired.line.raw_id
+                || sync.line_key != desired.line.key
+                || sync.desired_action != desired_action =>
+        {
+            db.update_dns_record_sync_desired(
                 desired.rule_id,
                 &desired.fqdn,
                 desired.record_type.as_str(),
@@ -1794,7 +1877,29 @@ async fn persist_line_desired(
                 (updated == 1)
                     .then_some(())
                     .ok_or(LineDesiredError::Database)
-            }),
+            })
+        }
+        Some(sync)
+            if force_schedule || matches!(sync.state.as_str(), "NOT_ELIGIBLE" | "DISABLED") =>
+        {
+            db.schedule_dns_record_sync(
+                desired.rule_id,
+                &desired.line.key,
+                "PENDING",
+                "UNKNOWN",
+                None,
+                Some(&now),
+                &now,
+            )
+            .await
+            .map_err(|_| LineDesiredError::Database)
+            .and_then(|updated| {
+                (updated == 1)
+                    .then_some(())
+                    .ok_or(LineDesiredError::Database)
+            })
+        }
+        Some(_) => Ok(()),
     }
 }
 
@@ -1808,6 +1913,19 @@ async fn persist_resolution(
         DnsDesiredResolution::Frozen => {}
         DnsDesiredResolution::NotEligible => {
             for sync in db.list_dns_record_syncs_for_rule(rule_id).await? {
+                if sync.line_key != DEFAULT_LINE_KEY
+                    && crate::service::relay_preference::dns_transaction_authorizes(
+                        db,
+                        sync.rule_id,
+                        &sync.fqdn,
+                        &sync.line_key,
+                        &sync.desired_action,
+                        sync.expected_value.as_deref(),
+                    )
+                    .await?
+                {
+                    continue;
+                }
                 let now = utc_now();
                 db.schedule_dns_record_sync(
                     rule_id,
@@ -1886,10 +2004,10 @@ async fn persist_carrier_desired(
                         "carrier UPSERT desired value is missing".into(),
                     )));
                 };
-                schedule_line_upsert(db, rule_id, &desired.line_id, value).await
+                project_line_desired(db, rule_id, &desired.line_id, "UPSERT", Some(value)).await
             }
             crate::service::relay_preference::RelayDnsAction::Delete => {
-                schedule_line_delete(db, rule_id, &desired.line_id).await
+                project_line_desired(db, rule_id, &desired.line_id, "DELETE", None).await
             }
         };
         result.map_err(|error| {
@@ -1899,6 +2017,18 @@ async fn persist_carrier_desired(
         })?;
     }
     Ok(())
+}
+
+async fn project_line_desired(
+    db: &dyn Repository,
+    rule_id: i64,
+    raw_line_id: &str,
+    action: &str,
+    value: Option<&str>,
+) -> Result<(), LineDesiredError> {
+    let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
+    let desired = line_desired_for_rule(db, rule_id, line, value).await?;
+    persist_line_desired(db, &desired, action, value, false).await
 }
 
 /// Schedule an eligible rule after its DB transaction has committed. Any
@@ -3314,6 +3444,187 @@ mod tests {
             Err(LineRecordSnapshotError::OwnershipUnverified)
         ));
         assert_eq!(duplicate.state.total_mutations(), 0);
+    }
+
+    async fn carrier_projection_db() -> SqliteRepository {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        db.set(
+            "relay_preference:10",
+            &serde_json::json!({
+                "preferred_node_id": null,
+                "pending_node_id": null,
+                "state": "idle",
+                "started_at": null,
+                "last_error": null,
+                "carrier_policy": {
+                    "bindings": [{
+                        "line_id": "Dianxin",
+                        "mode": "follow_default",
+                        "node_id": null
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        schedule_rule(&db, 100).await.unwrap();
+        db
+    }
+
+    async fn set_carrier_sync_state(
+        db: &SqliteRepository,
+        state: &str,
+        ownership: &str,
+        error: Option<&str>,
+        attempts: i32,
+        next_attempt_at: Option<&str>,
+    ) {
+        let sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_dns_record_sync_observation(
+            &sync,
+            &sync.state,
+            state,
+            ownership,
+            sync.mutation_verified_at.as_deref(),
+            sync.last_observed_at.as_deref(),
+            sync.propagated_at.as_deref(),
+            error,
+            attempts,
+            next_attempt_at,
+            "2026-08-31 12:00:00",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn carrier_background_refresh_preserves_identical_terminal_and_stable_syncs() {
+        for (state, ownership, error, attempts, next_attempt_at) in [
+            ("PROPAGATED", "PANEL", None, 0, None),
+            (
+                "MUTATION_OUTCOME_UNKNOWN",
+                "UNKNOWN",
+                Some("MUTATION_UNKNOWN"),
+                1,
+                None,
+            ),
+            (
+                "FAILED",
+                "UNKNOWN",
+                Some("DNSMGR_TEMPORARY"),
+                3,
+                Some("2099-01-01 00:00:00"),
+            ),
+        ] {
+            let db = carrier_projection_db().await;
+            set_carrier_sync_state(&db, state, ownership, error, attempts, next_attempt_at).await;
+            let before = db
+                .find_dns_record_sync(100, "dnsmgr:Dianxin")
+                .await
+                .unwrap()
+                .unwrap();
+            refresh_all_desired(&db).await.unwrap();
+            refresh_all_desired(&db).await.unwrap();
+            let after = db
+                .find_dns_record_sync(100, "dnsmgr:Dianxin")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after, before, "background refresh changed {state}");
+        }
+
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        db.insert_dns_record_sync(&NewDnsRecordSync {
+            rule_id: 100,
+            fqdn: "op1.example.com".into(),
+            record_type: "A".into(),
+            expected_value: None,
+            line: "Dianxin".into(),
+            line_key: "dnsmgr:Dianxin".into(),
+            desired_action: "DELETE".into(),
+            state: "PROPAGATED".into(),
+            ownership: "PANEL".into(),
+            last_error_category: None,
+            next_attempt_at: None,
+            created_at: "2026-08-31 00:00:00".into(),
+            updated_at: "2026-08-31 00:00:00".into(),
+        })
+        .await
+        .unwrap();
+        let before = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        refresh_all_desired(&db).await.unwrap();
+        assert_eq!(
+            db.find_dns_record_sync(100, "dnsmgr:Dianxin")
+                .await
+                .unwrap()
+                .unwrap(),
+            before,
+            "DELETE tombstone must remain stable"
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_background_refresh_reactivates_only_lifecycle_states() {
+        for state in ["NOT_ELIGIBLE", "DISABLED"] {
+            let db = carrier_projection_db().await;
+            set_carrier_sync_state(&db, state, "UNKNOWN", Some("LIFECYCLE"), 4, None).await;
+            refresh_all_desired(&db).await.unwrap();
+            let after = db
+                .find_dns_record_sync(100, "dnsmgr:Dianxin")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.state, "PENDING", "{state} did not reactivate");
+            assert_eq!(after.attempt_count, 0);
+            assert!(after.next_attempt_at.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_carrier_write_is_not_retried_by_the_next_refresh_tick() {
+        let db = carrier_projection_db().await;
+        let mock = spawn_ensure_mock(
+            Vec::new(),
+            MutationBehavior::TransportWithoutApply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        let sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_one(&db, sync, &mock.client).await;
+        assert_eq!(mock.state.total_mutations(), 1);
+        assert_eq!(
+            db.find_dns_record_sync(100, "dnsmgr:Dianxin")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "MUTATION_OUTCOME_UNKNOWN"
+        );
+
+        refresh_all_desired(&db).await.unwrap();
+        let due = list_executable_due_syncs(&db, &utc_now()).await.unwrap();
+        for sync in due
+            .into_iter()
+            .filter(|sync| sync.line_key == "dnsmgr:Dianxin")
+        {
+            reconcile_one(&db, sync, &mock.client).await;
+        }
+        assert_eq!(mock.state.total_mutations(), 1);
     }
 
     #[tokio::test]
