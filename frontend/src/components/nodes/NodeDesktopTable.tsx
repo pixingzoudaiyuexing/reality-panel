@@ -2,11 +2,11 @@
 import { Table, Tag, Typography, Button, Tooltip, Popconfirm } from 'antd';
 import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined, DeleteOutlined, FileTextOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons';
 import type { NodeLifecycleHandler, Tfn } from './types';
-import type { NodeDisplayRow } from '../../api/types';
+import type { NodeDisplayRow, RelayReadyNode } from '../../api/types';
 import { NodeResourceBar, NodeDiskBar } from './NodeResourceBar';
 import { formatBps, formatBytes, formatUptime, formatPercent } from '../../utils/format';
 import { versionRelation, versionTagColor } from '../../utils/version';
-import { NetworkCell } from './shared';
+import { NetworkCell, RelayReadyStatus } from './shared';
 import { resolveNodeUpgrade } from './upgrade';
 import { nodeDesktopColumnWidths } from './tableLayout';
 
@@ -30,13 +30,16 @@ interface Props {
    *  offline rows — deleting an online node's record achieves nothing, because
    *  the next report (within ~10s) recreates it. Absent for the user view. */
   onDelete?: (row: NodeDisplayRow) => void;
+  relayNodes?: RelayReadyNode[];
+  showRelayReady?: boolean;
 }
 
 /** Desktop table for one group's nodes. Both admin and user share the same
  *  columns — the permission difference is in the data source (admin reads
  *  /nodes, user reads /nodes/shared) and the detail drawer. */
-export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {}, onDelete }: Props) {
+export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {}, onDelete, relayNodes = [], showRelayReady = false }: Props) {
   const labels = { d: t('uptimeDay'), h: t('uptimeHour'), m: t('uptimeMinute'), s: t('uptimeSecond') };
+  const relayById = new Map(relayNodes.map((node) => [node.node_id, node]));
 
   const columns = [
     {
@@ -49,6 +52,12 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
         return r.online ? <Tag color="green">{t('online')}</Tag> : <Tag>{t('offline')}</Tag>;
       },
     },
+    ...(showRelayReady ? [{
+      title: t('relayReady'), key: 'relay_ready', width: nodeDesktopColumnWidths.relayReady,
+      render: (_: unknown, r: NodeDisplayRow) => (
+        <RelayReadyStatus node={r.node_id ? relayById.get(r.node_id) : undefined} t={t} />
+      ),
+    }] : []),
     // v1.0.10: node version moved forward, with the upgrade action right after it.
     // v1.2: compared against the latest NODE release (latestNodeVersion), not
     // the panel version.

@@ -51,15 +51,86 @@ export function compactRealityStatus(
   rule: Pick<ForwardRule, 'camouflage_enabled'>,
   dns: RuleDnsStatus | undefined,
   camouflage: CamouflageAggregateStatus,
-  t: (key: string) => string,
 ) {
   if (!rule.camouflage_enabled) return { dns: dns?.sync_state ?? '-', route: '-', certificate: '-' };
   const dnsValue = !dns || !dns.eligible ? '-' : dns.sync_state === 'PROPAGATED' ? 'OK' : dns.sync_state;
   const route = camouflage.state === 'active' ? 'OK' : camouflage.state === 'failed' ? 'FAIL' : camouflage.state.toUpperCase();
   const certificate = camouflage.certificate?.certificate_status === 'active'
     ? `OK${camouflage.certificate.valid_until ? ` ${Math.max(0, Math.floor((new Date(camouflage.certificate.valid_until).getTime() - Date.now()) / 86_400_000))}d` : ''}`
-    : (camouflage.certificate?.certificate_status ?? t('preparing')).toUpperCase();
+    : (camouflage.certificate?.certificate_status ?? 'PREPARING').toUpperCase();
   return { dns: dnsValue, route, certificate };
+}
+
+export type RuleHealthTone = 'normal' | 'waiting' | 'warning' | 'error' | 'unknown' | 'muted';
+
+export interface RuleHealthDisplay {
+  tone: RuleHealthTone;
+  label: string;
+  raw: string;
+}
+
+export function dnsSyncStateDisplay(state: string, t: (key: string) => string): RuleHealthDisplay {
+  if (state === 'PROPAGATED') return { tone: 'normal', label: t('rulesStatusNormal'), raw: state };
+  if (state === 'PENDING') return { tone: 'waiting', label: t('rulesStatusWaiting'), raw: state };
+  if (['SYNCING', 'MUTATION_VERIFIED', 'PROPAGATING'].includes(state)) {
+    return { tone: 'waiting', label: t('rulesStatusSyncing'), raw: state };
+  }
+  if (state === 'CONFLICT') return { tone: 'warning', label: t('rulesStatusConflict'), raw: state };
+  if (state === 'DISABLED') return { tone: 'muted', label: t('rulesStatusDisabled'), raw: state };
+  if (state === 'NOT_ELIGIBLE' || state === '-') {
+    return { tone: 'muted', label: t('rulesStatusNotApplicable'), raw: state };
+  }
+  if (state === 'MUTATION_OUTCOME_UNKNOWN') {
+    return { tone: 'error', label: t('rulesStatusUnknown'), raw: state };
+  }
+  if (['FAILED', 'INVALID_CONFIG'].includes(state)) {
+    return { tone: 'error', label: t('rulesStatusAbnormal'), raw: state };
+  }
+  return { tone: 'unknown', label: t('rulesStatusUnknown'), raw: state };
+}
+
+export function runtimeStateDisplay(state: string, t: (key: string) => string): RuleHealthDisplay {
+  const normalized = state.toLowerCase();
+  if (['ok', 'active', 'propagated', 'converged'].includes(normalized)) {
+    return { tone: 'normal', label: t('rulesStatusNormal'), raw: state };
+  }
+  if (['pending', 'preparing', 'syncing', 'propagating', 'withheld', 'reconciling', 'repairing'].includes(normalized)) {
+    return { tone: 'waiting', label: t('rulesStatusWaiting'), raw: state };
+  }
+  if (['partial', 'renewal_warning', 'warning', 'dependency_withheld', 'degraded_local_recovery'].includes(normalized)) {
+    return { tone: 'warning', label: t('rulesStatusWarning'), raw: state };
+  }
+  if (['fail', 'failed', 'failed_retrying', 'apply_failed', 'invalid_config'].includes(normalized)) {
+    return { tone: 'error', label: t('rulesStatusAbnormal'), raw: state };
+  }
+  if (normalized === 'offline') return { tone: 'error', label: t('offline'), raw: state };
+  if (normalized === 'disabled' || normalized === '-') {
+    return { tone: 'muted', label: t('rulesStatusNotApplicable'), raw: state };
+  }
+  return { tone: 'unknown', label: t('rulesStatusUnknown'), raw: state };
+}
+
+export function compactRealityStatusDisplay(
+  status: ReturnType<typeof compactRealityStatus>,
+  t: (key: string) => string,
+) {
+  const dns = dnsSyncStateDisplay(status.dns === 'OK' ? 'PROPAGATED' : status.dns, t);
+  const route = runtimeStateDisplay(status.route, t);
+  const days = /^OK (\d+)d$/.exec(status.certificate);
+  const certificate = days
+    ? {
+      tone: 'normal' as const,
+      label: t('rulesStatusDaysRemaining').replace('{count}', days[1]),
+      raw: status.certificate,
+    }
+    : runtimeStateDisplay(status.certificate, t);
+  return { dns, route, certificate };
+}
+
+export function dnsOwnershipDisplay(ownership: RuleDnsStatus['ownership'], t: (key: string) => string) {
+  if (ownership === 'PANEL_MANAGED') return t('dnsOwnershipPanelManaged');
+  if (ownership === 'EXTERNAL') return t('dnsOwnershipExternal');
+  return t('dnsOwnershipNone');
 }
 
 export function deriveCamouflageStatus(

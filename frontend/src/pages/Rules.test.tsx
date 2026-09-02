@@ -6,6 +6,7 @@ import type { NodeStatus, RealityDiagnosis, RuleDnsStatus } from '../api/types';
 import {
   camouflageCertificateMessage,
   compactRealityStatus,
+  compactRealityStatusDisplay,
   deriveCamouflageStatus,
   diagnosisStateDisplay,
   diagnoseRuntimeStatus,
@@ -330,7 +331,6 @@ describe('Reality rule controls and compact status', () => {
       { camouflage_enabled: true },
       propagatedDns,
       activeCamouflage,
-      translate,
     )).toMatchObject({ dns: 'OK', route: 'OK', certificate: expect.stringMatching(/^OK (88|89)d$/) });
   });
 
@@ -343,8 +343,20 @@ describe('Reality rule controls and compact status', () => {
       { camouflage_enabled: true },
       propagatedDns,
       view,
-      translate,
     ).certificate).toMatch(/^OK (88|89)d$/);
+  });
+
+  it('maps compact raw states to product language while retaining the raw value', () => {
+    const display = compactRealityStatusDisplay({
+      dns: 'MUTATION_OUTCOME_UNKNOWN',
+      route: 'PREPARING',
+      certificate: 'OK 89d',
+    }, translate);
+    expect(display).toEqual({
+      dns: { tone: 'error', label: 'rulesStatusUnknown', raw: 'MUTATION_OUTCOME_UNKNOWN' },
+      route: { tone: 'waiting', label: 'rulesStatusWaiting', raw: 'PREPARING' },
+      certificate: { tone: 'normal', label: 'rulesStatusDaysRemaining'.replace('{count}', '89'), raw: 'OK 89d' },
+    });
   });
 });
 
@@ -461,18 +473,18 @@ describe('rule DNS status', () => {
   });
 
   it.each([
-    'PENDING',
-    'SYNCING',
-    'MUTATION_VERIFIED',
-    'PROPAGATING',
-    'PROPAGATED',
-    'CONFLICT',
-    'FAILED',
-    'DISABLED',
-    'INVALID_CONFIG',
-  ])('renders %s independently from certificate and Relay state', (state) => {
+    ['PENDING', 'rulesStatusWaiting'],
+    ['SYNCING', 'rulesStatusSyncing'],
+    ['MUTATION_VERIFIED', 'rulesStatusSyncing'],
+    ['PROPAGATING', 'rulesStatusSyncing'],
+    ['PROPAGATED', 'rulesStatusNormal'],
+    ['CONFLICT', 'rulesStatusConflict'],
+    ['FAILED', 'rulesStatusAbnormal'],
+    ['DISABLED', 'rulesStatusDisabled'],
+    ['INVALID_CONFIG', 'rulesStatusAbnormal'],
+  ])('renders %s independently from certificate and Relay state', (state, label) => {
     const { unmount } = render(<DnsStatusCell status={status(state)} t={t} />);
-    expect(screen.getByText(state)).toBeInTheDocument();
+    expect(screen.getByText(label)).toHaveAttribute('data-raw-state', state);
     expect(screen.getByText('A op1.example.com → 192.0.2.10')).toBeInTheDocument();
     unmount();
   });
@@ -482,7 +494,7 @@ describe('rule DNS status', () => {
       ownership: 'EXTERNAL',
       warning_category: 'PUBLIC_DNS_MULTIPLE_ANSWERS',
     })} t={t} />);
-    expect(screen.getByText('dnsOwnership: EXTERNAL')).toBeInTheDocument();
+    expect(screen.getByText('dnsOwnership: dnsOwnershipExternal')).toHaveAttribute('data-raw-ownership', 'EXTERNAL');
     expect(screen.getByText('PUBLIC_DNS_MULTIPLE_ANSWERS')).toBeInTheDocument();
   });
 
@@ -495,6 +507,7 @@ describe('rule DNS status', () => {
     rerender(<DnsStatusCell status={status('MUTATION_OUTCOME_UNKNOWN', {
       last_error_category: 'POST_WRITE_NOT_VERIFIED',
     })} onRetry={retry} t={t} />);
+    expect(screen.getByText('rulesStatusUnknown')).toHaveAttribute('data-raw-state', 'MUTATION_OUTCOME_UNKNOWN');
     expect(screen.queryByRole('button', { name: /retryDnsSync/ })).not.toBeInTheDocument();
   });
 

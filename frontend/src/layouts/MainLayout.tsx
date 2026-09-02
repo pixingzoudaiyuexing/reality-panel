@@ -150,13 +150,13 @@ export default function MainLayout() {
         />
       </Sider>
       <Layout className="rp-app-main">
-        <Header style={{
+        <Header className="rp-app-header" style={{
           background: '#fff', height: 'var(--rp-header-height)',
           padding: '0 24px', lineHeight: 'var(--rp-header-height)',
           display: 'flex', justifyContent: 'flex-end', alignItems: 'center',
           borderBottom: '1px solid var(--rp-border)',
         }}>
-          <Space size="middle">
+          <Space size="middle" className="rp-app-header-actions">
             {/* v1.2.4: announcements live here rather than in the sidebar.
                 The banner already carries the current notice, so a menu row
                 would only be a route to the archive — a low-frequency
@@ -173,8 +173,10 @@ export default function MainLayout() {
                 size="small"
                 icon={<NotificationOutlined />}
                 onClick={() => navigate('/announcements')}
+                aria-label={t('announcements')}
+                title={t('announcements')}
               >
-                {t('announcements')}
+                <span className="rp-header-action-label">{t('announcements')}</span>
               </Button>
             </Badge>
             <Segmented
@@ -186,14 +188,14 @@ export default function MainLayout() {
                 { value: 'en-US', label: t('langEnUS') },
               ]}
             />
-            <Text type="secondary" style={{ fontSize: 13 }}>
+            <Text type="secondary" className="rp-header-role" style={{ fontSize: 13 }}>
               {isAdmin ? t('admin') : t('user')}
             </Text>
-            <Button type="text" size="small" icon={<LockOutlined />} onClick={() => setChangePwOpen(true)}>
-              {t('changePassword')}
+            <Button type="text" size="small" icon={<LockOutlined />} onClick={() => setChangePwOpen(true)} aria-label={t('changePassword')} title={t('changePassword')}>
+              <span className="rp-header-action-label">{t('changePassword')}</span>
             </Button>
-            <Button type="text" size="small" icon={<LogoutOutlined />} onClick={logout}>
-              {t('logout')}
+            <Button type="text" size="small" icon={<LogoutOutlined />} onClick={logout} aria-label={t('logout')} title={t('logout')}>
+              <span className="rp-header-action-label">{t('logout')}</span>
             </Button>
           </Space>
         </Header>

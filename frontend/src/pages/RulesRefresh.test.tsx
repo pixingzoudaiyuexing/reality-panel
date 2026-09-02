@@ -114,6 +114,62 @@ afterEach(() => {
 });
 
 describe('Rules lightweight background refresh', () => {
+  it('shows an inline retry when the initial rules request fails', async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/rules?owner_uid=1') return Promise.reject(new Error('database unavailable'));
+      return initialResponse(url);
+    });
+    render(<Rules />);
+    await flush();
+    expect(screen.getByText('rulesLoadFailed')).toBeInTheDocument();
+    expect(screen.queryByText('rulesEmpty')).not.toBeInTheDocument();
+
+    mockGet.mockImplementation(initialResponse);
+    fireEvent.click(screen.getByRole('button', { name: 'retry' }));
+    await flush();
+    expect(screen.getByText('alpha-rule')).toBeInTheDocument();
+    expect(screen.queryByText('rulesLoadFailed')).not.toBeInTheDocument();
+  });
+
+  it('distinguishes a valid empty rules list from a load failure', async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/rules?owner_uid=1') return Promise.resolve(ok([]));
+      return initialResponse(url);
+    });
+    render(<Rules />);
+    await flush();
+    expect(screen.getByText('rulesEmpty')).toBeInTheDocument();
+    expect(screen.queryByText('rulesLoadFailed')).not.toBeInTheDocument();
+  });
+
+  it('treats a non-zero rules envelope as a load failure and recovers on retry', async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/rules?owner_uid=1') return Promise.resolve({ code: 500, message: 'database unavailable', data: null });
+      return initialResponse(url);
+    });
+    render(<Rules />);
+    await flush();
+    expect(screen.getByText('rulesLoadFailed')).toBeInTheDocument();
+    expect(screen.queryByText('rulesEmpty')).not.toBeInTheDocument();
+
+    mockGet.mockImplementation(initialResponse);
+    fireEvent.click(screen.getByRole('button', { name: 'retry' }));
+    await flush();
+    expect(screen.getByText('alpha-rule')).toBeInTheDocument();
+    expect(screen.queryByText('rulesLoadFailed')).not.toBeInTheDocument();
+  });
+
+  it('treats a non-zero groups envelope as a load failure, not a valid empty page', async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/groups') return Promise.resolve({ code: 500, message: 'groups unavailable', data: null });
+      return initialResponse(url);
+    });
+    render(<Rules />);
+    await flush();
+    expect(screen.getByText('rulesLoadFailed')).toBeInTheDocument();
+    expect(screen.queryByText('rulesEmpty')).not.toBeInTheDocument();
+  });
+
   it('loads normally, then polls only dynamic admin endpoints after ten seconds', async () => {
     render(<Rules />);
     await flush();
@@ -132,7 +188,7 @@ describe('Rules lightweight background refresh', () => {
   it('keeps old DNS state and visible filters when one background endpoint fails', async () => {
     render(<Rules />);
     await flush();
-    expect(document.querySelector('.rp-compact-status')).toHaveTextContent('PROPAGATED');
+    expect(document.querySelector('.rp-compact-status')).toHaveTextContent('rulesStatusNormal');
 
     fireEvent.change(screen.getByPlaceholderText('searchRulePlaceholder'), {
       target: { value: 'alpha' },
@@ -151,8 +207,26 @@ describe('Rules lightweight background refresh', () => {
 
     expect(screen.getByPlaceholderText('searchRulePlaceholder')).toHaveValue('alpha');
     expect(screen.getByRole('combobox').closest('.ant-select')).toHaveTextContent('relay-group');
-    expect(document.querySelector('.rp-compact-status')).toHaveTextContent('PROPAGATED');
+    expect(document.querySelector('.rp-compact-status')).toHaveTextContent('rulesStatusNormal');
     expect(screen.getByText('traffic 20 B')).toBeInTheDocument();
+  });
+
+  it('keeps old rules and reports a failed background rules refresh', async () => {
+    render(<Rules />);
+    await flush();
+    expect(screen.getByText('alpha-rule')).toBeInTheDocument();
+
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/rules?owner_uid=1') return Promise.reject(new Error('temporary rules failure'));
+      if (url === '/nodes') return Promise.resolve(ok([]));
+      if (url === '/admin/rules/dns-status') return Promise.resolve(ok([dnsPropagated]));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+    await flush(10000);
+
+    expect(screen.getByText('alpha-rule')).toBeInTheDocument();
+    expect(screen.getByText('rulesLoadFailed')).toBeInTheDocument();
+    expect(screen.queryByText('rulesEmpty')).not.toBeInTheDocument();
   });
 
   it('does not show table loading or overlap ticks while a background refresh is slow', async () => {

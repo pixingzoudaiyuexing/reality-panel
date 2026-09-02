@@ -2,9 +2,9 @@
 import { Typography, Button, Space, Tag, Tooltip } from 'antd';
 import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined, FileTextOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons';
 import type { NodeLifecycleHandler, Tfn } from './types';
-import type { NodeDisplayRow } from '../../api/types';
+import type { NodeDisplayRow, RelayReadyNode } from '../../api/types';
 import { NodeResourceBar } from './NodeResourceBar';
-import { NetworkCell, statusTag } from './shared';
+import { NetworkCell, RelayReadyStatus, statusTag } from './shared';
 import { formatBps, formatUptime } from '../../utils/format';
 import { versionRelation, versionTagColor } from '../../utils/version';
 import { resolveNodeUpgrade, type NodeUpgradeState } from './upgrade';
@@ -27,13 +27,16 @@ interface Props {
   onUpgrade?: (row: NodeDisplayRow) => void;
   onLifecycle?: NodeLifecycleHandler;
   artifactVersions?: Record<string, string>;
+  relayNodes?: RelayReadyNode[];
+  showRelayReady?: boolean;
 }
 
 /** Mobile-friendly compact list — one card per node. No wide table, no
  *  horizontal scroll. Shows: status + version + upgrade + network + speed +
  *  resource bars + uptime + a details button. */
-export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {} }: Props) {
+export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {}, relayNodes = [], showRelayReady = false }: Props) {
   const labels = { d: t('uptimeDay'), h: t('uptimeHour'), m: t('uptimeMinute'), s: t('uptimeSecond') };
+  const relayById = new Map(relayNodes.map((node) => [node.node_id, node]));
 
   return (
     <Space orientation="vertical" style={{ width: '100%' }} size={8}>
@@ -55,7 +58,10 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
             style={{ border: '1px solid #f0f0f0', borderRadius: 8, padding: 10 }}
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 4 }}>
-              {statusTag(r, t, panelProtocol)}
+              <Space size={6} wrap>
+                {statusTag(r, t, panelProtocol)}
+                {showRelayReady ? <RelayReadyStatus node={r.node_id ? relayById.get(r.node_id) : undefined} t={t} /> : null}
+              </Space>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 {/* node version tag (only when the admin upgrade view is on).
                     When the node-version check failed, render the bare version

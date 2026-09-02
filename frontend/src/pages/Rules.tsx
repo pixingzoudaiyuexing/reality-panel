@@ -1,4 +1,4 @@
-import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Popover, Tag, Alert, Typography, Dropdown, Switch, Tabs, Tooltip, Pagination } from 'antd';
+import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Popover, Tag, Alert, Typography, Dropdown, Switch, Tabs, Tooltip, Pagination, Collapse } from 'antd';
 import type { MenuProps } from 'antd';
 import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, SearchOutlined, MoreOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -10,7 +10,18 @@ import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
 import { useAuth } from '../auth/useAuth';
 import { asValidatedEntry, buildExportJSON, buildImportedRulePayload, ruleTargets, validateImportEntry } from '../utils/rulesIO';
-import { camouflageCertificateMessage, compactRealityStatus, deriveCamouflageStatus, isRealityRule, normalizeSni } from '../utils/realityRuleStatus';
+import {
+  camouflageCertificateMessage,
+  compactRealityStatus,
+  compactRealityStatusDisplay,
+  deriveCamouflageStatus,
+  dnsOwnershipDisplay,
+  dnsSyncStateDisplay,
+  isRealityRule,
+  normalizeSni,
+  runtimeStateDisplay,
+  type RuleHealthDisplay,
+} from '../utils/realityRuleStatus';
 import { RuleDiagnosisModal } from '../components/diagnosis/RuleDiagnosisModal';
 
 const { Text } = Typography;
@@ -23,6 +34,29 @@ export const RULES_PAGE_SIZE = 20;
 function RuleEllipsis({ value, mono = true, tooltip = true }: { value: string; mono?: boolean; tooltip?: boolean }) {
   const content = <span className={`rp-rules-ellipsis${mono ? ' rp-mono' : ''}`} title={value}>{value}</span>;
   return tooltip ? <Tooltip title={value}>{content}</Tooltip> : content;
+}
+
+function RuleHealthItem({ label, display }: { label: string; display: RuleHealthDisplay }) {
+  return (
+    <Tooltip title={`${label}: ${display.raw}`}>
+      <span className="rp-rule-health-item" data-state={display.tone} data-raw-state={display.raw}>
+        <span className="rp-rule-health-dot" aria-hidden="true" />
+        <span>{label}</span>
+        <strong>{display.label}</strong>
+      </span>
+    </Tooltip>
+  );
+}
+
+function RuntimeDetailState({ label, state, t }: { label: string; state: string; t: (key: string) => string }) {
+  const display = runtimeStateDisplay(state, t);
+  return (
+    <Tooltip title={`${label}: ${state}`}>
+      <span className="rp-rules-detail-state" data-state={display.tone} data-raw-state={state}>
+        {label} {display.label}
+      </span>
+    </Tooltip>
+  );
 }
 
 function targetSummary(rule: ForwardRule): string {
@@ -66,10 +100,11 @@ export function DnsStatusCell({
   if (!status || !status.eligible || status.sync_state === 'NOT_ELIGIBLE') {
     return <Text type="secondary">-</Text>;
   }
-  const color = status.sync_state === 'PROPAGATED' ? 'green'
-    : status.sync_state === 'CONFLICT' ? 'orange'
-      : ['FAILED', 'INVALID_CONFIG', 'MUTATION_OUTCOME_UNKNOWN'].includes(status.sync_state) ? 'red'
-        : ['PENDING', 'SYNCING', 'MUTATION_VERIFIED', 'PROPAGATING'].includes(status.sync_state) ? 'gold'
+  const display = dnsSyncStateDisplay(status.sync_state, t);
+  const color = display.tone === 'normal' ? 'green'
+    : display.tone === 'warning' ? 'orange'
+      : display.tone === 'error' ? 'red'
+        : display.tone === 'waiting' ? 'gold'
           : 'default';
   const retryable = status.automation_enabled
     && ['FAILED', 'CONFLICT', 'DISABLED'].includes(status.sync_state)
@@ -78,13 +113,19 @@ export function DnsStatusCell({
   return (
     <Space orientation="vertical" size={2}>
       <Space size={4} wrap>
-        <Tag color={color}>{status.sync_state}</Tag>
+        <Tooltip title={status.sync_state}>
+          <Tag color={color} data-raw-state={status.sync_state}>{display.label}</Tag>
+        </Tooltip>
         {!status.automation_enabled && <Tag>{t('dnsAutomationDisabled')}</Tag>}
       </Space>
       {status.fqdn && status.record_type && status.expected_value && (
         <Text className="rp-mono">{status.record_type} {status.fqdn} → {status.expected_value}</Text>
       )}
-      <Text type="secondary">{t('dnsOwnership')}: {status.ownership}</Text>
+      <Tooltip title={status.ownership}>
+        <Text type="secondary" data-raw-ownership={status.ownership}>
+          {t('dnsOwnership')}: {dnsOwnershipDisplay(status.ownership, t)}
+        </Text>
+      </Tooltip>
       {status.warning_category && <Text type="warning">{status.warning_category}</Text>}
       {status.last_error_category && <Text type="danger">{status.last_error_category}</Text>}
       {retryable && onRetry && (
@@ -101,11 +142,13 @@ export function CamouflageFormFields({
   initialValue,
   isAdmin,
   t,
+  compact = false,
 }: {
   enabled: boolean;
   initialValue?: boolean;
   isAdmin: boolean;
   t: (key: string) => string;
+  compact?: boolean;
 }) {
   return (
     <>
@@ -118,14 +161,26 @@ export function CamouflageFormFields({
       >
         <Switch aria-label={t('camouflage')} disabled={!isAdmin} />
       </Form.Item>
-      <Form.Item label={t('camouflageTlsPort')}>
-        <InputNumber aria-label={t('camouflageTlsPort')} value={8443} disabled style={{ width: '100%' }} />
-      </Form.Item>
-      <Form.Item label={t('certificateRenewBefore')}>
-        <InputNumber aria-label={t('certificateRenewBefore')} value={30} addonAfter={t('days')} disabled style={{ width: '100%' }} />
-      </Form.Item>
+      {compact ? (
+        <div className="rp-rule-runtime-summary">
+          <Text type="secondary">
+            {enabled ? t('ruleRealityRuntimeSummary') : t('ruleRealityProtocolSummary')}
+          </Text>
+        </div>
+      ) : (
+        <>
+          <Form.Item label={t('camouflageTlsPort')}>
+            <InputNumber aria-label={t('camouflageTlsPort')} value={8443} disabled style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item label={t('certificateRenewBefore')}>
+            <InputNumber aria-label={t('certificateRenewBefore')} value={30} addonAfter={t('days')} disabled style={{ width: '100%' }} />
+          </Form.Item>
+        </>
+      )}
       {enabled && (
-        <Alert type="info" showIcon title={t('remoteRealityFallbackHint')} style={{ marginBottom: 12 }} />
+        compact
+          ? <Text type="warning" className="rp-rule-conditional-note">{t('remoteRealityFallbackHint')}</Text>
+          : <Alert type="info" showIcon title={t('remoteRealityFallbackHint')} style={{ marginBottom: 12 }} />
       )}
     </>
   );
@@ -135,10 +190,12 @@ export function ProxyProtocolFormField({
   initialValue,
   isAdmin,
   t,
+  showHint = true,
 }: {
   initialValue?: boolean;
   isAdmin: boolean;
   t: (key: string) => string;
+  showHint?: boolean;
 }) {
   return (
     <Form.Item
@@ -146,7 +203,7 @@ export function ProxyProtocolFormField({
       label={t('sendProxyProtocol')}
       valuePropName="checked"
       initialValue={initialValue}
-      extra={t('sendProxyProtocolHint')}
+      extra={showHint ? t('sendProxyProtocolHint') : undefined}
     >
       <Switch aria-label={t('sendProxyProtocol')} disabled={!isAdmin} />
     </Form.Item>
@@ -196,8 +253,10 @@ export default function Rules() {
   const [importResults, setImportResults] = useState<string[]>([]);
   const [editing, setEditing] = useState<ForwardRule | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
+  const pendingCreateValues = useRef<Record<string, unknown> | null>(null);
   // v0.4.8: rule diagnosis modal state.
   const [diagnosing, setDiagnosing] = useState<ForwardRule | null>(null);
   // v0.4.9: group-name column + filter. selectedGroup === null means "all".
@@ -232,6 +291,8 @@ export default function Rules() {
         api.get<unknown, ApiEnvelope<ForwardRule[]>>(scopedRulesUrl),
         api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups'),
       ]);
+      if (r.code !== 0) throw new Error(r.message || 'rules load failed');
+      if (g.code !== 0) throw new Error(g.message || 'groups load failed');
       setRules(r.data || []);
       setGroups(g.data || []);
       if (isAdmin) {
@@ -291,6 +352,9 @@ export default function Rules() {
         setSharedLoadFailed(false);
         setSharedGroups([]);
       }
+      setLoadFailed(false);
+    } catch {
+      setLoadFailed(true);
     } finally { setLoading(false); }
   }, [isAdmin, scopedRulesUrl]);
 
@@ -308,6 +372,9 @@ export default function Rules() {
         ]);
         if (rulesResult.status === 'fulfilled' && rulesResult.value.code === 0) {
           setRules(rulesResult.value.data || []);
+          setLoadFailed(false);
+        } else {
+          setLoadFailed(true);
         }
         if (nodesResult.status === 'fulfilled' && nodesResult.value.code === 0) {
           setNodeStatuses(nodesResult.value.data || []);
@@ -322,6 +389,9 @@ export default function Rules() {
         ]);
         if (rulesResult.status === 'fulfilled' && rulesResult.value.code === 0) {
           setRules(rulesResult.value.data || []);
+          setLoadFailed(false);
+        } else {
+          setLoadFailed(true);
         }
         if (meResult.status === 'fulfilled' && meResult.value.code === 0 && meResult.value.data) {
           setSelfQuota({
@@ -497,10 +567,9 @@ export default function Rules() {
     setEditOpen(true);
   };
 
-  /** Copy: open the create modal pre-filled with the rule's values, but with
-   *  a "-copy" name suffix and no listen_port (auto-assign). */
+  /** 复制规则时在 Modal 挂载后再写入表单，避免字段 initialValue 覆盖预填值。 */
   const handleCopy = (r: ForwardRule) => {
-    createForm.setFieldsValue({
+    pendingCreateValues.current = {
       name: `${r.name}-copy`,
       listen_port: null,
       protocol: r.public_transport === 'nginx_sni' || r.node_transport === 'nginx_sni' ? 'tcp' : r.protocol,
@@ -515,11 +584,14 @@ export default function Rules() {
       load_balance_strategy: r.load_balance_strategy ?? 'first',
       upload_limit_mbps: r.upload_limit_mbps ?? 0,
       download_limit_mbps: r.download_limit_mbps ?? 0,
-      // v1.2.0: max_connections / auto_restart_minutes are NOT carried over —
-      // they're edit-only (the create path can't store them), so the copy starts
-      // uncapped and the user sets them via Edit if wanted.
-    });
+      // max_connections 与 auto_restart_minutes 为仅编辑字段，不复制到新建表单。
+    };
     setCreateOpen(true);
+    window.setTimeout(() => {
+      if (!pendingCreateValues.current) return;
+      createForm.setFieldsValue(pendingCreateValues.current);
+      pendingCreateValues.current = null;
+    }, 0);
   };
 
   /** Export all rules as JSON download. */
@@ -895,7 +967,8 @@ export default function Rules() {
 
     const view = deriveCamouflageStatus(r, nodeStatuses);
     const dns = dnsStatusByRule.get(r.id);
-    const summary = compactRealityStatus(r, dns, view, t);
+    const summary = compactRealityStatus(r, dns, view);
+    const summaryDisplay = compactRealityStatusDisplay(summary, t);
     const dnsDetails = (
       <DnsStatusCell status={dns} retrying={dnsRetrying === r.id} onRetry={() => handleDnsRetry(r.id)} t={t} />
     );
@@ -906,10 +979,15 @@ export default function Rules() {
         <Typography.Text strong>{t('routeDetails')}</Typography.Text>
         <Text>{t('activeRelays')}: {view.activeCount}/{view.totalCount}</Text>
         {view.nodes.map(node => (
-          <Text key={`${node.relayIp ?? ''}:${node.nodeId ?? ''}`} type="secondary">
-            {node.relayIp ?? t('routeUnknown')} · {node.listenerState} · {node.siteState} · {node.certificateState}
-            {node.lastError ? ` · ${camouflageCertificateMessage(node.certificateState, node.lastError, t)}` : ''}
-          </Text>
+          <div key={`${node.relayIp ?? ''}:${node.nodeId ?? ''}`} className="rp-rules-node-state">
+            <Text className="rp-mono">{node.relayIp ?? t('routeUnknown')}</Text>
+            <Space size={8} wrap>
+              <RuntimeDetailState label={t('diagnosisListener')} state={node.listenerState} t={t} />
+              <RuntimeDetailState label={t('diagnosisCamouflage')} state={node.siteState} t={t} />
+              <RuntimeDetailState label={t('diagnosisCertificate')} state={node.certificateState} t={t} />
+            </Space>
+            {node.lastError ? <Text type="warning">{camouflageCertificateMessage(node.certificateState, node.lastError, t)}</Text> : null}
+          </div>
         ))}
         <Typography.Text strong>{t('certificateDetails')}</Typography.Text>
         {view.certificate?.issuer && <Text>{view.certificate.issuer}</Text>}
@@ -918,13 +996,17 @@ export default function Rules() {
         {view.certificate?.last_error && <Text type="warning">{camouflageCertificateMessage(view.certificate.certificate_status, view.certificate.last_error, t)}</Text>}
       </Space>
     );
-    const color = (value: string) => value === 'OK' || value.startsWith('OK ') ? 'green' : value === '-' ? 'default' : value === 'PREPARING' || value === 'PENDING' ? 'gold' : 'red';
     return (
       <div className="rp-rules-status-cell">
         <Popover title={t('statusDetails')} content={details} trigger="click">
           <Button type="text" size="small" className="rp-compact-status" aria-label={t('statusDetails')}>
-            <span><Tag color={color(summary.dns)}>DNS {summary.dns === 'OK' ? '✓' : summary.dns === '-' ? '-' : '✕'}{summary.dns !== 'OK' && summary.dns !== '-' ? ` ${summary.dns}` : ''}</Tag><Tag color={color(summary.route)}>路由 {summary.route === 'OK' ? '✓' : '✕'}</Tag></span>
-            <span><Tag color={color(summary.certificate)}>证书 {summary.certificate === 'OK' ? '✓' : summary.certificate.startsWith('OK ') ? `✓ ${summary.certificate.slice(3)}` : `✕ ${summary.certificate}`}</Tag></span>
+            <span className="rp-rule-health-row">
+              <RuleHealthItem label={t('dns')} display={summaryDisplay.dns} />
+              <RuleHealthItem label={t('routeDetails')} display={summaryDisplay.route} />
+            </span>
+            <span className="rp-rule-health-row">
+              <RuleHealthItem label={t('certificateDetails')} display={summaryDisplay.certificate} />
+            </span>
           </Button>
         </Popover>
         {stateTags}
@@ -1046,15 +1128,57 @@ export default function Rules() {
   const isUdp = (p?: string) => p === 'udp' || p === 'tcp_udp';
 
   const createGroupId = Form.useWatch('device_group_in', createForm);
-  const editGroupId = Form.useWatch('device_group_in', editForm);
+  const editGroupId = Form.useWatch('device_group_in', { form: editForm, preserve: true });
   const createProto = Form.useWatch('protocol', createForm);
-  const editProto = Form.useWatch('protocol', editForm);
+  const editProto = Form.useWatch('protocol', { form: editForm, preserve: true });
   const createTransport = Form.useWatch('public_transport', createForm);
-  const editTransport = Form.useWatch('public_transport', editForm);
+  const editTransport = Form.useWatch('public_transport', { form: editForm, preserve: true });
   const createIsSni = createTransport === 'nginx_sni';
   const editIsSni = editTransport === 'nginx_sni';
   const createCamouflage = Form.useWatch('camouflage_enabled', createForm) === true;
-  const editCamouflage = Form.useWatch('camouflage_enabled', editForm) === true;
+  const editCamouflage = Form.useWatch('camouflage_enabled', { form: editForm, preserve: true }) === true;
+  const createProxyProtocol = Form.useWatch('send_proxy_protocol', { form: createForm, preserve: true }) === true;
+  const editProxyProtocol = Form.useWatch('send_proxy_protocol', { form: editForm, preserve: true }) === true;
+  const createTargets = Form.useWatch('targets', { form: createForm, preserve: true }) as RuleTargetInput[] | undefined;
+  const editTargets = Form.useWatch('targets', { form: editForm, preserve: true }) as RuleTargetInput[] | undefined;
+  const createStrategy = Form.useWatch('load_balance_strategy', { form: createForm, preserve: true }) as string | undefined;
+  const editStrategy = Form.useWatch('load_balance_strategy', { form: editForm, preserve: true }) as string | undefined;
+  const createUploadLimit = Number(Form.useWatch('upload_limit_mbps', { form: createForm, preserve: true }) ?? 0);
+  const createDownloadLimit = Number(Form.useWatch('download_limit_mbps', { form: createForm, preserve: true }) ?? 0);
+  const editUploadLimit = Number(Form.useWatch('upload_limit_mbps', { form: editForm, preserve: true }) ?? 0);
+  const editDownloadLimit = Number(Form.useWatch('download_limit_mbps', { form: editForm, preserve: true }) ?? 0);
+  const editMaxConnections = Number(Form.useWatch('max_connections', { form: editForm, preserve: true }) ?? 0);
+  const editAutoRestart = Number(Form.useWatch('auto_restart_minutes', { form: editForm, preserve: true }) ?? 0);
+
+  const showCreateStrategy = (createTargets?.length ?? 0) > 1 || (createStrategy ?? 'first') !== 'first';
+  const showEditStrategy = (editTargets?.length ?? 0) > 1 || (editStrategy ?? 'first') !== 'first';
+  const createForwardingAdvancedLabels = [
+    createUploadLimit > 0 || createDownloadLimit > 0 ? t('rateLimits') : null,
+  ].filter((label): label is string => label !== null);
+  const forwardingAdvancedLabels = [
+    editUploadLimit > 0 || editDownloadLimit > 0 ? t('rateLimits') : null,
+    editMaxConnections > 0 ? t('maxConnections') : null,
+    editAutoRestart > 0 ? t('autoRestart') : null,
+  ].filter((label): label is string => label !== null);
+  const createBasicAdvancedSummary = createProxyProtocol
+    ? t('ruleAdvancedProxyEnabled')
+    : t('ruleAdvancedNone');
+  const editBasicAdvancedSummary = editProxyProtocol
+    ? t('ruleAdvancedProxyEnabled')
+    : t('ruleAdvancedNone');
+  const createForwardingAdvancedSummary = createForwardingAdvancedLabels.length > 0
+    ? t('ruleAdvancedConfiguredCount').replace('{count}', String(createForwardingAdvancedLabels.length))
+    : t('ruleAdvancedNone');
+  const forwardingAdvancedSummary = forwardingAdvancedLabels.length > 0
+    ? t('ruleAdvancedConfiguredCount').replace('{count}', String(forwardingAdvancedLabels.length))
+    : t('ruleAdvancedNone');
+
+  const advancedLabel = (title: string, summary: string, details?: string[]) => (
+    <span className="rp-rule-advanced-label">
+      <span>{title} · {summary}</span>
+      {details && details.length > 0 ? <Text type="secondary">{details.join(' · ')}</Text> : null}
+    </span>
+  );
 
   const hostForForm = (gid?: number) => {
     if (!gid) return '';
@@ -1063,15 +1187,10 @@ export default function Rules() {
     // (which also folds in their authorized shared groups) instead.
     return groupInfo.get(gid)?.connect_host ?? '';
   };
-  const renderHostHint = (gid?: number) => {
-    const host = hostForForm(gid);
-    return (
-      <Alert
-        type="info" showIcon style={{ marginBottom: 12, padding: '4px 12px' }}
-        title={t('currentInboundHost').replace('{host}', host || t('notConfigured'))}
-      />
-    );
-  };
+  const hostHint = (gid?: number) => t('currentInboundHost').replace(
+    '{host}',
+    hostForForm(gid) || t('notConfigured'),
+  );
 
   const handleCreateTransportChange = (v: string) => {
     if (v === 'nginx_sni') {
@@ -1096,19 +1215,13 @@ export default function Rules() {
     { value: 'nginx_sni', label: t('entryTransportNginxSni') },
   ];
 
-  /** v1.2.0: connection cap + scheduled restart. Shared by the create and edit
-   *  forms so the two can't drift (the rate-limit block above predates this and
-   *  is still duplicated).
+  /** v1.2.0：连接数限制和定时重启仅供编辑表单使用。
    *
-   *  Both fields are 0 = off. The cap's `extra` says the count is PER NODE,
-   *  because that isn't guessable: a rule on 3 nodes admits 3x the number typed
-   *  here.
+   *  两个字段均以 0 表示关闭。连接数限制按节点计数，因此通过 `extra`
+   *  明确告知用户，避免把多节点规则误解为共享一个总上限。
    *
-   *  The cap is disabled for a UDP-ONLY rule. It is enforced at accept(), which
-   *  UDP doesn't have — the panel would happily store the number and ship it to
-   *  the node, where nothing would ever read it. Showing an editable field that
-   *  silently does nothing is worse than showing a disabled one that says why.
-   *  A tcp_udp rule keeps it: the cap governs its TCP half. */
+   *  纯 UDP 规则没有 accept() 阶段，因此禁用该字段；tcp_udp 规则仍保留，
+   *  由它的 TCP 部分使用。 */
   const renderConnectionControls = (proto?: string) => {
     const udpOnly = proto === 'udp';
     return (
@@ -1127,8 +1240,7 @@ export default function Rules() {
         extra={t('autoRestartHint').replace('{min}', String(MIN_AUTO_RESTART_MINUTES))}
         initialValue={0}
         rules={[{
-          // Mirrors the API's floor. 0 = off is always allowed; anything between
-          // 1 and the floor would drop connections faster than clients reconnect.
+          // 与 API 最小值保持一致：0 表示关闭，1 到最小值之间不允许保存。
           validator: (_, value) => {
             const v = Number(value ?? 0);
             if (v === 0 || v >= MIN_AUTO_RESTART_MINUTES) return Promise.resolve();
@@ -1144,10 +1256,7 @@ export default function Rules() {
     );
   };
 
-  // Load-balance strategy field. The per-strategy explanation used to sit in an
-  // always-open Alert below the select, which is a lot of standing text for
-  // something you read once. It now hangs off a "?" on the label — hover to
-  // read, out of the way otherwise. Same pattern as the rate-limits label.
+  // 负载策略说明放在标签帮助入口中，避免长期占用表单空间。
   const renderStrategyField = () => (
     <Form.Item
       name="load_balance_strategy"
@@ -1181,8 +1290,8 @@ export default function Rules() {
       {(fields, { add, remove, move }) => (
         <Space orientation="vertical" style={{ width: '100%' }}>
           <Text strong>{realityRelay ? t('remoteRealityBackend') : t('targets')}</Text>
-          {fields.map((field, index) => (
-            <Space key={field.key} align="baseline" wrap>
+          {fields.map(({ key, ...field }, index) => (
+            <Space key={key} align="baseline" wrap>
               <Form.Item
                 {...field}
                 name={[field.name, 'host']}
@@ -1343,13 +1452,24 @@ export default function Rules() {
           description={t('loadFailedRetry')}
         />
       )}
-      {groupedPagedRules.length === 0 ? (
+      {loadFailed && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 12 }}
+          title={t('rulesLoadFailed')}
+          description={t('loadFailedRetry')}
+          action={<Button size="small" onClick={() => void load()}>{t('retry')}</Button>}
+        />
+      )}
+      {groupedPagedRules.length === 0 && (!loadFailed || rules.length > 0) ? (
         <Table
           rowSelection={rowSelectionFor([])}
           dataSource={[]}
           columns={columns}
           rowKey="id"
           loading={loading}
+          locale={{ emptyText: t('rulesEmpty') }}
           pagination={false}
           className="rp-rules-table"
           scroll={{ x: RULE_TABLE_SCROLL_X }}
@@ -1368,6 +1488,7 @@ export default function Rules() {
             columns={columns}
             rowKey="id"
             loading={loading}
+            locale={{ emptyText: t('rulesEmpty') }}
             pagination={false}
             className="rp-rules-table"
             scroll={{ x: RULE_TABLE_SCROLL_X }}
@@ -1386,7 +1507,16 @@ export default function Rules() {
         </div>
       ) : null}
 
-      <Modal title={t('addRule')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')} width={620}>
+      <Modal
+        title={t('addRule')}
+        open={createOpen}
+        onCancel={() => setCreateOpen(false)}
+        onOk={() => createForm.submit()}
+        okText={t('create')}
+        cancelText={t('cancel')}
+        width={620}
+        className="rp-rule-editor-modal"
+      >
         <Form form={createForm} onFinish={handleCreate} layout="vertical" className="rp-rule-form">
           <Tabs items={[
             {
@@ -1402,12 +1532,14 @@ export default function Rules() {
                     title={t('creatingRuleFor').replace('{user}', userMap.get(filterOwnerUid) ?? `#${filterOwnerUid}`)}
                   />
                 )}
-                {renderHostHint(createGroupId)}
-                <Form.Item name="listen_port" label={t('listenPort')} extra={createIsSni ? t('sniListenPortHint') : t('listenPortHint')}>
-                  <InputNumber min={1} max={65535} style={{ width: '100%' }} placeholder={createIsSni ? '443' : 'auto'} />
+                <Form.Item name="device_group_in" label={t('inboundGroup')} rules={[{ required: true }]} extra={hostHint(createGroupId)}>
+                  <Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} placeholder={allInGroups.length ? t('select') : t('createGroupFirst')} />
                 </Form.Item>
                 <Form.Item name="public_transport" label={t('transportMethod')} initialValue="raw">
                   <Select options={transportOptions} onChange={handleCreateTransportChange} />
+                </Form.Item>
+                <Form.Item name="listen_port" label={t('listenPort')} extra={createIsSni ? t('sniListenPortHint') : t('listenPortHint')}>
+                  <InputNumber min={1} max={65535} style={{ width: '100%' }} placeholder={createIsSni ? '443' : 'auto'} />
                 </Form.Item>
                 {createIsSni && (
                   <>
@@ -1424,52 +1556,83 @@ export default function Rules() {
                       initialValue={false}
                       isAdmin={isAdmin}
                       t={t}
+                      compact
                     />
-                    <ProxyProtocolFormField initialValue={false} isAdmin={isAdmin} t={t} />
                   </>
                 )}
-                <Form.Item name="protocol" label={t('protocol')} rules={[{ required: true }]} initialValue="tcp_udp"
-                  extra={createIsSni ? t('sniTcpOnly') : (isUdp(createProto) ? t('entryTransportUdpOnlyRaw') : undefined)}>
-                  <Select
-                    options={protocolOptions}
-                    disabled={createIsSni}
-                  />
-                </Form.Item>
+                {!createIsSni ? (
+                  <Form.Item name="protocol" label={t('protocol')} rules={[{ required: true }]} initialValue="tcp_udp"
+                    extra={isUdp(createProto) ? t('entryTransportUdpOnlyRaw') : undefined}>
+                    <Select options={protocolOptions} />
+                  </Form.Item>
+                ) : null}
                 {/* v0.4.20: forward_mode always direct. */}
                 <Form.Item name="forward_mode" hidden initialValue="direct"><Input /></Form.Item>
-                <Form.Item name="device_group_in" label={t('inboundGroup')} rules={[{ required: true }]}>
-                  <Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} placeholder={allInGroups.length ? t('select') : t('createGroupFirst')} />
-                </Form.Item>
+                {createIsSni ? (
+                  <Collapse
+                    className="rp-rule-advanced"
+                    ghost
+                    size="small"
+                    items={[{
+                      key: 'basic-advanced',
+                      forceRender: true,
+                      label: advancedLabel(t('ruleAdvancedSettings'), createBasicAdvancedSummary),
+                      children: <ProxyProtocolFormField initialValue={false} isAdmin={isAdmin} t={t} showHint={createProxyProtocol} />,
+                    }]}
+                  />
+                ) : null}
               </>),
             },
             {
               key: 'forward',
+              forceRender: true,
               label: t('tabForward'),
               children: (<>
                 {renderTargetsEditor(createIsSni)}
-                {renderStrategyField()}
-                <Form.Item
-                  label={<span>{t('rateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
-                  extra={t('rateLimitsHint')}
-                >
-                  <Space orientation="vertical" style={{ width: '100%' }}>
-                    <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
-                    <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
-                  </Space>
-                </Form.Item>
-                {/* v1.2.0: the connection cap / auto-restart controls are
-                    deliberately EDIT-ONLY. The atomic create transaction
-                    (create_rule_with_guard) doesn't carry them, so offering them
-                    here would silently discard whatever the user typed. They are
-                    also settings you tune after watching a rule misbehave, not
-                    ones you can guess up front. */}
+                {showCreateStrategy ? renderStrategyField() : (
+                  <Form.Item name="load_balance_strategy" initialValue="first" hidden><Input /></Form.Item>
+                )}
+                <Collapse
+                  className="rp-rule-advanced"
+                  ghost
+                  size="small"
+                  items={[{
+                    key: 'forward-advanced',
+                    forceRender: true,
+                    label: advancedLabel(
+                      t('ruleForwardAdvancedSettings'),
+                      createForwardingAdvancedSummary,
+                      createForwardingAdvancedLabels,
+                    ),
+                    children: (
+                      <Form.Item
+                        label={<span>{t('rateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
+                        extra={t('rateLimitsHint')}
+                      >
+                        <Space orientation="vertical" style={{ width: '100%' }}>
+                          <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                          <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                        </Space>
+                      </Form.Item>
+                    ),
+                  }]}
+                />
               </>),
             },
           ]} />
         </Form>
       </Modal>
 
-      <Modal title={t('editRule')} open={editOpen} onCancel={() => setEditOpen(false)} onOk={() => editForm.submit()} okText={t('save')} cancelText={t('cancel')} width={620}>
+      <Modal
+        title={t('editRule')}
+        open={editOpen}
+        onCancel={() => setEditOpen(false)}
+        onOk={() => editForm.submit()}
+        okText={t('save')}
+        cancelText={t('cancel')}
+        width={620}
+        className="rp-rule-editor-modal"
+      >
         <Form form={editForm} onFinish={handleUpdate} layout="vertical" className="rp-rule-form">
           <Tabs items={[
             {
@@ -1477,12 +1640,14 @@ export default function Rules() {
               label: t('tabBasic'),
               children: (<>
                 <Form.Item name="name" label={t('name')}><Input /></Form.Item>
-                {renderHostHint(editGroupId)}
-                <Form.Item name="listen_port" label={t('listenPort')} extra={editIsSni ? t('sniListenPortHint') : undefined}>
-                  <InputNumber min={1} max={65535} style={{ width: '100%' }} />
+                <Form.Item name="device_group_in" label={t('inboundGroup')} extra={hostHint(editGroupId)}>
+                  <Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} />
                 </Form.Item>
                 <Form.Item name="public_transport" label={t('transportMethod')} initialValue="raw">
                   <Select options={transportOptions} onChange={handleEditTransportChange} />
+                </Form.Item>
+                <Form.Item name="listen_port" label={t('listenPort')} extra={editIsSni ? t('sniListenPortHint') : undefined}>
+                  <InputNumber min={1} max={65535} style={{ width: '100%' }} />
                 </Form.Item>
                 {editIsSni && (
                   <>
@@ -1498,20 +1663,37 @@ export default function Rules() {
                       enabled={editCamouflage}
                       isAdmin={isAdmin}
                       t={t}
+                      compact
                     />
-                    <ProxyProtocolFormField isAdmin={isAdmin} t={t} />
                   </>
                 )}
-                <Form.Item name="protocol" label={t('protocol')}
-                  extra={editIsSni ? t('sniTcpOnly') : (isUdp(editProto) ? t('entryTransportUdpOnlyRaw') : undefined)}>
-                  <Select
-                    options={protocolOptions}
-                    disabled={editIsSni}
-                  />
-                </Form.Item>
+                {!editIsSni ? (
+                  <Form.Item name="protocol" label={t('protocol')}
+                    extra={isUdp(editProto) ? t('entryTransportUdpOnlyRaw') : undefined}>
+                    <Select options={protocolOptions} />
+                  </Form.Item>
+                ) : null}
                 {/* v0.4.20: forward_mode always direct. */}
                 <Form.Item name="forward_mode" hidden initialValue="direct"><Input /></Form.Item>
-                <Form.Item name="device_group_in" label={t('inboundGroup')}><Select options={allInGroups.map(g => ({ value: g.id, label: g.name }))} /></Form.Item>
+                {editIsSni ? (
+                  <Collapse
+                    className="rp-rule-advanced"
+                    ghost
+                    size="small"
+                    items={[{
+                      key: 'basic-advanced',
+                      forceRender: true,
+                      label: advancedLabel(t('ruleAdvancedSettings'), editBasicAdvancedSummary),
+                      children: (
+                        <ProxyProtocolFormField
+                          isAdmin={isAdmin}
+                          t={t}
+                          showHint={editProxyProtocol}
+                        />
+                      ),
+                    }]}
+                  />
+                ) : null}
               </>),
             },
             {
@@ -1525,17 +1707,35 @@ export default function Rules() {
               label: t('tabForward'),
               children: (<>
                 {renderTargetsEditor(editIsSni)}
-                {renderStrategyField()}
-                <Form.Item
-                  label={<span>{t('rateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
-                  extra={t('rateLimitsHint')}
-                >
-                  <Space orientation="vertical" style={{ width: '100%' }}>
-                    <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
-                    <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
-                  </Space>
-                </Form.Item>
-                {renderConnectionControls(editProto)}
+                {showEditStrategy ? renderStrategyField() : null}
+                <Collapse
+                  className="rp-rule-advanced"
+                  ghost
+                  size="small"
+                  items={[{
+                    key: 'forward-advanced',
+                    forceRender: true,
+                    label: advancedLabel(
+                      t('ruleForwardAdvancedSettings'),
+                      forwardingAdvancedSummary,
+                      forwardingAdvancedLabels,
+                    ),
+                    children: (
+                      <>
+                        <Form.Item
+                          label={<span>{t('rateLimits')} <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{t('rateLimitsTooltip')}</span>} overlayStyle={{ maxWidth: 340 }}><QuestionCircleOutlined style={{ color: '#999' }} /></Tooltip></span>}
+                          extra={t('rateLimitsHint')}
+                        >
+                          <Space orientation="vertical" style={{ width: '100%' }}>
+                            <Form.Item name="upload_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('uploadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                            <Form.Item name="download_limit_mbps" noStyle initialValue={0}><InputNumber min={0} addonBefore={t('downloadLimit')} addonAfter="Mbps" style={{ width: '100%' }} placeholder="0" /></Form.Item>
+                          </Space>
+                        </Form.Item>
+                        {renderConnectionControls(editProto)}
+                      </>
+                    ),
+                  }]}
+                />
               </>),
             },
           ]} />

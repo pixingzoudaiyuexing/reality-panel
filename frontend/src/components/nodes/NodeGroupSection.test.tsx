@@ -1,9 +1,11 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import type { Tfn } from './types';
-import type { NodeDisplayRow } from '../../api/types';
+import type { NodeDisplayRow, RelayReadyNode } from '../../api/types';
 import { statusTag } from './shared';
 import { NodeGroupSection } from './NodeGroupSection';
+import { NodeDesktopTable } from './NodeDesktopTable';
+import { NodeMobileList } from './NodeMobileList';
 import { nodeDesktopColumnWidths } from './tableLayout';
 
 // A fake t() that echoes the key — assertions match on the i18n KEY, not on a
@@ -58,6 +60,32 @@ describe('NodeGroupSection mobile vs desktop', () => {
       <NodeGroupSection rows={placeholder} panelProtocol={0} latestNodeVersion="1.1.0" nodeVersionCheckFailed={false} isMobile={false} t={t} openDetail={vi.fn()} />,
     );
     expect(screen.getByText('noNodeReportingInGroup')).toBeInTheDocument();
+  });
+});
+
+describe('Relay Ready in node status', () => {
+  const relayNodes: RelayReadyNode[] = [
+    { node_id: 'ready', public_ipv4: '203.0.113.1', online: true, ready: true, ready_reasons: [], preferred: true },
+    { node_id: 'blocked', public_ipv4: '203.0.113.2', online: true, ready: false, ready_reasons: ['CERTIFICATE_NOT_ACTIVE', 'LISTENER_ERROR'], preferred: false },
+  ];
+  const readyRows = [
+    row({ node_id: 'ready', online: true }),
+    row({ node_id: 'blocked', online: true }),
+  ];
+
+  it('shows Ready, Not Ready, and a visible primary reason in the desktop table', () => {
+    render(<NodeDesktopTable rows={readyRows} relayNodes={relayNodes} showRelayReady panelProtocol={0} latestNodeVersion="" nodeVersionCheckFailed={false} t={t} openDetail={vi.fn()} />);
+    expect(screen.getByRole('columnheader', { name: 'relayReady' })).toBeInTheDocument();
+    expect(screen.getAllByText('relayReady').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText('relayNotReady')).toBeInTheDocument();
+    expect(screen.getByText('relayReadyCertificateInactive · relayReadyMoreReasons')).toBeInTheDocument();
+  });
+
+  it('shows the same Ready distinction and reason in the mobile node list', () => {
+    render(<NodeMobileList rows={readyRows} relayNodes={relayNodes} showRelayReady panelProtocol={0} t={t} openDetail={vi.fn()} />);
+    expect(screen.getByText('relayReady')).toBeInTheDocument();
+    expect(screen.getByText('relayNotReady')).toBeInTheDocument();
+    expect(screen.getByText('relayReadyCertificateInactive · relayReadyMoreReasons')).toBeInTheDocument();
   });
 });
 

@@ -28,7 +28,12 @@ describe('NodeDetailDrawer desensitization', () => {
     expect(screen.getByText('node-abc')).toBeInTheDocument();
     expect(screen.getByText('configProtocolVersion')).toBeInTheDocument();
     expect(screen.getByText('networkInterface')).toBeInTheDocument();
-    // delete-status action is admin-only
+    // 在线状态来自实时数据，不能通过清除筛选条件隐藏。
+    expect(screen.queryByText('nodeStatusDelete')).not.toBeInTheDocument();
+  });
+
+  it('offers clear status only for an offline node', () => {
+    render(<NodeDetailDrawer row={{ ...baseRow, online: false }} open onClose={vi.fn()} isAdmin panelProtocol={2} />);
     expect(screen.getByText('nodeStatusDelete')).toBeInTheDocument();
   });
 
