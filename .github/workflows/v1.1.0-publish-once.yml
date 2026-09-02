@@ -65,6 +65,20 @@ jobs:
       - name: Promote source contract to v1.1.0
         if: steps.guard.outputs.publish == 'true'
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("scripts/promote-v1.1.0.py")
+          text = path.read_text()
+          replacements = {
+              'if f"## [{VERSION}]" in panel:': 'if f"## [{VERSION}] -" in panel:',
+              'if f"## [{VERSION}]" in node:': 'if f"## [{VERSION}] -" in node:',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f"promotion helper guard not found exactly once: {old}")
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
           python3 scripts/promote-v1.1.0.py
           git diff --check
           bash scripts/release-version-contract.sh "$RELEASE_TAG"
@@ -105,6 +119,7 @@ jobs:
             Cargo.lock \
             scripts/relay-node-install.sh \
             scripts/release-check.sh \
+            scripts/promote-v1.1.0.py \
             CHANGELOG.md \
             CHANGELOG-NODE.md \
             docs/VERSIONS.md \
