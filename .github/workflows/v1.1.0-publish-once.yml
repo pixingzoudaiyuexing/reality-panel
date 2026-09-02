@@ -94,7 +94,7 @@ jobs:
             --skip db::sqlite_repo::tests::rule_insert_quota_guarded_port_scoped_by_group \
             --skip db::sqlite_repo::tests::rule_insert_quota_guarded_surfaces_port_unique_violation \
             --skip db::sqlite_repo::tests::rule_insert_quota_guarded_tcp_udp_share_port
-          bash scripts/node-artifact-permissions.test.sh
+          sudo bash scripts/node-artifact-permissions.test.sh
 
       - name: Validate frontend
         if: steps.guard.outputs.publish == 'true'
