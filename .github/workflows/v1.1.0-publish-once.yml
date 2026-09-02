@@ -70,8 +70,8 @@ jobs:
           path = Path("scripts/promote-v1.1.0.py")
           text = path.read_text()
           replacements = {
-              'if f"## [{VERSION}]" in panel:': 'if f"## [{VERSION}] -" in panel:',
-              'if f"## [{VERSION}]" in node:': 'if f"## [{VERSION}] -" in node:',
+              'if f"## [{VERSION}]" in panel:': 'if marker + f"## [{VERSION}] - {RELEASE_DATE}\\n" in panel[:500]:',
+              'if f"## [{VERSION}]" in node:': 'if marker + f"## [{VERSION}] - {RELEASE_DATE}\\n" in node[:500]:',
           }
           for old, new in replacements.items():
               if text.count(old) != 1:
