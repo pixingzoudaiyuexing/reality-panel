@@ -96,12 +96,16 @@ write(node_path, node.replace(marker, marker + node_entry, 1))
 # 发布检查同时接受“当前稳定版”和“开发候选版”的文档声明。
 release_check_path = "scripts/release-check.sh"
 release_check = read(release_check_path)
-old_doc_check = """grep -Fq "candidate is \\`v$VERSION\\`" "$ROOT/docs/VERSIONS.md" || \\
-    fail "docs/VERSIONS.md does not declare v$VERSION as the development candidate""""
-new_doc_check = """if ! grep -Fq "stable release is \\`v$VERSION\\`" "$ROOT/docs/VERSIONS.md" && \\
-   ! grep -Fq "candidate is \\`v$VERSION\\`" "$ROOT/docs/VERSIONS.md"; then
-    fail "docs/VERSIONS.md does not declare v$VERSION as stable or candidate"
-fi"""
+old_doc_check = (
+    'grep -Fq "candidate is \\`v$VERSION\\`" "$ROOT/docs/VERSIONS.md" || \\\n'
+    '    fail "docs/VERSIONS.md does not declare v$VERSION as the development candidate"'
+)
+new_doc_check = (
+    'if ! grep -Fq "stable release is \\`v$VERSION\\`" "$ROOT/docs/VERSIONS.md" && \\\n'
+    '   ! grep -Fq "candidate is \\`v$VERSION\\`" "$ROOT/docs/VERSIONS.md"; then\n'
+    '    fail "docs/VERSIONS.md does not declare v$VERSION as stable or candidate"\n'
+    'fi'
+)
 if release_check.count(old_doc_check) != 1:
     raise SystemExit(f"{release_check_path}: version-doc contract block not found")
 release_check = release_check.replace(old_doc_check, new_doc_check, 1)
