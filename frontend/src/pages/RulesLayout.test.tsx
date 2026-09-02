@@ -83,6 +83,43 @@ beforeEach(() => {
 });
 
 describe('Rules grouped compact layout', () => {
+  const visibleRuleEditor = () => Array.from(document.querySelectorAll<HTMLElement>('.rp-rule-editor-modal'))
+    .find((modal) => modal.style.display !== 'none') ?? null;
+
+  async function openCreateRuleEditor() {
+    fireEvent.click(screen.getByRole('button', { name: /addRule/ }));
+    await waitFor(() => expect(visibleRuleEditor()).not.toBeNull());
+    return visibleRuleEditor() as HTMLElement;
+  }
+
+  async function openCreateCopyEditor(reality = true) {
+    const row = (await screen.findByText('rule-1')).closest('tr') as HTMLElement;
+    fireEvent.click(within(row).getByRole('button', { name: /moreActions/ }));
+    fireEvent.click(await screen.findByText('copy'));
+    await waitFor(() => {
+      const modal = visibleRuleEditor() as HTMLElement;
+      if (reality) {
+        expect(within(modal).getByLabelText('sni')).toBeInTheDocument();
+        expect(within(modal).getByText(/ruleReality(?:Runtime|Protocol)Summary/)).toBeInTheDocument();
+      } else {
+        expect(within(modal).getByLabelText('protocol')).toBeInTheDocument();
+      }
+    });
+    return visibleRuleEditor() as HTMLElement;
+  }
+
+  async function openExistingRuleEditor() {
+    const row = (await screen.findByText('rule-1')).closest('tr') as HTMLElement;
+    fireEvent.click(within(row).getByRole('button', { name: /edit/ }));
+    const title = await screen.findByText('editRule');
+    return title.closest('[role="dialog"]') as HTMLElement;
+  }
+
+  async function openRuleEditor() {
+    render(<Rules />);
+    return openExistingRuleEditor();
+  }
+
   it('keeps page actions in the header and search/filter in a separate toolbar', async () => {
     render(<Rules />);
     const header = screen.getByText('forwardRules').closest('.rp-page-header');
@@ -169,12 +206,14 @@ describe('Rules grouped compact layout', () => {
     expect(within(row).getByText('entryTransportNginxSni')).toBeInTheDocument();
     expect(within(row).getByText('198.51.100.10:55443 (+1)')).toBeInTheDocument();
     expect(within(row).getByText('lbFailover')).toBeInTheDocument();
-    expect(within(row).getByText(/DNS/)).toBeInTheDocument();
-    expect(within(row).getByText(/路由/)).toBeInTheDocument();
-    expect(within(row).getByText(/证书/)).toBeInTheDocument();
+    expect(within(row).getByText('dns')).toBeInTheDocument();
+    expect(within(row).getByText('routeDetails')).toBeInTheDocument();
+    expect(within(row).getByText('certificateDetails')).toBeInTheDocument();
     const statusTrigger = row.querySelector('.rp-rules-status-cell .rp-compact-status') as HTMLElement;
     expect(statusTrigger).toBeInTheDocument();
     expect(statusTrigger.querySelectorAll(':scope > span')).toHaveLength(2);
+    expect(statusTrigger).not.toHaveTextContent('PROPAGATED');
+    expect(statusTrigger.querySelector('[data-raw-state="PROPAGATED"]')).toBeInTheDocument();
     expect(within(row).getByText('traffic 145 B')).toBeInTheDocument();
     expect(within(row).getByText('paused')).toBeInTheDocument();
     expect(within(row).getByText('traffic 145 B')).toBeInTheDocument();
@@ -234,6 +273,105 @@ describe('Rules grouped compact layout', () => {
 
   });
 
+  it('aligns Create and Edit editor shells, tabs, field order, and advanced structure', async () => {
+    render(<Rules />);
+    await screen.findByText('rule-1');
+    const create = await openCreateRuleEditor();
+    expect(create).toHaveClass('rp-rule-editor-modal');
+    expect(within(create).getByRole('tab', { name: 'tabBasic' })).toBeInTheDocument();
+    expect(within(create).getByRole('tab', { name: 'tabForward' })).toBeInTheDocument();
+    const createLabels = Array.from(create.querySelectorAll('.ant-tabs-tabpane-active .ant-form-item-label'))
+      .map((label) => label.textContent?.trim());
+    expect(createLabels.slice(0, 4)).toEqual(['name', 'inboundGroup', 'transportMethod', 'listenPort']);
+    fireEvent.click(within(create).getByRole('button', { name: 'cancel' }));
+    await waitFor(() => expect(visibleRuleEditor()).toBeNull());
+
+    const realityCreate = await openCreateCopyEditor();
+    expect(within(realityCreate).getByText(/ruleReality(?:Runtime|Protocol)Summary/)).toBeInTheDocument();
+    expect(within(realityCreate).getByText('ruleAdvancedSettings · ruleAdvancedNone')).toBeInTheDocument();
+    fireEvent.click(within(realityCreate).getByRole('button', { name: 'cancel' }));
+    await waitFor(() => expect(visibleRuleEditor()).toBeNull());
+
+    const edit = await openExistingRuleEditor();
+    expect(edit).toHaveClass('rp-rule-editor-modal');
+    const editLabels = Array.from(edit.querySelectorAll('.ant-tabs-tabpane-active .ant-form-item-label'))
+      .map((label) => label.textContent?.trim());
+    expect(editLabels.slice(0, 4)).toEqual(['name', 'inboundGroup', 'transportMethod', 'listenPort']);
+    expect(within(edit).getByText('ruleRealityRuntimeSummary')).toBeInTheDocument();
+    expect(within(edit).getByText('ruleAdvancedSettings · ruleAdvancedNone')).toBeInTheDocument();
+  });
+
+  it('creates Reality with unchanged defaults while omitting edit-only and display-only fields', async () => {
+    setupAdmin([rule(1, { camouflage_enabled: false, send_proxy_protocol: false })]);
+    render(<Rules />);
+    const dialog = await openCreateCopyEditor();
+    fireEvent.change(within(dialog).getByLabelText('name'), { target: { value: 'new-reality' } });
+    fireEvent.change(within(dialog).getByLabelText('sni'), { target: { value: 'new.example.com' } });
+    expect(within(dialog).queryByLabelText('protocol')).toBeNull();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'create' }));
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/rules', expect.objectContaining({
+      name: 'new-reality', protocol: 'tcp', public_transport: 'nginx_sni',
+      camouflage_enabled: false, send_proxy_protocol: false,
+      load_balance_strategy: 'first', upload_limit_mbps: 0, download_limit_mbps: 0,
+    })));
+    const payload = mockPost.mock.calls.find(([url]) => url === '/rules')?.[1] as Record<string, unknown>;
+    expect(payload).not.toHaveProperty('max_connections');
+    expect(payload).not.toHaveProperty('auto_restart_minutes');
+    expect(payload).not.toHaveProperty('camouflage_tls_port');
+    expect(payload).not.toHaveProperty('certificate_renew_before');
+  });
+
+  it('preserves Reality camouflage and Proxy Protocol through the Create payload', async () => {
+    setupAdmin([rule(1, { camouflage_enabled: false, send_proxy_protocol: false })]);
+    render(<Rules />);
+    const dialog = await openCreateCopyEditor();
+    fireEvent.change(within(dialog).getByLabelText('name'), { target: { value: 'new-proxy' } });
+    fireEvent.change(within(dialog).getByLabelText('sni'), { target: { value: 'proxy.example.com' } });
+    fireEvent.click(within(dialog).getByLabelText('camouflage'));
+    fireEvent.click(within(dialog).getByText(/ruleAdvancedSettings/));
+    fireEvent.click(within(dialog).getByLabelText('sendProxyProtocol'));
+    await waitFor(() => expect(within(dialog).getByText('ruleAdvancedSettings · ruleAdvancedProxyEnabled')).toBeInTheDocument());
+    fireEvent.click(within(dialog).getByRole('button', { name: 'create' }));
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/rules', expect.objectContaining({
+      camouflage_enabled: true, send_proxy_protocol: true,
+    })));
+  });
+
+  it('keeps Raw protocol, multi-target strategy, and collapsed rate-limit values in Create', async () => {
+    setupAdmin([rule(1, {
+      public_transport: 'raw', node_transport: 'raw', sni: null, protocol: 'tcp_udp',
+      targets: [
+        { id: 1, rule_id: 1, host: '198.51.100.20', port: 443, position: 0, enabled: true, created_at: '' },
+        { id: 2, rule_id: 1, host: '198.51.100.21', port: 8443, position: 1, enabled: true, created_at: '' },
+      ],
+      upload_limit_mbps: 20, download_limit_mbps: 80,
+    })]);
+    render(<Rules />);
+    const dialog = await openCreateCopyEditor(false);
+    fireEvent.change(within(dialog).getByLabelText('name'), { target: { value: 'new-raw' } });
+    expect(within(dialog).getByLabelText('protocol')).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('tab', { name: 'tabForward' }));
+    await waitFor(() => expect(within(dialog).getByLabelText('loadBalanceStrategy')).toBeInTheDocument());
+    expect(within(dialog).getByText('ruleForwardAdvancedSettings · ruleAdvancedConfiguredCount')).toBeInTheDocument();
+    const advanced = within(dialog).getByText(/ruleForwardAdvancedSettings/);
+    fireEvent.click(advanced);
+    const rateInputs = within(dialog).getAllByRole('spinbutton').slice(-2);
+    expect(rateInputs[0]).toHaveValue('20');
+    expect(rateInputs[1]).toHaveValue('80');
+    fireEvent.click(advanced);
+    fireEvent.click(advanced);
+    expect(within(dialog).getAllByRole('spinbutton').slice(-2)[0]).toHaveValue('20');
+    expect(within(dialog).getAllByRole('spinbutton').slice(-2)[1]).toHaveValue('80');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'create' }));
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/rules', expect.objectContaining({
+      protocol: 'tcp_udp', public_transport: 'raw', load_balance_strategy: 'first',
+      upload_limit_mbps: 20, download_limit_mbps: 80,
+    })));
+    const payload = mockPost.mock.calls.find(([url]) => url === '/rules')?.[1] as Record<string, unknown>;
+    expect(payload).not.toHaveProperty('max_connections');
+    expect(payload).not.toHaveProperty('auto_restart_minutes');
+  });
+
   it('requires explicit confirmation before deleting from the more menu', async () => {
     render(<Rules />);
     const row = (await screen.findByText('rule-1')).closest('tr') as HTMLElement;
@@ -243,6 +381,96 @@ describe('Rules grouped compact layout', () => {
     expect(mockDelete).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'delete' }));
     await waitFor(() => expect(mockDelete).toHaveBeenCalledWith('/rules/1'));
+  });
+
+  it('keeps camouflage enabled when advanced settings stay collapsed', async () => {
+    setupAdmin([rule(1, { camouflage_enabled: true })]);
+    const dialog = await openRuleEditor();
+    expect(within(dialog).getByText('ruleRealityRuntimeSummary')).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText('camouflageTlsPort')).toBeNull();
+    expect(within(dialog).queryByLabelText('certificateRenewBefore')).toBeNull();
+    expect(within(dialog).getByText('ruleAdvancedSettings · ruleAdvancedNone')).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'editRule' })).toBeNull());
+    expect(mockPut).not.toHaveBeenCalled();
+
+    const reopened = await openExistingRuleEditor();
+    fireEvent.change(within(reopened).getByLabelText('name'), { target: { value: 'renamed-rule' } });
+    fireEvent.click(within(reopened).getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/rules/1', { name: 'renamed-rule' }));
+    const payload = mockPut.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(payload).not.toHaveProperty('camouflage_enabled');
+    expect(payload).not.toHaveProperty('camouflage_tls_port');
+    expect(payload).not.toHaveProperty('certificate_renew_before');
+  });
+
+  it('preserves an enabled Proxy Protocol without opening its collapse', async () => {
+    setupAdmin([rule(1, { send_proxy_protocol: true })]);
+    const dialog = await openRuleEditor();
+    expect(within(dialog).getByText('ruleAdvancedSettings · ruleAdvancedProxyEnabled')).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'editRule' })).toBeNull());
+    expect(mockPut).not.toHaveBeenCalled();
+
+    const reopened = await openExistingRuleEditor();
+    fireEvent.change(within(reopened).getByLabelText('listenPort'), { target: { value: '444' } });
+    fireEvent.click(within(reopened).getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/rules/1', { listen_port: 444 }));
+    expect(mockPut.mock.calls.at(-1)?.[1]).not.toHaveProperty('send_proxy_protocol');
+  });
+
+  it('preserves every forwarding advanced value without opening its collapse', async () => {
+    setupAdmin([rule(1, {
+      load_balance_strategy: 'failover',
+      upload_limit_mbps: 20,
+      download_limit_mbps: 80,
+      max_connections: 77,
+      auto_restart_minutes: 120,
+    })]);
+    const dialog = await openRuleEditor();
+    fireEvent.click(within(dialog).getByRole('tab', { name: 'tabForward' }));
+    expect(within(dialog).getByText('lbFailover')).toBeInTheDocument();
+    expect(within(dialog).getByText('ruleForwardAdvancedSettings · ruleAdvancedConfiguredCount')).toBeInTheDocument();
+    expect(within(dialog).getByText('rateLimits · maxConnections · autoRestart')).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'editRule' })).toBeNull());
+    expect(mockPut).not.toHaveBeenCalled();
+
+    const reopened = await openExistingRuleEditor();
+    fireEvent.change(within(reopened).getByLabelText('name'), { target: { value: 'advanced-preserved' } });
+    fireEvent.click(within(reopened).getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/rules/1', { name: 'advanced-preserved' }));
+  });
+
+  it('keeps collapse values stable and changes only one requested advanced setting pair', async () => {
+    setupAdmin([rule(1, {
+      upload_limit_mbps: 20,
+      download_limit_mbps: 80,
+      max_connections: 77,
+      auto_restart_minutes: 120,
+    })]);
+    const dialog = await openRuleEditor();
+    fireEvent.click(within(dialog).getByRole('tab', { name: 'tabForward' }));
+    const collapse = within(dialog).getByText(/ruleForwardAdvancedSettings/);
+    fireEvent.click(collapse);
+    expect(within(dialog).getByLabelText('maxConnections')).toHaveValue('77');
+    expect(within(dialog).getByLabelText('autoRestart')).toHaveValue('120');
+    fireEvent.click(collapse);
+    fireEvent.click(collapse);
+    expect(within(dialog).getByLabelText('maxConnections')).toHaveValue('77');
+    expect(within(dialog).getByLabelText('autoRestart')).toHaveValue('120');
+
+    fireEvent.change(within(dialog).getByLabelText('maxConnections'), { target: { value: '88' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/rules/1', {
+      max_connections: 88,
+      auto_restart_minutes: 120,
+    }));
+    const payload = mockPut.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(payload).not.toHaveProperty('upload_limit_mbps');
+    expect(payload).not.toHaveProperty('download_limit_mbps');
+    expect(payload).not.toHaveProperty('load_balance_strategy');
   });
 
   it('merges selection across group tables and exposes a cancellable batch bar', async () => {

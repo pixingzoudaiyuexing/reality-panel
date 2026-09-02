@@ -2,7 +2,7 @@
 
 @media (max-width: 720px) {
   .rp-carrier-binding-row {
-    grid-template-columns: minmax(0, 1fr) auto !important;
+    grid-template-columns: minmax(0, 1fr) auto;
   }
 
   .rp-carrier-binding-row > :nth-child(2),

@@ -1,4 +1,4 @@
-import { render } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-router-dom', () => ({
@@ -33,5 +33,9 @@ describe('MainLayout desktop scroll wiring', () => {
     expect(container.querySelector('.rp-app-sider')).not.toBeNull();
     expect(container.querySelector('.rp-app-main')).not.toBeNull();
     expect(container.querySelector('.rp-app-content')).not.toBeNull();
+    expect(container.querySelector('.rp-app-header-actions')).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'announcements' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'changePassword' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'logout' })).toBeInTheDocument();
   });
 });

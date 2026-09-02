@@ -1,6 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import type { NodeDiagnoseStatus, RealityDiagnosis, RealityCheck } from '../../api/types';
-import { deriveDiagnosisConclusion, deriveNodeDiagnosisSummary } from './summary';
+import {
+  aggregateCheckDisplayStatuses,
+  aggregateDiagnosisChecks,
+  aggregateDiagnosisStatuses,
+  aggregateNodeBackends,
+  aggregateNodeListeners,
+  deriveDiagnosisConclusion,
+  deriveNodeDiagnosisSummary,
+  diagnosisDisplayStatus,
+  combineDiagnosisChecks,
+  diagnosisOverview,
+  nodeDiagnosisHighlights,
+  nodeDiagnosisChecks,
+  primaryControlIssue,
+} from './summary';
 
 const check = (state: RealityCheck['state'] = 'pass'): RealityCheck => ({ state });
 
@@ -39,6 +53,27 @@ function node(overrides: Partial<Extract<NodeDiagnoseStatus, { status: 'result' 
 }
 
 describe('diagnosis summary semantics', () => {
+  it.each([
+    ['pass', 'normal'],
+    ['fail', 'abnormal'],
+    ['blocked', 'waiting'],
+    ['not_tested', 'not_tested'],
+    ['warning', 'attention'],
+    ['future_state', 'unknown'],
+  ] as const)('maps raw state %s to %s', (raw, display) => {
+    expect(diagnosisDisplayStatus(check(raw))).toBe(display);
+  });
+
+  it('never maps an unknown raw state to abnormal', () => {
+    expect(diagnosisDisplayStatus(check('future_state'))).toBe('unknown');
+    expect(diagnosisDisplayStatus(check('future_state'))).not.toBe('abnormal');
+  });
+
+  it('uses partial only for an aggregate with mixed failures', () => {
+    expect(aggregateDiagnosisStatuses(['normal', 'abnormal']).status).toBe('partial');
+    expect(aggregateDiagnosisStatuses(['attention']).status).toBe('attention');
+  });
+
   it('is healthy when all checks pass and VLESS authentication is not tested', () => {
     expect(deriveDiagnosisConclusion([node()])).toBe('healthy');
   });
@@ -89,6 +124,89 @@ describe('diagnosis summary semantics', () => {
     })])).toBe('partial');
   });
 
+  it('builds the Reality overview only from checks returned by the current API', () => {
+    const overview = diagnosisOverview([node()], {
+      dnsmgr: check(),
+      dns_sync: check(),
+      certificate: check(),
+      route: check(),
+    });
+    expect(overview.map((item) => item.key)).toEqual([
+      'dns', 'listener', 'certificate', 'reality_service', 'backend', 'client_path',
+    ]);
+    expect(overview.find((item) => item.key === 'client_path')?.check.state).toBe('not_tested');
+  });
+
+  it('keeps a mixed multi-node failure visible as a rule-level warning', () => {
+    const overview = diagnosisOverview([
+      node(),
+      node({
+        node_id: 'node-b',
+        reality: reality({ nginx: { ...reality().nginx, check: check('fail'), mapping_matches: false } }),
+      }),
+    ]);
+    expect(overview.find((item) => item.key === 'reality_service')?.check.state).toBe('warning');
+    expect(nodeDiagnosisChecks(node({
+      reality: reality({ nginx: { ...reality().nginx, check: check('fail'), mapping_matches: false } }),
+    })).find((item) => item.key === 'nginx')?.check.state).toBe('fail');
+  });
+
+  it('keeps listener failure independent from DNS dependencies', () => {
+    const failedListener = node({ listener_running: false });
+    const overview = diagnosisOverview([failedListener], {
+      dnsmgr: check('fail'),
+      dns_sync: check('blocked'),
+      certificate: check('blocked'),
+      route: check('blocked'),
+    });
+    expect(overview.find((item) => item.key === 'dns')?.check.state).toBe('fail');
+    expect(overview.find((item) => item.key === 'listener')?.check.state).toBe('fail');
+    expect(nodeDiagnosisHighlights(failedListener)[0]).toEqual({
+      key: 'listener',
+      check: { state: 'fail' },
+    });
+  });
+
+  it('chooses a concrete control failure before downstream blocked checks', () => {
+    expect(primaryControlIssue({
+      dnsmgr: check(),
+      dns_sync: check('fail'),
+      certificate: check('blocked'),
+      route: check('blocked'),
+    })?.key).toBe('dns_sync');
+  });
+
+  it('keeps the RC9 conclusion independent from certificate and route dependencies', () => {
+    expect(deriveDiagnosisConclusion([node()], {
+      dnsmgr: check(),
+      dns_sync: check(),
+      certificate: check('fail'),
+      route: check('blocked'),
+    })).toBe('healthy');
+  });
+
+  it('keeps the RC9 Reality conclusion independent from listener_running', () => {
+    expect(deriveNodeDiagnosisSummary(node({ listener_running: false })).level).toBe('normal');
+    expect(deriveDiagnosisConclusion([node({ listener_running: false })])).toBe('healthy');
+  });
+
+  it('preserves future states through combine and node aggregation', () => {
+    expect(combineDiagnosisChecks([check('future_state')]).state).toBe('future_state');
+    expect(combineDiagnosisChecks([check('future_state'), check()]).state).toBe('future_state');
+    expect(combineDiagnosisChecks([check('future_state'), check('not_tested')]).state).toBe('future_state');
+    expect(aggregateDiagnosisChecks([check('future_state'), check()]).state).toBe('future_state');
+    expect(diagnosisDisplayStatus(aggregateDiagnosisChecks([check('future_state'), check()]))).toBe('unknown');
+  });
+
+  it('uses conservative display aggregation without changing the RC9 conclusion', () => {
+    expect(aggregateCheckDisplayStatuses(['normal', 'abnormal'])).toBe('partial');
+    expect(aggregateCheckDisplayStatuses(['normal', 'attention'])).toBe('attention');
+    expect(aggregateCheckDisplayStatuses(['normal', 'waiting'])).toBe('waiting');
+    expect(aggregateCheckDisplayStatuses(['normal', 'unknown'])).toBe('unknown');
+    expect(aggregateCheckDisplayStatuses(['normal', 'not_tested'])).toBe('normal');
+    expect(aggregateCheckDisplayStatuses(['normal', 'normal'])).toBe('normal');
+  });
+
   it('treats an ordinary TCP listener failure as critical and partial target reachability as warning', () => {
     expect(deriveNodeDiagnosisSummary(node({ reality: undefined, listener_running: false })).level).toBe('critical');
     expect(deriveNodeDiagnosisSummary(node({
@@ -98,5 +216,30 @@ describe('diagnosis summary semantics', () => {
         { address: '192.0.2.2:443', outcome: { failed: { error: 'refused' } } },
       ],
     })).level).toBe('warning');
+  });
+
+  it('aggregates mixed and all-failed listeners without treating missing results as failures', () => {
+    expect(aggregateNodeListeners([
+      node(),
+      node({ node_id: 'node-b', listener_running: false }),
+      { status: 'timeout', node_id: 'node-c', group_name: 'group-a' },
+    ])).toMatchObject({ status: 'partial', total: 3, abnormal: 1, notTested: 1 });
+    expect(aggregateNodeListeners([
+      node({ listener_running: false }),
+      node({ node_id: 'node-b', listener_running: false }),
+    ]).status).toBe('abnormal');
+  });
+
+  it('aggregates backend probes as mixed, failed or untested from real node evidence', () => {
+    const failedReality = reality({
+      backends: [{ address: '192.0.2.1:443', check: check('fail') }],
+    });
+    expect(aggregateNodeBackends([
+      node(),
+      node({ node_id: 'node-b', reality: failedReality }),
+    ]).status).toBe('partial');
+    expect(aggregateNodeBackends([
+      { status: 'timeout', node_id: 'node-c', group_name: 'group-a' },
+    ]).status).toBe('not_tested');
   });
 });

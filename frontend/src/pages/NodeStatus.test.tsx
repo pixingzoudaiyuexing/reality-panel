@@ -113,17 +113,32 @@ describe('NodeStatus page data source', () => {
         last_error: null,
         nodes: [{ node_id: 'n1', public_ipv4: '203.0.113.10', online: true, ready: true, ready_reasons: [], preferred: true }],
       }));
+      if (url === '/groups/1/carrier-affinity') return Promise.resolve(ok({
+        group_id: 1,
+        default_node_id: 'n1',
+        active_policy: { bindings: [] },
+        pending_policy: null,
+        transaction: { kind: null, state: 'idle', started_at: null, last_error: null, rollback_error: null },
+        bindings: [],
+        catalog_stale: false,
+      }));
+      if (url === '/groups/1/carrier-lines') return Promise.resolve(ok({ lines: [], stale: false }));
+      if (url === '/admin/relay-schedules') return Promise.resolve(ok([]));
       return Promise.reject(new Error(`unexpected ${url}`));
     });
 
     renderPage();
     await flush();
 
-    expect(screen.getByText('relayPreferenceTitle')).toBeInTheDocument();
-    expect(screen.getByText('relayScheduleLoadFailed')).toBeInTheDocument();
+    expect(screen.getByText('defaultLineTitle')).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'carrierAffinityTitle' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'relayScheduleTitle' })).toBeInTheDocument();
     expect(mockGet).toHaveBeenCalledWith('/groups/1/relay-preference');
-    expect(mockGet).toHaveBeenCalledWith('/admin/relay-schedules');
+    expect(mockGet).not.toHaveBeenCalledWith('/admin/relay-schedules');
     expect(mockGet).not.toHaveBeenCalledWith('/groups/2/relay-preference');
+    fireEvent.click(screen.getByRole('tab', { name: 'relayScheduleTitle' }));
+    await flush();
+    expect(mockGet).toHaveBeenCalledWith('/admin/relay-schedules');
   });
 });
 
@@ -230,6 +245,17 @@ describe('NodeStatus targeted diagnosis entry point', () => {
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       if (url === '/groups') return Promise.resolve(ok([{ id: 1, name: 'group-a', group_type: 'in' }]));
       if (url === '/groups/1/relay-preference') return Promise.resolve(preference());
+      if (url === '/groups/1/carrier-affinity') return Promise.resolve(ok({
+        group_id: 1,
+        default_node_id: 'n1',
+        active_policy: { bindings: [] },
+        pending_policy: null,
+        transaction: { kind: null, state: 'idle', started_at: null, last_error: null, rollback_error: null },
+        bindings: [],
+        catalog_stale: false,
+      }));
+      if (url === '/groups/1/carrier-lines') return Promise.resolve(ok({ lines: [], stale: false }));
+      if (url === '/admin/relay-schedules') return Promise.resolve(ok([]));
       if (url === '/rules') return Promise.resolve(ok(rules));
       return Promise.reject(new Error(`unexpected ${url}`));
     });
@@ -240,8 +266,8 @@ describe('NodeStatus targeted diagnosis entry point', () => {
     renderPage();
     await flush();
 
-    const preferred = screen.getByTestId('relay-preference-node-n1');
-    const notReady = screen.getByTestId('relay-preference-node-n2');
+    const preferred = screen.getByTestId('default-line-candidate-n1');
+    const notReady = screen.getByTestId('default-line-candidate-n2');
     expect(within(preferred).getByRole('button', { name: /diagnose/ })).toBeEnabled();
     expect(within(notReady).getByRole('button', { name: /diagnose/ })).toBeEnabled();
   });
@@ -250,7 +276,7 @@ describe('NodeStatus targeted diagnosis entry point', () => {
     setup([rule(1)]);
     renderPage();
     await flush();
-    const row = screen.getByTestId('relay-preference-node-n1');
+    const row = screen.getByTestId('default-line-candidate-n1');
     fireEvent.click(within(row).getByRole('button', { name: /diagnose/ }));
     await flush();
 
@@ -261,11 +287,12 @@ describe('NodeStatus targeted diagnosis entry point', () => {
     setup([rule(1), rule(2), rule(3, 'udp')]);
     renderPage();
     await flush();
-    const row = screen.getByTestId('relay-preference-node-n1');
+    const row = screen.getByTestId('default-line-candidate-n1');
     fireEvent.click(within(row).getByRole('button', { name: /diagnose/ }));
     await flush();
 
-    expect(screen.getByRole('dialog', { name: 'diagnosisSelectRule' })).toBeInTheDocument();
+    const picker = screen.getAllByRole('dialog').find((dialog) => within(dialog).queryByRole('button', { name: /#1 rule-1/ }));
+    expect(picker).toBeDefined();
     expect(screen.getByRole('button', { name: /#1 rule-1/ })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /#2 rule-2/ })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /#3 rule-3/ })).toBeNull();
@@ -276,7 +303,7 @@ describe('NodeStatus targeted diagnosis entry point', () => {
     setup([rule(3, 'udp')]);
     renderPage();
     await flush();
-    const row = screen.getByTestId('relay-preference-node-n1');
+    const row = screen.getByTestId('default-line-candidate-n1');
     fireEvent.click(within(row).getByRole('button', { name: /diagnose/ }));
     await flush();
 

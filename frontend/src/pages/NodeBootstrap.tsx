@@ -138,11 +138,11 @@ export default function NodeBootstrap() {
   };
 
   const capabilityItems = deployment?.capabilities ? [
-    { key: 'nginx_stream', label: t('nodeCapabilityNginxStream'), children: <Tag color={deployment.capabilities.nginx_stream ? 'green' : 'red'}>{deployment.capabilities.nginx_stream ? 'PASS' : 'FAIL'}</Tag> },
-    { key: 'openlist', label: t('nodeCapabilityOpenList'), children: <Tag color={deployment.capabilities.openlist ? 'green' : 'red'}>{deployment.capabilities.openlist ? 'PASS' : 'FAIL'}</Tag> },
-    { key: 'http01', label: t('nodeCapabilityHttp01'), children: <Tag color={deployment.capabilities.http01 ? 'green' : 'red'}>{deployment.capabilities.http01 ? 'PASS' : 'FAIL'}</Tag> },
-    { key: 'certificate_lifecycle', label: t('nodeCapabilityCertificateLifecycle'), children: <Tag color={deployment.capabilities.certificate_lifecycle ? 'green' : 'red'}>{deployment.capabilities.certificate_lifecycle ? 'PASS' : 'FAIL'}</Tag> },
-    { key: 'reality_camouflage', label: t('nodeCapabilityRealityCamouflage'), children: <Tag color={deployment.capabilities.reality_camouflage ? 'green' : 'red'}>{deployment.capabilities.reality_camouflage ? 'PASS' : 'FAIL'}</Tag> },
+    { key: 'nginx_stream', label: t('nodeCapabilityNginxStream'), children: <Tag color={deployment.capabilities.nginx_stream ? 'green' : 'red'}>{deployment.capabilities.nginx_stream ? t('ok') : t('failed')}</Tag> },
+    { key: 'openlist', label: t('nodeCapabilityOpenList'), children: <Tag color={deployment.capabilities.openlist ? 'green' : 'red'}>{deployment.capabilities.openlist ? t('ok') : t('failed')}</Tag> },
+    { key: 'http01', label: t('nodeCapabilityHttp01'), children: <Tag color={deployment.capabilities.http01 ? 'green' : 'red'}>{deployment.capabilities.http01 ? t('ok') : t('failed')}</Tag> },
+    { key: 'certificate_lifecycle', label: t('nodeCapabilityCertificateLifecycle'), children: <Tag color={deployment.capabilities.certificate_lifecycle ? 'green' : 'red'}>{deployment.capabilities.certificate_lifecycle ? t('ok') : t('failed')}</Tag> },
+    { key: 'reality_camouflage', label: t('nodeCapabilityRealityCamouflage'), children: <Tag color={deployment.capabilities.reality_camouflage ? 'green' : 'red'}>{deployment.capabilities.reality_camouflage ? t('ok') : t('failed')}</Tag> },
   ] : [];
 
   const sshContent = <>

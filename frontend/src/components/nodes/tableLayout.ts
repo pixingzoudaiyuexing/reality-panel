@@ -4,6 +4,7 @@
 // across two lines.
 export const nodeDesktopColumnWidths = {
   status: 78,
+  relayReady: 172,
   nodeVersion: 90,
   nodeUpgrade: 68,
   cpu: 80,

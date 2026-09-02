@@ -345,7 +345,7 @@ export default function NodeStatus() {
         title={activeOperation ? t(`nodeOperation_${activeOperation.action}`) : t('nodeOperations')}
         open={activeOperation !== null}
         onClose={() => setActiveOperation(null)}
-        width={isMobile ? '100%' : 640}
+        size={isMobile ? '100%' : 640}
         extra={activeOperation ? (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
             {activeOperation.action === 'logs' ? (

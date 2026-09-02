@@ -1,7 +1,8 @@
  
 import { Tag, Typography, Collapse } from 'antd';
 import { ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
-import type { NodeDisplayRow, RelayReadyNode } from '../../api/types';
+import type { NodeDisplayRow, RelayPreferenceView, RelayReadyNode } from '../../api/types';
+import { useState } from 'react';
 import type { NodeLifecycleHandler, Tfn } from './types';
 import { NodeDesktopTable } from './NodeDesktopTable';
 import { NodeMobileList } from './NodeMobileList';
@@ -47,11 +48,16 @@ function groupSummary(rows: NodeDisplayRow[]) {
  *  either a desktop table or mobile list. Collapsible. A group with only a
  *  placeholder row shows "no node reporting". */
 export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade, onLifecycle, artifactVersions, onDelete, showRelayPreference = false, onDiagnoseNode }: Props) {
+  const [relayPreference, setRelayPreference] = useState<RelayPreferenceView | null>(null);
   const head = rows[0];
   const { total, online, up, down } = groupSummary(rows);
   const region = head.region;
   const lineType = head.line_type;
   const onlyPlaceholder = rows.length === 1 && !head.node_id;
+  const readyCount = relayPreference?.nodes.filter((node) => node.ready).length;
+  const anomalyCount = relayPreference
+    ? relayPreference.nodes.filter((node) => !node.online || !node.ready).length
+    : null;
 
   const header = (
     <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
@@ -59,7 +65,13 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
       <Text type="secondary" style={{ fontSize: 12 }}>ID: {head.group_id}</Text>
       {region ? <Tag>{region}</Tag> : null}
       {lineType ? <Tag color="blue">{lineType}</Tag> : null}
-      <Tag color={online > 0 ? 'green' : undefined}>{online}/{total}</Tag>
+      <Text type="secondary" className="rp-group-node-summary">
+        {t('nodes')} {total} · {t('online')} {online}
+        {showRelayPreference ? ` · ${t('relayReady')} ${readyCount ?? '-'}` : ''}
+        {showRelayPreference && anomalyCount !== null
+          ? ` · ${t('nodeSummaryIssues').replace('{count}', String(anomalyCount))}`
+          : ''}
+      </Text>
       <span style={{ marginLeft: 'auto' }} className="rp-mono">
         <Text type="secondary" style={{ fontSize: 12 }}>
           <ArrowUpOutlined /> {formatBps(up)} <ArrowDownOutlined /> {formatBps(down)}
@@ -84,16 +96,18 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
         onUpgrade={onUpgrade}
         onLifecycle={onLifecycle}
         artifactVersions={artifactVersions}
+        relayNodes={relayPreference?.nodes}
+        showRelayReady={showRelayPreference}
       />
     </div>
   ) : (
-    <NodeDesktopTable rows={rows} panelProtocol={panelProtocol} latestNodeVersion={latestNodeVersion} nodeVersionCheckFailed={nodeVersionCheckFailed} t={t} openDetail={openDetail} onUpgrade={onUpgrade} onLifecycle={onLifecycle} artifactVersions={artifactVersions} onDelete={onDelete} />
+    <NodeDesktopTable rows={rows} panelProtocol={panelProtocol} latestNodeVersion={latestNodeVersion} nodeVersionCheckFailed={nodeVersionCheckFailed} t={t} openDetail={openDetail} onUpgrade={onUpgrade} onLifecycle={onLifecycle} artifactVersions={artifactVersions} onDelete={onDelete} relayNodes={relayPreference?.nodes} showRelayReady={showRelayPreference} />
   );
 
   const body = (
     <>
       {nodeBody}
-      {showRelayPreference ? <RelayPreferencePanel groupId={head.group_id} t={t} onDiagnoseNode={onDiagnoseNode ? (node) => onDiagnoseNode(head.group_id, node) : undefined} /> : null}
+      {showRelayPreference ? <RelayPreferencePanel groupId={head.group_id} t={t} onViewChange={setRelayPreference} onDiagnoseNode={onDiagnoseNode ? (node) => onDiagnoseNode(head.group_id, node) : undefined} /> : null}
     </>
   );
 

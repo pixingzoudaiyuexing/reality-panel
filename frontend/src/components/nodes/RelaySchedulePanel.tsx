@@ -3,11 +3,9 @@ import {
   Alert,
   Button,
   Checkbox,
-  Divider,
   Empty,
   Form,
   Input,
-  InputNumber,
   Modal,
   Popconfirm,
   Select,
@@ -23,13 +21,18 @@ import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from '@ant
 import api from '../../api/client';
 import type {
   ApiEnvelope,
+  CarrierLineCatalog,
+  CarrierPolicy,
   CreateRelayScheduleRequest,
+  RelayPreferencePhase,
   RelayReadyNode,
   RelaySchedule,
   RelayScheduleType,
   UpdateRelayScheduleRequest,
 } from '../../api/types';
 import type { Tfn } from './types';
+import { relayReadyReasonLabel } from './shared';
+import { formatUtcOffset, utcOffsetOptions } from './relayScheduleTime';
 
 const { Text } = Typography;
 
@@ -37,6 +40,9 @@ interface Props {
   groupId: number;
   nodes: RelayReadyNode[];
   t: Tfn;
+  carrierPolicy?: CarrierPolicy;
+  carrierCatalog?: CarrierLineCatalog | null;
+  topologyState?: RelayPreferencePhase;
 }
 
 interface ScheduleFormValues {
@@ -70,13 +76,6 @@ function toLocalDateTimeInput(value: string | null): string | undefined {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function formatOffset(minutes: number | null): string {
-  if (minutes === null) return 'UTC+00:00';
-  const sign = minutes < 0 ? '-' : '+';
-  const absolute = Math.abs(minutes);
-  return `UTC${sign}${pad(Math.floor(absolute / 60))}:${pad(absolute % 60)}`;
-}
-
 function weekdayLabel(day: number, t: Tfn): string {
   const keys = [
     'relayScheduleMonday',
@@ -95,15 +94,15 @@ function scheduleDescription(schedule: RelaySchedule, t: Tfn): string {
     return `${t('relayScheduleOneTime')} · ${formatLocalDateTime(schedule.execute_at)}`;
   }
   if (schedule.schedule_type === 'daily') {
-    return `${t('relayScheduleDaily')} · ${schedule.time ?? '-'} · ${formatOffset(schedule.utc_offset_minutes)}`;
+    return `${t('relayScheduleDaily')} · ${schedule.time ?? '-'} · ${formatUtcOffset(schedule.utc_offset_minutes)}`;
   }
   const days = schedule.weekdays
     .map((day) => weekdayLabel(day, t))
     .join(t('relayScheduleWeekdaySeparator'));
-  return `${t('relayScheduleWeekly')} · ${days} · ${schedule.time ?? '-'} · ${formatOffset(schedule.utc_offset_minutes)}`;
+  return `${t('relayScheduleWeekly')} · ${days} · ${schedule.time ?? '-'} · ${formatUtcOffset(schedule.utc_offset_minutes)}`;
 }
 
-function resultLabel(result: string | null, t: Tfn): string {
+function resultLabel(result: string | null, t: Tfn): string | null {
   const keys: Record<string, Parameters<Tfn>[0]> = {
     started: 'relayScheduleResultStarted',
     already_preferred: 'relayScheduleResultAlreadyPreferred',
@@ -112,7 +111,7 @@ function resultLabel(result: string | null, t: Tfn): string {
     failed: 'relayScheduleResultFailed',
     missed: 'relayScheduleResultMissed',
   };
-  return result ? t(keys[result] ?? 'relayScheduleResultFailed') : t('relayScheduleNeverRun');
+  return result ? t(keys[result] ?? 'relayScheduleResultFailed') : null;
 }
 
 function requestError(error: unknown, fallback: string): string {
@@ -120,7 +119,7 @@ function requestError(error: unknown, fallback: string): string {
   return message ? `${fallback}: ${message}` : fallback;
 }
 
-export function RelaySchedulePanel({ groupId, nodes, t }: Props) {
+export function RelaySchedulePanel({ groupId, nodes, t, carrierPolicy, carrierCatalog, topologyState }: Props) {
   const [schedules, setSchedules] = useState<RelaySchedule[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
@@ -156,8 +155,11 @@ export function RelaySchedulePanel({ groupId, nodes, t }: Props) {
   );
   const nodeOptions = nodes.map((node) => ({
     value: node.node_id,
-    label: `${node.public_ipv4 ?? node.node_id}${node.public_ipv4 ? ` · ${node.node_id}` : ''} · ${node.ready ? t('relayReady') : t('relayNotReady')}`,
+    label: `${node.public_ipv4 ?? node.node_id}${node.public_ipv4 ? ` · ${node.node_id}` : ''} · ${node.ready ? t('relayReady') : `${t('relayNotReady')}: ${node.ready_reasons.map((reason) => relayReadyReasonLabel(reason, t)).join(' · ')}`}`,
   }));
+  const catalogNames = new Map((carrierCatalog?.lines ?? []).map((line) => [line.id, line.name || line.id]));
+  const followDefaultLines = (carrierPolicy?.bindings ?? []).filter((binding) => binding.mode === 'follow_default');
+  const explicitLines = (carrierPolicy?.bindings ?? []).filter((binding) => binding.mode === 'node');
 
   const openCreate = () => {
     setEditing(null);
@@ -245,12 +247,11 @@ export function RelaySchedulePanel({ groupId, nodes, t }: Props) {
   };
 
   return (
-    <div data-testid={`relay-schedules-${groupId}`} style={{ padding: '0 12px 12px' }}>
-      <Divider style={{ margin: '12px 0' }} />
+    <section data-testid={`relay-schedules-${groupId}`} className="rp-line-feature-section">
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 10 }}>
-        <Text strong>{t('relayScheduleTitle')}</Text>
+        <span />
         <Space size={4}>
-          <Button size="small" icon={<PlusOutlined />} onClick={openCreate}>{t('relayScheduleCreate')}</Button>
+          <Button size="small" icon={<PlusOutlined />} onClick={openCreate}>{t('relayScheduleCreateSwitch')}</Button>
           <Tooltip title={t('refresh')}>
             <Button
               size="small"
@@ -265,6 +266,9 @@ export function RelaySchedulePanel({ groupId, nodes, t }: Props) {
       </div>
 
       {loadError ? <Alert type="warning" showIcon title={t('relayScheduleLoadFailed')} action={<Button size="small" onClick={() => void load()}>{t('refresh')}</Button>} /> : null}
+      {topologyState === 'failed_manual_intervention' ? (
+        <Alert type="warning" showIcon title={t('relayScheduleSplitWarningTitle')} description={t('relayScheduleSplitWarningDescription')} style={{ marginBottom: 10 }} />
+      ) : null}
       {loading && schedules.length === 0 && !loadError ? <div style={{ textAlign: 'center', padding: 12 }}><Spin size="small" /></div> : null}
       {!loading && !loadError && schedules.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('relayScheduleEmpty')} /> : null}
 
@@ -288,17 +292,32 @@ export function RelaySchedulePanel({ groupId, nodes, t }: Props) {
             style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 12, padding: '10px 0', borderBottom: '1px solid var(--rp-border)' }}
           >
             <div style={{ flex: '1 1 420px', minWidth: 0 }}>
+              <Text type="secondary">{t('relayScheduleDefaultSwitch')}</Text>
               <Space size={6} wrap>
                 <Text strong className="rp-mono">{targetPrimary}</Text>
                 <Tag color={schedule.enabled ? 'green' : undefined}>{t(schedule.enabled ? 'relayScheduleEnabled' : 'relayScheduleDisabled')}</Tag>
+                {target && !target.ready ? <Tag color="red">{t('relayNotReady')}</Tag> : null}
               </Space>
               {target?.public_ipv4 ? <div><Text type="secondary" code>{schedule.target_node_id}</Text></div> : null}
+              {target && !target.ready && target.ready_reasons.length > 0 ? (
+                <div><Text type="danger">{target.ready_reasons.map((reason) => relayReadyReasonLabel(reason, t)).join(' · ')}</Text></div>
+              ) : null}
               <div><Text>{scheduleDescription(schedule, t)}</Text></div>
               <Space size={6} wrap>
-                <Text type="secondary">{schedule.last_run_at ? `${t('relayScheduleLastRun')}: ${formatLocalDateTime(schedule.last_run_at, true)}` : t('relayScheduleNeverRun')}</Text>
-                <Tag>{resultLabel(schedule.last_result, t)}</Tag>
+                <Text type="secondary">{t('relayScheduleLastRun')}: {schedule.last_run_at ? formatLocalDateTime(schedule.last_run_at, true) : '-'}</Text>
+                {resultLabel(schedule.last_result, t) ? <Tag>{resultLabel(schedule.last_result, t)}</Tag> : null}
                 {schedule.last_error ? <Tooltip title={schedule.last_error}><Text type="danger" ellipsis style={{ maxWidth: 280 }}>{schedule.last_error}</Text></Tooltip> : null}
               </Space>
+              <div className="rp-schedule-impact" data-testid={`relay-schedule-impact-${schedule.id}`}>
+                <Text type="secondary">{t('relayScheduleImpactCurrentPolicy')}</Text>
+                {carrierPolicy ? (
+                  <>
+                    <div>{t('relayScheduleImpactFollow')}: {followDefaultLines.length > 0 ? followDefaultLines.map((binding) => catalogNames.get(binding.line_id) ?? binding.line_id).join('、') : t('relaySwitchImpactNone')}</div>
+                    <div>{t('relayScheduleImpactExplicit')}: {explicitLines.length > 0 ? explicitLines.map((binding) => catalogNames.get(binding.line_id) ?? binding.line_id).join('、') : t('relaySwitchImpactNone')}</div>
+                    <div><Text type="secondary">{t('relayScheduleImpactUnconfigured')}</Text></div>
+                  </>
+                ) : <Text type="secondary">{t('carrierPolicyUnavailable')}</Text>}
+              </div>
             </div>
             <Space size={4} wrap>
               <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(schedule)}>{t('edit')}</Button>
@@ -348,10 +367,9 @@ export function RelaySchedulePanel({ groupId, nodes, t }: Props) {
               <Form.Item
                 name="utc_offset_minutes"
                 label={t('relayScheduleUtcOffset')}
-                extra={offsetMinutes !== undefined ? formatOffset(offsetMinutes) : undefined}
                 rules={[{ required: true }]}
               >
-                <InputNumber min={-840} max={840} step={30} style={{ width: '100%' }} />
+                <Select aria-label={t('relayScheduleUtcOffset')} options={utcOffsetOptions(offsetMinutes)} showSearch optionFilterProp="label" />
               </Form.Item>
             </>
           )}
@@ -365,6 +383,6 @@ export function RelaySchedulePanel({ groupId, nodes, t }: Props) {
           </Form.Item>
         </Form>
       </Modal>
-    </div>
+    </section>
   );
 }
