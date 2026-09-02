@@ -103,3 +103,15 @@ ENV DATABASE_URL="sqlite:/app/data/data.db?mode=rwc" \
     LISTEN="0.0.0.0:18888" \
     PUBLIC_DIR="/app/public"
 CMD ["./relay-panel"]
+
+# ---- Node release image (used by docker-release.yml for multi-arch publishing) ----
+# The release workflow compiles relay-node natively on each architecture and
+# injects the verified binary here. This keeps the published runtime image
+# independent from QEMU/cross-compilation and matches the panel-release model.
+FROM debian:bookworm-slim AS node-release
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates iproute2 && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY release-dist/node/relay-node /app/relay-node
+RUN chmod 0755 /app/relay-node
+ENTRYPOINT ["./relay-node"]

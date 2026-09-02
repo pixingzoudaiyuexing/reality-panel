@@ -1,0 +1,148 @@
+name: Publish v1.1.0 Stable Once
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: reality-panel-v1.1.0-stable-once
+  cancel-in-progress: false
+
+env:
+  RELEASE_VERSION: 1.1.0
+  RELEASE_TAG: v1.1.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    if: github.actor != 'github-actions[bot]'
+    name: Promote RC9 and dispatch verified releases
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact main revision
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Decide whether publication is still needed
+        id: guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $RELEASE_TAG already exists; nothing to do."
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install release dependencies
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates file openssl sqlite3 pkg-config libssl-dev libssh2-1-dev zlib1g-dev
+
+      - name: Install Rust toolchain
+        if: steps.guard.outputs.publish == 'true'
+        run: rustup show
+
+      - name: Install Node.js
+        if: steps.guard.outputs.publish == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Promote source contract to v1.1.0
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          python3 scripts/promote-v1.1.0.py
+          git diff --check
+          bash scripts/release-version-contract.sh "$RELEASE_TAG"
+          bash scripts/release-check.sh "$RELEASE_VERSION"
+
+      - name: Run locked release validation
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          cargo fmt --all -- --check
+          cargo check --workspace --locked
+          cargo test --workspace --locked -- \
+            --skip db::schema::tests::migration_skips_index_when_duplicates_exist \
+            --skip db::sqlite_repo::tests::rule_insert_quota_guarded_port_scoped_by_group \
+            --skip db::sqlite_repo::tests::rule_insert_quota_guarded_surfaces_port_unique_violation \
+            --skip db::sqlite_repo::tests::rule_insert_quota_guarded_tcp_udp_share_port
+          bash scripts/node-artifact-permissions.test.sh
+
+      - name: Validate frontend
+        if: steps.guard.outputs.publish == 'true'
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run typecheck
+          npm run build
+
+      - name: Commit stable source atomically
+        if: steps.guard.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          test -n "$(git status --porcelain)"
+          git add \
+            crates/panel/Cargo.toml \
+            crates/node/Cargo.toml \
+            Cargo.lock \
+            scripts/relay-node-install.sh \
+            scripts/release-check.sh \
+            CHANGELOG.md \
+            CHANGELOG-NODE.md \
+            docs/VERSIONS.md \
+            README.md
+          git diff --cached --check
+          git commit -m "chore: 发布 v1.1.0 正式版"
+          git push origin HEAD:main
+
+      - name: Create immutable stable tag
+        if: steps.guard.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          RELEASE_SHA="$(git rev-parse HEAD)"
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            test "$(git rev-list -n1 "$RELEASE_TAG")" = "$RELEASE_SHA"
+          else
+            git tag -a "$RELEASE_TAG" "$RELEASE_SHA" -m "Reality Panel $RELEASE_TAG"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+
+      - name: Dispatch verified binary and Docker releases
+        if: steps.guard.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run binary-release.yml --ref "$RELEASE_TAG"
+          gh workflow run docker-release.yml --ref "$RELEASE_TAG"
+
+      - name: Write publication summary
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          {
+            echo "## Stable source promoted"
+            echo
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- Source: \`$(git rev-parse HEAD)\`"
+            echo "- Binary Release and Docker Release workflows dispatched."
+          } >> "$GITHUB_STEP_SUMMARY"
