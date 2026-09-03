@@ -7,6 +7,27 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.0] - 2026-09-03
+
+First stable 1.1 release. This promotes the accepted RC9 code line
+without additional Panel runtime, schema, or wire-protocol changes.
+
+### Highlights
+
+- Carrier Affinity with DNSMgr line-aware Relay selection and safe DNS
+  transactions.
+- Scheduled Relay switching with restart recovery and LKG protection.
+- Panel-centralized wildcard certificate lifecycle and distribution.
+- Multi-Relay readiness, diagnostics, safer topology switching, and the
+  RC9 DNS ownership/value-drift protections.
+
+### Upgrade
+
+- Back up the Panel database before upgrading.
+- RC9 to 1.1.0 keeps Config Protocol 10 and the RC9 database schema.
+- The standard systemd release and the official Docker images are built
+  from the same `v1.1.0` tagged source.
+
 ## [1.1.0-rc.9] - 2026-09-01
 
 Release candidate for DNS provider Carrier Affinity and line-aware Relay

@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.0] - 2026-09-03
+
+First stable 1.1 relay-node release. This promotes the accepted RC9
+node line without additional runtime or wire-protocol changes.
+Config Protocol remains 10 and Lifecycle Protocol remains 1.
+
 ## [1.1.0-rc.9] - 2026-09-01
 
 Unified Reality Panel release alignment. Carrier Affinity is implemented by

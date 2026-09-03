@@ -153,12 +153,13 @@ Reality Panel / Relay Node 使用 **Last Known Good（最后已知可用配置�
 | --- | --- |
 | Panel 系统 | Debian 12 |
 | Relay 系统 | Debian 12 |
-| 架构 | amd64 / x86_64 |
+| systemd 架构 | amd64 / x86_64 |
+| Docker 架构 | amd64 / arm64 |
 | 服务管理 | systemd |
 | 安装权限 | root |
 | Panel 默认端口 | `18888` |
 
-仓库中可能存在 Docker 相关开发或兼容文件，但 **Docker 不是当前 v1 的正式生产部署方式**。
+Docker / Docker Compose 现在也是正式生产部署方式；官方镜像由 `v*` Tag 从同一份源码构建并发布到 GitHub Container Registry，支持 `amd64` 与 `arm64`。
 
 ---
 
@@ -184,33 +185,58 @@ relay-panel.service
 
 全新安装成功后，终端会一次性显示初始管理员账号信息。请登录后立即修改密码。
 
-### 安装当前 RC9
+### Docker / Docker Compose
 
-当前 1.1 发布候选版本：
+正式版同时发布多架构 GHCR 镜像：
 
 ```text
-v1.1.0-rc.9
+ghcr.io/pixingzoudaiyuexing/relay-panel-panel:v1.1.0
+ghcr.io/pixingzoudaiyuexing/relay-panel-node:v1.1.0
+```
+
+使用仓库中的生产 Compose：
+
+```bash
+git clone https://github.com/pixingzoudaiyuexing/reality-panel.git
+cd reality-panel
+
+export RELAYPANEL_RELEASE_VERSION=v1.1.0
+export JWT_SECRET="$(openssl rand -hex 32)"
+export PANEL_KEY="$(openssl rand -hex 32)"
+
+docker compose -f docker-compose.release.yaml up -d
+```
+
+默认只启动 Panel；Relay Node 通常部署在独立服务器。需要同机 Node 时，
+再启用 `node` profile 并设置真实 `NODE_TOKEN`。
+
+### 安装 v1.1.0 正式版
+
+当前 1.1 正式版本：
+
+```text
+v1.1.0
 ```
 
 显式安装 RC9：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh \
-  | bash -s -- v1.1.0-rc.9
+  | bash -s -- v1.1.0
 ```
 
 自定义 Panel 端口：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh \
-  | bash -s -- v1.1.0-rc.9 --port 28888
+  | bash -s -- v1.1.0 --port 28888
 ```
 
 指定公网访问地址：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh \
-  | bash -s -- v1.1.0-rc.9 \
+  | bash -s -- v1.1.0 \
   --public-panel-url https://panel.example.com
 ```
 
@@ -251,7 +277,7 @@ reality-panel-update
 更新到指定版本，包括 RC：
 
 ```bash
-reality-panel-update v1.1.0-rc.9
+reality-panel-update v1.1.0
 ```
 
 Panel 更新完成后，再通过 Panel 的节点管理功能逐台更新 Relay Node。
@@ -262,7 +288,7 @@ Panel 更新完成后，再通过 Panel 的节点管理功能逐台更新 Relay 
 
 ## RC9 升级注意事项
 
-从旧版本升级到 `v1.1.0-rc.9` 前，**先备份 Panel 数据库**。
+从旧版本升级到 `v1.1.0` 前，**先备份 Panel 数据库**。
 
 RC9 为 Carrier Affinity 将 DNS 同步记录身份从：
 
@@ -312,7 +338,7 @@ systemctl status relay-panel
 使用当前 RC9 安装脚本：
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.1.0-rc.9/install.sh \
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.1.0/install.sh \
   | bash -s -- uninstall
 ```
 
@@ -336,7 +362,7 @@ Panel 和 Relay Node 使用同一个 Reality Panel Release 版本发布。
 当前 1.1 发布候选：
 
 ```text
-v1.1.0-rc.9
+v1.1.0
 ```
 
 Config Protocol：

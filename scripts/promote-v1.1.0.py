@@ -50,7 +50,7 @@ write(installer, installer_text.replace(BASE, VERSION))
 marker = "---\n\n"
 panel_path = "CHANGELOG.md"
 panel = read(panel_path)
-if f"## [{VERSION}]" in panel:
+if marker + f"## [{VERSION}] - {RELEASE_DATE}\n" in panel[:500]:
     raise SystemExit(f"{panel_path}: {VERSION} already exists")
 panel_entry = f"""## [{VERSION}] - {RELEASE_DATE}
 
@@ -80,7 +80,7 @@ write(panel_path, panel.replace(marker, marker + panel_entry, 1))
 
 node_path = "CHANGELOG-NODE.md"
 node = read(node_path)
-if f"## [{VERSION}]" in node:
+if marker + f"## [{VERSION}] - {RELEASE_DATE}\n" in node[:500]:
     raise SystemExit(f"{node_path}: {VERSION} already exists")
 node_entry = f"""## [{VERSION}] - {RELEASE_DATE}
 

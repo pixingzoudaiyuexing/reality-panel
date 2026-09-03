@@ -1,8 +1,7 @@
 # Release Contract
 
 Reality Panel uses one release tag and one compatibility version for the Panel
-and Node. The current stable release is `v1.0.1`; the current 1.1 development
-candidate is `v1.1.0-rc.9`. The wire protocol remains
+and Node. The current stable release is `v1.1.0`. The wire protocol remains
 `CONFIG_PROTOCOL_VERSION = 10`.
 
 ## Release assets
@@ -22,8 +21,10 @@ SHA256SUMS
 
 The release workflow checks that Cargo package versions equal the tag, builds
 both binaries and the frontend from that checkout, and creates the checksum
-manifest. No branch, raw commit, Actions artifact, GHCR image, or local binary
-is a production update source.
+manifest. The systemd updater only trusts GitHub Release assets. Official Docker
+deployments use GHCR images produced from the same tagged checkout by
+`.github/workflows/docker-release.yml`; branch/local images are not
+production update sources.
 
 ## Version locations
 
@@ -32,12 +33,13 @@ is a production update source.
 - `Cargo.lock` records both package versions.
 - `crates/panel/src/config.rs` reads the Panel package version by default.
 - `scripts/relay-node-install.sh` is a legacy compatibility script only.
-- `.github/workflows/binary-release.yml` is the only v1 release workflow.
+- `.github/workflows/binary-release.yml` publishes systemd release assets.
+- `.github/workflows/docker-release.yml` publishes the official multi-arch GHCR images.
 
 Run before tagging:
 
 ```bash
-bash scripts/release-check.sh 1.1.0-rc.9
+bash scripts/release-check.sh 1.1.0
 ```
 
 The default updater resolves the latest non-prerelease `v*` Release. An

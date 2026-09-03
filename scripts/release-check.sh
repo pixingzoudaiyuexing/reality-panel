@@ -20,8 +20,10 @@ bash "$ROOT/scripts/release-version-contract.sh" "v$VERSION"
 [ "$node_installer_version" = "$VERSION" ] || fail "Node installer version is $node_installer_version, expected $VERSION"
 grep -Fq "## [$VERSION]" "$ROOT/CHANGELOG.md" || fail "Panel changelog has no $VERSION entry"
 grep -Fq "## [$VERSION]" "$ROOT/CHANGELOG-NODE.md" || fail "Node changelog has no $VERSION entry"
-grep -Fq "candidate is \`v$VERSION\`" "$ROOT/docs/VERSIONS.md" || \
-    fail "docs/VERSIONS.md does not declare v$VERSION as the development candidate"
+if ! grep -Fq "stable release is \`v$VERSION\`" "$ROOT/docs/VERSIONS.md" && \
+   ! grep -Fq "candidate is \`v$VERSION\`" "$ROOT/docs/VERSIONS.md"; then
+    fail "docs/VERSIONS.md does not declare v$VERSION as stable or candidate"
+fi
 grep -q 'pixingzoudaiyuexing/reality-panel' "$ROOT/install.sh" || fail "installer repository is not Reality Panel"
 grep -q "tags:" "$ROOT/.github/workflows/binary-release.yml" || fail "tag-only release workflow missing"
 grep -q "cargo build --release --locked" "$ROOT/.github/workflows/binary-release.yml" || fail "release build is not locked"
@@ -29,6 +31,10 @@ grep -q 'reality-panel-linux-amd64' "$ROOT/.github/workflows/binary-release.yml"
 grep -q 'reality-node-linux-amd64' "$ROOT/.github/workflows/binary-release.yml" || fail "Node asset missing"
 grep -q 'SHA256SUMS' "$ROOT/.github/workflows/binary-release.yml" || fail "checksum manifest missing"
 grep -q 'container: rust:1.96-bookworm' "$ROOT/.github/workflows/binary-release.yml" || fail "release binaries are not built on Debian 12"
+[ -s "$ROOT/.github/workflows/docker-release.yml" ] || fail "Docker release workflow missing"
+grep -q 'packages: write' "$ROOT/.github/workflows/docker-release.yml" || fail "Docker release workflow cannot publish GHCR packages"
+grep -q 'relay-panel-panel' "$ROOT/.github/workflows/docker-release.yml" || fail "Panel GHCR image contract missing"
+grep -q 'relay-panel-node' "$ROOT/.github/workflows/docker-release.yml" || fail "Node GHCR image contract missing"
 grep -A2 -q 'defaults:' "$ROOT/.github/workflows/binary-release.yml" || fail "release job has no explicit run shell"
 grep -q 'shell: bash' "$ROOT/.github/workflows/binary-release.yml" || fail "release job does not use Bash"
 grep -q 'releases/download' "$ROOT/install.sh" || fail "installer is not Release-only"
