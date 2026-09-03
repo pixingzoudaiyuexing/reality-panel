@@ -297,8 +297,8 @@ describe('Rules grouped compact layout', () => {
     const editLabels = Array.from(edit.querySelectorAll('.ant-tabs-tabpane-active .ant-form-item-label'))
       .map((label) => label.textContent?.trim());
     expect(editLabels.slice(0, 4)).toEqual(['name', 'inboundGroup', 'transportMethod', 'listenPort']);
-    expect(within(edit).getByText('ruleRealityRuntimeSummary')).toBeInTheDocument();
-    expect(within(edit).getByText('ruleAdvancedSettings · ruleAdvancedNone')).toBeInTheDocument();
+    expect(await within(edit).findByText('ruleRealityRuntimeSummary')).toBeInTheDocument();
+    expect(await within(edit).findByText('ruleAdvancedSettings · ruleAdvancedNone')).toBeInTheDocument();
   });
 
   it('creates Reality with unchanged defaults while omitting edit-only and display-only fields', async () => {
