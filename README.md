@@ -187,28 +187,157 @@ relay-panel.service
 
 ### Docker / Docker Compose
 
-正式版同时发布多架构 GHCR 镜像：
+正式版同时发布 `amd64` / `arm64` 多架构 GHCR 镜像：
 
 ```text
 ghcr.io/pixingzoudaiyuexing/reality-panel-panel:v1.1.0
 ghcr.io/pixingzoudaiyuexing/reality-panel-node:v1.1.0
 ```
 
-使用仓库中的生产 Compose：
+需要 Docker Engine、Docker Compose Plugin 和 OpenSSL。生产部署使用仓库中的
+`docker-compose.release.yaml`，它只拉取已发布镜像，不在服务器上编译源码。
+
+#### Docker 安装 Panel
 
 ```bash
 git clone https://github.com/pixingzoudaiyuexing/reality-panel.git
 cd reality-panel
 
-export RELAYPANEL_RELEASE_VERSION=v1.1.0
-export JWT_SECRET="$(openssl rand -hex 32)"
-export PANEL_KEY="$(openssl rand -hex 32)"
+umask 077
+cat > .env <<EOF
+RELAYPANEL_RELEASE_VERSION=v1.1.0
+JWT_SECRET=$(openssl rand -hex 32)
+PANEL_KEY=$(openssl rand -hex 32)
+EOF
 
-docker compose -f docker-compose.release.yaml up -d
+docker compose -f docker-compose.release.yaml pull panel
+docker compose -f docker-compose.release.yaml up -d panel
 ```
 
-默认只启动 Panel；Relay Node 通常部署在独立服务器。需要同机 Node 时，
-再启用 `node` profile 并设置真实 `NODE_TOKEN`。
+`.env` 包含长期使用的签名和加密密钥。请限制其权限、纳入备份，不要在重建或升级时重新生成。
+
+确认容器和健康状态：
+
+```bash
+docker compose -f docker-compose.release.yaml ps
+docker compose -f docker-compose.release.yaml logs --tail=100 panel
+curl -fsS http://127.0.0.1:18888/api/v1/health
+docker compose -f docker-compose.release.yaml exec panel ./relay-panel --version
+```
+
+默认只启动 Panel，并将 `18888` 发布到所有网络接口。需要交给本机反向代理时，在 `.env` 中增加：
+
+```text
+RELAYPANEL_PANEL_PORT_BINDING=127.0.0.1:18888
+PUBLIC_PANEL_URL=https://panel.example.com
+```
+
+#### 可选：同机启动 Relay Node
+
+通常应从 Panel 部署独立 Relay Node。确实需要在 Panel 主机同时运行 Node 时，先在 Panel
+中取得真实的入口分组 Token，再写入 `.env`：
+
+```bash
+cat >> .env <<'EOF'
+RELAYPANEL_NODE_TAG=v1.1.0
+NODE_TOKEN=请替换为真实入口分组Token
+EOF
+
+docker compose -f docker-compose.release.yaml --profile node pull panel node
+docker compose -f docker-compose.release.yaml --profile node up -d panel node
+docker compose -f docker-compose.release.yaml --profile node exec node ./relay-node --version
+```
+
+不要使用示例文字或 Panel 管理密钥代替 `NODE_TOKEN`。
+
+#### Docker 常用运维命令
+
+```bash
+# 查看状态
+docker compose -f docker-compose.release.yaml ps
+
+# 查看日志
+docker compose -f docker-compose.release.yaml logs -f --tail=200 panel
+
+# 重启 Panel
+docker compose -f docker-compose.release.yaml restart panel
+
+# 停止后再启动
+docker compose -f docker-compose.release.yaml stop panel
+docker compose -f docker-compose.release.yaml start panel
+```
+
+Compose 默认使用命名卷 `panel_data` 保存 SQLite 数据；重建容器不会删除该卷。
+
+#### Docker 升级
+
+升级前先备份 `.env` 和默认 SQLite 数据卷。下面的备份命令会短暂停止 Panel，避免复制过程中
+数据库继续写入：
+
+```bash
+mkdir -p backups
+cp -p .env "backups/env-$(date +%Y%m%d-%H%M%S)"
+
+docker compose -f docker-compose.release.yaml stop panel
+docker compose -f docker-compose.release.yaml run --rm --no-deps --entrypoint /bin/sh panel \
+  -c 'tar -C /app/data -czf - .' \
+  > "backups/panel-data-$(date +%Y%m%d-%H%M%S).tar.gz"
+docker compose -f docker-compose.release.yaml start panel
+```
+
+以上数据卷备份适用于默认 SQLite 部署。使用 PostgreSQL 时，应另外执行 `pg_dump`，不要用文件复制
+代替数据库备份。
+
+然后执行 `git pull --ff-only`，并将 `.env` 中的 `RELAYPANEL_RELEASE_VERSION` 改成需要升级到的
+稳定版本，再拉取和重建 Panel：
+
+```bash
+git pull --ff-only
+docker compose -f docker-compose.release.yaml pull panel
+docker compose -f docker-compose.release.yaml up -d --no-deps panel
+
+docker compose -f docker-compose.release.yaml exec panel ./relay-panel --version
+curl -fsS http://127.0.0.1:18888/api/v1/health
+```
+
+同机 Node 也需要升级时，同时更新 `.env` 中的 `RELAYPANEL_NODE_TAG`，再执行：
+
+```bash
+docker compose -f docker-compose.release.yaml --profile node pull panel node
+docker compose -f docker-compose.release.yaml --profile node up -d panel node
+```
+
+远端 Relay Node 不会因为重建 Panel 容器而自动升级；请在 Panel 的节点管理中逐台执行更新。
+
+回滚前先确认旧版本能够读取当前数据库格式。不能确认时，应停止容器并恢复升级前的数据卷备份，
+不要只改镜像标签后直接启动旧版本。
+
+#### Docker 卸载
+
+只删除容器和网络、保留 `.env` 与命名卷中的数据：
+
+```bash
+docker compose -f docker-compose.release.yaml --profile node --profile caddy --profile postgres \
+  down --remove-orphans
+```
+
+以后仍可在当前目录执行 `docker compose -f docker-compose.release.yaml up -d panel` 恢复服务。
+
+确认不再需要任何本地数据后，才执行彻底删除。以下命令会永久删除 SQLite、PostgreSQL 和 Caddy
+命名卷，无法撤销：
+
+```bash
+docker compose -f docker-compose.release.yaml --profile node --profile caddy --profile postgres \
+  down --volumes --remove-orphans
+```
+
+容器和数据卷删除后，如需释放镜像空间，可再删除已拉取镜像：
+
+```bash
+docker image rm \
+  ghcr.io/pixingzoudaiyuexing/reality-panel-panel:v1.1.0 \
+  ghcr.io/pixingzoudaiyuexing/reality-panel-node:v1.1.0
+```
 
 ### 安装 v1.1.0 正式版
 
@@ -218,7 +347,7 @@ docker compose -f docker-compose.release.yaml up -d
 v1.1.0
 ```
 
-显式安装 RC9：
+显式安装 v1.1.0：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh \

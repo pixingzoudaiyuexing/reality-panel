@@ -68,10 +68,10 @@ services:
         hard: 65536
     environment:
       - PANEL_URL=http://127.0.0.1:18888
-      # NODE_TOKEN has no default: the node refuses to start with an unset or
-      # "default-token" value. Set NODE_TOKEN to a real inbound-group token
-      # from the panel UI before enabling the node profile.
-      - NODE_TOKEN=${NODE_TOKEN:?NODE_TOKEN must be set to a real inbound-group token from the panel UI}
+      # Panel-only Compose parsing allows this to remain empty. Once the node
+      # profile is enabled, relay-node rejects an empty or "default-token"
+      # value. Set a real inbound-group token from the panel UI first.
+      - NODE_TOKEN=${NODE_TOKEN:-}
       - POLL_INTERVAL=10
       # v1.0.5: dual-stack listen + outbound source binding. All optional —
       # the defaults already enable IPv4+IPv6 listening with system routing.
