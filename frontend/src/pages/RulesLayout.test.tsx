@@ -386,7 +386,7 @@ describe('Rules grouped compact layout', () => {
   it('keeps camouflage enabled when advanced settings stay collapsed', async () => {
     setupAdmin([rule(1, { camouflage_enabled: true })]);
     const dialog = await openRuleEditor();
-    expect(within(dialog).getByText('ruleRealityRuntimeSummary')).toBeInTheDocument();
+    expect(await within(dialog).findByText('ruleRealityRuntimeSummary')).toBeInTheDocument();
     expect(within(dialog).queryByLabelText('camouflageTlsPort')).toBeNull();
     expect(within(dialog).queryByLabelText('certificateRenewBefore')).toBeNull();
     expect(within(dialog).getByText('ruleAdvancedSettings · ruleAdvancedNone')).toBeInTheDocument();
@@ -408,7 +408,7 @@ describe('Rules grouped compact layout', () => {
   it('preserves an enabled Proxy Protocol without opening its collapse', async () => {
     setupAdmin([rule(1, { send_proxy_protocol: true })]);
     const dialog = await openRuleEditor();
-    expect(within(dialog).getByText('ruleAdvancedSettings · ruleAdvancedProxyEnabled')).toBeInTheDocument();
+    expect(await within(dialog).findByText('ruleAdvancedSettings · ruleAdvancedProxyEnabled')).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole('button', { name: 'save' }));
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'editRule' })).toBeNull());
     expect(mockPut).not.toHaveBeenCalled();
