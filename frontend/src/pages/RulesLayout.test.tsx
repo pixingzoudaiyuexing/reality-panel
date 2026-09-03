@@ -430,9 +430,9 @@ describe('Rules grouped compact layout', () => {
     })]);
     const dialog = await openRuleEditor();
     fireEvent.click(within(dialog).getByRole('tab', { name: 'tabForward' }));
-    expect(within(dialog).getByText('lbFailover')).toBeInTheDocument();
-    expect(within(dialog).getByText('ruleForwardAdvancedSettings · ruleAdvancedConfiguredCount')).toBeInTheDocument();
-    expect(within(dialog).getByText('rateLimits · maxConnections · autoRestart')).toBeInTheDocument();
+    expect(await within(dialog).findByText('lbFailover')).toBeInTheDocument();
+    expect(await within(dialog).findByText('ruleForwardAdvancedSettings · ruleAdvancedConfiguredCount')).toBeInTheDocument();
+    expect(await within(dialog).findByText('rateLimits · maxConnections · autoRestart')).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole('button', { name: 'save' }));
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'editRule' })).toBeNull());
     expect(mockPut).not.toHaveBeenCalled();
