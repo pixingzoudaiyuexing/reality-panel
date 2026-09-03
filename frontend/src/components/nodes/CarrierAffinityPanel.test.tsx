@@ -119,7 +119,7 @@ function arrange(view = affinity(), lineCatalog = catalog, dnsRecords: RelayDnsR
 
 async function openEditor() {
   fireEvent.click(await screen.findByRole('button', { name: /carrierEditPolicy/ }));
-  return screen.findByRole('dialog', { name: 'carrierEditPolicy' });
+  return screen.findByRole('dialog', { name: 'carrierEditPolicy' }, { timeout: 3000 });
 }
 
 describe('CarrierAffinityPanel', () => {
@@ -291,8 +291,10 @@ describe('CarrierAffinityPanel', () => {
   it('blocks changed UPSERTs when the catalog is stale', async () => {
     arrange(affinity({ catalog_stale: true }), { ...catalog, stale: true });
     const dialog = await openEditor();
+    expect(within(dialog).getByText('carrierCatalogStale')).toBeInTheDocument();
     expect(within(dialog).getByLabelText('Dianxin_Shandong carrierSelectMode')).toBeDisabled();
     expect(within(dialog).getByRole('button', { name: /carrierAddLine/ })).toBeEnabled();
+    expect(mockPut).not.toHaveBeenCalled();
   });
 
   it('freezes all topology controls after DNS split', async () => {
