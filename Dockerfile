@@ -79,6 +79,7 @@ ENTRYPOINT ["./relay-node"]
 # produce `linux/amd64` and `linux/arm64` images from their respective native
 # runners without QEMU or cross-compilation toolchains.
 FROM debian:bookworm-slim AS panel-release
+LABEL org.opencontainers.image.source="https://github.com/pixingzoudaiyuexing/reality-panel"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app
@@ -109,6 +110,7 @@ CMD ["./relay-panel"]
 # injects the verified binary here. This keeps the published runtime image
 # independent from QEMU/cross-compilation and matches the panel-release model.
 FROM debian:bookworm-slim AS node-release
+LABEL org.opencontainers.image.source="https://github.com/pixingzoudaiyuexing/reality-panel"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates iproute2 && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /app

@@ -190,8 +190,8 @@ relay-panel.service
 正式版同时发布多架构 GHCR 镜像：
 
 ```text
-ghcr.io/pixingzoudaiyuexing/relay-panel-panel:v1.1.0
-ghcr.io/pixingzoudaiyuexing/relay-panel-node:v1.1.0
+ghcr.io/pixingzoudaiyuexing/reality-panel-panel:v1.1.0
+ghcr.io/pixingzoudaiyuexing/reality-panel-node:v1.1.0
 ```
 
 使用仓库中的生产 Compose：

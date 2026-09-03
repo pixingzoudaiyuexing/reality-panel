@@ -634,7 +634,7 @@ export const enUS: Dict = {
   nodeUpgrade: 'Update',
   nodeUpgradeTip: 'Upgrade to v{v}',
   nodeUpgradeLatest: 'Up to date',
-  nodeUpgradeDocker: 'Docker deploy: pull the latest relay-panel-node image and recreate the container (no binary self-replace)',
+  nodeUpgradeDocker: 'Docker deploy: pull the latest reality-panel-node image and recreate the container (no binary self-replace)',
   nodeUpgradeManual: 'Manual run: one-click upgrade unavailable (nothing would restart it)',
   nodeUpgradeConfirmTitle: 'Upgrade node',
   nodeUpgradeConfirm: 'Upgrade to the Panel-managed v{v} artifact? The node briefly stops forwarding while it restarts.',

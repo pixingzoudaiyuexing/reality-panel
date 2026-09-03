@@ -115,8 +115,8 @@ docker_anchor = """grep -q 'container: rust:1.96-bookworm' "$ROOT/.github/workfl
 docker_checks = """grep -q 'container: rust:1.96-bookworm' "$ROOT/.github/workflows/binary-release.yml" || fail "release binaries are not built on Debian 12"
 [ -s "$ROOT/.github/workflows/docker-release.yml" ] || fail "Docker release workflow missing"
 grep -q 'packages: write' "$ROOT/.github/workflows/docker-release.yml" || fail "Docker release workflow cannot publish GHCR packages"
-grep -q 'relay-panel-panel' "$ROOT/.github/workflows/docker-release.yml" || fail "Panel GHCR image contract missing"
-grep -q 'relay-panel-node' "$ROOT/.github/workflows/docker-release.yml" || fail "Node GHCR image contract missing"
+grep -q 'reality-panel-panel' "$ROOT/.github/workflows/docker-release.yml" || fail "Panel GHCR image contract missing"
+grep -q 'reality-panel-node' "$ROOT/.github/workflows/docker-release.yml" || fail "Node GHCR image contract missing"
 """
 if release_check.count(docker_anchor) != 1:
     raise SystemExit(f"{release_check_path}: Docker check insertion anchor not found")
@@ -200,8 +200,8 @@ docker_section = f"""### Docker / Docker Compose
 正式版同时发布多架构 GHCR 镜像：
 
 ```text
-ghcr.io/pixingzoudaiyuexing/relay-panel-panel:v{VERSION}
-ghcr.io/pixingzoudaiyuexing/relay-panel-node:v{VERSION}
+ghcr.io/pixingzoudaiyuexing/reality-panel-panel:v{VERSION}
+ghcr.io/pixingzoudaiyuexing/reality-panel-node:v{VERSION}
 ```
 
 使用仓库中的生产 Compose：

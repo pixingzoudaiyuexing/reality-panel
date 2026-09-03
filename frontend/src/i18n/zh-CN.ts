@@ -631,7 +631,7 @@ export const zhCN = {
   nodeUpgrade: '节点更新',
   nodeUpgradeTip: '升级到 v{v}',
   nodeUpgradeLatest: '已是最新',
-  nodeUpgradeDocker: 'Docker 部署：请拉取最新 relay-panel-node 镜像并重建容器（不支持二进制自替换）',
+  nodeUpgradeDocker: 'Docker 部署：请拉取最新 reality-panel-node 镜像并重建容器（不支持二进制自替换）',
   nodeUpgradeManual: '手动运行：不支持一键升级（退出后无人拉起）',
   nodeUpgradeConfirmTitle: '确认升级节点',
   nodeUpgradeConfirm: '升级到 Panel 管理的 v{v} artifact？节点重启期间转发会短暂中断。',

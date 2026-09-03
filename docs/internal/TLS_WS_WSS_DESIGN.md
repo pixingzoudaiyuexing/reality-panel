@@ -1197,12 +1197,12 @@ exec /opt/relay-node/relay-node
 
 ### 10.3 Docker Compose 示例更新
 
-`docker-compose.release.yaml`（v0.3.0 起）。镜像名遵循项目发布规范：`relay-panel-panel`（面板）和 `relay-panel-node`（节点）：
+`docker-compose.release.yaml`（v0.3.0 起）。当前镜像名遵循项目发布规范：`reality-panel-panel`（面板）和 `reality-panel-node`（节点）：
 
 ```yaml
 services:
   panel:
-    image: ghcr.io/pixingzoudaiyuexing/relay-panel-panel:0.3.0
+    image: ghcr.io/pixingzoudaiyuexing/reality-panel-panel:0.3.0
     ports:
       - "18888:18888"
     environment:
@@ -1224,7 +1224,7 @@ services:
       - panel
 
   node:
-    image: ghcr.io/pixingzoudaiyuexing/relay-panel-node:0.3.0
+    image: ghcr.io/pixingzoudaiyuexing/reality-panel-node:0.3.0
     environment:
       - PANEL_URL=http://panel:18888
       - NODE_TOKEN=${NODE_TOKEN}
@@ -1240,9 +1240,9 @@ volumes:
   caddy-config:
 ```
 
-> **镜像命名约定**：GHCR 镜像统一以 `relay-panel-` 为前缀（仓库归属），后缀区分服务类型：
-> - `ghcr.io/pixingzoudaiyuexing/relay-panel-panel:<version>` — 面板
-> - `ghcr.io/pixingzoudaiyuexing/relay-panel-node:<version>` — 转发节点
+> **镜像命名约定**：GHCR 镜像统一以 `reality-panel-` 为前缀（仓库归属），后缀区分服务类型：
+> - `ghcr.io/pixingzoudaiyuexing/reality-panel-panel:<version>` — 面板
+> - `ghcr.io/pixingzoudaiyuexing/reality-panel-node:<version>` — 转发节点
 >
 > 与 `docker-compose.release.yaml`、`.github/workflows/docker-release.yml`、`docs/VERSIONS.md` 保持一致。
 

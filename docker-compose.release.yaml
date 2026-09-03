@@ -19,7 +19,7 @@ services:
   panel:
     # Release-time values are explicit. The placeholder deliberately fails at
     # image pull time instead of silently deploying an unrelated old release.
-    image: ghcr.io/pixingzoudaiyuexing/relay-panel-panel:${RELAYPANEL_PANEL_TAG:-${RELAYPANEL_RELEASE_VERSION:-RELEASE_VERSION_REQUIRED}}
+    image: ghcr.io/pixingzoudaiyuexing/reality-panel-panel:${RELAYPANEL_PANEL_TAG:-${RELAYPANEL_RELEASE_VERSION:-RELEASE_VERSION_REQUIRED}}
     ports:
       # RELAYPANEL_WEB_MODE controls how the panel port is published:
       #   direct         → 0.0.0.0:18888:18888  (public, default)
@@ -55,7 +55,7 @@ services:
     # Optional local node container: set its independently released tag
     # explicitly. Remote Relay bootstrap/lifecycle use the matching artifacts
     # embedded in the panel image above, not this image.
-    image: ghcr.io/pixingzoudaiyuexing/relay-panel-node:${RELAYPANEL_NODE_TAG:-RELEASE_NODE_TAG_REQUIRED}
+    image: ghcr.io/pixingzoudaiyuexing/reality-panel-node:${RELAYPANEL_NODE_TAG:-RELEASE_NODE_TAG_REQUIRED}
     profiles:
       - node
     network_mode: host

@@ -16,8 +16,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  PANEL_IMAGE: ghcr.io/pixingzoudaiyuexing/relay-panel-panel
-  NODE_IMAGE: ghcr.io/pixingzoudaiyuexing/relay-panel-node
+  PANEL_IMAGE: ghcr.io/pixingzoudaiyuexing/reality-panel-panel
+  NODE_IMAGE: ghcr.io/pixingzoudaiyuexing/reality-panel-node
 
 jobs:
   metadata:
