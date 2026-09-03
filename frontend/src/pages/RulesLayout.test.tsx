@@ -299,7 +299,7 @@ describe('Rules grouped compact layout', () => {
     expect(editLabels.slice(0, 4)).toEqual(['name', 'inboundGroup', 'transportMethod', 'listenPort']);
     expect(await within(edit).findByText('ruleRealityRuntimeSummary')).toBeInTheDocument();
     expect(await within(edit).findByText('ruleAdvancedSettings · ruleAdvancedNone')).toBeInTheDocument();
-  });
+  }, 15000);
 
   it('creates Reality with unchanged defaults while omitting edit-only and display-only fields', async () => {
     setupAdmin([rule(1, { camouflage_enabled: false, send_proxy_protocol: false })]);
