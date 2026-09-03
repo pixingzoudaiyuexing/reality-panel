@@ -118,8 +118,10 @@ function arrange(view = affinity(), lineCatalog = catalog, dnsRecords: RelayDnsR
 }
 
 async function openEditor() {
-  fireEvent.click(await screen.findByRole('button', { name: /carrierEditPolicy/ }));
-  return screen.findByRole('dialog', { name: 'carrierEditPolicy' }, { timeout: 3000 });
+  const button = await screen.findByRole('button', { name: /carrierEditPolicy/ });
+  await waitFor(() => expect(button).toBeEnabled());
+  fireEvent.click(button);
+  return screen.findByRole('dialog', { name: 'carrierEditPolicy' });
 }
 
 describe('CarrierAffinityPanel', () => {
