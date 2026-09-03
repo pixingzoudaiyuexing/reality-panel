@@ -26,6 +26,7 @@ use relay_shared::protocol::{
 };
 use relay_shared::reconciliation::certificate_domain_covers_sni;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
@@ -50,6 +51,11 @@ pub enum NodeConfigBuildError {
 pub struct GroupCertificateScope {
     pub domain: String,
     pub snis: Vec<String>,
+}
+
+struct CertificateDomainResolution {
+    domain: String,
+    issuance_authorized: bool,
 }
 
 impl std::fmt::Display for NodeConfigBuildError {
@@ -158,7 +164,9 @@ pub async fn build_node_config_for_node(
         if effective_rule.camouflage_enabled && effective_rule.node_transport == "nginx_sni" {
             if let Some(sni) = camouflage_sni {
                 let certificate_domain =
-                    certificate_domain_for_rule(db, effective_rule.id, &sni).await?;
+                    certificate_domain_resolution_for_rule(db, effective_rule.id, &sni)
+                        .await?
+                        .domain;
                 let expected_public_ip =
                     expected_camouflage_public_ipv4(db, &group, node_id).await?;
                 camouflage_by_sni
@@ -205,6 +213,27 @@ pub async fn certificate_scopes_for_group(
     db: &dyn Repository,
     group_id: i64,
 ) -> Result<Vec<GroupCertificateScope>, NodeConfigBuildError> {
+    let (scopes, _) = certificate_scope_maps_for_group(db, group_id).await?;
+    Ok(group_certificate_scopes(scopes))
+}
+
+pub async fn issuance_authorized_certificate_scopes_for_group(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<Vec<GroupCertificateScope>, NodeConfigBuildError> {
+    let (scopes, authorized_domains) = certificate_scope_maps_for_group(db, group_id).await?;
+    Ok(group_certificate_scopes(
+        scopes
+            .into_iter()
+            .filter(|(domain, _)| authorized_domains.contains(domain))
+            .collect(),
+    ))
+}
+
+async fn certificate_scope_maps_for_group(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<(BTreeMap<String, BTreeSet<String>>, BTreeSet<String>), NodeConfigBuildError> {
     let group = GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await?;
     match group {
         Some(group) if group.group_type == "in" => {}
@@ -213,6 +242,7 @@ pub async fn certificate_scopes_for_group(
     }
 
     let mut scopes = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut authorized_domains = BTreeSet::new();
     for rule in db.list_active_for_config(group_id).await? {
         let Some(rule) = effective_rule_for_config(db, &rule).await? else {
             continue;
@@ -229,16 +259,20 @@ pub async fn certificate_scopes_for_group(
         else {
             continue;
         };
-        let domain = certificate_domain_for_rule(db, rule.id, &sni).await?;
-        if !certificate_domain_covers_sni(&domain, &sni) {
+        let resolution = certificate_domain_resolution_for_rule(db, rule.id, &sni).await?;
+        if !certificate_domain_covers_sni(&resolution.domain, &sni) {
             return Err(NodeConfigBuildError::InvalidConfig(format!(
-                "certificate domain {domain} does not cover camouflage SNI {sni}"
+                "certificate domain {} does not cover camouflage SNI {sni}",
+                resolution.domain
             )));
         }
-        scopes.entry(domain).or_default().insert(sni);
+        if resolution.issuance_authorized {
+            authorized_domains.insert(resolution.domain.clone());
+        }
+        scopes.entry(resolution.domain).or_default().insert(sni);
     }
 
-    Ok(group_certificate_scopes(scopes))
+    Ok((scopes, authorized_domains))
 }
 
 fn group_certificate_scopes(
@@ -293,14 +327,69 @@ pub async fn build_node_config_snapshot(
     build_node_config_snapshot_for_node(db, group_id, None).await
 }
 
+#[cfg(test)]
 pub async fn build_node_config_snapshot_for_node(
     db: &dyn Repository,
     group_id: i64,
     node_id: Option<&str>,
 ) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
+    build_node_config_snapshot_for_node_inner(db, None, group_id, node_id).await
+}
+
+pub async fn build_node_config_snapshot_for_node_with_certificate_inventory(
+    db: &dyn Repository,
+    certificate_state_dir: &Path,
+    group_id: i64,
+    node_id: Option<&str>,
+) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
+    build_node_config_snapshot_for_node_inner(db, Some(certificate_state_dir), group_id, node_id)
+        .await
+}
+
+async fn build_node_config_snapshot_for_node_inner(
+    db: &dyn Repository,
+    certificate_state_dir: Option<&Path>,
+    group_id: i64,
+    node_id: Option<&str>,
+) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
     let lock = CONFIG_BUILD_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().await;
-    let config = build_node_config_for_node(db, group_id, node_id).await?;
+    let mut config = build_node_config_for_node(db, group_id, node_id).await?;
+    if let Some(state_dir) = certificate_state_dir {
+        let mut requested = BTreeMap::<String, BTreeSet<String>>::new();
+        for site in &config.camouflage_sites {
+            requested
+                .entry(site.certificate.domain.clone())
+                .or_default()
+                .insert(site.sni.clone());
+        }
+        let scopes = requested
+            .into_iter()
+            .map(|(domain, snis)| GroupCertificateScope {
+                domain,
+                snis: snis.into_iter().collect(),
+            })
+            .collect();
+        let resolved = crate::service::panel_certificate::resolve_managed_certificate_scopes(
+            state_dir, group_id, scopes,
+        )
+        .await
+        .map_err(NodeConfigBuildError::InvalidConfig)?;
+        let domains_by_sni = resolved
+            .into_iter()
+            .flat_map(|scope| {
+                scope
+                    .snis
+                    .into_iter()
+                    .map(move |sni| (sni, scope.domain.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for site in &mut config.camouflage_sites {
+            if let Some(domain) = domains_by_sni.get(&site.sni) {
+                site.certificate.domain = domain.clone();
+            }
+        }
+    }
     let fingerprint = relay_shared::reconciliation::config_fingerprint(&config)
         .as_str()
         .to_string();
@@ -381,28 +470,63 @@ async fn expected_camouflage_public_ipv4(
 
 /// 根据已经验证过的 Panel DNS ownership 计算证书作用域。
 /// 没有 ownership binding 时保持单域名证书；绝不靠“最后两段域名”猜 zone。
-async fn certificate_domain_for_rule(
+async fn certificate_domain_resolution_for_rule(
     db: &dyn Repository,
     rule_id: i64,
     sni: &str,
-) -> Result<String, DbError> {
+) -> Result<CertificateDomainResolution, DbError> {
     let exact = sni.trim_end_matches('.').to_ascii_lowercase();
+    let pending = || CertificateDomainResolution {
+        domain: exact.clone(),
+        issuance_authorized: false,
+    };
     let Some(sync) = db
         .find_dns_record_sync(rule_id, crate::service::dnsmgr::DEFAULT_LINE_KEY)
         .await?
     else {
-        return Ok(exact);
+        return Ok(pending());
     };
-    if !sync.fqdn.trim_end_matches('.').eq_ignore_ascii_case(&exact) {
-        return Ok(exact);
+    if !sync.fqdn.trim_end_matches('.').eq_ignore_ascii_case(&exact)
+        || sync.record_type != "A"
+        || sync.line_key != crate::service::dnsmgr::DEFAULT_LINE_KEY
+        || sync.desired_action != "UPSERT"
+        || sync.ownership != "PANEL"
+        || !matches!(
+            sync.state.as_str(),
+            "MUTATION_VERIFIED" | "PROPAGATING" | "PROPAGATED"
+        )
+        || sync.mutation_verified_at.is_none()
+        || sync.expected_value.is_none()
+    {
+        return Ok(pending());
     }
     let Some(binding) = db
         .find_dns_record_binding_for_rule(rule_id, &sync.fqdn, &sync.record_type, &sync.line_key)
         .await?
     else {
-        return Ok(exact);
+        return Ok(pending());
     };
-    Ok(wildcard_domain_for_managed_sni(&exact, &binding.zone_name).unwrap_or(exact))
+    let binding_authorized = binding.rule_id == Some(rule_id)
+        && binding
+            .fqdn
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(&exact)
+        && binding.record_type == sync.record_type
+        && binding.line_key == sync.line_key
+        && binding.desired_value == sync.expected_value.as_deref().unwrap_or_default()
+        && binding.state == "BOUND"
+        && binding.last_observed_at.is_some()
+        && binding.last_error_category.is_none()
+        && binding.zone_id > 0
+        && !binding.zone_name.trim().is_empty()
+        && !binding.record_id.trim().is_empty();
+    if !binding_authorized {
+        return Ok(pending());
+    }
+    Ok(CertificateDomainResolution {
+        domain: wildcard_domain_for_managed_sni(&exact, &binding.zone_name).unwrap_or(exact),
+        issuance_authorized: true,
+    })
 }
 
 fn wildcard_domain_for_managed_sni(sni: &str, zone_name: &str) -> Option<String> {
@@ -584,6 +708,84 @@ mod tests {
                     "op2.13886.xyz".into(),
                     "op3.13886.xyz".into(),
                 ],
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_fallback_is_pending_until_verified_binding_authorizes_issuance() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        add_group(&pool, 10, "in", 2).await;
+        add_rule(&pool, 100, 2, 10, 443).await;
+        sqlx::query(
+            "UPDATE forward_rules SET protocol='tcp', public_transport='nginx_sni', \
+             node_transport='nginx_sni', entry_transport='nginx_sni', \
+             sni='b.example.com', camouflage_enabled=1 WHERE id=100",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repository = repo(&pool);
+
+        assert_eq!(
+            certificate_scopes_for_group(&repository, 10).await.unwrap(),
+            vec![GroupCertificateScope {
+                domain: "b.example.com".into(),
+                snis: vec!["b.example.com".into()],
+            }]
+        );
+        assert!(
+            issuance_authorized_certificate_scopes_for_group(&repository, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        sqlx::query(
+            "INSERT INTO dns_record_syncs \
+             (rule_id, fqdn, record_type, expected_value, line, line_key, desired_action, \
+              state, ownership, created_at, updated_at) \
+             VALUES (100, 'b.example.com', 'A', '192.0.2.10', 'default', 'default', \
+                     'UPSERT', 'PENDING', 'UNKNOWN', '2026-09-04 00:00:00', \
+                     '2026-09-04 00:00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO dns_record_bindings \
+             (rule_id, fqdn, zone_id, zone_name, host, record_type, line, line_key, \
+              record_id, desired_value, state, last_observed_at, created_at, updated_at) \
+             VALUES (100, 'b.example.com', 7, 'example.com', 'b', 'A', 'default', \
+                     'default', 'record-100', '192.0.2.10', 'BOUND', '2026-09-04 00:00:00', \
+                     '2026-09-04 00:00:00', '2026-09-04 00:00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            issuance_authorized_certificate_scopes_for_group(&repository, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a binding alone is not enough before mutation read-back state is committed"
+        );
+
+        sqlx::query(
+            "UPDATE dns_record_syncs SET state='MUTATION_VERIFIED', ownership='PANEL', \
+             mutation_verified_at='2026-09-04 00:00:01' WHERE rule_id=100 AND line_key='default'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            issuance_authorized_certificate_scopes_for_group(&repository, 10)
+                .await
+                .unwrap(),
+            vec![GroupCertificateScope {
+                domain: "*.example.com".into(),
+                snis: vec!["b.example.com".into()],
             }]
         );
     }

@@ -18,6 +18,7 @@ use crate::integrations::dnsmgr::{
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const DISCOVERY_PAGE_LIMIT: u16 = 100;
@@ -29,6 +30,30 @@ const DNS_SYNC_BASE_BACKOFF_SECS: u64 = 5;
 const DNS_SYNC_MAX_BACKOFF_SECS: u64 = 300;
 const PUBLIC_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PROVIDER_LINE_ID_BYTES: usize = 256;
+static DNS_RECONCILE_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+
+fn dns_reconcile_notify() -> &'static tokio::sync::Notify {
+    DNS_RECONCILE_NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+fn notify_reconcile() {
+    dns_reconcile_notify().notify_one();
+}
+
+fn notify_certificate_reconcile_on_ownership<F>(
+    line_key: &str,
+    mutation_state_saved: bool,
+    notify: F,
+) -> bool
+where
+    F: FnOnce(),
+{
+    if line_key != DEFAULT_LINE_KEY || !mutation_state_saved {
+        return false;
+    }
+    notify();
+    true
+}
 
 /// KVS key holding the single Panel-wide DNSMgr integration configuration.
 pub const DNSMGR_CONFIG_KEY: &str = "dns:dnsmgr";
@@ -2082,6 +2107,7 @@ pub async fn schedule_rule(
         )
         .await?;
     }
+    notify_reconcile();
     Ok(())
 }
 
@@ -2544,6 +2570,11 @@ async fn reconcile_one(
                     ));
                 }
                 if sync.line_key == DEFAULT_LINE_KEY {
+                    notify_certificate_reconcile_on_ownership(
+                        &sync.line_key,
+                        true,
+                        crate::service::panel_certificate::notify_reconcile,
+                    );
                     if let Some(audit) = observe_and_store(
                         db,
                         &sync,
@@ -2944,7 +2975,10 @@ pub fn spawn(state: AppState) {
             DNS_SYNC_TICK.as_secs()
         );
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = dns_reconcile_notify().notified() => {}
+            }
             reconciliation_tick(&state).await;
         }
     });
@@ -2981,6 +3015,31 @@ mod tests {
         assert!(!serialized.contains(&settings.api_key));
         assert!(serialized.contains("has_api_key"));
         assert!(!format!("{settings:?}").contains(&settings.api_key));
+    }
+
+    #[tokio::test]
+    async fn verified_default_ownership_wakes_certificate_reconcile_without_public_a_gate() {
+        let notify = tokio::sync::Notify::new();
+        assert!(notify_certificate_reconcile_on_ownership(
+            DEFAULT_LINE_KEY,
+            true,
+            || notify.notify_one(),
+        ));
+        tokio::time::timeout(Duration::from_millis(50), notify.notified())
+            .await
+            .expect("verified default ownership must wake certificate reconcile");
+
+        let line_notify = tokio::sync::Notify::new();
+        assert!(!notify_certificate_reconcile_on_ownership(
+            "dnsmgr:Dianxin",
+            true,
+            || line_notify.notify_one(),
+        ));
+        assert!(!notify_certificate_reconcile_on_ownership(
+            DEFAULT_LINE_KEY,
+            false,
+            || line_notify.notify_one(),
+        ));
     }
 
     #[test]

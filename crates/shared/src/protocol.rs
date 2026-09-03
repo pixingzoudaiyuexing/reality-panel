@@ -1110,6 +1110,28 @@ pub fn node_supports_restart_rule(version: Option<&str>) -> bool {
     (major, minor, patch) >= (1, 2, 0)
 }
 
+/// Whether a node understands the dedicated shared nginx_sni reapply command.
+/// The command shipped in the v1.1.0 stable node, independently of the newer
+/// generic `restart_rule` capability.
+pub fn node_supports_reapply_nginx_sni(version: Option<&str>) -> bool {
+    let Some(version) = version else {
+        return false;
+    };
+    if is_reality_panel_capable_rc(version) {
+        return true;
+    }
+    let mut parts = version.trim().trim_start_matches('v').split('.');
+    let parsed = (
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts.next().and_then(|part| part.parse::<u64>().ok()),
+        parts
+            .next()
+            .and_then(|part| part.split('-').next())
+            .and_then(|part| part.parse::<u64>().ok()),
+    );
+    matches!(parsed, (Some(major), Some(minor), Some(patch)) if (major, minor, patch) >= (1, 1, 0))
+}
+
 /// Panel -> node control operation for the shared nginx_sni plan. This is an
 /// optional control message, so it does not change the config snapshot wire
 /// format or CONFIG_PROTOCOL_VERSION.
@@ -2083,6 +2105,20 @@ mod tests {
         assert!(node_supports_restart_rule(Some("1.0.0-rc.5")));
         assert!(node_supports_restart_rule(Some("v1.0.0-rc.6")));
         assert!(!node_supports_restart_rule(Some("1.0.0-rc.4")));
+    }
+
+    #[test]
+    fn node_supports_reapply_nginx_sni_version_gate() {
+        assert!(!node_supports_reapply_nginx_sni(None));
+        assert!(!node_supports_reapply_nginx_sni(Some("")));
+        assert!(!node_supports_reapply_nginx_sni(Some("garbage")));
+        assert!(!node_supports_reapply_nginx_sni(Some("1.0.9")));
+        assert!(node_supports_reapply_nginx_sni(Some("1.1.0")));
+        assert!(node_supports_reapply_nginx_sni(Some("v1.1.0")));
+        assert!(node_supports_reapply_nginx_sni(Some("1.1.1")));
+        assert!(node_supports_reapply_nginx_sni(Some("1.2.0")));
+        assert!(node_supports_reapply_nginx_sni(Some("1.0.0-rc.5")));
+        assert!(!node_supports_reapply_nginx_sni(Some("1.0.0-rc.4")));
     }
 
     /// A rule's `max_connections` reaches the wire, and 0 means "no cap" rather

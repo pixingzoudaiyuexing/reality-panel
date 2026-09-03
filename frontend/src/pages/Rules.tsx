@@ -808,26 +808,6 @@ export default function Rules() {
     }
   };
 
-  const handleReapply = async (r: ForwardRule) => {
-    try {
-      const res = await api.post<unknown, ApiEnvelope<ReapplyResponse>>(`/rules/${r.id}/reapply`, {});
-      if (res.code !== 0 || !res.data) {
-        message.error(res.message || t('reapplyFailed'));
-        return;
-      }
-      const failed = res.data.nodes.filter(node => node.state !== 'result' || node.success !== true).length;
-      if (res.data.applied > 0 && failed === 0) {
-        message.success(t('reapplySuccess').replace('{count}', String(res.data.applied)));
-      } else if (res.data.applied > 0) {
-        message.warning(t('reapplyPartial').replace('{ok}', String(res.data.applied)).replace('{fail}', String(failed)));
-      } else {
-        message.error(t('reapplyFailed'));
-      }
-    } catch {
-      message.error(t('reapplyFailed'));
-    }
-  };
-
   /** v1.2.0: batch restart. Per-rule POST like batch pause/resume — there is no
    *  bulk endpoint. A rule can fail individually (paused → 400, or not owned →
    *  404), so tally ok/fail rather than assuming Promise.all means success. */
@@ -912,16 +892,6 @@ export default function Rules() {
   };
 
   const confirmRuntimeAction = (r: ForwardRule) => {
-    if (isRealityRule(r)) {
-      Modal.confirm({
-        title: t('reapplyConfirmTitle'),
-        content: t('reapplyConfirmDesc'),
-        okText: t('reapply'),
-        cancelText: t('cancel'),
-        onOk: () => handleReapply(r),
-      });
-      return;
-    }
     Modal.confirm({
       title: t('restartConfirmTitle'),
       content: t('restartConfirmDesc'),
@@ -1015,25 +985,34 @@ export default function Rules() {
     );
   };
 
-  const moreMenuItems = (r: ForwardRule): MenuProps['items'] => [
-    {
-      key: 'toggle',
-      label: r.paused ? t('resume') : t('pause'),
-      icon: r.paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />,
-      onClick: () => void handleTogglePause(r),
-    },
-    { key: 'copy', label: t('copy'), icon: <CopyOutlined />, onClick: () => handleCopy(r) },
-    { type: 'divider' },
-    {
-      key: 'runtime',
-      label: isRealityRule(r) ? t('reapply') : t('restart'),
-      icon: isRealityRule(r) ? <ReloadOutlined /> : <ThunderboltOutlined />,
-      disabled: r.paused,
-      onClick: () => confirmRuntimeAction(r),
-    },
-    { type: 'divider' },
-    { key: 'delete', label: t('delete'), icon: <DeleteOutlined />, danger: true, onClick: () => confirmDeleteRule(r) },
-  ];
+  const moreMenuItems = (r: ForwardRule): MenuProps['items'] => {
+    const items: MenuProps['items'] = [
+      {
+        key: 'toggle',
+        label: r.paused ? t('resume') : t('pause'),
+        icon: r.paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />,
+        onClick: () => void handleTogglePause(r),
+      },
+      { key: 'copy', label: t('copy'), icon: <CopyOutlined />, onClick: () => handleCopy(r) },
+    ];
+    if (!isRealityRule(r)) {
+      items.push(
+        { type: 'divider' },
+        {
+          key: 'runtime',
+          label: t('restart'),
+          icon: <ThunderboltOutlined />,
+          disabled: r.paused,
+          onClick: () => confirmRuntimeAction(r),
+        },
+      );
+    }
+    items.push(
+      { type: 'divider' },
+      { key: 'delete', label: t('delete'), icon: <DeleteOutlined />, danger: true, onClick: () => confirmDeleteRule(r) },
+    );
+    return items;
+  };
 
   const allColumns = [
     {

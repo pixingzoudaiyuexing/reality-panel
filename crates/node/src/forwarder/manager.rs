@@ -1052,14 +1052,37 @@ impl ForwarderManager {
         if !present {
             return Err("nginx_sni rule is not present in the accepted configuration".into());
         }
-        if self
-            .apply_config_scoped(&config, &HashSet::new(), true, false)
-            .await
-        {
-            Ok(())
-        } else {
-            Err("nginx_sni configuration test or reload failed".into())
+        if !self.nginx_sni.enabled {
+            self.listener_errors.lock().await.push(ListenerError {
+                port: 0,
+                protocol: "tcp".into(),
+                error: "nginx_sni disabled on this node".into(),
+            });
+            return Err("nginx_sni disabled on this node".into());
         }
+        let listeners = config
+            .listeners
+            .iter()
+            .filter(|listener| listener.node_transport == NodeTransport::NginxSni)
+            .cloned()
+            .collect::<Vec<_>>();
+        let plan = NginxSniPlan::from_listeners(
+            &listeners,
+            &self.nginx_sni.default_backend,
+            &self.nginx_sni.access_log_path,
+        )
+        .map_err(|error| format!("nginx_sni plan rejected: {error}"))?;
+        if let Err(error) = nginx_sni::apply_plan(&plan, &self.nginx_sni) {
+            let error = format!("nginx_sni reapply failed: {error}");
+            self.listener_errors.lock().await.push(ListenerError {
+                port: listeners.first().map(|listener| listener.port).unwrap_or(0),
+                protocol: "tcp".into(),
+                error: error.clone(),
+            });
+            return Err(error);
+        }
+        self.nginx_sni_plan = Some(plan);
+        Ok(())
     }
 
     /// v1.2.0: restart ONE rule — drop every connection it is currently
@@ -2626,7 +2649,8 @@ mod tests {
         assert!(mgr.listener_keys().is_empty());
 
         mgr.nginx_sni.test_cmd = "false".into();
-        assert!(mgr.reapply_nginx_sni(10).await.is_err());
+        let error = mgr.reapply_nginx_sni(10).await.unwrap_err();
+        assert!(error.contains("false failed"), "unexpected error: {error}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(mgr.nginx_sni_rule_for_id(11).is_some());
         let _ = std::fs::remove_dir_all(dir);

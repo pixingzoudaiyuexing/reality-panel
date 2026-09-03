@@ -162,6 +162,7 @@ async fn main() {
     service::panel_certificate::spawn(
         service::panel_certificate::PanelCertificateManager::new(state.db.clone(), &config)
             .expect("Failed to initialize Panel certificate manager"),
+        state.node_connections.clone(),
     );
 
     let app = app.with_state(state);

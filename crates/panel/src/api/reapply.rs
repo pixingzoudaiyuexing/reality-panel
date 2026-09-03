@@ -11,7 +11,7 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use relay_shared::protocol::{
-    node_supports_restart_rule, ApiResponse, ReapplyNginxSniMessage, ReapplyNginxSniResult,
+    node_supports_reapply_nginx_sni, ApiResponse, ReapplyNginxSniMessage, ReapplyNginxSniResult,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -139,7 +139,7 @@ pub async fn reapply_nginx_sni(
     let mut statuses = Vec::new();
     let mut candidates = Vec::<NodeStatusRow>::new();
     for node in nodes {
-        if !node_supports_restart_rule(node.node_version.as_deref()) {
+        if !node_supports_reapply_nginx_sni(node.node_version.as_deref()) {
             statuses.push(NodeReapplyStatus::Unsupported {
                 node_id: node.node_id,
                 group_name: node.group_name,

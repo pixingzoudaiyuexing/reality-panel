@@ -391,8 +391,10 @@ async fn run() {
     // node-id file, so the panel can tell multiple nodes sharing one group
     // token apart (otherwise their status entries overwrite each other).
     let node_id = poller::get_or_create_node_id();
-    let mut panel_certificate_sync = panel_certificate::PanelCertificateSync::new()
-        .expect("failed to initialize Panel certificate HTTP client");
+    let panel_certificate_sync = Arc::new(Mutex::new(
+        panel_certificate::PanelCertificateSync::new()
+            .expect("failed to initialize Panel certificate HTTP client"),
+    ));
 
     // --- Fork 1: WebSocket control channel (real-time config push) ---
     {
@@ -401,12 +403,14 @@ async fn run() {
         let camouflage_ws = camouflage_sites.clone();
         let reconciler_ws = reconciler.clone();
         let node_id_ws = node_id.clone();
+        let panel_certificate_sync_ws = panel_certificate_sync.clone();
         tokio::spawn(async move {
             ws_client::run_ws_loop(
                 &config_ws,
                 &manager_ws,
                 &camouflage_ws,
                 &reconciler_ws,
+                &panel_certificate_sync_ws,
                 &node_id_ws,
             )
             .await;
@@ -480,6 +484,8 @@ async fn run() {
         }
 
         if let Err(error) = panel_certificate_sync
+            .lock()
+            .await
             .sync(&config, &node_id, &camouflage_sites)
             .await
         {

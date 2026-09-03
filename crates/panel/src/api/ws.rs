@@ -482,8 +482,14 @@ async fn handle_node_ws(
     // immediately, without waiting for the first HTTP poll. None (DB error) →
     // skip the push; the node will get its config on the next HTTP poll.
     if config_compatible {
-        if let Some(config) =
-            build_config_snapshot_for_node(db.as_ref(), group_id, node_id.as_deref()).await
+        let certificate_state_dir = std::path::PathBuf::from(state.config.certificate_state_dir());
+        if let Some(config) = build_config_snapshot_for_node(
+            db.as_ref(),
+            &certificate_state_dir,
+            group_id,
+            node_id.as_deref(),
+        )
+        .await
         {
             if let Ok(config_json) = serde_json::to_string(&config) {
                 let _ = sender.send(Message::Text(config_json.into())).await;
@@ -569,6 +575,7 @@ async fn handle_node_ws(
 
 pub(crate) async fn build_config_snapshot_for_node(
     db: &dyn crate::db::Repository,
+    certificate_state_dir: &std::path::Path,
     group_id: i64,
     node_id: Option<&str>,
 ) -> Option<NodeConfigSnapshot> {
@@ -582,8 +589,13 @@ pub(crate) async fn build_config_snapshot_for_node(
     // Returns None on DB error so the caller skips the snapshot push (rather
     // than pushing an empty config that would incorrectly tear down the node's
     // listeners). An empty Ok is a legitimate "no rules" snapshot.
-    match crate::service::node_config::build_node_config_snapshot_for_node(db, group_id, node_id)
-        .await
+    match crate::service::node_config::build_node_config_snapshot_for_node_with_certificate_inventory(
+        db,
+        certificate_state_dir,
+        group_id,
+        node_id,
+    )
+    .await
     {
         Ok(cfg) => Some(cfg),
         Err(e) => {

@@ -165,10 +165,25 @@ describe('RuleDiagnosisModal table diagnosis', () => {
     expect(route).toHaveTextContent('等待');
   });
 
-  it('shows mixed listeners as partial and all failed listeners as abnormal', async () => {
+  it('ignores the absent generic Reality listener and uses Nginx runtime evidence', async () => {
+    mockPost.mockResolvedValue(response([
+      diagnosedNode('node-a', '192.0.2.10', { listener_running: false }),
+    ]));
+    renderModal(realityRule, zhT);
+    await settle();
+    const checkTable = screen.getByTestId('diagnosis-check-table');
+    expect(within(checkTable).getByText('监听服务').closest('tr')).toHaveTextContent('正常');
+    expect(screen.getByTestId('diagnosis-conclusion')).toHaveTextContent('诊断结论: 正常');
+    expect(screen.getByTestId('diagnosis-conclusion')).toHaveTextContent('未发现异常');
+  });
+
+  it('shows mixed Reality runtime listeners as partial and all failed runtimes as abnormal', async () => {
+    const failedRuntime = reality({
+      runtime: { check: { state: 'fail' }, listen_443: false, listen_8443: true },
+    });
     mockPost.mockResolvedValue(response([
       diagnosedNode(),
-      diagnosedNode('node-b', '192.0.2.11', { listener_running: false }),
+      diagnosedNode('node-b', '192.0.2.11', { listener_running: false, reality: failedRuntime }),
     ]));
     const first = renderModal(realityRule, zhT);
     await settle();
@@ -178,8 +193,8 @@ describe('RuleDiagnosisModal table diagnosis', () => {
     first.unmount();
 
     mockPost.mockResolvedValue(response([
-      diagnosedNode('node-a', '192.0.2.10', { listener_running: false }),
-      diagnosedNode('node-b', '192.0.2.11', { listener_running: false }),
+      diagnosedNode('node-a', '192.0.2.10', { listener_running: false, reality: failedRuntime }),
+      diagnosedNode('node-b', '192.0.2.11', { listener_running: false, reality: failedRuntime }),
     ]));
     renderModal(realityRule, zhT);
     await settle();
@@ -310,8 +325,8 @@ describe('RuleDiagnosisModal table diagnosis', () => {
     const table = screen.getByTestId('diagnosis-node-table');
     expect(within(table).getByText('192.0.2.10')).toBeInTheDocument();
     const failedRow = within(table).getByText('192.0.2.11').closest('tr') as HTMLElement;
-    expect(failedRow).toHaveTextContent('规则监听器未正常运行');
-    expect(failedRow).toHaveTextContent('另有');
+    expect(failedRow).toHaveTextContent('Nginx 计划或映射与期望配置不一致');
+    expect(failedRow).not.toHaveTextContent('规则监听器未正常运行');
   });
 
   it('keeps technical evidence hidden, expands one row at a time, and preserves raw values', async () => {
@@ -354,5 +369,36 @@ describe('RuleDiagnosisModal table diagnosis', () => {
     fireEvent.click(screen.getByRole('button', { name: /重\s*试/ }));
     await settle();
     expect(screen.getByTestId('diagnosis-check-table')).toBeInTheDocument();
+  });
+
+  it('keeps reapply in diagnosis and shows every backend failure reason', async () => {
+    mockPost
+      .mockResolvedValueOnce(response())
+      .mockResolvedValueOnce({
+        code: 0,
+        message: 'ok',
+        data: {
+          rule_id: 7,
+          applied: 0,
+          nodes: [
+            { state: 'unsupported', node_id: 'old', group_name: 'group-a', public_ip: '192.0.2.11', node_version: '1.0.9' },
+            { state: 'control_channel_offline', node_id: 'offline', group_name: 'group-a', public_ip: '192.0.2.12' },
+            { state: 'timeout', node_id: 'slow', group_name: 'group-a', public_ip: '192.0.2.13' },
+            { state: 'result', node_id: 'missing', group_name: 'group-a', public_ip: '192.0.2.14', success: false, error: 'nginx_sni rule is not present in the accepted configuration' },
+            { state: 'result', node_id: 'nginx', group_name: 'group-a', public_ip: '192.0.2.15', success: false, error: 'nginx -t failed: invalid mapping' },
+          ],
+        },
+      });
+    renderModal(realityRule, zhT);
+    await settle();
+    expect(screen.getByTestId('diagnosis-repair-actions')).toHaveTextContent('修复操作');
+    fireEvent.click(screen.getByRole('button', { name: /重新加载 SNI 路由/ }));
+    await settle();
+    expect(mockPost).toHaveBeenLastCalledWith('/rules/7/reapply', {});
+    expect(screen.getByText(/节点版本 1\.0\.9 不支持此修复操作/)).toBeInTheDocument();
+    expect(screen.getByText(/节点控制通道离线/)).toBeInTheDocument();
+    expect(screen.getByText(/等待节点响应超时/)).toBeInTheDocument();
+    expect(screen.getByText(/规则不存在于节点已接受的配置中/)).toBeInTheDocument();
+    expect(screen.getByText(/nginx -t failed: invalid mapping/)).toBeInTheDocument();
   });
 });

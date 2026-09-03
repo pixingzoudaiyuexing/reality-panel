@@ -693,13 +693,15 @@ pub async fn diagnose_rule(
     // holds node_id strings).
     let node_by_id: std::collections::HashMap<&str, &NodeStatusRow> =
         nodes.iter().map(|n| (n.node_id.as_str(), n)).collect();
+    let certificate_state_dir = std::path::PathBuf::from(state.config.certificate_state_dir());
     for nid in &candidates {
         let row = node_by_id.get(nid.as_str()).copied();
         // Config fingerprints include node-local camouflage ownership IP, so
         // diagnosis must bind each probe to the snapshot intended for that
         // concrete Relay instead of reusing one group-wide snapshot.
-        let desired_snapshot = crate::service::node_config::build_node_config_snapshot_for_node(
+        let desired_snapshot = crate::service::node_config::build_node_config_snapshot_for_node_with_certificate_inventory(
             state.db.as_ref(),
+            &certificate_state_dir,
             group_id,
             Some(nid),
         )

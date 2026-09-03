@@ -142,6 +142,7 @@ function backendCheck(results: DiagnoseTargetResult[]): RealityCheck {
 
 export function nodeListenerDisplayStatus(node: NodeDiagnoseStatus): DiagnosisDisplayStatus {
   if (node.status !== 'result') return 'not_tested';
+  if (node.reality) return diagnosisDisplayStatus(node.reality.runtime.check);
   return node.listener_running ? 'normal' : 'abnormal';
 }
 
@@ -228,7 +229,9 @@ export function nodeDiagnosisIssues(node: NodeDiagnoseStatus): DiagnosisCheckSum
   }
 
   const highlights: DiagnosisCheckSummary[] = [];
-  if (!node.listener_running) highlights.push({ key: 'listener', check: { state: 'fail' } });
+  if (!node.reality && !node.listener_running) {
+    highlights.push({ key: 'listener', check: { state: 'fail' } });
+  }
   if (node.reality) {
     const service = nodeRealityServiceSummary(node);
     if (service.check.state !== 'pass' && service.check.state !== 'not_tested') {
@@ -310,7 +313,7 @@ export function diagnosisOverview(
     (node): node is Extract<NodeDiagnoseStatus, { status: 'result' }> => node.status === 'result' && !!node.reality,
   );
   const listener = aggregateDiagnosisChecks(
-    realityNodes.map((node) => ({ state: node.listener_running ? 'pass' : 'fail' })),
+    realityNodes.map((node) => node.reality?.runtime.check ?? { state: 'not_tested' }),
   );
   const realityService = aggregateDiagnosisChecks(
     realityNodes.map((node) => nodeRealityServiceSummary(node).check),

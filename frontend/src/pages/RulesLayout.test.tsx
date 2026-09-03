@@ -226,7 +226,7 @@ describe('Rules grouped compact layout', () => {
     expect(quotaRow.querySelector('.rp-rules-protocol-cell')).not.toHaveTextContent('quotaExhausted');
   });
 
-  it('keeps only edit, diagnose and more persistent while preserving Reality and raw menu actions', async () => {
+  it('keeps Reality repair out of ordinary row actions while preserving raw restart', async () => {
     setupAdmin([rule(1), rule(2, { public_transport: 'raw', node_transport: 'raw', sni: null })]);
     render(<Rules />);
     const row = (await screen.findByText('rule-1')).closest('tr') as HTMLElement;
@@ -237,7 +237,7 @@ describe('Rules grouped compact layout', () => {
     fireEvent.click(within(actions).getByRole('button', { name: /moreActions/ }));
     expect(await screen.findByText('pause')).toBeInTheDocument();
     expect(screen.getByText('copy')).toBeInTheDocument();
-    expect(screen.getByText('reapply')).toBeInTheDocument();
+    expect(screen.queryByText('reapply')).toBeNull();
     expect(screen.getByText('delete')).toBeInTheDocument();
     fireEvent.keyDown(document, { key: 'Escape' });
 
@@ -255,14 +255,6 @@ describe('Rules grouped compact layout', () => {
     render(<Rules />);
     const udpRow = (await screen.findByText('rule-1')).closest('tr') as HTMLElement;
     expect(within(udpRow).getByRole('button', { name: /diagnose/ })).toBeDisabled();
-    const realityRow = screen.getByText('rule-2').closest('tr') as HTMLElement;
-    fireEvent.click(within(realityRow).getByRole('button', { name: /moreActions/ }));
-    fireEvent.click(await screen.findByText('reapply'));
-    expect((await screen.findAllByText('reapplyConfirmTitle')).length).toBeGreaterThan(0);
-    expect(mockPost).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: 'reapply' }));
-    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/rules/2/reapply', {}));
-
     const rawRow = screen.getByText('rule-3').closest('tr') as HTMLElement;
     fireEvent.click(within(rawRow).getByRole('button', { name: /moreActions/ }));
     fireEvent.click(await screen.findByText('restart'));

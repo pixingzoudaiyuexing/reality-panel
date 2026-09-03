@@ -95,8 +95,10 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     // push path (ws.rs) now use the SAME function.
     //
     // Only an inbound group with genuinely no active rules yields Ok(empty).
-    match crate::service::node_config::build_node_config_snapshot_for_node(
+    let certificate_state_dir = std::path::PathBuf::from(state.config.certificate_state_dir());
+    match crate::service::node_config::build_node_config_snapshot_for_node_with_certificate_inventory(
         state.db.as_ref(),
+        &certificate_state_dir,
         group.id,
         extract_node_id(&headers).as_deref(),
     )
@@ -219,30 +221,32 @@ async fn acme_dns01_operation(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let scopes = match crate::service::node_config::certificate_scopes_for_group(
-        state.db.as_ref(),
-        group.id,
-    )
-    .await
-    {
-        Ok(scopes) => scopes,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let requested_domain = request.sni.trim_end_matches('.');
-    let authorized = scopes.iter().any(|scope| {
-        let certificate_domain = scope.domain.trim_end_matches('.');
-        let certificate_authorized = certificate_domain.eq_ignore_ascii_case(requested_domain)
-            || certificate_domain
-                .strip_prefix("*.")
-                .is_some_and(|base| base.eq_ignore_ascii_case(requested_domain));
-        certificate_authorized
-    });
-    if !authorized {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"code": "ACME_DNS01_SNI_NOT_AUTHORIZED"})),
-        )
-            .into_response();
+    if present {
+        let scopes =
+            match crate::service::node_config::issuance_authorized_certificate_scopes_for_group(
+                state.db.as_ref(),
+                group.id,
+            )
+            .await
+            {
+                Ok(scopes) => scopes,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+        let requested_domain = request.sni.trim_end_matches('.');
+        let authorized = scopes.iter().any(|scope| {
+            let certificate_domain = scope.domain.trim_end_matches('.');
+            certificate_domain.eq_ignore_ascii_case(requested_domain)
+                || certificate_domain
+                    .strip_prefix("*.")
+                    .is_some_and(|base| base.eq_ignore_ascii_case(requested_domain))
+        });
+        if !authorized {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"code": "ACME_DNS01_SNI_NOT_AUTHORIZED"})),
+            )
+                .into_response();
+        }
     }
 
     let result = if present {
@@ -999,7 +1003,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acme_dns01_api_requires_group_scoped_eligible_sni() {
+    async fn acme_dns01_present_requires_verified_issuance_scope() {
         let (state, pool) = seeded_state().await;
         sqlx::query("UPDATE device_groups SET connect_host='192.0.2.10' WHERE id=10")
             .execute(&pool)
@@ -1041,13 +1045,57 @@ mod tests {
             present_acme_dns01(State(state.clone()), auth_headers("tok-A"), Json(unrelated)).await;
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
 
-        let eligible = crate::service::acme_dns01::AcmeDns01Request {
+        let pending = crate::service::acme_dns01::AcmeDns01Request {
             node_id: "node-a".into(),
             sni: "site.example.com".into(),
             value: "challenge-token-123456".into(),
         };
-        let provider_unavailable =
-            present_acme_dns01(State(state.clone()), auth_headers("tok-A"), Json(eligible)).await;
+        let ownership_required =
+            present_acme_dns01(State(state.clone()), auth_headers("tok-A"), Json(pending)).await;
+        assert_eq!(ownership_required.status(), StatusCode::FORBIDDEN);
+        assert!(
+            state
+                .db
+                .scan_prefix("acme:dns01:")
+                .await
+                .unwrap()
+                .is_empty(),
+            "unauthorized present must not create challenge state or TXT work"
+        );
+
+        sqlx::query(
+            "INSERT INTO dns_record_syncs \
+             (rule_id, fqdn, record_type, expected_value, line, line_key, desired_action, \
+              state, ownership, mutation_verified_at, created_at, updated_at) \
+             VALUES (100, 'site.example.com', 'A', '192.0.2.10', 'default', 'default', \
+                     'UPSERT', 'MUTATION_VERIFIED', 'PANEL', '2026-09-04 00:00:00', \
+                     '2026-09-04 00:00:00', '2026-09-04 00:00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO dns_record_bindings \
+             (rule_id, fqdn, zone_id, zone_name, host, record_type, line, line_key, \
+              record_id, desired_value, state, last_observed_at, created_at, updated_at) \
+             VALUES (100, 'site.example.com', 7, 'example.com', 'site', 'A', 'default', \
+                     'default', 'record-100', '192.0.2.10', 'BOUND', '2026-09-04 00:00:00', \
+                     '2026-09-04 00:00:00', '2026-09-04 00:00:00')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let authorized = crate::service::acme_dns01::AcmeDns01Request {
+            node_id: "node-a".into(),
+            sni: "example.com".into(),
+            value: "challenge-token-123456".into(),
+        };
+        let provider_unavailable = present_acme_dns01(
+            State(state.clone()),
+            auth_headers("tok-A"),
+            Json(authorized),
+        )
+        .await;
         assert_eq!(
             provider_unavailable.status(),
             StatusCode::SERVICE_UNAVAILABLE
@@ -1225,10 +1273,15 @@ mod tests {
         let body = axum::body::to_bytes(http.into_body(), 65536).await.unwrap();
         let http_snapshot: NodeConfigSnapshot = serde_json::from_slice(&body).unwrap();
         let http_config = &http_snapshot.config;
-        let ws_config =
-            crate::api::ws::build_config_snapshot_for_node(state.db.as_ref(), 10, Some("node-a"))
-                .await
-                .expect("WS snapshot");
+        let certificate_state_dir = std::path::PathBuf::from(state.config.certificate_state_dir());
+        let ws_config = crate::api::ws::build_config_snapshot_for_node(
+            state.db.as_ref(),
+            &certificate_state_dir,
+            10,
+            Some("node-a"),
+        )
+        .await
+        .expect("WS snapshot");
 
         assert_eq!(
             serde_json::to_value(http_config).unwrap(),

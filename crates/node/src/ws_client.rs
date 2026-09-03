@@ -1,6 +1,7 @@
 use crate::config::NodeConfig;
 use crate::forwarder::camouflage_site::CamouflageSiteManager;
 use crate::forwarder::ForwarderManager;
+use crate::panel_certificate::PanelCertificateSync;
 use crate::poller;
 use crate::reconciler::{Reconciler, ReconciliationInput, ReconciliationState};
 use std::future::Future;
@@ -56,6 +57,7 @@ pub async fn run_ws_loop(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
     reconciler: &Arc<Mutex<Reconciler>>,
+    panel_certificate_sync: &Arc<Mutex<PanelCertificateSync>>,
     node_id: &str,
 ) {
     let ws_url = derive_ws_url(&config.panel_url);
@@ -75,6 +77,7 @@ pub async fn run_ws_loop(
             manager,
             camouflage,
             reconciler,
+            panel_certificate_sync,
             node_id,
         )
         .await;
@@ -177,6 +180,7 @@ async fn connect_and_run(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
     reconciler: &Arc<Mutex<Reconciler>>,
+    panel_certificate_sync: &Arc<Mutex<PanelCertificateSync>>,
     node_id: &str,
 ) -> WsExit {
     use futures_util::{SinkExt, StreamExt};
@@ -314,6 +318,13 @@ async fn connect_and_run(
                             );
                             if apply_snapshot(manager, camouflage, reconciler, resp).await {
                                 tracing::info!("websocket: config applied and committed as LKG");
+                                sync_panel_certificates(
+                                    panel_certificate_sync,
+                                    config,
+                                    node_id,
+                                    camouflage,
+                                )
+                                .await;
                             } else {
                                 tracing::warn!("websocket: config apply/commit failed; preserving LKG");
                             }
@@ -323,6 +334,13 @@ async fn connect_and_run(
                                 poller::FetchResult::Ok(resp) => {
                                     if apply_snapshot(manager, camouflage, reconciler, resp).await {
                                         tracing::info!("websocket: config applied after config_changed");
+                                        sync_panel_certificates(
+                                            panel_certificate_sync,
+                                            config,
+                                            node_id,
+                                            camouflage,
+                                        )
+                                        .await;
                                     } else {
                                         tracing::warn!("websocket: config_changed apply/commit failed; preserving LKG");
                                     }
@@ -566,6 +584,19 @@ async fn connect_and_run(
                 tracing::debug!("websocket: ping sent");
             }
         }
+    }
+}
+
+async fn sync_panel_certificates(
+    sync: &Arc<Mutex<PanelCertificateSync>>,
+    config: &NodeConfig,
+    node_id: &str,
+    camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+) {
+    if let Err(error) = sync.lock().await.sync(config, node_id, camouflage).await {
+        tracing::warn!(
+            "websocket: Panel certificate sync failed; retaining active certificate and LKG: {error}"
+        );
     }
 }
 

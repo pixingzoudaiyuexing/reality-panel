@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Alert, Button, Modal, Space, Spin, Table, Tag, Tooltip, Typography, message } from 'antd';
-import { ReloadOutlined } from '@ant-design/icons';
+import { ReloadOutlined, ToolOutlined } from '@ant-design/icons';
 import api from '../../api/client';
 import type {
   ApiEnvelope,
@@ -8,6 +8,8 @@ import type {
   DiagnoseTargetResult,
   ForwardRule,
   NodeDiagnoseStatus,
+  ReapplyNodeStatus,
+  ReapplyResponse,
   RealityCheck,
   RealityDiagnosis,
 } from '../../api/types';
@@ -90,6 +92,21 @@ function conclusionLabel(level: DiagnosisConclusionLevel, t: Tfn) {
   if (level === 'healthy') return t('diagnosisHealthy');
   if (level === 'unavailable') return t('diagnosisUnavailable');
   return t('diagnosisPartial');
+}
+
+function reapplyNodeReason(node: ReapplyNodeStatus, t: Tfn) {
+  if (node.state === 'unsupported') {
+    return t('reapplyNodeUnsupported').replace('{version}', node.node_version || t('routeUnknown'));
+  }
+  if (node.state === 'control_channel_offline') return t('reapplyNodeOffline');
+  if (node.state === 'timeout') return t('reapplyNodeTimeout');
+  if (node.success) return t('reapplyNodeSuccess');
+  if (node.error === 'no accepted configuration is available') return t('reapplyNodeNoAcceptedConfig');
+  if (node.error === 'nginx_sni rule is not present in the accepted configuration') {
+    return t('reapplyNodeRuleMissing');
+  }
+  if (node.error === 'nginx_sni disabled on this node') return t('reapplyNodeNginxDisabled');
+  return node.error || t('reapplyFailed');
 }
 
 function formatElapsed(last: number | null, now: number, t: Tfn) {
@@ -496,6 +513,9 @@ export function RuleDiagnosisModal({ rule, open, onClose, isAdmin, t, nodeId, no
   const [lastDiagnosedAt, setLastDiagnosedAt] = useState<number | null>(null);
   const [now, setNow] = useState(0);
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const [repairing, setRepairing] = useState(false);
+  const [repairResult, setRepairResult] = useState<ReapplyResponse | null>(null);
+  const [repairError, setRepairError] = useState<string | null>(null);
   const inFlight = useRef(false);
   const ruleId = rule?.id ?? null;
 
@@ -537,10 +557,38 @@ export function RuleDiagnosisModal({ rule, open, onClose, isAdmin, t, nodeId, no
     return () => window.clearInterval(timer);
   }, [open]);
 
+  useEffect(() => {
+    if (!open) return;
+    setRepairResult(null);
+    setRepairError(null);
+  }, [open, ruleId]);
+
+  const runReapply = async () => {
+    if (!rule || repairing || !isRealityRule(rule)) return;
+    setRepairing(true);
+    setRepairResult(null);
+    setRepairError(null);
+    try {
+      const response = await api.post<unknown, ApiEnvelope<ReapplyResponse>>(`/rules/${rule.id}/reapply`, {});
+      if (response.code !== 0 || !response.data) {
+        setRepairError(response.message || t('reapplyFailed'));
+        return;
+      }
+      setRepairResult(response.data);
+    } catch {
+      setRepairError(t('reapplyRequestFailed'));
+    } finally {
+      setRepairing(false);
+    }
+  };
+
   const conclusion = result ? deriveDiagnosisConclusion(result.nodes, result.dependencies) : null;
   const checkRows = result && rule ? buildCheckRows(rule, result, t) : [];
   const nodeRows = result ? buildNodeRows(result.nodes, t) : [];
   const title = rule ? `${t('diagnoseTitle')} · ${nodeLabel ?? rule.name}` : t('diagnoseTitle');
+  const repairAllSucceeded = !!repairResult
+    && repairResult.nodes.length > 0
+    && repairResult.applied === repairResult.nodes.length;
 
   const toggleEvidence = (key: string) => setExpandedKey((current) => current === key ? null : key);
   const actionButton = (key: string, hasEvidence: boolean) => hasEvidence ? (
@@ -648,6 +696,39 @@ export function RuleDiagnosisModal({ rule, open, onClose, isAdmin, t, nodeId, no
               }}
             />
           </section>
+
+          {isRealityRule(rule) ? (
+            <section className="rp-diagnosis-repair" data-testid="diagnosis-repair-actions">
+              <Title level={5}>{t('diagnosisRepairActions')}</Title>
+              <Text type="secondary">{t('reapplyRepairDescription')}</Text>
+              <div className="rp-diagnosis-repair-control">
+                <Button icon={<ToolOutlined />} loading={repairing} disabled={repairing} onClick={() => void runReapply()}>
+                  {t('reapply')}
+                </Button>
+              </div>
+              {repairError ? <Alert type="error" showIcon title={repairError} /> : null}
+              {repairResult ? (
+                <Alert
+                  type={repairAllSucceeded ? 'success' : repairResult.applied > 0 ? 'warning' : 'error'}
+                  showIcon
+                  title={repairAllSucceeded
+                    ? t('reapplySuccess').replace('{count}', String(repairResult.applied))
+                    : repairResult.nodes.length > 0
+                      ? t('reapplyPartial').replace('{ok}', String(repairResult.applied)).replace('{fail}', String(repairResult.nodes.length - repairResult.applied))
+                      : t('reapplyFailed')}
+                  description={(
+                    <Space orientation="vertical" size={2}>
+                      {repairResult.nodes.map((node) => (
+                        <Text key={node.node_id} type={node.state === 'result' && node.success ? 'success' : 'danger'}>
+                          {node.public_ip || node.group_name}: {reapplyNodeReason(node, t)}
+                        </Text>
+                      ))}
+                    </Space>
+                  )}
+                />
+              ) : null}
+            </section>
+          ) : null}
         </div>
       ) : null}
     </Modal>

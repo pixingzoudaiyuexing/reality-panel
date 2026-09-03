@@ -2,12 +2,15 @@ use crate::config::Config;
 use crate::db::repo::{GroupRepository, ResourceScope};
 use crate::db::Repository;
 use crate::service::acme_dns01::AcmeDns01Request;
-use crate::service::node_config::{certificate_scopes_for_group, GroupCertificateScope};
+use crate::service::node_config::{
+    certificate_scopes_for_group, issuance_authorized_certificate_scopes_for_group,
+    GroupCertificateScope,
+};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use relay_shared::models::DeviceGroup;
 use relay_shared::protocol::{NodeCertificatesResponse, PanelCertificateBundle};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -26,6 +29,7 @@ const MAX_GROUP_CERTIFICATE_SCOPES: usize = 128;
 const MAX_GROUP_CERTIFICATE_BYTES: usize = 2 * 1024 * 1024;
 const RETRY_DELAYS_SECS: &[i64] = &[30, 120, 300, 900, 1_800, 3_600];
 static CERTIFICATE_ISSUANCE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static CERTIFICATE_RECONCILE_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct PanelCertificateManager {
@@ -70,26 +74,35 @@ impl PanelCertificateManager {
     }
 
     pub async fn group_manifest(&self, group_id: i64) -> Result<GroupCertificateManifest, String> {
-        let scopes = certificate_scopes_for_group(self.db.as_ref(), group_id)
-            .await
-            .map_err(|error| error.to_string())?;
+        let scopes = self.certificate_scopes(group_id).await?;
         let state_dir = self.state_dir.clone();
         tokio::task::spawn_blocking(move || build_group_manifest(&state_dir, group_id, &scopes))
             .await
             .map_err(|error| error.to_string())?
     }
 
-    async fn reconcile_all(&self) {
+    async fn certificate_scopes(
+        &self,
+        group_id: i64,
+    ) -> Result<Vec<GroupCertificateScope>, String> {
+        let scopes = certificate_scopes_for_group(self.db.as_ref(), group_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        resolve_managed_certificate_scopes(&self.state_dir, group_id, scopes).await
+    }
+
+    async fn reconcile_all(&self) -> HashSet<i64> {
+        let mut changed_groups = HashSet::new();
         let groups = match GroupRepository::list_groups(self.db.as_ref(), &ResourceScope::All).await
         {
             Ok(groups) => groups,
             Err(error) => {
                 tracing::error!("panel certificate: group discovery failed: {error}");
-                return;
+                return changed_groups;
             }
         };
         for group in groups.into_iter().filter(|group| group.group_type == "in") {
-            let scopes = match certificate_scopes_for_group(self.db.as_ref(), group.id).await {
+            let scopes = match self.certificate_scopes(group.id).await {
                 Ok(scopes) => scopes,
                 Err(error) => {
                     tracing::warn!(
@@ -100,22 +113,29 @@ impl PanelCertificateManager {
                 }
             };
             for scope in scopes {
-                if let Err(error) = self.reconcile_scope(&group, &scope).await {
-                    tracing::warn!(
-                        group_id = group.id,
-                        domain = %scope.domain,
-                        "panel certificate reconcile failed: {error}"
-                    );
+                match self.reconcile_scope(&group, &scope).await {
+                    Ok(true) => {
+                        changed_groups.insert(group.id);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            group_id = group.id,
+                            domain = %scope.domain,
+                            "panel certificate reconcile failed: {error}"
+                        );
+                    }
                 }
             }
         }
+        changed_groups
     }
 
     async fn reconcile_scope(
         &self,
         group: &DeviceGroup,
         scope: &GroupCertificateScope,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let scope_root = scope_root(&self.state_dir, group.id, &scope.domain);
         let current = recover_current(&scope_root, &scope.domain)?;
         if current
@@ -123,10 +143,14 @@ impl PanelCertificateManager {
             .is_some_and(|current| !renewal_due(current))
         {
             clear_retry(&scope_root);
-            return Ok(());
+            return Ok(false);
+        }
+        if !self.issuance_authorized(group.id, &scope.domain).await? {
+            clear_retry(&scope_root);
+            return Ok(false);
         }
         if !retry_due(&scope_root)? {
-            return Ok(());
+            return Ok(false);
         }
         let issuance_lock = CERTIFICATE_ISSUANCE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
         let _issuance_guard = issuance_lock.lock().await;
@@ -136,10 +160,14 @@ impl PanelCertificateManager {
             .is_some_and(|current| !renewal_due(current))
         {
             clear_retry(&scope_root);
-            return Ok(());
+            return Ok(false);
+        }
+        if !self.issuance_authorized(group.id, &scope.domain).await? {
+            clear_retry(&scope_root);
+            return Ok(false);
         }
         if !retry_due(&scope_root)? {
-            return Ok(());
+            return Ok(false);
         }
         schedule_retry_before_attempt(&scope_root)?;
 
@@ -157,7 +185,16 @@ impl PanelCertificateManager {
             tracing::info!(group_id, domain = %scope.domain, "published Panel certificate generation");
         }
         clear_retry(&scope_root);
-        Ok(())
+        Ok(issued)
+    }
+
+    async fn issuance_authorized(&self, group_id: i64, domain: &str) -> Result<bool, String> {
+        let scopes = issuance_authorized_certificate_scopes_for_group(self.db.as_ref(), group_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(scopes
+            .iter()
+            .any(|scope| scope.domain.eq_ignore_ascii_case(domain)))
     }
 
     fn issue_and_publish(
@@ -227,7 +264,7 @@ impl PanelCertificateManager {
     }
 }
 
-pub fn spawn(manager: PanelCertificateManager) {
+pub fn spawn(manager: PanelCertificateManager, node_connections: crate::api::ws::NodeConnections) {
     tokio::spawn(async move {
         // HTTP listener先开始服务，Certbot manual hook才能通过本机现有端口复用
         // Panel DNS-01。该等待不创建新调度器，之后仍只有一个顺序worker。
@@ -235,10 +272,25 @@ pub fn spawn(manager: PanelCertificateManager) {
         let mut ticker = tokio::time::interval(manager.check_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            ticker.tick().await;
-            manager.reconcile_all().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = certificate_reconcile_notify().notified() => {}
+            }
+            for group_id in manager.reconcile_all().await {
+                node_connections
+                    .send_group(group_id, r#"{"type":"config_changed"}"#)
+                    .await;
+            }
         }
     });
+}
+
+fn certificate_reconcile_notify() -> &'static tokio::sync::Notify {
+    CERTIFICATE_RECONCILE_NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+pub(crate) fn notify_reconcile() {
+    certificate_reconcile_notify().notify_one();
 }
 
 pub fn is_hook_command(args: &[String]) -> bool {
@@ -306,6 +358,99 @@ pub async fn run_hook(args: &[String]) -> Result<(), String> {
             status.as_u16()
         ))
     }
+}
+
+pub(crate) async fn resolve_managed_certificate_scopes(
+    state_dir: &Path,
+    group_id: i64,
+    scopes: Vec<GroupCertificateScope>,
+) -> Result<Vec<GroupCertificateScope>, String> {
+    let state_dir = state_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let inventory = managed_certificate_inventory(&state_dir, group_id)?;
+        let mut resolved = BTreeMap::<String, BTreeSet<String>>::new();
+        for scope in scopes {
+            for sni in scope.snis {
+                let domain = best_managed_certificate_domain(&inventory, &sni)
+                    .unwrap_or_else(|| scope.domain.clone());
+                resolved.entry(domain).or_default().insert(sni);
+            }
+        }
+        Ok(resolved
+            .into_iter()
+            .map(|(domain, snis)| GroupCertificateScope {
+                domain,
+                snis: snis.into_iter().collect(),
+            })
+            .collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn managed_certificate_inventory(
+    state_dir: &Path,
+    group_id: i64,
+) -> Result<Vec<CurrentCertificate>, String> {
+    let scopes_root = state_dir
+        .join("groups")
+        .join(group_id.to_string())
+        .join("scopes");
+    let entries = match fs::read_dir(&scopes_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut inventory = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(link_metadata) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !metadata.is_dir() || link_metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Some(scope_name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let root = entry.path();
+        let domain = ["current.json", "current.backup.json"]
+            .into_iter()
+            .find_map(|name| {
+                let path = root.join(name);
+                validate_private_file(&path, false).ok()?;
+                let current = read_json::<CurrentCertificate>(&path).ok()?;
+                (scope_id(&current.domain) == scope_name).then_some(current.domain)
+            });
+        let Some(domain) = domain else {
+            continue;
+        };
+        if let Some(current) = recover_current(&root, &domain)? {
+            inventory.push(current);
+        }
+    }
+    Ok(inventory)
+}
+
+fn best_managed_certificate_domain(inventory: &[CurrentCertificate], sni: &str) -> Option<String> {
+    let sni = sni.trim_end_matches('.');
+    let mut candidates = inventory
+        .iter()
+        .filter(|current| {
+            relay_shared::reconciliation::certificate_domain_covers_sni(&current.domain, sni)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        let left_exact = left.domain.eq_ignore_ascii_case(sni);
+        let right_exact = right.domain.eq_ignore_ascii_case(sni);
+        right_exact
+            .cmp(&left_exact)
+            .then_with(|| right.domain.len().cmp(&left.domain.len()))
+            .then_with(|| left.domain.cmp(&right.domain))
+    });
+    candidates.first().map(|current| current.domain.clone())
 }
 
 fn internal_panel_url(listen: &str) -> Result<String, String> {
@@ -820,6 +965,8 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::schema::SCHEMA_SQL;
+    use crate::db::sqlite_repo::SqliteRepository;
     use ::time::{Duration as TimeDuration, OffsetDateTime};
     use axum::extract::{Path as AxumPath, State};
     use axum::http::{HeaderMap, StatusCode};
@@ -827,6 +974,7 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use rcgen::{CertificateParams, KeyPair};
+    use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
@@ -942,6 +1090,234 @@ mod tests {
         write_private_file(&cert_path, certificate.pem().as_bytes()).unwrap();
         write_private_file(&key_path, key.serialize_pem().as_bytes()).unwrap();
         (cert_path, key_path)
+    }
+
+    fn scope(domain: &str, sni: &str) -> GroupCertificateScope {
+        GroupCertificateScope {
+            domain: domain.into(),
+            snis: vec![sni.into()],
+        }
+    }
+
+    async fn issuance_fixture(
+        label: &str,
+    ) -> (PanelCertificateManager, DeviceGroup, SqlitePool, PathBuf) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, password, admin) VALUES (2, 'owner', 'hash', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) \
+             VALUES (10, 'inbound', 'in', 'group-token', 2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port, protocol, \
+              public_transport, node_transport, entry_transport, sni, camouflage_enabled) \
+             VALUES (100, 'reality', 2, 443, 10, '192.0.2.20', 443, 'tcp', \
+                     'nginx_sni', 'nginx_sni', 'nginx_sni', 'b.example.com', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let dir = unique_dir(label);
+        ensure_private_dir(&dir).unwrap();
+        let marker = dir.join("certbot-called");
+        let certbot = dir.join("certbot-mock.sh");
+        fs::write(
+            &certbot,
+            format!(
+                "#!/bin/sh\nprintf called > '{}'\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&certbot, fs::Permissions::from_mode(0o700)).unwrap();
+        let db: Arc<dyn Repository> = Arc::new(SqliteRepository::new(pool.clone()));
+        let group = GroupRepository::find_by_id(db.as_ref(), 10, &ResourceScope::All)
+            .await
+            .unwrap()
+            .unwrap();
+        let manager = PanelCertificateManager {
+            db,
+            state_dir: dir,
+            certbot_binary: certbot,
+            hook_binary: PathBuf::from("/usr/bin/false"),
+            internal_panel_url: "http://127.0.0.1:1".into(),
+            check_interval: Duration::from_secs(60),
+        };
+        (manager, group, pool, marker)
+    }
+
+    async fn authorize_fixture_scope(pool: &SqlitePool) {
+        sqlx::query(
+            "INSERT INTO dns_record_syncs \
+             (rule_id, fqdn, record_type, expected_value, line, line_key, desired_action, \
+              state, ownership, mutation_verified_at, created_at, updated_at) \
+             VALUES (100, 'b.example.com', 'A', '192.0.2.10', 'default', 'default', \
+                     'UPSERT', 'MUTATION_VERIFIED', 'PANEL', '2026-09-04 00:00:00', \
+                     '2026-09-04 00:00:00', '2026-09-04 00:00:00')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO dns_record_bindings \
+             (rule_id, fqdn, zone_id, zone_name, host, record_type, line, line_key, \
+              record_id, desired_value, state, last_observed_at, created_at, updated_at) \
+             VALUES (100, 'b.example.com', 7, 'example.com', 'b', 'A', 'default', \
+                     'default', 'record-100', '192.0.2.10', 'BOUND', '2026-09-04 00:00:00', \
+                     '2026-09-04 00:00:00', '2026-09-04 00:00:00')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_never_issues_pending_exact_scope_but_reuses_managed_wildcard() {
+        let (manager, group, _pool, marker) = issuance_fixture("issuance-pending").await;
+        let scopes = manager.certificate_scopes(group.id).await.unwrap();
+        assert_eq!(scopes, vec![scope("b.example.com", "b.example.com")]);
+        assert!(!manager.reconcile_scope(&group, &scopes[0]).await.unwrap());
+        assert!(
+            !marker.exists(),
+            "pending ownership must not execute Certbot"
+        );
+
+        let wildcard = candidate(&manager.state_dir, "wildcard", "*.example.com", 90);
+        publish_candidate(
+            &manager.state_dir,
+            group.id,
+            "*.example.com",
+            &wildcard.0,
+            &wildcard.1,
+        )
+        .unwrap();
+        let scopes = manager.certificate_scopes(group.id).await.unwrap();
+        assert_eq!(scopes, vec![scope("*.example.com", "b.example.com")]);
+        assert!(!manager.reconcile_scope(&group, &scopes[0]).await.unwrap());
+        assert!(
+            !marker.exists(),
+            "managed certificate reuse must not execute Certbot"
+        );
+        let _ = fs::remove_dir_all(&manager.state_dir);
+    }
+
+    #[tokio::test]
+    async fn worker_enters_issuance_only_after_verified_binding() {
+        let (manager, group, pool, marker) = issuance_fixture("issuance-authorized").await;
+        authorize_fixture_scope(&pool).await;
+        let scopes = manager.certificate_scopes(group.id).await.unwrap();
+        assert_eq!(scopes, vec![scope("*.example.com", "b.example.com")]);
+        assert!(manager.reconcile_scope(&group, &scopes[0]).await.is_err());
+        assert!(
+            marker.exists(),
+            "verified ownership should reach the Certbot invocation"
+        );
+        let _ = fs::remove_dir_all(&manager.state_dir);
+    }
+
+    #[tokio::test]
+    async fn managed_wildcard_inventory_is_reused_before_public_a_propagation() {
+        let dir = unique_dir("managed-wildcard-reuse");
+        let wildcard = candidate(&dir, "wildcard", "*.example.com", 90);
+        publish_candidate(&dir, 7, "*.example.com", &wildcard.0, &wildcard.1).unwrap();
+
+        let resolved = resolve_managed_certificate_scopes(
+            &dir,
+            7,
+            vec![scope("b.example.com", "b.example.com")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, vec![scope("*.example.com", "b.example.com")]);
+        let manifest = build_group_manifest(&dir, 7, &resolved).unwrap();
+        assert_eq!(manifest.response.certificates.len(), 1);
+        assert_eq!(manifest.response.certificates[0].domain, "*.example.com");
+        assert!(manifest.response.missing_domains.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn managed_inventory_never_guesses_or_reuses_unusable_certificates() {
+        let empty = unique_dir("managed-empty");
+        let requested = vec![scope("b.example.com", "b.example.com")];
+        assert_eq!(
+            resolve_managed_certificate_scopes(&empty, 7, requested.clone())
+                .await
+                .unwrap(),
+            requested,
+            "without trusted inventory the resolver must not guess a wildcard"
+        );
+
+        let wrong = candidate(&empty, "wrong", "*.other.example", 90);
+        publish_candidate(&empty, 7, "*.other.example", &wrong.0, &wrong.1).unwrap();
+        assert_eq!(
+            resolve_managed_certificate_scopes(&empty, 7, requested.clone())
+                .await
+                .unwrap(),
+            requested,
+            "a managed certificate that does not cover the SNI is not reusable"
+        );
+
+        let wildcard = candidate(&empty, "valid", "*.example.com", 90);
+        publish_candidate(&empty, 7, "*.example.com", &wildcard.0, &wildcard.1).unwrap();
+        let root = scope_root(&empty, 7, "*.example.com");
+        let current = recover_current(&root, "*.example.com").unwrap().unwrap();
+        let key_path = root
+            .join("generations")
+            .join(current.generation.to_string())
+            .join("privkey.pem");
+        let mismatch = candidate(&empty, "mismatch", "*.example.com", 90);
+        fs::copy(mismatch.1, &key_path).unwrap();
+        assert_eq!(
+            resolve_managed_certificate_scopes(&empty, 7, requested.clone())
+                .await
+                .unwrap(),
+            requested,
+            "a key mismatch invalidates the managed inventory entry"
+        );
+
+        let expired_dir = unique_dir("managed-expired");
+        let expired = candidate(&expired_dir, "expired", "*.example.com", -1);
+        let expired_root = scope_root(&expired_dir, 7, "*.example.com");
+        let generation = expired_root.join("generations/1");
+        ensure_private_dir(&generation).unwrap();
+        fs::copy(&expired.0, generation.join("fullchain.pem")).unwrap();
+        fs::copy(&expired.1, generation.join("privkey.pem")).unwrap();
+        write_json_private(
+            &expired_root.join("current.json"),
+            &CurrentCertificate {
+                generation: 1,
+                domain: "*.example.com".into(),
+                expires_at: (Utc::now() - ChronoDuration::days(1)).to_rfc3339(),
+                fingerprint: "0".repeat(64),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_managed_certificate_scopes(&expired_dir, 7, requested.clone())
+                .await
+                .unwrap(),
+            requested,
+            "an expired managed certificate is not reusable"
+        );
+
+        let _ = fs::remove_dir_all(empty);
+        let _ = fs::remove_dir_all(expired_dir);
     }
 
     #[test]

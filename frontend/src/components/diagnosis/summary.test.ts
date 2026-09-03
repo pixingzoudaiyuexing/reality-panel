@@ -13,6 +13,7 @@ import {
   diagnosisOverview,
   nodeDiagnosisHighlights,
   nodeDiagnosisChecks,
+  nodeListenerDisplayStatus,
   primaryControlIssue,
 } from './summary';
 
@@ -151,7 +152,7 @@ describe('diagnosis summary semantics', () => {
     })).find((item) => item.key === 'nginx')?.check.state).toBe('fail');
   });
 
-  it('keeps listener failure independent from DNS dependencies', () => {
+  it('uses the Reality Nginx runtime instead of the absent generic listener', () => {
     const failedListener = node({ listener_running: false });
     const overview = diagnosisOverview([failedListener], {
       dnsmgr: check('fail'),
@@ -160,11 +161,19 @@ describe('diagnosis summary semantics', () => {
       route: check('blocked'),
     });
     expect(overview.find((item) => item.key === 'dns')?.check.state).toBe('fail');
-    expect(overview.find((item) => item.key === 'listener')?.check.state).toBe('fail');
-    expect(nodeDiagnosisHighlights(failedListener)[0]).toEqual({
-      key: 'listener',
-      check: { state: 'fail' },
+    expect(overview.find((item) => item.key === 'listener')?.check.state).toBe('pass');
+    expect(nodeListenerDisplayStatus(failedListener)).toBe('normal');
+    expect(nodeDiagnosisHighlights(failedListener)).toEqual([]);
+
+    const failedRuntime = node({
+      listener_running: false,
+      reality: reality({
+        runtime: { check: check('fail'), listen_443: false, listen_8443: true },
+      }),
     });
+    expect(nodeListenerDisplayStatus(failedRuntime)).toBe('abnormal');
+    expect(diagnosisOverview([failedRuntime]).find((item) => item.key === 'listener')?.check.state)
+      .toBe('fail');
   });
 
   it('chooses a concrete control failure before downstream blocked checks', () => {
@@ -218,15 +227,15 @@ describe('diagnosis summary semantics', () => {
     })).level).toBe('warning');
   });
 
-  it('aggregates mixed and all-failed listeners without treating missing results as failures', () => {
+  it('aggregates ordinary listener failures without treating missing results as failures', () => {
     expect(aggregateNodeListeners([
-      node(),
-      node({ node_id: 'node-b', listener_running: false }),
+      node({ reality: undefined }),
+      node({ node_id: 'node-b', reality: undefined, listener_running: false }),
       { status: 'timeout', node_id: 'node-c', group_name: 'group-a' },
     ])).toMatchObject({ status: 'partial', total: 3, abnormal: 1, notTested: 1 });
     expect(aggregateNodeListeners([
-      node({ listener_running: false }),
-      node({ node_id: 'node-b', listener_running: false }),
+      node({ reality: undefined, listener_running: false }),
+      node({ node_id: 'node-b', reality: undefined, listener_running: false }),
     ]).status).toBe('abnormal');
   });
 
