@@ -11,7 +11,7 @@ use relay_shared::protocol::{
     ListenerConfig, ListenerError, LoadBalanceStrategy, NodeConfigResponse, NodeTransport, Protocol,
 };
 use relay_shared::reconciliation::{fingerprint_bytes, ConfigFingerprint};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -293,11 +293,7 @@ impl ForwarderManager {
             camouflage_sites: config.camouflage_sites.clone(),
         };
 
-        let sni_plan = match NginxSniPlan::from_listeners(
-            &sni_listeners,
-            &self.nginx_sni.default_backend,
-            &self.nginx_sni.access_log_path,
-        ) {
+        let sni_plan = match self.nginx_sni_plan_from_listeners(&sni_listeners).await {
             Ok(plan) => plan,
             Err(error) => {
                 tracing::error!("nginx_sni plan rejected: {}", error);
@@ -882,11 +878,13 @@ impl ForwarderManager {
             .filter(|listener| listener.node_transport == NodeTransport::NginxSni)
             .cloned()
             .collect();
-        let sni_plan = NginxSniPlan::from_listeners(
-            &sni_listeners,
-            &self.nginx_sni.default_backend,
-            &self.nginx_sni.access_log_path,
-        );
+        let sni_plan = self.nginx_sni_plan.clone().map(Ok).unwrap_or_else(|| {
+            NginxSniPlan::from_listeners(
+                &sni_listeners,
+                &self.nginx_sni.default_backend,
+                &self.nginx_sni.access_log_path,
+            )
+        });
         let (nginx_drift, nginx_healthy, nginx_fingerprint) = match sni_plan {
             Ok(plan) => {
                 let observation =
@@ -1036,6 +1034,52 @@ impl ForwarderManager {
         socket_bound(port, Protocol::Tcp).unwrap_or(false)
     }
 
+    /// Re-resolve hostname-backed Nginx SNI targets through the same cached
+    /// resolver used by native TCP. A changed resolved plan is applied through
+    /// the normal Nginx test/reload transaction; a DNS blip keeps the last
+    /// known-good runtime untouched.
+    pub async fn refresh_nginx_sni_dns(&mut self) -> Result<bool, String> {
+        if !self.nginx_sni.enabled {
+            return Ok(false);
+        }
+        let Some(config) = self.last_config.clone() else {
+            return Ok(false);
+        };
+        let listeners = config
+            .listeners
+            .iter()
+            .filter(|listener| listener.node_transport == NodeTransport::NginxSni)
+            .cloned()
+            .collect::<Vec<_>>();
+        let plan = self.nginx_sni_plan_from_listeners(&listeners).await;
+        self.apply_refreshed_nginx_sni_plan(plan)
+    }
+
+    fn apply_refreshed_nginx_sni_plan(
+        &mut self,
+        plan: Result<NginxSniPlan, String>,
+    ) -> Result<bool, String> {
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) if self.nginx_sni_plan.is_some() => {
+                tracing::warn!(
+                    "nginx_sni DNS refresh deferred; retaining last-known-good runtime: {}",
+                    error
+                );
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if self.nginx_sni_plan.as_ref() == Some(&plan) {
+            return Ok(false);
+        }
+        nginx_sni::apply_plan(&plan, &self.nginx_sni)
+            .map_err(|error| format!("nginx_sni DNS refresh apply failed: {error}"))?;
+        self.nginx_sni_plan = Some(plan);
+        tracing::info!("nginx_sni targets refreshed after DNS resolution changed");
+        Ok(true)
+    }
+
     /// Rebuild only the shared nginx_sni plan from the node's accepted config.
     /// This never invokes the camouflage or certificate managers and never
     /// restarts the relay process.
@@ -1066,12 +1110,10 @@ impl ForwarderManager {
             .filter(|listener| listener.node_transport == NodeTransport::NginxSni)
             .cloned()
             .collect::<Vec<_>>();
-        let plan = NginxSniPlan::from_listeners(
-            &listeners,
-            &self.nginx_sni.default_backend,
-            &self.nginx_sni.access_log_path,
-        )
-        .map_err(|error| format!("nginx_sni plan rejected: {error}"))?;
+        let plan = self
+            .nginx_sni_plan_from_listeners(&listeners)
+            .await
+            .map_err(|error| format!("nginx_sni plan rejected: {error}"))?;
         if let Err(error) = nginx_sni::apply_plan(&plan, &self.nginx_sni) {
             let error = format!("nginx_sni reapply failed: {error}");
             self.listener_errors.lock().await.push(ListenerError {
@@ -1083,6 +1125,36 @@ impl ForwarderManager {
         }
         self.nginx_sni_plan = Some(plan);
         Ok(())
+    }
+
+    async fn nginx_sni_plan_from_listeners(
+        &self,
+        listeners: &[ListenerConfig],
+    ) -> Result<NginxSniPlan, String> {
+        let mut resolutions = BTreeMap::new();
+        for target in listeners.iter().flat_map(|listener| &listener.targets) {
+            let target = target.trim();
+            if target.is_empty() || target.parse::<SocketAddr>().is_ok() {
+                continue;
+            }
+            if resolutions.contains_key(target) {
+                continue;
+            }
+            let addrs = super::outbound::resolve_cached(target)
+                .await
+                .map_err(|error| format!("DNS resolution failed for {target}: {error}"))?;
+            let addrs = canonical_socket_addrs(addrs);
+            if addrs.is_empty() {
+                return Err(format!("DNS resolution returned no addresses for {target}"));
+            }
+            resolutions.insert(target.to_string(), addrs);
+        }
+        nginx_sni_plan_with_resolutions(
+            listeners,
+            &resolutions,
+            &self.nginx_sni.default_backend,
+            &self.nginx_sni.access_log_path,
+        )
     }
 
     /// v1.2.0: restart ONE rule — drop every connection it is currently
@@ -1172,6 +1244,40 @@ impl ForwarderManager {
         );
         (dropped, restarted)
     }
+}
+
+fn canonical_socket_addrs(mut addrs: Vec<SocketAddr>) -> Vec<String> {
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs.into_iter().map(|addr| addr.to_string()).collect()
+}
+
+fn nginx_sni_plan_with_resolutions(
+    listeners: &[ListenerConfig],
+    resolutions: &BTreeMap<String, Vec<String>>,
+    default_backend: &str,
+    access_log_path: &str,
+) -> Result<NginxSniPlan, String> {
+    let mut resolved_listeners = listeners.to_vec();
+    for listener in &mut resolved_listeners {
+        let mut targets = Vec::new();
+        for target in &listener.targets {
+            let target = target.trim();
+            if target.is_empty() {
+                continue;
+            }
+            if target.parse::<SocketAddr>().is_ok() {
+                targets.push(target.to_string());
+            } else {
+                let Some(addrs) = resolutions.get(target) else {
+                    return Err(format!("no resolved addresses available for {target}"));
+                };
+                targets.extend(addrs.iter().cloned());
+            }
+        }
+        listener.targets = targets;
+    }
+    NginxSniPlan::from_listeners(&resolved_listeners, default_backend, access_log_path)
 }
 
 fn protocol_tag(protocol: Protocol) -> &'static str {
@@ -2653,6 +2759,191 @@ mod tests {
         assert!(error.contains("false failed"), "unexpected error: {error}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(mgr.nginx_sni_rule_for_id(11).is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn nginx_sni_listener(
+        target: &str,
+        strategy: LoadBalanceStrategy,
+        proxy_protocol: bool,
+    ) -> ListenerConfig {
+        ListenerConfig {
+            rule_id: 91,
+            port: 443,
+            protocol: Protocol::Tcp,
+            node_transport: NodeTransport::NginxSni,
+            ws_path: None,
+            sni: Some("ddns.example.com".into()),
+            camouflage_required: false,
+            send_proxy_protocol: proxy_protocol,
+            targets: vec![target.into()],
+            load_balance_strategy: strategy,
+            upload_limit_bps: None,
+            download_limit_bps: None,
+            max_connections: None,
+        }
+    }
+
+    fn ddns_resolutions(addresses: &[&str]) -> BTreeMap<String, Vec<String>> {
+        let addrs = addresses
+            .iter()
+            .map(|address| address.parse::<SocketAddr>().unwrap())
+            .collect();
+        BTreeMap::from([(
+            "ddns.example.com:50036".into(),
+            canonical_socket_addrs(addrs),
+        )])
+    }
+
+    #[test]
+    fn nginx_sni_ddns_plan_changes_only_for_new_canonical_addresses() {
+        let listeners = vec![nginx_sni_listener(
+            "ddns.example.com:50036",
+            LoadBalanceStrategy::First,
+            false,
+        )];
+        let first = nginx_sni_plan_with_resolutions(
+            &listeners,
+            &ddns_resolutions(&["1.1.1.1:50036", "2.2.2.2:50036"]),
+            "127.0.0.1:9",
+            "/tmp/sni.log",
+        )
+        .unwrap();
+        let same_set_different_order = nginx_sni_plan_with_resolutions(
+            &listeners,
+            &ddns_resolutions(&["2.2.2.2:50036", "1.1.1.1:50036"]),
+            "127.0.0.1:9",
+            "/tmp/sni.log",
+        )
+        .unwrap();
+        let changed = nginx_sni_plan_with_resolutions(
+            &listeners,
+            &ddns_resolutions(&["2.2.2.2:50036"]),
+            "127.0.0.1:9",
+            "/tmp/sni.log",
+        )
+        .unwrap();
+
+        assert_eq!(
+            first, same_set_different_order,
+            "same answers must not reload"
+        );
+        assert_ne!(first, changed, "a changed DDNS answer must reconcile");
+        assert!(first.render().contains("server 1.1.1.1:50036"));
+        assert!(changed.render().contains("server 2.2.2.2:50036"));
+    }
+
+    #[test]
+    fn nginx_sni_ddns_requires_resolution_without_replacing_lkg_with_empty_upstream() {
+        let listeners = vec![nginx_sni_listener(
+            "ddns.example.com:50036",
+            LoadBalanceStrategy::First,
+            false,
+        )];
+        let lkg = nginx_sni_plan_with_resolutions(
+            &listeners,
+            &ddns_resolutions(&["1.1.1.1:50036"]),
+            "127.0.0.1:9",
+            "/tmp/sni.log",
+        )
+        .unwrap();
+        let failed_refresh = nginx_sni_plan_with_resolutions(
+            &listeners,
+            &BTreeMap::new(),
+            "127.0.0.1:9",
+            "/tmp/sni.log",
+        );
+
+        assert!(failed_refresh.is_err());
+        assert!(lkg.render().contains("server 1.1.1.1:50036"));
+    }
+
+    #[test]
+    fn nginx_sni_ddns_keeps_literal_targets_and_proxy_load_balance_semantics() {
+        let mut listeners = vec![nginx_sni_listener(
+            "192.0.2.10:50036",
+            LoadBalanceStrategy::Failover,
+            true,
+        )];
+        listeners[0].targets.push("ddns.example.com:50036".into());
+        let plan = nginx_sni_plan_with_resolutions(
+            &listeners,
+            &ddns_resolutions(&["198.51.100.20:50036"]),
+            "127.0.0.1:9",
+            "/tmp/sni.log",
+        )
+        .unwrap();
+        let rendered = plan.render();
+
+        assert!(rendered.contains("server 192.0.2.10:50036 max_fails=1 fail_timeout=10s;"));
+        assert!(
+            rendered.contains("server 198.51.100.20:50036 max_fails=1 fail_timeout=10s backup;")
+        );
+        assert!(rendered.contains("proxy_protocol on;"));
+    }
+
+    #[test]
+    fn nginx_sni_ddns_refresh_reloads_only_changed_plan_and_retains_lkg_on_error() {
+        let mut mgr = fresh_mgr();
+        let dir = std::env::temp_dir().join(format!(
+            "relay-panel-manager-ddns-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("relay.conf");
+        let reload_marker = dir.join("reloads");
+        mgr.set_nginx_sni_config_for_test(NginxSniConfig {
+            enabled: true,
+            conf_path: path.clone(),
+            test_cmd: "true".into(),
+            reload_cmd: format!("printf x >> {}", reload_marker.display()),
+            default_backend: "127.0.0.1:9".into(),
+            access_log_path: "/tmp/relay-panel-test.log".into(),
+        });
+        let listeners = vec![nginx_sni_listener(
+            "ddns.example.com:50036",
+            LoadBalanceStrategy::First,
+            false,
+        )];
+        let lkg = nginx_sni_plan_with_resolutions(
+            &listeners,
+            &ddns_resolutions(&["1.1.1.1:50036"]),
+            "127.0.0.1:9",
+            "/tmp/relay-panel-test.log",
+        )
+        .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, lkg.render()).unwrap();
+        mgr.nginx_sni_plan = Some(lkg.clone());
+
+        assert!(!mgr.apply_refreshed_nginx_sni_plan(Ok(lkg)).unwrap());
+        assert!(
+            !reload_marker.exists(),
+            "unchanged addresses must not reload"
+        );
+        assert!(!mgr
+            .apply_refreshed_nginx_sni_plan(Err("temporary DNS failure".into()))
+            .unwrap());
+        assert!(
+            !reload_marker.exists(),
+            "a DNS failure must retain LKG without reload"
+        );
+
+        let changed = nginx_sni_plan_with_resolutions(
+            &listeners,
+            &ddns_resolutions(&["2.2.2.2:50036"]),
+            "127.0.0.1:9",
+            "/tmp/relay-panel-test.log",
+        )
+        .unwrap();
+        assert!(mgr.apply_refreshed_nginx_sni_plan(Ok(changed)).unwrap());
+        assert_eq!(std::fs::read_to_string(&reload_marker).unwrap(), "x");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("server 2.2.2.2:50036"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

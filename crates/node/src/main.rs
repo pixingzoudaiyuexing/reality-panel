@@ -483,6 +483,10 @@ async fn run() {
             }
         }
 
+        if let Err(error) = manager.lock().await.refresh_nginx_sni_dns().await {
+            tracing::warn!("nginx_sni DNS refresh failed; retaining prior runtime: {error}");
+        }
+
         if let Err(error) = panel_certificate_sync
             .lock()
             .await
