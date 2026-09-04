@@ -27,6 +27,9 @@ async fn main() {
             Ok(()) => return,
             Err(error) => {
                 eprintln!("ACME DNS-01 hook failed: {error}");
+                if args.get(1).is_some_and(|action| action == "auth") {
+                    service::panel_certificate::hard_abort_certbot_process_group();
+                }
                 std::process::exit(1);
             }
         }

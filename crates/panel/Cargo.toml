@@ -43,6 +43,7 @@ subtle = "2"
 tar = "0.4"
 hickory-resolver = "0.24"
 x509-parser = "0.16"
+libc = "0.2"
 
 [dev-dependencies]
 # tower::ServiceExt (.oneshot) for the security-headers router tests. Already in

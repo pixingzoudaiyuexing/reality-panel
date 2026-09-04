@@ -15,6 +15,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
@@ -27,6 +28,11 @@ const RENEW_BEFORE_DAYS: i64 = 30;
 const MAX_HOOK_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_GROUP_CERTIFICATE_SCOPES: usize = 128;
 const MAX_GROUP_CERTIFICATE_BYTES: usize = 2 * 1024 * 1024;
+const CERTBOT_HARD_ABORT_ENV: &str = "RELAY_PANEL_CERTBOT_HARD_ABORT";
+const ISSUANCE_ID_ENV: &str = "RELAY_PANEL_CERTIFICATE_ISSUANCE_ID";
+const ISSUANCE_GROUP_ENV: &str = "RELAY_PANEL_CERTIFICATE_GROUP_ID";
+const ISSUANCE_DOMAIN_ENV: &str = "RELAY_PANEL_CERTIFICATE_DOMAIN";
+const ISSUANCE_RECEIPT_ENV: &str = "RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT";
 const RETRY_DELAYS_SECS: &[i64] = &[30, 120, 300, 900, 1_800, 3_600];
 static CERTIFICATE_ISSUANCE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static CERTIFICATE_RECONCILE_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
@@ -53,6 +59,34 @@ struct CurrentCertificate {
 struct RetryState {
     attempt: usize,
     next_retry_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+struct IssuanceAuthorizationReceipt {
+    issuance_id: String,
+    group_id: i64,
+    certificate_domain: String,
+    challenge_sni: String,
+    actor: String,
+    challenge_id: String,
+    value_sha256: String,
+    state: String,
+}
+
+#[derive(Clone, Debug)]
+struct IssuanceAttempt {
+    issuance_id: String,
+    group_id: i64,
+    certificate_domain: String,
+    challenge_sni: String,
+    actor: String,
+    receipt_path: PathBuf,
+}
+
+struct IssuedCertificateCandidate {
+    attempt: IssuanceAttempt,
+    cert_source: PathBuf,
+    key_source: PathBuf,
 }
 
 pub struct GroupCertificateManifest {
@@ -176,8 +210,31 @@ impl PanelCertificateManager {
         let token = group.token.clone();
         let domain = scope.domain.clone();
         let current_for_issue = current.clone();
+        let candidate = tokio::task::spawn_blocking(move || {
+            manager.issue_candidate(group_id, &token, &domain, current_for_issue.as_ref())
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+        if !self.issuance_authorized(group.id, &scope.domain).await? {
+            remove_regular_file(&candidate.attempt.receipt_path);
+            return Err("certificate issuance authorization changed before publish".into());
+        }
+        let state_dir = self.state_dir.clone();
+        let publish_domain = scope.domain.clone();
         let issued = tokio::task::spawn_blocking(move || {
-            manager.issue_and_publish(group_id, &token, &domain, current_for_issue.as_ref())
+            let result =
+                validate_issuance_receipt(&candidate.attempt.receipt_path, &candidate.attempt)
+                    .and_then(|_| {
+                        publish_candidate(
+                            &state_dir,
+                            group_id,
+                            &publish_domain,
+                            &candidate.cert_source,
+                            &candidate.key_source,
+                        )
+                    });
+            remove_regular_file(&candidate.attempt.receipt_path);
+            result
         })
         .await
         .map_err(|error| error.to_string())??;
@@ -197,13 +254,13 @@ impl PanelCertificateManager {
             .any(|scope| scope.domain.eq_ignore_ascii_case(domain)))
     }
 
-    fn issue_and_publish(
+    fn issue_candidate(
         &self,
         group_id: i64,
         token: &str,
         domain: &str,
         current: Option<&CurrentCertificate>,
-    ) -> Result<bool, String> {
+    ) -> Result<IssuedCertificateCandidate, String> {
         ensure_private_dir(&self.state_dir)?;
         let acme_root = self.state_dir.join("acme");
         let config_dir = acme_root.join("config");
@@ -215,6 +272,17 @@ impl PanelCertificateManager {
 
         let certificate_name = format!("reality-panel-g{group_id}-{}", &scope_id(domain)[..16]);
         let actor = format!("panel-certificate-g{group_id}-{}", &scope_id(domain)[..16]);
+        let issuance_id = uuid::Uuid::new_v4().to_string();
+        let issuance_dir = self.state_dir.join("issuance");
+        ensure_private_dir(&issuance_dir)?;
+        let attempt = IssuanceAttempt {
+            issuance_id: issuance_id.clone(),
+            group_id,
+            certificate_domain: domain.to_string(),
+            challenge_sni: challenge_domain(domain)?,
+            actor: actor.clone(),
+            receipt_path: issuance_dir.join(format!("{issuance_id}.json")),
+        };
         let mut args = vec![
             "certonly".to_string(),
             "--non-interactive".to_string(),
@@ -241,18 +309,30 @@ impl PanelCertificateManager {
         if current.is_some() {
             args.push("--force-renewal".to_string());
         }
-        let output = Command::new(&self.certbot_binary)
+        let mut command = Command::new(&self.certbot_binary);
+        command.process_group(0);
+        let output = command
             .args(&args)
             .env("RELAY_PANEL_INTERNAL_URL", &self.internal_panel_url)
             .env("RELAY_PANEL_NODE_TOKEN", token)
-            .env("RELAY_PANEL_CERTIFICATE_ACTOR", actor)
+            .env("RELAY_PANEL_CERTIFICATE_ACTOR", &actor)
+            .env(ISSUANCE_ID_ENV, &attempt.issuance_id)
+            .env(ISSUANCE_GROUP_ENV, group_id.to_string())
+            .env(ISSUANCE_DOMAIN_ENV, domain)
+            .env(ISSUANCE_RECEIPT_ENV, &attempt.receipt_path)
+            .env(CERTBOT_HARD_ABORT_ENV, "1")
             .stdin(Stdio::null())
             .output()
             .map_err(|error| format!("cannot run Certbot: {error}"))?;
         if !output.status.success() {
+            remove_regular_file(&attempt.receipt_path);
             return Err(
                 "Panel ACME certificate command failed; retained current generation".into(),
             );
+        }
+        if let Err(error) = validate_issuance_receipt(&attempt.receipt_path, &attempt) {
+            remove_regular_file(&attempt.receipt_path);
+            return Err(error);
         }
 
         let live = config_dir.join("live").join(certificate_name);
@@ -260,7 +340,11 @@ impl PanelCertificateManager {
         let key_path = live.join("privkey.pem");
         let cert_source = resolve_certbot_source(&cert_path, &config_dir)?;
         let key_source = resolve_certbot_source(&key_path, &config_dir)?;
-        publish_candidate(&self.state_dir, group_id, domain, &cert_source, &key_source)
+        Ok(IssuedCertificateCandidate {
+            attempt,
+            cert_source,
+            key_source,
+        })
     }
 }
 
@@ -297,6 +381,23 @@ pub fn is_hook_command(args: &[String]) -> bool {
     args.first().is_some_and(|value| value == HOOK_COMMAND)
 }
 
+pub fn hard_abort_certbot_process_group() {
+    if std::env::var(CERTBOT_HARD_ABORT_ENV).as_deref() != Ok("1")
+        || std::env::var(ISSUANCE_ID_ENV)
+            .ok()
+            .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+            .is_none()
+    {
+        return;
+    }
+    let process_group = unsafe { libc::getpgrp() };
+    if process_group > 1 {
+        unsafe {
+            libc::killpg(process_group, libc::SIGKILL);
+        }
+    }
+}
+
 pub async fn run_hook(args: &[String]) -> Result<(), String> {
     let action = match args.get(1).map(String::as_str) {
         Some("auth") => "present",
@@ -331,9 +432,9 @@ pub async fn run_hook(args: &[String]) -> Result<(), String> {
         .bearer_auth(token)
         .header("X-Node-ID", &node_id)
         .json(&AcmeDns01Request {
-            node_id,
-            sni,
-            value,
+            node_id: node_id.clone(),
+            sni: sni.clone(),
+            value: value.clone(),
         })
         .send()
         .await
@@ -347,6 +448,9 @@ pub async fn run_hook(args: &[String]) -> Result<(), String> {
         return Err("Panel challenge response is too large".into());
     }
     if status.is_success() {
+        if action == "present" {
+            write_issuance_receipt_from_hook(&body, &node_id, &sni, &value)?;
+        }
         Ok(())
     } else {
         let code = serde_json::from_slice::<serde_json::Value>(&body)
@@ -358,6 +462,88 @@ pub async fn run_hook(args: &[String]) -> Result<(), String> {
             status.as_u16()
         ))
     }
+}
+
+fn write_issuance_receipt_from_hook(
+    response_body: &[u8],
+    actor: &str,
+    challenge_sni: &str,
+    value: &str,
+) -> Result<(), String> {
+    let issuance_id =
+        std::env::var(ISSUANCE_ID_ENV).map_err(|_| "certificate issuance ID is unavailable")?;
+    uuid::Uuid::parse_str(&issuance_id).map_err(|_| "certificate issuance ID is invalid")?;
+    let group_id = std::env::var(ISSUANCE_GROUP_ENV)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or("certificate issuance group is invalid")?;
+    let certificate_domain = std::env::var(ISSUANCE_DOMAIN_ENV)
+        .map_err(|_| "certificate issuance domain is unavailable")?;
+    if challenge_domain(&certificate_domain)? != challenge_sni {
+        return Err("certificate issuance challenge domain mismatch".into());
+    }
+    let receipt_path = PathBuf::from(
+        std::env::var(ISSUANCE_RECEIPT_ENV)
+            .map_err(|_| "certificate issuance receipt path is unavailable")?,
+    );
+    if receipt_path.file_name().and_then(|name| name.to_str())
+        != Some(&format!("{issuance_id}.json"))
+    {
+        return Err("certificate issuance receipt path is invalid".into());
+    }
+    let response: serde_json::Value =
+        serde_json::from_slice(response_body).map_err(|_| "Panel challenge response is invalid")?;
+    let challenge_id = response
+        .get("challenge_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Panel challenge authorization response is invalid")?;
+    if response.get("state").and_then(serde_json::Value::as_str) != Some("presented")
+        || challenge_id.len() != 64
+        || !challenge_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("Panel challenge authorization response is invalid".into());
+    }
+    write_json_private(
+        &receipt_path,
+        &IssuanceAuthorizationReceipt {
+            issuance_id,
+            group_id,
+            certificate_domain,
+            challenge_sni: challenge_sni.to_string(),
+            actor: actor.to_string(),
+            challenge_id: challenge_id.to_string(),
+            value_sha256: hex::encode(Sha256::digest(value.as_bytes())),
+            state: "propagation_succeeded".into(),
+        },
+    )
+}
+
+fn validate_issuance_receipt(path: &Path, attempt: &IssuanceAttempt) -> Result<(), String> {
+    validate_private_file(path, true)
+        .map_err(|_| "certificate issuance authorization receipt is unavailable")?;
+    let receipt: IssuanceAuthorizationReceipt =
+        read_json(path).map_err(|_| "certificate issuance authorization receipt is invalid")?;
+    if receipt.issuance_id != attempt.issuance_id
+        || receipt.group_id != attempt.group_id
+        || receipt.certificate_domain != attempt.certificate_domain
+        || receipt.challenge_sni != attempt.challenge_sni
+        || receipt.actor != attempt.actor
+        || receipt.state != "propagation_succeeded"
+        || receipt.challenge_id.len() != 64
+        || !receipt
+            .challenge_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || receipt.value_sha256.len() != 64
+        || !receipt
+            .value_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("certificate issuance authorization receipt does not match attempt".into());
+    }
+    Ok(())
 }
 
 pub(crate) async fn resolve_managed_certificate_scopes(
@@ -982,16 +1168,22 @@ mod tests {
 
     static HOOK_ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
-    const HOOK_ENV_KEYS: [&str; 5] = [
+    const HOOK_ENV_KEYS: [&str; 10] = [
         "RELAY_PANEL_INTERNAL_URL",
         "RELAY_PANEL_NODE_TOKEN",
         "RELAY_PANEL_CERTIFICATE_ACTOR",
+        ISSUANCE_ID_ENV,
+        ISSUANCE_GROUP_ENV,
+        ISSUANCE_DOMAIN_ENV,
+        ISSUANCE_RECEIPT_ENV,
+        CERTBOT_HARD_ABORT_ENV,
         "CERTBOT_DOMAIN",
         "CERTBOT_VALIDATION",
     ];
 
     struct HookEnvGuard {
         previous: Vec<(&'static str, Option<OsString>)>,
+        receipt_path: PathBuf,
     }
 
     impl HookEnvGuard {
@@ -1003,9 +1195,20 @@ mod tests {
             std::env::set_var("RELAY_PANEL_INTERNAL_URL", panel_url);
             std::env::set_var("RELAY_PANEL_NODE_TOKEN", "test-node-token");
             std::env::set_var("RELAY_PANEL_CERTIFICATE_ACTOR", "panel-certificate-test");
+            let issuance_id = "01234567-89ab-4def-8123-456789abcdef";
+            let receipt_dir = unique_dir("hook-receipt");
+            let receipt_path = receipt_dir.join(format!("{issuance_id}.json"));
+            std::env::set_var(ISSUANCE_ID_ENV, issuance_id);
+            std::env::set_var(ISSUANCE_GROUP_ENV, "7");
+            std::env::set_var(ISSUANCE_DOMAIN_ENV, "*.i4ktv.top");
+            std::env::set_var(ISSUANCE_RECEIPT_ENV, &receipt_path);
+            std::env::remove_var(CERTBOT_HARD_ABORT_ENV);
             std::env::set_var("CERTBOT_DOMAIN", "*.i4ktv.top");
             std::env::set_var("CERTBOT_VALIDATION", "validation-token-123456");
-            Self { previous }
+            Self {
+                previous,
+                receipt_path,
+            }
         }
     }
 
@@ -1016,6 +1219,9 @@ mod tests {
                     Some(value) => std::env::set_var(key, value),
                     None => std::env::remove_var(key),
                 }
+            }
+            if let Some(parent) = self.receipt_path.parent() {
+                let _ = fs::remove_dir_all(parent);
             }
         }
     }
@@ -1227,6 +1433,88 @@ mod tests {
             marker.exists(),
             "verified ownership should reach the Certbot invocation"
         );
+        let _ = fs::remove_dir_all(&manager.state_dir);
+    }
+
+    fn install_fake_successful_certbot(
+        manager: &mut PanelCertificateManager,
+        cert_path: &Path,
+        key_path: &Path,
+        write_receipt: bool,
+    ) {
+        let certificate_name = format!("reality-panel-g10-{}", &scope_id("*.example.com")[..16]);
+        let script = manager.state_dir.join(if write_receipt {
+            "certbot-with-receipt.sh"
+        } else {
+            "certbot-without-receipt.sh"
+        });
+        let receipt = if write_receipt {
+            format!(
+                r#"cat > "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT" <<EOF
+{{"issuance_id":"$RELAY_PANEL_CERTIFICATE_ISSUANCE_ID","group_id":10,"certificate_domain":"*.example.com","challenge_sni":"example.com","actor":"$RELAY_PANEL_CERTIFICATE_ACTOR","challenge_id":"{}","value_sha256":"{}","state":"propagation_succeeded"}}
+EOF
+chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
+"#,
+                "a".repeat(64),
+                "b".repeat(64),
+            )
+        } else {
+            String::new()
+        };
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nset -eu\nmkdir -p '{}/acme/config/live/{certificate_name}'\ncp '{}' '{}/acme/config/live/{certificate_name}/fullchain.pem'\ncp '{}' '{}/acme/config/live/{certificate_name}/privkey.pem'\n{receipt}exit 0\n",
+                manager.state_dir.display(),
+                cert_path.display(),
+                manager.state_dir.display(),
+                key_path.display(),
+                manager.state_dir.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        manager.certbot_binary = script;
+    }
+
+    #[tokio::test]
+    async fn publish_requires_current_propagation_receipt_even_if_certbot_reports_success() {
+        let (mut manager, group, pool, _marker) = issuance_fixture("publish-hard-gate").await;
+        authorize_fixture_scope(&pool).await;
+        let certificate = candidate(&manager.state_dir, "fake-issued", "*.example.com", 90);
+        install_fake_successful_certbot(&mut manager, &certificate.0, &certificate.1, false);
+        let scopes = manager.certificate_scopes(group.id).await.unwrap();
+        let error = manager
+            .reconcile_scope(&group, &scopes[0])
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("authorization receipt"),
+            "unexpected error: {error}"
+        );
+        assert!(recover_current(
+            &scope_root(&manager.state_dir, group.id, "*.example.com"),
+            "*.example.com"
+        )
+        .unwrap()
+        .is_none());
+        let _ = fs::remove_dir_all(&manager.state_dir);
+    }
+
+    #[tokio::test]
+    async fn propagation_receipt_allows_valid_candidate_to_publish() {
+        let (mut manager, group, pool, _marker) = issuance_fixture("publish-authorized").await;
+        authorize_fixture_scope(&pool).await;
+        let certificate = candidate(&manager.state_dir, "fake-issued", "*.example.com", 90);
+        install_fake_successful_certbot(&mut manager, &certificate.0, &certificate.1, true);
+        let scopes = manager.certificate_scopes(group.id).await.unwrap();
+        assert!(manager.reconcile_scope(&group, &scopes[0]).await.unwrap());
+        assert!(recover_current(
+            &scope_root(&manager.state_dir, group.id, "*.example.com"),
+            "*.example.com"
+        )
+        .unwrap()
+        .is_some());
         let _ = fs::remove_dir_all(&manager.state_dir);
     }
 
@@ -1541,7 +1829,10 @@ mod tests {
             requests: Arc::new(AsyncMutex::new(Vec::new())),
             response: Arc::new(AsyncMutex::new(HookMockResponse {
                 status: StatusCode::OK,
-                body: r#"{"code":"OK"}"#.into(),
+                body: format!(
+                    r#"{{"challenge_id":"{}","state":"presented"}}"#,
+                    "a".repeat(64)
+                ),
             })),
         };
         let app = Router::new()
@@ -1558,6 +1849,16 @@ mod tests {
         run_hook(&[HOOK_COMMAND.into(), "cleanup".into()])
             .await
             .unwrap();
+
+        let attempt = IssuanceAttempt {
+            issuance_id: "01234567-89ab-4def-8123-456789abcdef".into(),
+            group_id: 7,
+            certificate_domain: "*.i4ktv.top".into(),
+            challenge_sni: "i4ktv.top".into(),
+            actor: "panel-certificate-test".into(),
+            receipt_path: _env.receipt_path.clone(),
+        };
+        validate_issuance_receipt(&_env.receipt_path, &attempt).unwrap();
 
         let requests = state.requests.lock().await.clone();
         assert_eq!(requests.len(), 2);
