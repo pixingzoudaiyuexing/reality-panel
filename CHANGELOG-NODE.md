@@ -7,6 +7,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.1] - 2026-09-05
+
+Unified v1.1.1 relay-node release. Config Protocol remains 10 and Lifecycle
+Protocol remains 1.
+
+### Fixed
+
+- Stable v1.1.0+ Nodes advertise the Reality Nginx SNI reapply capability
+  independently from the stricter rule-restart capability gate.
+
+### Improved
+
+- Nginx SNI hostname targets use the shared 30-second DNS cache and safely
+  reload only after a resolved-address change. Resolver failures retain the
+  last known good upstream; literal targets, load balancing, and Proxy Protocol
+  behavior are unchanged.
+
 ## [1.1.0] - 2026-09-03
 
 First stable 1.1 relay-node release. This promotes the accepted RC9

@@ -7,6 +7,31 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.1] - 2026-09-05
+
+Production hotfix and convergence optimization release. Config Protocol remains
+10 and no database migration is introduced.
+
+### Fixed
+
+- Reality diagnosis now evaluates Nginx SNI listeners through the existing
+  Nginx runtime checks instead of misreporting the absent generic listener.
+- The advanced "Reload SNI route" recovery action correctly recognizes stable
+  v1.1.0+ Relay Nodes and reports Node-specific outcomes.
+- ACME DNS-01 propagation is a Panel-controlled hard gate: a failed auth hook
+  terminates its Certbot process group, and publish requires the matching
+  propagation-success receipt and current issuance authorization.
+
+### Improved
+
+- Certificate convergence begins immediately after trusted DNS ownership is
+  established; public business A-record propagation remains asynchronous.
+- New SNI rules safely reuse an existing valid managed wildcard certificate
+  when its verified coverage matches the SNI.
+- Reality Nginx SNI hostname targets now refresh through the shared 30-second
+  DNS cache, apply Nginx only when resolved addresses change, and retain the
+  last known good upstream through resolver failures.
+
 ## [1.1.0] - 2026-09-03
 
 First stable 1.1 release. This promotes the accepted RC9 code line

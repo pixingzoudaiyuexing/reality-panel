@@ -190,8 +190,8 @@ relay-panel.service
 正式版同时发布 `amd64` / `arm64` 多架构 GHCR 镜像：
 
 ```text
-ghcr.io/pixingzoudaiyuexing/reality-panel-panel:v1.1.0
-ghcr.io/pixingzoudaiyuexing/reality-panel-node:v1.1.0
+ghcr.io/pixingzoudaiyuexing/reality-panel-panel:v1.1.1
+ghcr.io/pixingzoudaiyuexing/reality-panel-node:v1.1.1
 ```
 
 需要 Docker Engine、Docker Compose Plugin 和 OpenSSL。生产部署使用仓库中的
@@ -205,7 +205,7 @@ cd reality-panel
 
 umask 077
 cat > .env <<EOF
-RELAYPANEL_RELEASE_VERSION=v1.1.0
+RELAYPANEL_RELEASE_VERSION=v1.1.1
 JWT_SECRET=$(openssl rand -hex 32)
 PANEL_KEY=$(openssl rand -hex 32)
 EOF
@@ -239,7 +239,7 @@ PUBLIC_PANEL_URL=https://panel.example.com
 
 ```bash
 cat >> .env <<'EOF'
-RELAYPANEL_NODE_TAG=v1.1.0
+RELAYPANEL_NODE_TAG=v1.1.1
 NODE_TOKEN=请替换为真实入口分组Token
 EOF
 
@@ -335,37 +335,37 @@ docker compose -f docker-compose.release.yaml --profile node --profile caddy --p
 
 ```bash
 docker image rm \
-  ghcr.io/pixingzoudaiyuexing/reality-panel-panel:v1.1.0 \
-  ghcr.io/pixingzoudaiyuexing/reality-panel-node:v1.1.0
+  ghcr.io/pixingzoudaiyuexing/reality-panel-panel:v1.1.1 \
+  ghcr.io/pixingzoudaiyuexing/reality-panel-node:v1.1.1
 ```
 
-### 安装 v1.1.0 正式版
+### 安装 v1.1.1 正式版
 
 当前 1.1 正式版本：
 
 ```text
-v1.1.0
+v1.1.1
 ```
 
-显式安装 v1.1.0：
+显式安装 v1.1.1：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh \
-  | bash -s -- v1.1.0
+  | bash -s -- v1.1.1
 ```
 
 自定义 Panel 端口：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh \
-  | bash -s -- v1.1.0 --port 28888
+  | bash -s -- v1.1.1 --port 28888
 ```
 
 指定公网访问地址：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh \
-  | bash -s -- v1.1.0 \
+  | bash -s -- v1.1.1 \
   --public-panel-url https://panel.example.com
 ```
 
@@ -406,7 +406,7 @@ reality-panel-update
 更新到指定版本，包括 RC：
 
 ```bash
-reality-panel-update v1.1.0
+reality-panel-update v1.1.1
 ```
 
 Panel 更新完成后，再通过 Panel 的节点管理功能逐台更新 Relay Node。
@@ -467,7 +467,7 @@ systemctl status relay-panel
 使用当前 RC9 安装脚本：
 
 ```bash
-curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.1.0/install.sh \
+curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.1.1/install.sh \
   | bash -s -- uninstall
 ```
 
@@ -488,10 +488,10 @@ curl -fsSL https://github.com/pixingzoudaiyuexing/reality-panel/releases/downloa
 
 Panel 和 Relay Node 使用同一个 Reality Panel Release 版本发布。
 
-当前 1.1 发布候选：
+当前 1.1 正式版本：
 
 ```text
-v1.1.0
+v1.1.1
 ```
 
 Config Protocol：
