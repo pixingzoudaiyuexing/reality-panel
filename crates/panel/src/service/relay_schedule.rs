@@ -92,6 +92,8 @@ pub enum RelayScheduleError {
     GroupNotRelayInbound,
     TargetNodeNotFound,
     ScheduleNotFound,
+    FailoverEnabled,
+    FailoverStateUnavailable(String),
 }
 
 impl fmt::Display for RelayScheduleError {
@@ -104,6 +106,12 @@ impl fmt::Display for RelayScheduleError {
             Self::GroupNotRelayInbound => f.write_str("group is not an inbound Relay group"),
             Self::TargetNodeNotFound => f.write_str("target Node is not known in this group"),
             Self::ScheduleNotFound => f.write_str("schedule not found"),
+            Self::FailoverEnabled => {
+                f.write_str("该分组已启用故障切换，请先停用后再启用定时切换。")
+            }
+            Self::FailoverStateUnavailable(error) => {
+                write!(f, "failover policy state is unavailable: {error}")
+            }
         }
     }
 }
@@ -291,6 +299,7 @@ pub async fn create_schedule(
     node_connections: &NodeConnections,
     request: CreateRelayScheduleRequest,
 ) -> Result<RelaySchedule, RelayScheduleError> {
+    let _automatic_policy_guard = crate::service::relay_failover::lock_automatic_policy().await;
     let target_node_id = validate_group_and_target(
         db,
         node_connections,
@@ -325,6 +334,14 @@ pub async fn create_schedule(
         last_error: None,
     };
 
+    if schedule.enabled
+        && crate::service::relay_failover::enabled_for_group(db, schedule.group_id)
+            .await
+            .map_err(|error| RelayScheduleError::FailoverStateUnavailable(error.to_string()))?
+    {
+        return Err(RelayScheduleError::FailoverEnabled);
+    }
+
     let _guard = RELAY_SCHEDULE_MUTATION_LOCK.lock().await;
     let mut schedules = load_schedules(db).await?;
     schedules.push(schedule.clone());
@@ -338,6 +355,7 @@ pub async fn update_schedule(
     id: &str,
     request: UpdateRelayScheduleRequest,
 ) -> Result<RelaySchedule, RelayScheduleError> {
+    let _automatic_policy_guard = crate::service::relay_failover::lock_automatic_policy().await;
     let _guard = RELAY_SCHEDULE_MUTATION_LOCK.lock().await;
     let mut schedules = load_schedules(db).await?;
     let schedule = schedules
@@ -377,6 +395,13 @@ pub async fn update_schedule(
     schedule.schedule_type = fields.schedule_type;
     if let Some(enabled) = request.enabled {
         schedule.enabled = enabled;
+    }
+    if schedule.enabled
+        && crate::service::relay_failover::enabled_for_group(db, schedule.group_id)
+            .await
+            .map_err(|error| RelayScheduleError::FailoverStateUnavailable(error.to_string()))?
+    {
+        return Err(RelayScheduleError::FailoverEnabled);
     }
     schedule.updated_at = chrono::Utc::now().to_rfc3339();
     schedule.execute_at = fields.execute_at;
@@ -421,17 +446,36 @@ pub async fn set_schedule_enabled(
     id: &str,
     enabled: bool,
 ) -> Result<RelaySchedule, RelayScheduleError> {
+    let _automatic_policy_guard = crate::service::relay_failover::lock_automatic_policy().await;
     let _guard = RELAY_SCHEDULE_MUTATION_LOCK.lock().await;
     let mut schedules = load_schedules(db).await?;
     let schedule = schedules
         .iter_mut()
         .find(|schedule| schedule.id == id)
         .ok_or(RelayScheduleError::ScheduleNotFound)?;
+    if enabled
+        && crate::service::relay_failover::enabled_for_group(db, schedule.group_id)
+            .await
+            .map_err(|error| RelayScheduleError::FailoverStateUnavailable(error.to_string()))?
+    {
+        return Err(RelayScheduleError::FailoverEnabled);
+    }
     schedule.enabled = enabled;
     schedule.updated_at = chrono::Utc::now().to_rfc3339();
     let updated = schedule.clone();
     save_schedules(db, &schedules).await?;
     Ok(updated)
+}
+
+pub(crate) async fn has_enabled_schedule_for_group(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<bool, RelayScheduleError> {
+    let _guard = RELAY_SCHEDULE_MUTATION_LOCK.lock().await;
+    Ok(load_schedules(db)
+        .await?
+        .iter()
+        .any(|schedule| schedule.group_id == group_id && schedule.enabled))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

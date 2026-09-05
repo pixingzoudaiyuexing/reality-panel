@@ -149,6 +149,7 @@ async fn main() {
     // out over exactly the same control channel as a manual one.
     service::auto_restart::spawn(state.clone());
     service::relay_schedule::spawn(state.clone());
+    service::relay_failover::spawn(state.clone());
 
     // v1.2.0: node offline/recovery alerting. Runs unconditionally — it tracks
     // state even when notifications are disabled, so turning them on later

@@ -222,6 +222,9 @@ pub async fn set_carrier_affinity(
                 CarrierPolicyApplyError::TransactionInProgress => {
                     (StatusCode::CONFLICT, 409, error.to_string())
                 }
+                CarrierPolicyApplyError::FailoverEnabled => {
+                    (StatusCode::CONFLICT, 409, error.to_string())
+                }
                 CarrierPolicyApplyError::InvalidPolicy(_)
                 | CarrierPolicyApplyError::LineUnavailable(_)
                 | CarrierPolicyApplyError::NodeNotInGroup(_)
@@ -243,7 +246,8 @@ pub async fn set_carrier_affinity(
                 }
                 CarrierPolicyApplyError::Database(_)
                 | CarrierPolicyApplyError::InvalidPreference(_)
-                | CarrierPolicyApplyError::DnsSchedulingFailed => {
+                | CarrierPolicyApplyError::DnsSchedulingFailed
+                | CarrierPolicyApplyError::FailoverStateUnavailable(_) => {
                     tracing::error!(group_id, "set carrier affinity failed: {error}");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,

@@ -21,6 +21,7 @@ pub mod notify;
 mod provisioning;
 pub mod reapply;
 pub mod redeem;
+pub mod relay_failover;
 pub mod relay_preference;
 pub mod relay_schedule;
 pub mod restart;
@@ -247,6 +248,14 @@ pub fn routes() -> Router<AppState> {
             "/groups/{group_id}/carrier-affinity",
             axum::routing::get(relay_preference::get_carrier_affinity)
                 .put(relay_preference::set_carrier_affinity),
+        )
+        .route(
+            "/groups/{group_id}/relay-failover",
+            axum::routing::get(relay_failover::get).put(relay_failover::update),
+        )
+        .route(
+            "/groups/{group_id}/relay-failover/reinclude",
+            axum::routing::post(relay_failover::reinclude),
         )
         .route(
             "/admin/relay-schedules",

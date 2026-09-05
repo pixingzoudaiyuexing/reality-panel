@@ -19,7 +19,10 @@ fn error_response(error: RelayScheduleError) -> Response {
         RelayScheduleError::GroupNotRelayInbound
         | RelayScheduleError::TargetNodeNotFound
         | RelayScheduleError::InvalidInput(_) => (StatusCode::UNPROCESSABLE_ENTITY, 422),
-        RelayScheduleError::Database(_) | RelayScheduleError::InvalidStoredData(_) => {
+        RelayScheduleError::FailoverEnabled => (StatusCode::CONFLICT, 409),
+        RelayScheduleError::Database(_)
+        | RelayScheduleError::InvalidStoredData(_)
+        | RelayScheduleError::FailoverStateUnavailable(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, 500)
         }
     };

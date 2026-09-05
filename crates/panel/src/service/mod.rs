@@ -13,6 +13,7 @@ pub mod panel_certificate;
 pub mod password;
 pub mod profiles;
 pub mod redeem;
+pub mod relay_failover;
 pub mod relay_preference;
 pub mod relay_schedule;
 pub mod rules;

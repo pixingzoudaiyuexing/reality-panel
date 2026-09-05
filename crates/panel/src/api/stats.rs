@@ -474,6 +474,26 @@ pub async fn delete_node_status(
         }),
         Ok(_) => {
             tracing::info!("admin deleted node status record {}", key);
+            if let Some(node_id) = q
+                .node_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                if let Err(error) = crate::service::relay_failover::remove_excluded_node(
+                    state.db.as_ref(),
+                    group_id,
+                    node_id,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        group_id,
+                        node_id,
+                        "delete_node_status: failover exclusion cleanup failed: {error}"
+                    );
+                }
+            }
             // v1.2.5: audited like every other destructive admin action. The
             // record is what the panel knows about a machine — removing it is
             // how a decommissioned node disappears from the list, and "who
@@ -510,7 +530,7 @@ pub struct DeleteStatusQuery {
 #[cfg(test)]
 mod tests {
     use super::parse_status_key;
-    use crate::api::middleware::AuthUser;
+    use crate::api::middleware::{AdminOnly, AuthUser};
     use crate::api::node_ops::NodeOperationRegistry;
     use crate::api::system::ReleaseCache;
     use crate::api::ws::NodeConnections;
@@ -518,6 +538,7 @@ mod tests {
     use crate::config::Config;
     use crate::db::schema::SCHEMA_SQL;
     use crate::db::sqlite_repo::SqliteRepository;
+    use axum::extract::{Path, Query, State};
     use std::sync::Arc;
 
     /// The v0.3.0 per-node key must parse into (group_id, Some(node_id)). This
@@ -620,6 +641,48 @@ mod tests {
             geoip_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         };
         (state, pool)
+    }
+
+    #[tokio::test]
+    async fn deleting_node_status_also_removes_only_that_failover_exclusion() {
+        let (state, pool) = status_test_state().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) VALUES (5, 'relay', 'in', 'token', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        put_kvs(
+            &pool,
+            "node_status:5:node-a",
+            r#"{"public_ipv4":"8.8.8.8"}"#,
+        )
+        .await;
+        put_kvs(
+            &pool,
+            "relay_failover:5",
+            r#"{"model_version":1,"enabled":false,"health_check_port":443,"failure_after_seconds":5,"excluded_failed_node_ids":["node-a","node-b"],"last_switch_at":null,"last_from_node_id":null,"last_to_node_id":null,"last_result":null,"last_error":null}"#,
+        )
+        .await;
+
+        let response = super::delete_node_status(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path((5,)),
+            Query(super::DeleteStatusQuery {
+                node_id: Some("node-a".into()),
+            }),
+        )
+        .await;
+        assert_eq!(response.0.code, 0);
+        assert!(!exists(&pool, "node_status:5:node-a").await);
+        let policy = crate::service::relay_failover::load_policy(state.db.as_ref(), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            policy.excluded_failed_node_ids,
+            std::collections::BTreeSet::from(["node-b".to_string()])
+        );
     }
 
     #[tokio::test]

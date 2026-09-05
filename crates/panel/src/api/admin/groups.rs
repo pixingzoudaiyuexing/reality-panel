@@ -254,6 +254,15 @@ pub async fn delete_group(
                     error
                 );
             }
+            if let Err(error) =
+                crate::service::relay_failover::delete_failover(state.db.as_ref(), id).await
+            {
+                tracing::warn!(
+                    "delete_group {}: relay failover cleanup failed: {}",
+                    id,
+                    error
+                );
+            }
             tracing::warn!(
                 action = "delete_group",
                 group_id = id,

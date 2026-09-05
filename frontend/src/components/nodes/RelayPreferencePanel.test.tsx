@@ -13,6 +13,7 @@ const { mockGet, mockPost, mockCarrierAvailability } = vi.hoisted(() => ({
 
 vi.mock('../../api/client', () => ({ default: { get: mockGet, post: mockPost } }));
 vi.mock('./RelaySchedulePanel', () => ({ RelaySchedulePanel: () => null }));
+vi.mock('./RelayFailoverPanel', () => ({ RelayFailoverPanel: () => null }));
 vi.mock('./CarrierAffinityPanel', async () => {
   const React = await import('react');
   const carrier: CarrierAffinityView = {

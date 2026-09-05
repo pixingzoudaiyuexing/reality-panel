@@ -6,6 +6,7 @@ import type { ApiEnvelope, CarrierAffinityView, CarrierLineCatalog, RelayPrefere
 import type { Tfn } from './types';
 import { RelaySchedulePanel } from './RelaySchedulePanel';
 import { CarrierAffinityPanel } from './CarrierAffinityPanel';
+import { RelayFailoverPanel } from './RelayFailoverPanel';
 import { relayReadyReasonLabel } from './shared';
 import { dnsSyncStateDisplay } from '../../utils/realityRuleStatus';
 
@@ -421,6 +422,11 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
                 topologyState={view?.state}
               />
             ),
+          },
+          {
+            key: 'failover',
+            label: t('relayFailoverTitle'),
+            children: <RelayFailoverPanel groupId={groupId} t={t} />,
           },
         ]}
       />

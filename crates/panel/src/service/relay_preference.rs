@@ -400,6 +400,8 @@ pub enum CarrierPolicyApplyError {
         line_id: String,
     },
     DnsSchedulingFailed,
+    FailoverEnabled,
+    FailoverStateUnavailable(String),
 }
 
 impl std::fmt::Display for CarrierPolicyApplyError {
@@ -431,6 +433,12 @@ impl std::fmt::Display for CarrierPolicyApplyError {
                 "DNS ownership could not be verified for rule {rule_id} line {line_id}"
             ),
             Self::DnsSchedulingFailed => write!(f, "failed to schedule carrier DNS transaction"),
+            Self::FailoverEnabled => {
+                write!(f, "该分组已启用故障切换，请先停用后再启用运营商策略。")
+            }
+            Self::FailoverStateUnavailable(error) => {
+                write!(f, "failover policy state is unavailable: {error}")
+            }
         }
     }
 }
@@ -672,7 +680,7 @@ fn valid_public_ipv4(value: Option<&str>) -> Option<String> {
     }
 }
 
-async fn load_preference(
+pub(crate) async fn load_preference(
     db: &dyn Repository,
     group_id: i64,
 ) -> Result<RelayPreferenceState, RelayPreferenceError> {
@@ -885,6 +893,18 @@ async fn evaluate_group_nodes(
             let raw_status = (!raw_status.is_empty()).then_some(raw_status.as_str());
             evaluate_node(node_id, raw_status, now, &live_node_ids, &rules)
         })
+        .collect())
+}
+
+pub(crate) async fn evaluate_group_ready_nodes(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+) -> Result<Vec<RelayReadyNode>, RelayPreferenceError> {
+    Ok(evaluate_group_nodes(db, node_connections, group_id)
+        .await?
+        .into_iter()
+        .map(|node| node.info)
         .collect())
 }
 
@@ -1193,6 +1213,14 @@ pub async fn start_carrier_policy_apply(
     let requested = requested
         .normalize()
         .map_err(CarrierPolicyApplyError::InvalidPolicy)?;
+    let _automatic_policy_guard = crate::service::relay_failover::lock_automatic_policy().await;
+    if !requested.bindings.is_empty()
+        && crate::service::relay_failover::enabled_for_group(db, group_id)
+            .await
+            .map_err(|error| CarrierPolicyApplyError::FailoverStateUnavailable(error.to_string()))?
+    {
+        return Err(CarrierPolicyApplyError::FailoverEnabled);
+    }
     let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
     let group = GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await?;
     let Some(group) = group.filter(|group| group.group_type == "in") else {
@@ -1372,6 +1400,18 @@ pub async fn start_carrier_policy_apply(
     Ok(CarrierPolicyApplyOutcome::Started)
 }
 
+pub(crate) async fn carrier_policy_is_configured(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<bool, RelayPreferenceError> {
+    let preference = load_preference(db, group_id).await?;
+    Ok(!preference.carrier_policy.bindings.is_empty()
+        || preference
+            .pending_carrier_policy
+            .as_ref()
+            .is_some_and(|policy| !policy.bindings.is_empty()))
+}
+
 async fn build_dns_transaction_records(
     db: &dyn Repository,
     group_id: i64,
@@ -1511,8 +1551,47 @@ pub async fn start_relay_switch(
     group_id: i64,
     target_node_id: &str,
 ) -> Result<StartRelaySwitchOutcome, StartRelaySwitchError> {
-    let target_node_id = target_node_id.trim();
     let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
+    start_relay_switch_locked(db, node_connections, group_id, target_node_id).await
+}
+
+/// Start an automatic switch only if the preferred Relay observed by the
+/// caller is still current. The comparison and transaction start share the
+/// same mutation lock as manual and scheduled switches, so a stale health
+/// decision cannot overwrite a newer operator choice.
+pub(crate) async fn start_relay_switch_if_current(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+    expected_current_node_id: &str,
+    target_node_id: &str,
+) -> Result<Option<StartRelaySwitchOutcome>, StartRelaySwitchError> {
+    let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
+    let preference = load_preference(db, group_id)
+        .await
+        .map_err(|error| match error {
+            RelayPreferenceError::Database(error) => StartRelaySwitchError::Database(error),
+            RelayPreferenceError::InvalidPreference(error) => {
+                StartRelaySwitchError::InvalidPreference(error)
+            }
+        })?;
+    if preference.state != RelayPreferencePhase::Idle
+        || preference.preferred_node_id.as_deref() != Some(expected_current_node_id)
+    {
+        return Ok(None);
+    }
+    start_relay_switch_locked(db, node_connections, group_id, target_node_id)
+        .await
+        .map(Some)
+}
+
+async fn start_relay_switch_locked(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+    target_node_id: &str,
+) -> Result<StartRelaySwitchOutcome, StartRelaySwitchError> {
+    let target_node_id = target_node_id.trim();
 
     let group = GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await?;
     if group.as_ref().map(|group| group.group_type.as_str()) != Some("in") {
@@ -4482,6 +4561,53 @@ mod tests {
                 .await
                 .unwrap(),
             StartRelaySwitchOutcome::AlreadySwitching
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_switch_aborts_a_stale_failover_decision_before_dns_mutation() {
+        let (repo, connections, _) = switch_fixture().await;
+        let outcome = start_relay_switch_if_current(
+            &repo,
+            &connections,
+            7,
+            "node-that-was-current",
+            "node-c",
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, None);
+        let preference = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(preference.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(preference.state, RelayPreferencePhase::Idle);
+        assert!(repo
+            .find_dns_record_sync(1, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_conditional_failover_decisions_start_exactly_one_switch() {
+        let (repo, connections, _) = switch_fixture().await;
+        let first = start_relay_switch_if_current(&repo, &connections, 7, "node-a", "node-c");
+        let second = start_relay_switch_if_current(&repo, &connections, 7, "node-a", "node-c");
+        let (first, second) = tokio::join!(first, second);
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Some(StartRelaySwitchOutcome::Started { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_none()).count(),
+            1
+        );
+        assert_eq!(
+            load_preference(&repo, 7).await.unwrap().state,
+            RelayPreferencePhase::Switching
         );
     }
 

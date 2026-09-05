@@ -978,6 +978,14 @@ mod tests {
         state
             .db
             .set(
+                "relay_failover:20",
+                r#"{"model_version":1,"enabled":true,"health_check_port":443,"failure_after_seconds":5,"excluded_failed_node_ids":["node-a"],"last_switch_at":null,"last_from_node_id":null,"last_to_node_id":null,"last_result":null,"last_error":null}"#,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .set(
                 crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY,
                 r#"[{"id":"delete-me","group_id":20,"target_node_id":"node-a","schedule_type":"one_time","enabled":true,"created_at":"2026-08-31T00:00:00Z","updated_at":"2026-08-31T00:00:00Z","execute_at":"2026-09-01T00:00:00Z","time":null,"utc_offset_minutes":null,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null},{"id":"keep-me","group_id":21,"target_node_id":"node-b","schedule_type":"one_time","enabled":true,"created_at":"2026-08-31T00:00:00Z","updated_at":"2026-08-31T00:00:00Z","execute_at":"2026-09-01T00:00:00Z","time":null,"utc_offset_minutes":null,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null}]"#,
             )
@@ -992,6 +1000,7 @@ mod tests {
             resp.message
         );
         assert!(state.db.get("relay_preference:20").await.unwrap().is_none());
+        assert!(state.db.get("relay_failover:20").await.unwrap().is_none());
         let schedules = state
             .db
             .get(crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY)

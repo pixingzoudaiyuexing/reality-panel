@@ -511,6 +511,35 @@ export interface CreateRelayScheduleRequest {
 
 export type UpdateRelayScheduleRequest = Omit<CreateRelayScheduleRequest, 'group_id'>;
 
+export type RelayProbeStatus = 'unknown' | 'healthy' | 'unhealthy';
+
+export interface RelayFailoverNodeView {
+  node_id: string;
+  public_ipv4: string | null;
+  ready: boolean;
+  ready_reasons: string[];
+  current: boolean;
+  excluded: boolean;
+  probe_status: RelayProbeStatus;
+  last_probed_at: string | null;
+}
+
+export interface RelayFailoverView {
+  model_version: number;
+  enabled: boolean;
+  health_check_port: number;
+  failure_after_seconds: number;
+  excluded_failed_node_ids: string[];
+  last_switch_at: string | null;
+  last_from_node_id: string | null;
+  last_to_node_id: string | null;
+  last_result: string | null;
+  last_error: string | null;
+  group_id: number;
+  current_node_id: string | null;
+  nodes: RelayFailoverNodeView[];
+}
+
 export interface Plan {
   id: number;
   name: string;
