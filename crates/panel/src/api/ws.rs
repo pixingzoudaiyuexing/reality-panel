@@ -536,7 +536,19 @@ async fn handle_node_ws(
                     >(&text)
                     {
                         if event.msg_type == "node_lifecycle_event" {
-                            if let Some(operation) = node_operations.event(group_id, event) {
+                            let outcome = node_operations.event_from_authenticated_node(
+                                group_id,
+                                lifecycle_node_id.as_deref(),
+                                event,
+                            );
+                            if let Some(ack) = outcome.boot_ack {
+                                if let Ok(payload) = serde_json::to_string(&ack) {
+                                    if sender.send(Message::Text(payload.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(operation) = outcome.operation {
                                 crate::api::node_ops::audit_terminal_operation(
                                     &state,
                                     &operation,

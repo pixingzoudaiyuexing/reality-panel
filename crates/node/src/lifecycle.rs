@@ -2,8 +2,8 @@
 
 use crate::config::NodeConfig;
 use relay_shared::protocol::{
-    lifecycle_artifact_architecture, NodeLifecycleAction, NodeLifecycleCommand, NodeLifecycleEvent,
-    NodeLifecycleEventStatus,
+    lifecycle_artifact_architecture, NodeLifecycleAck, NodeLifecycleAction, NodeLifecycleCommand,
+    NodeLifecycleEvent, NodeLifecycleEventStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -128,6 +128,14 @@ pub(crate) fn pending_boot_event() -> Option<(NodeLifecycleEvent, PathBuf)> {
 
 pub(crate) fn clear_pending_boot_event(path: &Path) {
     let _ = std::fs::remove_file(path);
+}
+
+pub(crate) fn boot_ack_matches(event: &NodeLifecycleEvent, ack: &NodeLifecycleAck) -> bool {
+    ack.msg_type == "node_lifecycle_ack"
+        && event.status == NodeLifecycleEventStatus::Completed
+        && ack.operation_id == event.operation_id
+        && ack.node_id == event.node_id
+        && ack.action == event.action
 }
 
 fn require_managed_systemd() -> Result<(), String> {
@@ -635,6 +643,49 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .contains(".tmp")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pending_boot_marker_requires_an_exact_panel_ack_before_removal() {
+        let dir = test_dir("relay-lifecycle-ack");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lifecycle-pending.json");
+        let command = NodeLifecycleCommand {
+            msg_type: "node_lifecycle".into(),
+            operation_id: "operation-ack".into(),
+            node_id: "node-a".into(),
+            action: NodeLifecycleAction::Upgrade,
+            target_version: Some("1.2.4".into()),
+            target_architecture: Some("amd64".into()),
+            sha256: Some("0".repeat(64)),
+            artifact_id: Some("operation-ack".into()),
+            log_lines: None,
+        };
+        write_pending_at(&path, &command).unwrap();
+        let boot = event(
+            &command,
+            NodeLifecycleEventStatus::Completed,
+            "relay-node restarted",
+        );
+        let wrong = relay_shared::protocol::NodeLifecycleAck {
+            msg_type: "node_lifecycle_ack".into(),
+            operation_id: "other-operation".into(),
+            node_id: command.node_id.clone(),
+            action: command.action,
+        };
+        assert!(!boot_ack_matches(&boot, &wrong));
+        assert!(path.exists(), "wrong ACK must retain the boot marker");
+
+        let matching = relay_shared::protocol::NodeLifecycleAck {
+            msg_type: "node_lifecycle_ack".into(),
+            operation_id: command.operation_id.clone(),
+            node_id: command.node_id.clone(),
+            action: command.action,
+        };
+        assert!(boot_ack_matches(&boot, &matching));
+        clear_pending_boot_event(&path);
+        assert!(!path.exists(), "exact ACK may clear the boot marker");
         let _ = std::fs::remove_dir_all(dir);
     }
 

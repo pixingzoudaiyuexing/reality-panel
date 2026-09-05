@@ -7,8 +7,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use relay_shared::protocol::{
-    lifecycle_artifact_architecture, ApiResponse, NodeLifecycleAction, NodeLifecycleCommand,
-    NodeLifecycleEvent, NodeLifecycleEventStatus, CONFIG_PROTOCOL_VERSION,
+    lifecycle_artifact_architecture, ApiResponse, NodeLifecycleAck, NodeLifecycleAction,
+    NodeLifecycleCommand, NodeLifecycleEvent, NodeLifecycleEventStatus, CONFIG_PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,7 +17,8 @@ use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const MAX_LOG_LINES: u16 = 500;
-const OPERATION_TIMEOUT_SECS: i64 = 180;
+const OPERATION_IDLE_TIMEOUT_SECS: i64 = 300;
+const OPERATION_HARD_TIMEOUT_SECS: i64 = 900;
 const UNINSTALL_CONFIRMATION: &str = "UNINSTALL";
 const MIN_ARTIFACT_BYTES: usize = 64 * 1024;
 
@@ -71,8 +72,21 @@ pub struct NodeOperation {
 struct RegistryEntry {
     operation: NodeOperation,
     saw_disconnect: bool,
+    matching_boot_confirmation: Option<BootConfirmation>,
     uninstall_final: bool,
     result_audited: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BootConfirmation {
+    message: String,
+    architecture: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LifecycleEventOutcome {
+    pub operation: Option<NodeOperation>,
+    pub boot_ack: Option<NodeLifecycleAck>,
 }
 
 #[derive(Clone, Default)]
@@ -134,6 +148,7 @@ impl NodeOperationRegistry {
             RegistryEntry {
                 operation: operation.clone(),
                 saw_disconnect: false,
+                matching_boot_confirmation: None,
                 uninstall_final: false,
                 result_audited: false,
             },
@@ -154,39 +169,103 @@ impl NodeOperationRegistry {
         }
     }
 
+    #[cfg(test)]
     pub fn event(&self, group_id: i64, event: NodeLifecycleEvent) -> Option<NodeOperation> {
+        self.event_from_authenticated_node(group_id, None, event)
+            .operation
+    }
+
+    pub(crate) fn event_from_authenticated_node(
+        &self,
+        group_id: i64,
+        authenticated_node_id: Option<&str>,
+        event: NodeLifecycleEvent,
+    ) -> LifecycleEventOutcome {
         let mut inner = self.inner.lock().expect("node operation registry lock");
-        let entry = inner.get_mut(&event.operation_id)?;
+        let Some(entry) = inner.get_mut(&event.operation_id) else {
+            return LifecycleEventOutcome::default();
+        };
         if entry.operation.group_id != group_id
             || entry.operation.node_id != event.node_id
             || entry.operation.action != event.action
-            || entry.operation.status.terminal()
+            || authenticated_node_id.is_some_and(|node_id| node_id != event.node_id)
         {
-            return None;
+            return LifecycleEventOutcome::default();
+        }
+        let is_boot_confirmation = matches!(
+            event.action,
+            NodeLifecycleAction::Restart | NodeLifecycleAction::Upgrade
+        ) && event.status == NodeLifecycleEventStatus::Completed;
+        if entry.operation.status.terminal() {
+            let version_matches = event.action != NodeLifecycleAction::Upgrade
+                || event.node_version.as_deref() == entry.operation.target_version.as_deref();
+            let boot_ack = (is_boot_confirmation
+                && match entry.operation.status {
+                    OperationStatus::Success | OperationStatus::Timeout => version_matches,
+                    OperationStatus::Failed => true,
+                    _ => false,
+                })
+            .then(|| lifecycle_ack(&event));
+            return LifecycleEventOutcome {
+                operation: None,
+                boot_ack,
+            };
         }
         if event.status == NodeLifecycleEventStatus::Completed {
             match entry.operation.action {
-                NodeLifecycleAction::Restart if !entry.saw_disconnect => return None,
-                NodeLifecycleAction::Upgrade
-                    if !entry.saw_disconnect
-                        || event.node_version.as_deref()
-                            != entry.operation.target_version.as_deref() =>
-                {
-                    if entry.saw_disconnect {
-                        entry.operation.status = OperationStatus::Failed;
-                        entry.operation.message = format!(
-                            "relay-node restarted with version {}, expected {}",
-                            event.node_version.as_deref().unwrap_or("unknown"),
-                            entry
-                                .operation
-                                .target_version
-                                .as_deref()
-                                .unwrap_or("unknown")
-                        );
-                        entry.operation.updated_at = now();
-                        return Some(entry.operation.clone());
+                NodeLifecycleAction::Restart | NodeLifecycleAction::Upgrade => {
+                    if event.action == NodeLifecycleAction::Upgrade
+                        && event.node_version.as_deref()
+                            != entry.operation.target_version.as_deref()
+                    {
+                        if entry.saw_disconnect {
+                            entry.operation.status = OperationStatus::Failed;
+                            entry.operation.message = format!(
+                                "relay-node restarted with version {}, expected {}",
+                                event.node_version.as_deref().unwrap_or("unknown"),
+                                entry
+                                    .operation
+                                    .target_version
+                                    .as_deref()
+                                    .unwrap_or("unknown")
+                            );
+                            entry.operation.updated_at = now();
+                            return LifecycleEventOutcome {
+                                operation: Some(entry.operation.clone()),
+                                boot_ack: Some(lifecycle_ack(&event)),
+                            };
+                        }
+                        return LifecycleEventOutcome::default();
                     }
-                    return None;
+                    entry
+                        .matching_boot_confirmation
+                        .get_or_insert(BootConfirmation {
+                            message: event.message.clone(),
+                            architecture: event.architecture.clone(),
+                        });
+                    entry.operation.updated_at = now();
+                    if let Some(confirmation) = entry.matching_boot_confirmation.as_ref() {
+                        entry.operation.architecture = confirmation
+                            .architecture
+                            .clone()
+                            .or(entry.operation.architecture.take());
+                    }
+                    if complete_if_ready(entry) {
+                        return LifecycleEventOutcome {
+                            operation: Some(entry.operation.clone()),
+                            boot_ack: Some(lifecycle_ack(&event)),
+                        };
+                    }
+                    entry.operation.status = OperationStatus::Verifying;
+                    entry.operation.message = if entry.saw_disconnect {
+                        "relay-node reconnected; waiting for correlated boot confirmation".into()
+                    } else {
+                        "matching boot confirmation received; waiting for disconnect".into()
+                    };
+                    return LifecycleEventOutcome {
+                        operation: Some(entry.operation.clone()),
+                        boot_ack: Some(lifecycle_ack(&event)),
+                    };
                 }
                 _ => {}
             }
@@ -216,30 +295,35 @@ impl NodeOperationRegistry {
             }
             NodeLifecycleEventStatus::Completed => OperationStatus::Success,
         };
-        Some(operation.clone())
+        LifecycleEventOutcome {
+            operation: Some(operation.clone()),
+            boot_ack: None,
+        }
     }
 
     pub fn disconnected(&self, group_id: i64, node_id: &str) -> Vec<NodeOperation> {
         let mut transitioned = Vec::new();
         let mut inner = self.inner.lock().expect("node operation registry lock");
         for entry in inner.values_mut() {
-            let operation = &mut entry.operation;
-            if operation.group_id != group_id
-                || operation.node_id != node_id
-                || operation.status.terminal()
-                || operation.action == NodeLifecycleAction::Logs
+            if entry.operation.group_id != group_id
+                || entry.operation.node_id != node_id
+                || entry.operation.status.terminal()
+                || entry.operation.action == NodeLifecycleAction::Logs
             {
                 continue;
             }
             entry.saw_disconnect = true;
-            operation.updated_at = now();
-            if operation.action == NodeLifecycleAction::Uninstall && entry.uninstall_final {
-                operation.status = OperationStatus::Success;
-                operation.message = "uninstall confirmed and node disconnected".into();
-                transitioned.push(operation.clone());
+            entry.operation.updated_at = now();
+            if entry.operation.action == NodeLifecycleAction::Uninstall && entry.uninstall_final {
+                entry.operation.status = OperationStatus::Success;
+                entry.operation.message = "uninstall confirmed and node disconnected".into();
+                transitioned.push(entry.operation.clone());
+            } else if complete_if_ready(entry) {
+                transitioned.push(entry.operation.clone());
             } else {
-                operation.status = OperationStatus::Verifying;
-                operation.message = "node disconnected; waiting for authenticated reconnect".into();
+                entry.operation.status = OperationStatus::Verifying;
+                entry.operation.message =
+                    "node disconnected; waiting for authenticated reconnect".into();
             }
         }
         transitioned
@@ -258,8 +342,11 @@ impl NodeOperationRegistry {
             if operation.group_id != group_id
                 || operation.node_id != node_id
                 || operation.status.terminal()
-                || !entry.saw_disconnect
             {
+                continue;
+            }
+            operation.updated_at = now();
+            if !entry.saw_disconnect {
                 continue;
             }
             match operation.action {
@@ -276,7 +363,6 @@ impl NodeOperationRegistry {
                 }
                 NodeLifecycleAction::Logs | NodeLifecycleAction::Uninstall => continue,
             }
-            operation.updated_at = now();
         }
         Vec::new()
     }
@@ -286,14 +372,23 @@ impl NodeOperationRegistry {
         let entry = inner.get_mut(id)?;
         if !entry.operation.status.terminal() {
             let created = chrono::DateTime::parse_from_rfc3339(&entry.operation.created_at).ok()?;
-            if chrono::Utc::now()
-                .signed_duration_since(created.with_timezone(&chrono::Utc))
-                .num_seconds()
-                >= OPERATION_TIMEOUT_SECS
-            {
+            let updated = chrono::DateTime::parse_from_rfc3339(&entry.operation.updated_at).ok()?;
+            let elapsed =
+                chrono::Utc::now().signed_duration_since(created.with_timezone(&chrono::Utc));
+            let idle =
+                chrono::Utc::now().signed_duration_since(updated.with_timezone(&chrono::Utc));
+            if elapsed.num_seconds() >= OPERATION_HARD_TIMEOUT_SECS {
                 entry.operation.status = OperationStatus::Timeout;
-                entry.operation.message =
-                    "operation timed out waiting for node confirmation".into();
+                entry.operation.message = "relay-node 生命周期操作超过最长等待时间".into();
+                entry.operation.updated_at = now();
+            } else if idle.num_seconds() >= OPERATION_IDLE_TIMEOUT_SECS {
+                entry.operation.status = OperationStatus::Timeout;
+                entry.operation.message = if entry.operation.action == NodeLifecycleAction::Upgrade
+                {
+                    "等待 relay-node 重启并重新连接确认超时".into()
+                } else {
+                    "等待节点确认超时".into()
+                };
                 entry.operation.updated_at = now();
             }
         }
@@ -332,6 +427,35 @@ impl NodeOperationRegistry {
         entry.result_audited = true;
         true
     }
+}
+
+fn lifecycle_ack(event: &NodeLifecycleEvent) -> NodeLifecycleAck {
+    NodeLifecycleAck {
+        msg_type: "node_lifecycle_ack".into(),
+        operation_id: event.operation_id.clone(),
+        node_id: event.node_id.clone(),
+        action: event.action,
+    }
+}
+
+fn complete_if_ready(entry: &mut RegistryEntry) -> bool {
+    if !entry.saw_disconnect || entry.matching_boot_confirmation.is_none() {
+        return false;
+    }
+    if !matches!(
+        entry.operation.action,
+        NodeLifecycleAction::Restart | NodeLifecycleAction::Upgrade
+    ) {
+        return false;
+    }
+    let confirmation = entry
+        .matching_boot_confirmation
+        .as_ref()
+        .expect("matching confirmation was checked");
+    entry.operation.status = OperationStatus::Success;
+    entry.operation.message = confirmation.message.clone();
+    entry.operation.updated_at = now();
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1142,6 +1266,315 @@ mod tests {
         assert_eq!(
             registry.event(1, boot).unwrap().status,
             OperationStatus::Success
+        );
+    }
+
+    fn upgrade_operation(registry: &NodeOperationRegistry) -> NodeOperation {
+        registry
+            .start(
+                1,
+                "node-a".into(),
+                NodeLifecycleAction::Upgrade,
+                Some("1.2.3".into()),
+                Some("1.2.4".into()),
+                Some("amd64".into()),
+                Some("0".repeat(64)),
+                Some(1),
+            )
+            .unwrap()
+    }
+
+    fn matching_upgrade_boot(operation: &NodeOperation) -> NodeLifecycleEvent {
+        let mut event = lifecycle_event(operation, NodeLifecycleEventStatus::Completed);
+        event.node_version = Some("1.2.4".into());
+        event
+    }
+
+    #[test]
+    fn upgrade_boot_confirmation_and_disconnect_are_order_independent() {
+        let confirmation_first = NodeOperationRegistry::new();
+        let operation = upgrade_operation(&confirmation_first);
+        confirmation_first.event(
+            1,
+            lifecycle_event(&operation, NodeLifecycleEventStatus::Restarting),
+        );
+        let outcome = confirmation_first.event_from_authenticated_node(
+            1,
+            Some("node-a"),
+            matching_upgrade_boot(&operation),
+        );
+        assert!(outcome.boot_ack.is_some());
+        assert_eq!(
+            outcome.operation.unwrap().status,
+            OperationStatus::Verifying,
+            "confirmation alone must not complete an upgrade"
+        );
+        assert_eq!(
+            confirmation_first.disconnected(1, "node-a")[0].status,
+            OperationStatus::Success
+        );
+
+        let disconnect_first = NodeOperationRegistry::new();
+        let operation = upgrade_operation(&disconnect_first);
+        disconnect_first.event(
+            1,
+            lifecycle_event(&operation, NodeLifecycleEventStatus::Restarting),
+        );
+        assert!(disconnect_first.disconnected(1, "node-a").is_empty());
+        assert_eq!(
+            disconnect_first.get(&operation.id).unwrap().status,
+            OperationStatus::Verifying,
+            "disconnect alone must not complete an upgrade"
+        );
+        assert_eq!(
+            disconnect_first
+                .event_from_authenticated_node(1, Some("node-a"), matching_upgrade_boot(&operation))
+                .operation
+                .unwrap()
+                .status,
+            OperationStatus::Success
+        );
+    }
+
+    #[test]
+    fn early_upgrade_confirmation_rejects_wrong_correlation_and_is_idempotent() {
+        let registry = NodeOperationRegistry::new();
+        let operation = upgrade_operation(&registry);
+        registry.event(
+            1,
+            lifecycle_event(&operation, NodeLifecycleEventStatus::Restarting),
+        );
+
+        let mut wrong_operation = matching_upgrade_boot(&operation);
+        wrong_operation.operation_id = "wrong".into();
+        let outcome = registry.event_from_authenticated_node(1, Some("node-a"), wrong_operation);
+        assert!(outcome.operation.is_none());
+        assert!(outcome.boot_ack.is_none());
+        let outcome = registry.event_from_authenticated_node(
+            2,
+            Some("node-a"),
+            matching_upgrade_boot(&operation),
+        );
+        assert!(outcome.operation.is_none());
+        assert!(outcome.boot_ack.is_none());
+        let mut wrong_node = matching_upgrade_boot(&operation);
+        wrong_node.node_id = "node-b".into();
+        let outcome = registry.event_from_authenticated_node(1, Some("node-b"), wrong_node);
+        assert!(outcome.operation.is_none());
+        assert!(outcome.boot_ack.is_none());
+        let mut wrong_action = matching_upgrade_boot(&operation);
+        wrong_action.action = NodeLifecycleAction::Restart;
+        let outcome = registry.event_from_authenticated_node(1, Some("node-a"), wrong_action);
+        assert!(outcome.operation.is_none());
+        assert!(outcome.boot_ack.is_none());
+        let mut wrong_version = matching_upgrade_boot(&operation);
+        wrong_version.node_version = Some("9.9.9".into());
+        let outcome = registry.event_from_authenticated_node(1, Some("node-a"), wrong_version);
+        assert!(outcome.operation.is_none());
+        assert!(outcome.boot_ack.is_none());
+
+        let first = registry.event_from_authenticated_node(
+            1,
+            Some("node-a"),
+            matching_upgrade_boot(&operation),
+        );
+        let duplicate = registry.event_from_authenticated_node(
+            1,
+            Some("node-a"),
+            matching_upgrade_boot(&operation),
+        );
+        assert!(first.boot_ack.is_some());
+        assert!(duplicate.boot_ack.is_some());
+        assert_eq!(
+            registry.get(&operation.id).unwrap().status,
+            OperationStatus::Verifying
+        );
+        registry.disconnected(1, "node-a");
+        assert_eq!(
+            registry.get(&operation.id).unwrap().status,
+            OperationStatus::Success
+        );
+        assert!(registry
+            .event_from_authenticated_node(1, Some("node-a"), matching_upgrade_boot(&operation))
+            .boot_ack
+            .is_some());
+        assert_eq!(
+            registry.get(&operation.id).unwrap().status,
+            OperationStatus::Success
+        );
+    }
+
+    #[test]
+    fn consumed_boot_confirmations_ack_failed_and_timeout_operations_without_reopening_them() {
+        let failed = NodeOperationRegistry::new();
+        let operation = upgrade_operation(&failed);
+        failed.event(
+            1,
+            lifecycle_event(&operation, NodeLifecycleEventStatus::Restarting),
+        );
+        failed.disconnected(1, "node-a");
+        let mut wrong_version = matching_upgrade_boot(&operation);
+        wrong_version.node_version = Some("9.9.9".into());
+        let outcome = failed.event_from_authenticated_node(1, Some("node-a"), wrong_version);
+        assert_eq!(outcome.operation.unwrap().status, OperationStatus::Failed);
+        assert!(outcome.boot_ack.is_some());
+        let mut duplicate = matching_upgrade_boot(&operation);
+        duplicate.node_version = Some("9.9.9".into());
+        let outcome = failed.event_from_authenticated_node(1, Some("node-a"), duplicate);
+        assert!(outcome.operation.is_none());
+        assert!(outcome.boot_ack.is_some());
+        assert_eq!(
+            failed.get(&operation.id).unwrap().status,
+            OperationStatus::Failed
+        );
+
+        let timed_out = NodeOperationRegistry::new();
+        let operation = upgrade_operation(&timed_out);
+        {
+            let mut entries = timed_out.inner.lock().unwrap();
+            let entry = entries.get_mut(&operation.id).unwrap();
+            entry.operation.created_at = (chrono::Utc::now()
+                - chrono::Duration::seconds(OPERATION_HARD_TIMEOUT_SECS + 1))
+            .to_rfc3339();
+        }
+        assert_eq!(
+            timed_out.get(&operation.id).unwrap().status,
+            OperationStatus::Timeout
+        );
+        let outcome = timed_out.event_from_authenticated_node(
+            1,
+            Some("node-a"),
+            matching_upgrade_boot(&operation),
+        );
+        assert!(outcome.operation.is_none());
+        assert!(outcome.boot_ack.is_some());
+        assert_eq!(
+            timed_out.get(&operation.id).unwrap().status,
+            OperationStatus::Timeout
+        );
+    }
+
+    #[test]
+    fn lifecycle_progress_events_refresh_idle_timeout_without_moving_created_at() {
+        let registry = NodeOperationRegistry::new();
+        let operation = upgrade_operation(&registry);
+        let created_at = (chrono::Utc::now()
+            - chrono::Duration::seconds(OPERATION_IDLE_TIMEOUT_SECS + 1))
+        .to_rfc3339();
+        {
+            let mut entries = registry.inner.lock().unwrap();
+            let entry = entries.get_mut(&operation.id).unwrap();
+            entry.operation.created_at = created_at.clone();
+            entry.operation.updated_at = (chrono::Utc::now()
+                - chrono::Duration::seconds(OPERATION_IDLE_TIMEOUT_SECS + 1))
+            .to_rfc3339();
+        }
+
+        for status in [
+            NodeLifecycleEventStatus::Accepted,
+            NodeLifecycleEventStatus::Downloading,
+            NodeLifecycleEventStatus::Validating,
+            NodeLifecycleEventStatus::Installing,
+            NodeLifecycleEventStatus::Restarting,
+        ] {
+            registry.event(1, lifecycle_event(&operation, status));
+            let current = registry.get(&operation.id).unwrap();
+            assert_ne!(
+                current.status,
+                OperationStatus::Timeout,
+                "{status:?} is progress"
+            );
+            assert_eq!(
+                current.created_at, created_at,
+                "progress must not extend hard deadline"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_timeout_uses_idle_and_hard_deadlines_without_rewriting_terminal_states() {
+        let registry = NodeOperationRegistry::new();
+        let operation = upgrade_operation(&registry);
+        {
+            let mut entries = registry.inner.lock().unwrap();
+            let entry = entries.get_mut(&operation.id).unwrap();
+            entry.operation.created_at = (chrono::Utc::now()
+                - chrono::Duration::seconds(OPERATION_IDLE_TIMEOUT_SECS + 1))
+            .to_rfc3339();
+            entry.operation.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+        assert_ne!(
+            registry.get(&operation.id).unwrap().status,
+            OperationStatus::Timeout
+        );
+
+        {
+            let mut entries = registry.inner.lock().unwrap();
+            let entry = entries.get_mut(&operation.id).unwrap();
+            entry.operation.updated_at = (chrono::Utc::now()
+                - chrono::Duration::seconds(OPERATION_IDLE_TIMEOUT_SECS + 1))
+            .to_rfc3339();
+        }
+        assert_eq!(
+            registry.get(&operation.id).unwrap().status,
+            OperationStatus::Timeout
+        );
+
+        let hard_deadline = NodeOperationRegistry::new();
+        let operation = upgrade_operation(&hard_deadline);
+        {
+            let mut entries = hard_deadline.inner.lock().unwrap();
+            let entry = entries.get_mut(&operation.id).unwrap();
+            entry.operation.created_at = (chrono::Utc::now()
+                - chrono::Duration::seconds(OPERATION_HARD_TIMEOUT_SECS + 1))
+            .to_rfc3339();
+            entry.operation.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+        assert_eq!(
+            hard_deadline.get(&operation.id).unwrap().status,
+            OperationStatus::Timeout
+        );
+
+        let terminal = NodeOperationRegistry::new();
+        let operation = upgrade_operation(&terminal);
+        terminal.event(
+            1,
+            lifecycle_event(&operation, NodeLifecycleEventStatus::Restarting),
+        );
+        terminal.disconnected(1, "node-a");
+        terminal.event_from_authenticated_node(
+            1,
+            Some("node-a"),
+            matching_upgrade_boot(&operation),
+        );
+        {
+            let mut entries = terminal.inner.lock().unwrap();
+            let entry = entries.get_mut(&operation.id).unwrap();
+            entry.operation.created_at = (chrono::Utc::now()
+                - chrono::Duration::seconds(OPERATION_HARD_TIMEOUT_SECS + 1))
+            .to_rfc3339();
+        }
+        assert_eq!(
+            terminal.get(&operation.id).unwrap().status,
+            OperationStatus::Success
+        );
+
+        let failed = NodeOperationRegistry::new();
+        let operation = upgrade_operation(&failed);
+        failed.event(
+            1,
+            lifecycle_event(&operation, NodeLifecycleEventStatus::Failed),
+        );
+        {
+            let mut entries = failed.inner.lock().unwrap();
+            let entry = entries.get_mut(&operation.id).unwrap();
+            entry.operation.created_at = (chrono::Utc::now()
+                - chrono::Duration::seconds(OPERATION_HARD_TIMEOUT_SECS + 1))
+            .to_rfc3339();
+        }
+        assert_eq!(
+            failed.get(&operation.id).unwrap().status,
+            OperationStatus::Failed
         );
     }
 

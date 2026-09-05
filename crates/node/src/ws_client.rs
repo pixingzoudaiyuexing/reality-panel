@@ -28,6 +28,14 @@ where
     tokio::spawn(work)
 }
 
+fn boot_confirmation_ack(text: &str) -> Option<relay_shared::protocol::NodeLifecycleAck> {
+    serde_json::from_str(text)
+        .ok()
+        .filter(|ack: &relay_shared::protocol::NodeLifecycleAck| {
+            ack.msg_type == "node_lifecycle_ack"
+        })
+}
+
 /// Derive the WebSocket URL from PANEL_URL.
 /// http://ip:port -> ws://ip:port/api/v1/node/ws
 /// https://domain -> wss://domain/api/v1/node/ws
@@ -261,6 +269,7 @@ async fn connect_and_run(
         }
     };
 
+    let mut pending_boot_confirmation = None;
     if let Some((event, marker)) = crate::lifecycle::pending_boot_event() {
         if event.node_id == node_id {
             let payload = match serde_json::to_string(&event) {
@@ -273,7 +282,7 @@ async fn connect_and_run(
             if ws_stream.send(Message::Text(payload.into())).await.is_err() {
                 return WsExit::Disconnected;
             }
-            crate::lifecycle::clear_pending_boot_event(&marker);
+            pending_boot_confirmation = Some((event, marker));
         } else {
             tracing::error!(
                 "lifecycle marker belongs to node {}, current node is {}; preserving marker",
@@ -295,6 +304,8 @@ async fn connect_and_run(
     let mut heartbeat = interval(HEARTBEAT_INTERVAL);
     // Don't fire immediately on the first tick (we just connected).
     heartbeat.reset();
+    let mut boot_confirmation_retry = interval(Duration::from_secs(10));
+    boot_confirmation_retry.reset();
     let (lifecycle_tx, mut lifecycle_rx) =
         mpsc::unbounded_channel::<relay_shared::protocol::NodeLifecycleEvent>();
     let lifecycle_lock = Arc::new(Mutex::new(()));
@@ -309,6 +320,18 @@ async fn connect_and_run(
                 };
                 match msg_result {
                     Ok(Message::Text(text)) => {
+                        if let Some(ack) = boot_confirmation_ack(&text) {
+                            if let Some((event, marker)) = pending_boot_confirmation.as_ref() {
+                                if crate::lifecycle::boot_ack_matches(event, &ack) {
+                                    crate::lifecycle::clear_pending_boot_event(marker);
+                                    pending_boot_confirmation = None;
+                                    tracing::info!(
+                                        "websocket: lifecycle boot confirmation acknowledged"
+                                    );
+                                }
+                            }
+                            continue;
+                        }
                         if let Ok(resp) =
                             serde_json::from_str::<relay_shared::protocol::NodeConfigSnapshot>(&text)
                         {
@@ -554,6 +577,22 @@ async fn connect_and_run(
                 }
             }
 
+            _ = boot_confirmation_retry.tick(), if pending_boot_confirmation.is_some() => {
+                let (event, _) = pending_boot_confirmation
+                    .as_ref()
+                    .expect("pending boot confirmation was checked");
+                let payload = match serde_json::to_string(event) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        tracing::error!("serialize lifecycle boot confirmation: {error}");
+                        continue;
+                    }
+                };
+                if ws_stream.send(Message::Text(payload.into())).await.is_err() {
+                    return WsExit::Disconnected;
+                }
+            }
+
             // ── Heartbeat tick (every HEARTBEAT_INTERVAL) ──
             _ = heartbeat.tick() => {
                 // Before sending this ping, check if the PREVIOUS ping is still
@@ -635,12 +674,13 @@ async fn apply_snapshot_at(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_snapshot_at, derive_ws_url, spawn_lifecycle_work};
+    use super::{apply_snapshot_at, boot_confirmation_ack, derive_ws_url, spawn_lifecycle_work};
     use crate::forwarder::ForwarderManager;
     use crate::poller::{self, CachePaths};
     use crate::reporter::{ConnectionTracker, TrafficCounter};
     use relay_shared::protocol::{
-        ListenerConfig, LoadBalanceStrategy, NodeConfigResponse, NodeTransport, Protocol,
+        ListenerConfig, LoadBalanceStrategy, NodeConfigResponse, NodeLifecycleAck,
+        NodeLifecycleAction, NodeLifecycleCommand, NodeTransport, Protocol,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -668,6 +708,35 @@ mod tests {
         assert_eq!(
             derive_ws_url("127.0.0.1:18888"),
             "ws://127.0.0.1:18888/api/v1/node/ws"
+        );
+    }
+
+    #[test]
+    fn only_explicit_boot_ack_messages_are_consumed_as_acknowledgements() {
+        let command = NodeLifecycleCommand {
+            msg_type: "node_lifecycle".into(),
+            operation_id: "operation-1".into(),
+            node_id: "node-a".into(),
+            action: NodeLifecycleAction::Upgrade,
+            target_version: Some("1.2.4".into()),
+            target_architecture: Some("amd64".into()),
+            sha256: Some("0".repeat(64)),
+            artifact_id: Some("operation-1".into()),
+            log_lines: None,
+        };
+        assert!(boot_confirmation_ack(&serde_json::to_string(&command).unwrap()).is_none());
+
+        let ack = NodeLifecycleAck {
+            msg_type: "node_lifecycle_ack".into(),
+            operation_id: command.operation_id,
+            node_id: command.node_id,
+            action: command.action,
+        };
+        assert_eq!(
+            boot_confirmation_ack(&serde_json::to_string(&ack).unwrap())
+                .unwrap()
+                .msg_type,
+            "node_lifecycle_ack"
         );
     }
 

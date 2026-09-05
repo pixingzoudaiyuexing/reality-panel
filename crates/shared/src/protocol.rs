@@ -978,6 +978,17 @@ pub struct NodeLifecycleEvent {
     pub logs: Option<String>,
 }
 
+/// Panel acknowledgement for a boot-time lifecycle completion. This is
+/// additive: Nodes that predate it ignore the unknown message type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeLifecycleAck {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub operation_id: String,
+    pub node_id: String,
+    pub action: NodeLifecycleAction,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeLifecycleEventStatus {
