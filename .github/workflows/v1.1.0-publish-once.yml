@@ -149,7 +149,6 @@ jobs:
         run: |
           set -euo pipefail
           gh workflow run binary-release.yml --ref "$RELEASE_TAG"
-          gh workflow run docker-release.yml --ref "$RELEASE_TAG"
 
       - name: Write publication summary
         if: steps.guard.outputs.publish == 'true'
@@ -159,5 +158,5 @@ jobs:
             echo
             echo "- Tag: \`$RELEASE_TAG\`"
             echo "- Source: \`$(git rev-parse HEAD)\`"
-            echo "- Binary Release and Docker Release workflows dispatched."
+            echo "- Binary Release workflow dispatched."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -159,7 +159,7 @@ Reality Panel / Relay Node 使用 **Last Known Good（最后已知可用配置�
 | 安装权限 | root |
 | Panel 默认端口 | `18888` |
 
-Docker / Docker Compose 现在也是正式生产部署方式；官方镜像由 `v*` Tag 从同一份源码构建并发布到 GitHub Container Registry，支持 `amd64` 与 `arm64`。
+Docker / Docker Compose 可作为兼容部署方式；现有 GHCR 镜像仍可使用，后续版本不再由仓库自动构建或发布 Docker Release。
 
 ---
 
@@ -187,7 +187,7 @@ relay-panel.service
 
 ### Docker / Docker Compose
 
-正式版同时发布 `amd64` / `arm64` 多架构 GHCR 镜像：
+现有 v1.1.1 镜像提供 `amd64` / `arm64` 多架构支持：
 
 ```text
 ghcr.io/pixingzoudaiyuexing/reality-panel-panel:v1.1.1

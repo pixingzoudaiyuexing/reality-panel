@@ -21,10 +21,9 @@ SHA256SUMS
 
 The release workflow checks that Cargo package versions equal the tag, builds
 both binaries and the frontend from that checkout, and creates the checksum
-manifest. The systemd updater only trusts GitHub Release assets. Official Docker
-deployments use GHCR images produced from the same tagged checkout by
-`.github/workflows/docker-release.yml`; branch/local images are not
-production update sources.
+manifest. The systemd updater only trusts GitHub Release assets. Existing Docker
+images remain available for compatibility deployments, but Docker is no longer
+part of the automatic release workflow.
 
 ## Version locations
 
@@ -34,7 +33,6 @@ production update sources.
 - `crates/panel/src/config.rs` reads the Panel package version by default.
 - `scripts/relay-node-install.sh` is a legacy compatibility script only.
 - `.github/workflows/binary-release.yml` publishes systemd release assets.
-- `.github/workflows/docker-release.yml` publishes the official multi-arch GHCR images.
 
 Run before tagging:
 
