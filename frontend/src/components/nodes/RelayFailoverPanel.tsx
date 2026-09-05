@@ -21,11 +21,17 @@ function requestError(error: unknown, fallback: string): string {
 function resultLabel(result: string, t: Tfn): string {
   const keys: Record<string, Parameters<Tfn>[0]> = {
     started: 'relayFailoverResult_started',
+    success: 'relayFailoverResult_success',
     failed: 'relayFailoverResult_failed',
+    exhausted: 'relayFailoverResult_exhausted',
     aborted: 'relayFailoverResult_aborted',
   };
   const key = keys[result];
   return key ? t(key) : result;
+}
+
+function errorLabel(error: string, t: Tfn): string {
+  return error === 'NO_AVAILABLE_CANDIDATES' ? t('relayFailoverNoCandidates') : error;
 }
 
 export function RelayFailoverPanel({ groupId, t }: Props) {
@@ -194,11 +200,20 @@ export function RelayFailoverPanel({ groupId, t }: Props) {
             title={t('relayFailoverDescription')}
             style={{ margin: '10px 0' }}
           />
+          {view.last_result === 'exhausted' ? (
+            <Alert
+              type="error"
+              showIcon
+              title={t('relayFailoverResult_exhausted')}
+              description={t('relayFailoverNoCandidates')}
+              style={{ marginBottom: 10 }}
+            />
+          ) : null}
           <Space size={6} wrap style={{ marginBottom: 8 }}>
             <Text type="secondary">{t('relayFailoverCurrent')}:</Text>
             <Text code>{view.current_node_id ?? '-'}</Text>
             {view.last_result ? <Tag>{resultLabel(view.last_result, t)}</Tag> : null}
-            {view.last_error ? <Text type="danger">{view.last_error}</Text> : null}
+            {view.last_error ? <Text type="danger">{errorLabel(view.last_error, t)}</Text> : null}
           </Space>
 
           {view.nodes.map((node) => {

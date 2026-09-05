@@ -145,4 +145,37 @@ describe('RelayFailoverPanel', () => {
     expect(await screen.findByText(/该分组已启用定时切换/)).toBeInTheDocument();
     expect(screen.getByRole('switch', { name: '自动故障切换' })).not.toBeChecked();
   });
+
+  it('does not present a started Relay transaction as failover success', async () => {
+    mockGet.mockResolvedValue(ok(failover({
+      last_from_node_id: 'node-a',
+      last_to_node_id: 'node-b',
+      last_result: 'started',
+    })));
+    await renderPanel();
+    expect(screen.getByText('切换处理中')).toBeInTheDocument();
+    expect(screen.queryByText('切换成功')).toBeNull();
+  });
+
+  it('shows success only after the backend reports a committed preference', async () => {
+    mockGet.mockResolvedValue(ok(failover({
+      current_node_id: 'node-b',
+      last_from_node_id: 'node-a',
+      last_to_node_id: 'node-b',
+      last_result: 'success',
+      last_switch_at: '2026-09-06T01:00:00Z',
+    })));
+    await renderPanel();
+    expect(screen.getByText('切换成功')).toBeInTheDocument();
+  });
+
+  it('renders exhausted as an explicit no-candidate failure', async () => {
+    mockGet.mockResolvedValue(ok(failover({
+      last_result: 'exhausted',
+      last_error: 'NO_AVAILABLE_CANDIDATES',
+    })));
+    await renderPanel();
+    expect(screen.getAllByText('故障切换失败').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('无可用备选节点').length).toBeGreaterThan(0);
+  });
 });

@@ -1575,8 +1575,12 @@ pub(crate) async fn start_relay_switch_if_current(
                 StartRelaySwitchError::InvalidPreference(error)
             }
         })?;
-    if preference.state != RelayPreferencePhase::Idle
-        || preference.preferred_node_id.as_deref() != Some(expected_current_node_id)
+    if !matches!(
+        preference.state,
+        RelayPreferencePhase::Idle
+            | RelayPreferencePhase::Failed
+            | RelayPreferencePhase::FailedRolledBack
+    ) || preference.preferred_node_id.as_deref() != Some(expected_current_node_id)
     {
         return Ok(None);
     }
@@ -4609,6 +4613,34 @@ mod tests {
             load_preference(&repo, 7).await.unwrap().state,
             RelayPreferencePhase::Switching
         );
+    }
+
+    #[tokio::test]
+    async fn conditional_failover_retries_after_completed_rollback_but_not_during_transaction() {
+        let (repo, connections, _) = switch_fixture().await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.state = RelayPreferencePhase::RollingBack;
+        store_preference(&repo, 7, &preference).await.unwrap();
+        assert_eq!(
+            start_relay_switch_if_current(&repo, &connections, 7, "node-a", "node-c")
+                .await
+                .unwrap(),
+            None
+        );
+
+        preference.state = RelayPreferencePhase::FailedRolledBack;
+        preference.pending_node_id = Some("node-b".into());
+        preference.last_error = Some("DNS_PROVIDER_FAILED".into());
+        store_preference(&repo, 7, &preference).await.unwrap();
+        assert!(matches!(
+            start_relay_switch_if_current(&repo, &connections, 7, "node-a", "node-c")
+                .await
+                .unwrap(),
+            Some(StartRelaySwitchOutcome::Started {
+                from_node_id: Some(from),
+                to_node_id
+            }) if from == "node-a" && to_node_id == "node-c"
+        ));
     }
 
     #[tokio::test]

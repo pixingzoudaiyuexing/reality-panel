@@ -9,7 +9,7 @@ use crate::api::AppState;
 use crate::db::error::DbError;
 use crate::db::repo::{GroupRepository, Repository, ResourceScope};
 use crate::service::relay_preference::{
-    RelayPreferencePhase, RelayReadyNode, StartRelaySwitchOutcome,
+    RelayPreferencePhase, RelayPreferenceState, RelayReadyNode, StartRelaySwitchOutcome,
 };
 use futures_util::{stream, StreamExt};
 use once_cell::sync::Lazy;
@@ -31,6 +31,7 @@ const BACKUP_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 const MAX_CONCURRENT_GROUPS: usize = 16;
 const MAX_CONCURRENT_PROBES: usize = 32;
+const RETRY_BACKOFF_SECONDS: [u64; 4] = [5, 10, 20, 30];
 
 /// Serializes writes which enable one of the three mutually-exclusive Group
 /// automation policies. The Panel has one process, matching the existing KVS
@@ -185,6 +186,8 @@ struct TransientState {
     failure_started_at: Option<Instant>,
     last_backup_probe_at: Option<Instant>,
     last_decision_at: Option<Instant>,
+    retry_attempts: usize,
+    retry_not_before: Option<Instant>,
     probes: HashMap<String, ProbeObservation>,
 }
 
@@ -323,9 +326,15 @@ pub async fn update_policy(
 
     let _guard = FAILOVER_MUTATION_LOCK.lock().await;
     let mut policy = load_policy(db, group_id).await?;
+    let resume_exhausted = enabled && automatic_switch_suspended(&policy);
     let reset_runtime = policy.enabled != enabled
         || policy.health_check_port != health_check_port
-        || policy.failure_after_seconds != failure_after_seconds;
+        || policy.failure_after_seconds != failure_after_seconds
+        || resume_exhausted;
+    if enabled && (!policy.enabled || resume_exhausted) {
+        policy.last_result = None;
+        policy.last_error = None;
+    }
     policy.enabled = enabled;
     policy.health_check_port = health_check_port;
     policy.failure_after_seconds = failure_after_seconds;
@@ -427,12 +436,83 @@ fn candidate_nodes(
         .collect()
 }
 
-fn choose_candidate<'a>(candidates: &'a [&'a str]) -> Option<&'a str> {
-    if candidates.is_empty() {
-        return None;
+fn choose_candidate(candidates: &mut [String]) -> Option<&str> {
+    candidates.sort_unstable();
+    candidates.first().map(String::as_str)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayAttemptDisposition {
+    None,
+    Wait,
+    Succeeded,
+    RolledBack,
+    ManualIntervention,
+    Aborted,
+}
+
+fn relay_attempt_disposition(
+    policy: &RelayFailoverPolicy,
+    preference: &RelayPreferenceState,
+) -> RelayAttemptDisposition {
+    if policy.last_result.as_deref() != Some("started") {
+        return match preference.state {
+            RelayPreferencePhase::Switching
+            | RelayPreferencePhase::RollingBack
+            | RelayPreferencePhase::FailedManualIntervention => RelayAttemptDisposition::Wait,
+            _ => RelayAttemptDisposition::None,
+        };
     }
-    let index = (uuid::Uuid::new_v4().as_u128() % candidates.len() as u128) as usize;
-    candidates.get(index).copied()
+    let (Some(from_node_id), Some(to_node_id)) = (
+        policy.last_from_node_id.as_deref(),
+        policy.last_to_node_id.as_deref(),
+    ) else {
+        return RelayAttemptDisposition::Aborted;
+    };
+    match preference.state {
+        RelayPreferencePhase::Switching | RelayPreferencePhase::RollingBack => {
+            RelayAttemptDisposition::Wait
+        }
+        RelayPreferencePhase::Idle
+            if preference.preferred_node_id.as_deref() == Some(to_node_id) =>
+        {
+            RelayAttemptDisposition::Succeeded
+        }
+        RelayPreferencePhase::Failed | RelayPreferencePhase::FailedRolledBack
+            if preference.preferred_node_id.as_deref() == Some(from_node_id) =>
+        {
+            RelayAttemptDisposition::RolledBack
+        }
+        RelayPreferencePhase::FailedManualIntervention => {
+            RelayAttemptDisposition::ManualIntervention
+        }
+        _ => RelayAttemptDisposition::Aborted,
+    }
+}
+
+fn retry_delay(attempt: usize) -> Duration {
+    let index = attempt.min(RETRY_BACKOFF_SECONDS.len() - 1);
+    Duration::from_secs(RETRY_BACKOFF_SECONDS[index])
+}
+
+fn schedule_retry(transient: &mut TransientState, now: Instant) {
+    transient.retry_not_before = Some(now + retry_delay(transient.retry_attempts));
+    transient.retry_attempts = transient.retry_attempts.saturating_add(1);
+}
+
+fn retry_ready(transient: &TransientState, now: Instant) -> bool {
+    transient
+        .retry_not_before
+        .is_none_or(|not_before| now >= not_before)
+}
+
+fn reset_retry(transient: &mut TransientState) {
+    transient.retry_attempts = 0;
+    transient.retry_not_before = None;
+}
+
+fn automatic_switch_suspended(policy: &RelayFailoverPolicy) -> bool {
+    policy.last_result.as_deref() == Some("exhausted")
 }
 
 async fn observe_probe(runtime: &GroupRuntime, node_id: &str, healthy: bool) {
@@ -584,7 +664,104 @@ async fn process_group(state: &AppState, group_id: i64, policy: RelayFailoverPol
             return;
         }
     };
-    if preference.state != RelayPreferencePhase::Idle {
+    match relay_attempt_disposition(&policy, &preference) {
+        RelayAttemptDisposition::Wait => return,
+        RelayAttemptDisposition::Succeeded => {
+            if persist_outcome(
+                state.db.as_ref(),
+                group_id,
+                &policy,
+                policy.last_from_node_id.as_deref().unwrap_or("unknown"),
+                policy.last_to_node_id.as_deref(),
+                "success",
+                None,
+            )
+            .await
+            .unwrap_or(false)
+            {
+                let mut transient = runtime.transient.lock().await;
+                reset_retry(&mut transient);
+                drop(transient);
+                crate::service::audit::record(
+                    state,
+                    None,
+                    "RELAY_FAILOVER_SUCCEEDED",
+                    "device_group",
+                    group_id,
+                    &format!(
+                        "from_node_id={} to_node_id={}",
+                        policy.last_from_node_id.as_deref().unwrap_or("none"),
+                        policy.last_to_node_id.as_deref().unwrap_or("none")
+                    ),
+                )
+                .await;
+            }
+            return;
+        }
+        RelayAttemptDisposition::RolledBack => {
+            let error = preference
+                .last_error
+                .as_deref()
+                .unwrap_or("DNS_TRANSACTION_ROLLED_BACK");
+            if persist_outcome(
+                state.db.as_ref(),
+                group_id,
+                &policy,
+                policy.last_from_node_id.as_deref().unwrap_or("unknown"),
+                policy.last_to_node_id.as_deref(),
+                "failed",
+                Some(error),
+            )
+            .await
+            .unwrap_or(false)
+            {
+                crate::service::audit::record(
+                    state,
+                    None,
+                    "RELAY_FAILOVER_FAILED",
+                    "device_group",
+                    group_id,
+                    &format!("error={error}"),
+                )
+                .await;
+            }
+            let mut transient = runtime.transient.lock().await;
+            schedule_retry(&mut transient, Instant::now());
+        }
+        RelayAttemptDisposition::ManualIntervention => {
+            let error = preference
+                .rollback_error
+                .as_deref()
+                .or(preference.last_error.as_deref())
+                .unwrap_or("DNS_MANUAL_INTERVENTION_REQUIRED");
+            let _ = persist_outcome(
+                state.db.as_ref(),
+                group_id,
+                &policy,
+                policy.last_from_node_id.as_deref().unwrap_or("unknown"),
+                policy.last_to_node_id.as_deref(),
+                "failed",
+                Some(error),
+            )
+            .await;
+            return;
+        }
+        RelayAttemptDisposition::Aborted => {
+            let _ = persist_outcome(
+                state.db.as_ref(),
+                group_id,
+                &policy,
+                policy.last_from_node_id.as_deref().unwrap_or("unknown"),
+                policy.last_to_node_id.as_deref(),
+                "aborted",
+                Some("RELAY_TRANSACTION_STATE_CHANGED"),
+            )
+            .await;
+            return;
+        }
+        RelayAttemptDisposition::None => {}
+    }
+    if automatic_switch_suspended(&policy) {
         return;
     }
     let Some(current_node_id) = preference.preferred_node_id else {
@@ -618,9 +795,13 @@ async fn process_group(state: &AppState, group_id: i64, policy: RelayFailoverPol
     let threshold_reached = {
         let mut transient = runtime.transient.lock().await;
         if transient.current_node_id.as_deref() != Some(current_node_id.as_str()) {
+            let replacing_known_current = transient.current_node_id.is_some();
             transient.current_node_id = Some(current_node_id.clone());
             transient.failure_started_at = None;
             transient.last_decision_at = None;
+            if replacing_known_current {
+                reset_retry(&mut transient);
+            }
         }
         failure_threshold_reached(
             &mut transient.failure_started_at,
@@ -640,11 +821,18 @@ async fn process_group(state: &AppState, group_id: i64, policy: RelayFailoverPol
     )
     .await;
     if current_healthy || !threshold_reached {
+        if current_healthy {
+            let mut transient = runtime.transient.lock().await;
+            reset_retry(&mut transient);
+        }
         return;
     }
 
     {
         let mut transient = runtime.transient.lock().await;
+        if !retry_ready(&transient, now) {
+            return;
+        }
         if transient
             .last_decision_at
             .is_some_and(|last| now.duration_since(last) < BACKUP_PROBE_INTERVAL)
@@ -699,18 +887,17 @@ async fn process_group(state: &AppState, group_id: i64, policy: RelayFailoverPol
             healthy_ids.push(node_id);
         }
     }
-    let candidate_refs = healthy_ids.iter().map(String::as_str).collect::<Vec<_>>();
     if !runtime_is_current(group_id, &runtime) {
         return;
     }
-    let Some(target_node_id) = choose_candidate(&candidate_refs) else {
+    let Some(target_node_id) = choose_candidate(&mut healthy_ids).map(str::to_string) else {
         if persist_outcome(
             state.db.as_ref(),
             group_id,
             &policy,
             &current_node_id,
             None,
-            "failed",
+            "exhausted",
             Some("NO_AVAILABLE_CANDIDATES"),
         )
         .await
@@ -744,7 +931,7 @@ async fn process_group(state: &AppState, group_id: i64, policy: RelayFailoverPol
         &state.node_connections,
         group_id,
         &current_node_id,
-        target_node_id,
+        &target_node_id,
     )
     .await
     {
@@ -754,7 +941,7 @@ async fn process_group(state: &AppState, group_id: i64, policy: RelayFailoverPol
                 group_id,
                 &policy,
                 &current_node_id,
-                Some(target_node_id),
+                Some(&target_node_id),
                 "started",
                 None,
             )
@@ -786,7 +973,7 @@ async fn process_group(state: &AppState, group_id: i64, policy: RelayFailoverPol
                 group_id,
                 &policy,
                 &current_node_id,
-                Some(target_node_id),
+                Some(&target_node_id),
                 "aborted",
                 Some("PREFERRED_NODE_CHANGED_OR_BUSY"),
             )
@@ -794,18 +981,24 @@ async fn process_group(state: &AppState, group_id: i64, policy: RelayFailoverPol
         }
         Err(error) => {
             let detail = error.to_string();
-            if persist_outcome(
+            if !runtime_is_current(group_id, &runtime) {
+                return;
+            }
+            let changed = persist_outcome(
                 state.db.as_ref(),
                 group_id,
                 &policy,
                 &current_node_id,
-                Some(target_node_id),
+                Some(&target_node_id),
                 "failed",
                 Some(&detail),
             )
             .await
-            .unwrap_or(false)
-            {
+            .unwrap_or(false);
+            let mut transient = runtime.transient.lock().await;
+            schedule_retry(&mut transient, Instant::now());
+            drop(transient);
+            if changed {
                 crate::service::audit::record(
                     state,
                     None,
@@ -930,6 +1123,10 @@ where
         return Err(RelayFailoverError::NodeStillUnhealthy);
     }
     policy.excluded_failed_node_ids.remove(node_id);
+    if policy.last_result.as_deref() == Some("exhausted") {
+        policy.last_result = None;
+        policy.last_error = None;
+    }
     store_policy(db, group_id, &policy).await?;
     let runtime = runtime_for(group_id);
     observe_probe(&runtime, node_id, true).await;
@@ -1154,12 +1351,168 @@ mod tests {
     }
 
     #[test]
-    fn random_selection_never_leaves_the_legal_candidate_set() {
-        let candidates = ["a", "b", "c"];
-        for _ in 0..100 {
-            assert!(candidates.contains(&choose_candidate(&candidates).unwrap()));
+    fn deterministic_selection_always_uses_lowest_node_id() {
+        for mut candidates in [
+            vec![
+                "node-c".to_string(),
+                "node-a".to_string(),
+                "node-b".to_string(),
+            ],
+            vec![
+                "node-b".to_string(),
+                "node-c".to_string(),
+                "node-a".to_string(),
+            ],
+            vec![
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string(),
+            ],
+        ] {
+            assert_eq!(choose_candidate(&mut candidates), Some("node-a"));
         }
-        assert_eq!(choose_candidate(&[]), None);
+        assert_eq!(choose_candidate(&mut []), None);
+    }
+
+    fn started_policy() -> RelayFailoverPolicy {
+        RelayFailoverPolicy {
+            enabled: true,
+            last_from_node_id: Some("node-a".into()),
+            last_to_node_id: Some("node-b".into()),
+            last_result: Some("started".into()),
+            ..Default::default()
+        }
+    }
+
+    fn preference(phase: RelayPreferencePhase, current: &str) -> RelayPreferenceState {
+        RelayPreferenceState {
+            preferred_node_id: Some(current.into()),
+            state: phase,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn relay_transaction_states_wait_commit_or_retry_without_guessing_success() {
+        let policy = started_policy();
+        assert_eq!(
+            relay_attempt_disposition(
+                &policy,
+                &preference(RelayPreferencePhase::Switching, "node-a")
+            ),
+            RelayAttemptDisposition::Wait
+        );
+        assert_eq!(
+            relay_attempt_disposition(
+                &policy,
+                &preference(RelayPreferencePhase::RollingBack, "node-a")
+            ),
+            RelayAttemptDisposition::Wait
+        );
+        assert_eq!(
+            relay_attempt_disposition(&policy, &preference(RelayPreferencePhase::Idle, "node-b")),
+            RelayAttemptDisposition::Succeeded
+        );
+        assert_eq!(
+            relay_attempt_disposition(
+                &policy,
+                &preference(RelayPreferencePhase::FailedRolledBack, "node-a")
+            ),
+            RelayAttemptDisposition::RolledBack
+        );
+        assert_eq!(
+            relay_attempt_disposition(
+                &policy,
+                &preference(RelayPreferencePhase::FailedManualIntervention, "node-a")
+            ),
+            RelayAttemptDisposition::ManualIntervention
+        );
+    }
+
+    #[test]
+    fn provider_failure_retry_backoff_is_bounded_and_resettable() {
+        let now = Instant::now();
+        let mut transient = TransientState::default();
+        for (attempt, expected) in [5, 10, 20, 30, 30].into_iter().enumerate() {
+            let attempt_at = now + Duration::from_secs((attempt as u64) * 60);
+            schedule_retry(&mut transient, attempt_at);
+            assert_eq!(
+                transient.retry_not_before,
+                Some(attempt_at + Duration::from_secs(expected))
+            );
+            assert!(!retry_ready(
+                &transient,
+                attempt_at + Duration::from_secs(expected - 1)
+            ));
+            assert!(retry_ready(
+                &transient,
+                attempt_at + Duration::from_secs(expected)
+            ));
+        }
+        reset_retry(&mut transient);
+        assert_eq!(transient.retry_attempts, 0);
+        assert_eq!(transient.retry_not_before, None);
+    }
+
+    #[test]
+    fn quarantined_current_still_requires_and_can_reach_a_fresh_failure_threshold() {
+        let policy = RelayFailoverPolicy {
+            excluded_failed_node_ids: BTreeSet::from(["node-a".to_string()]),
+            ..Default::default()
+        };
+        assert!(policy.excluded_failed_node_ids.contains("node-a"));
+        let now = Instant::now();
+        let mut failure_started_at = None;
+        assert!(!failure_threshold_reached(
+            &mut failure_started_at,
+            false,
+            now,
+            Duration::from_secs(5)
+        ));
+        assert!(failure_threshold_reached(
+            &mut failure_started_at,
+            false,
+            now + Duration::from_secs(5),
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn exhausted_state_suspends_automatic_switching_without_reusing_quarantine() {
+        let policy = RelayFailoverPolicy {
+            enabled: true,
+            last_result: Some("exhausted".into()),
+            last_error: Some("NO_AVAILABLE_CANDIDATES".into()),
+            excluded_failed_node_ids: BTreeSet::from(["node-a".to_string()]),
+            ..Default::default()
+        };
+        assert!(automatic_switch_suspended(&policy));
+        assert_eq!(
+            policy.excluded_failed_node_ids,
+            BTreeSet::from(["node-a".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_policy_save_resumes_exhausted_with_a_fresh_runtime() {
+        let _test_guard = TEST_LOCK.lock().await;
+        remove_runtime(1);
+        let (repo, _) = test_repo().await;
+        let mut policy = RelayFailoverPolicy {
+            enabled: true,
+            last_result: Some("exhausted".into()),
+            last_error: Some("NO_AVAILABLE_CANDIDATES".into()),
+            ..Default::default()
+        };
+        policy.excluded_failed_node_ids.insert("node-a".into());
+        store_policy(&repo, 1, &policy).await.unwrap();
+        let old_runtime = runtime_for(1);
+
+        let resumed = update_policy(&repo, 1, true, 443, 5).await.unwrap();
+        assert_eq!(resumed.last_result, None);
+        assert_eq!(resumed.last_error, None);
+        assert!(resumed.excluded_failed_node_ids.contains("node-a"));
+        assert!(!Arc::ptr_eq(&old_runtime, &runtime_for(1)));
     }
 
     #[tokio::test]
@@ -1180,6 +1533,7 @@ mod tests {
             "last_success_at",
             "failure_started_at",
             "probe",
+            "retry_",
         ] {
             assert!(
                 !raw.contains(forbidden),
@@ -1239,6 +1593,66 @@ mod tests {
             .unwrap()
             .excluded_failed_node_ids
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn dns_failure_never_quarantines_the_healthy_target_and_commit_marks_success() {
+        let _test_guard = TEST_LOCK.lock().await;
+        remove_runtime(1);
+        let (repo, _) = test_repo().await;
+        let mut policy = update_policy(&repo, 1, true, 443, 5).await.unwrap();
+        policy.excluded_failed_node_ids.insert("node-a".into());
+        store_policy(&repo, 1, &policy).await.unwrap();
+
+        persist_outcome(&repo, 1, &policy, "node-a", Some("node-b"), "started", None)
+            .await
+            .unwrap();
+        let started = load_policy(&repo, 1).await.unwrap();
+        assert_eq!(started.last_result.as_deref(), Some("started"));
+        assert!(started.last_switch_at.is_some());
+
+        persist_outcome(
+            &repo,
+            1,
+            &started,
+            "node-a",
+            Some("node-b"),
+            "failed",
+            Some("DNS_TRANSACTION_ROLLED_BACK"),
+        )
+        .await
+        .unwrap();
+        let failed = load_policy(&repo, 1).await.unwrap();
+        assert_eq!(
+            failed.excluded_failed_node_ids,
+            BTreeSet::from(["node-a".to_string()])
+        );
+        assert!(!failed.excluded_failed_node_ids.contains("node-b"));
+        assert_eq!(failed.last_switch_at, started.last_switch_at);
+
+        persist_outcome(&repo, 1, &failed, "node-a", Some("node-b"), "started", None)
+            .await
+            .unwrap();
+        let restarted = load_policy(&repo, 1).await.unwrap();
+
+        persist_outcome(
+            &repo,
+            1,
+            &restarted,
+            "node-a",
+            Some("node-b"),
+            "success",
+            None,
+        )
+        .await
+        .unwrap();
+        let committed = load_policy(&repo, 1).await.unwrap();
+        assert_eq!(committed.last_result.as_deref(), Some("success"));
+        assert!(committed.last_switch_at.is_some());
+        assert_eq!(
+            committed.excluded_failed_node_ids,
+            BTreeSet::from(["node-a".to_string()])
+        );
     }
 
     #[tokio::test]
