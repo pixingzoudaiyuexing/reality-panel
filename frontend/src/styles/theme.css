@@ -830,6 +830,11 @@ html, body, #root {
   gap: 6px;
 }
 
+.rp-failover-toggle-setting {
+  flex: 0 0 auto;
+  min-width: 120px;
+}
+
 .rp-line-feature-section {
   padding-bottom: 4px;
 }

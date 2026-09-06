@@ -389,7 +389,7 @@ async fn reality_dependencies(
         Some(status) if status.sync_state == "PROPAGATED" => dependency_check(
             "pass",
             format!(
-                "{} resolves to {}",
+                "provider record {} is applied to {}",
                 status.fqdn.as_deref().unwrap_or("configured SNI"),
                 status.expected_value.as_deref().unwrap_or("the Relay")
             ),

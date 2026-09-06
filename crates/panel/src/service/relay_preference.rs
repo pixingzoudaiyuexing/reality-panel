@@ -1786,11 +1786,13 @@ async fn capture_target_outcomes(
             .find_dns_record_sync(record.rule_id, &record.line_key)
             .await?
         {
+            let provider_applied =
+                transaction_record_provider_applied(db, &sync, record, false).await?;
             record.target_state = Some(sync.state);
-            record.target_error = sync.last_error_category;
-            if record.target_action == RelayDnsAction::Upsert
-                && record.target_state.as_deref() == Some("PROPAGATED")
-            {
+            record.target_error = sync
+                .last_error_category
+                .filter(|error| !is_legacy_public_dns_observation_error(error));
+            if record.target_action == RelayDnsAction::Upsert && provider_applied {
                 record.target_record_id = db
                     .find_dns_record_binding_for_rule(
                         record.rule_id,
@@ -1952,7 +1954,7 @@ async fn finalize_rollback(
 ) -> Result<FinalizeOutcome, RelayPreferenceError> {
     let target_node_id = preference.pending_node_id.clone().unwrap_or_default();
     let eligible = crate::service::dnsmgr::eligible_rule_ids_for_group(db, group_id).await?;
-    let mut all_propagated = !preference.dns_records.is_empty();
+    let mut all_applied = !preference.dns_records.is_empty();
 
     for record in &preference.dns_records {
         if eligible.binary_search(&record.rule_id).is_err() {
@@ -1972,7 +1974,7 @@ async fn finalize_rollback(
             .find_dns_record_sync(record.rule_id, &record.line_key)
             .await?
         else {
-            all_propagated = false;
+            all_applied = false;
             continue;
         };
         if !sync_matches_action(
@@ -1980,13 +1982,10 @@ async fn finalize_rollback(
             record.rollback_action,
             record.rollback_value.as_deref(),
         ) {
-            all_propagated = false;
+            all_applied = false;
             continue;
         }
-        let rollback_failure = terminal_dns_error(&sync).or_else(|| {
-            (sync.last_error_category.as_deref() == Some("PUBLIC_DNS_MULTIPLE_ANSWERS"))
-                .then(|| "PUBLIC_DNS_MULTIPLE_ANSWERS".into())
-        });
+        let rollback_failure = terminal_dns_error(&sync);
         if let Some(error) = rollback_failure {
             preference.state = RelayPreferencePhase::FailedManualIntervention;
             preference.rollback_error = Some(error.clone());
@@ -2000,14 +1999,12 @@ async fn finalize_rollback(
                 rollback_error: error,
             });
         }
-        if sync.state != "PROPAGATED"
-            || sync.last_error_category.as_deref() == Some("PUBLIC_DNS_MULTIPLE_ANSWERS")
-        {
-            all_propagated = false;
+        if !transaction_record_provider_applied(db, &sync, record, true).await? {
+            all_applied = false;
         }
     }
 
-    if !all_propagated {
+    if !all_applied {
         return Ok(FinalizeOutcome::Pending);
     }
     preference.state = RelayPreferencePhase::FailedRolledBack;
@@ -2037,18 +2034,106 @@ fn sync_matches_action(
     }
 }
 
+fn sync_has_provider_readback(sync: &crate::db::repo::DnsRecordSync) -> bool {
+    sync.ownership == "PANEL"
+        && sync.mutation_verified_at.is_some()
+        && sync
+            .last_error_category
+            .as_deref()
+            .is_none_or(is_legacy_public_dns_observation_error)
+        && matches!(
+            sync.state.as_str(),
+            "MUTATION_VERIFIED" | "PROPAGATING" | "PROPAGATED"
+        )
+}
+
+fn is_legacy_public_dns_observation_error(error: &str) -> bool {
+    error.starts_with("PUBLIC_DNS_")
+}
+
+async fn sync_provider_readback_applied(
+    db: &dyn Repository,
+    sync: &crate::db::repo::DnsRecordSync,
+) -> Result<bool, DbError> {
+    if !sync_has_provider_readback(sync) || sync.record_type != "A" {
+        return Ok(false);
+    }
+    let binding = db
+        .find_dns_record_binding_for_rule(
+            sync.rule_id,
+            &sync.fqdn,
+            &sync.record_type,
+            &sync.line_key,
+        )
+        .await?;
+    match sync.desired_action.as_str() {
+        "UPSERT" => {
+            let Some(expected_value) = sync.expected_value.as_deref() else {
+                return Ok(false);
+            };
+            Ok(binding.is_some_and(|binding| {
+                binding.rule_id == Some(sync.rule_id)
+                    && binding.fqdn == sync.fqdn
+                    && binding.record_type == sync.record_type
+                    && binding.line_key == sync.line_key
+                    && (sync.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY
+                        || binding.line == sync.line)
+                    && !binding.record_id.is_empty()
+                    && binding.desired_value == expected_value
+                    && binding.state == "BOUND"
+                    && binding.last_observed_at.is_some()
+                    && binding.last_error_category.is_none()
+            }))
+        }
+        "DELETE" => Ok(binding.is_none_or(|binding| {
+            binding.rule_id == Some(sync.rule_id)
+                && binding.fqdn == sync.fqdn
+                && binding.record_type == sync.record_type
+                && binding.line_key == sync.line_key
+                && (sync.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY
+                    || binding.line == sync.line)
+                && binding.state == "MISSING"
+                && binding.last_error_category.is_none()
+        })),
+        _ => Ok(false),
+    }
+}
+
+async fn transaction_record_provider_applied(
+    db: &dyn Repository,
+    sync: &crate::db::repo::DnsRecordSync,
+    record: &RelayDnsTransactionRecord,
+    rollback: bool,
+) -> Result<bool, DbError> {
+    let (action, value) = if rollback {
+        (record.rollback_action, record.rollback_value.as_deref())
+    } else {
+        (record.target_action, record.target_value.as_deref())
+    };
+    if sync.rule_id != record.rule_id
+        || sync.fqdn != record.fqdn
+        || sync.record_type != "A"
+        || sync.line != record.line_id
+        || sync.line_key != record.line_key
+        || !sync_matches_action(sync, action, value)
+    {
+        return Ok(false);
+    }
+    sync_provider_readback_applied(db, sync).await
+}
+
 async fn finalize_carrier_rollback(
     db: &dyn Repository,
     group_id: i64,
     mut preference: RelayPreferenceState,
 ) -> Result<FinalizeOutcome, RelayPreferenceError> {
-    let mut all_propagated = !preference.dns_records.is_empty();
+    let mut all_applied = !preference.dns_records.is_empty();
     for record in &preference.dns_records {
         let Some(sync) = db
             .find_dns_record_sync(record.rule_id, &record.line_key)
             .await?
         else {
-            all_propagated = false;
+            all_applied = false;
             continue;
         };
         if !sync_matches_action(
@@ -2056,7 +2141,7 @@ async fn finalize_carrier_rollback(
             record.rollback_action,
             record.rollback_value.as_deref(),
         ) {
-            all_propagated = false;
+            all_applied = false;
             continue;
         }
         if let Some(error) = terminal_dns_error(&sync) {
@@ -2072,11 +2157,11 @@ async fn finalize_carrier_rollback(
                 rollback_error: error,
             });
         }
-        if sync.state != "PROPAGATED" {
-            all_propagated = false;
+        if !transaction_record_provider_applied(db, &sync, record, true).await? {
+            all_applied = false;
         }
     }
-    if !all_propagated {
+    if !all_applied {
         return Ok(FinalizeOutcome::Pending);
     }
     preference.state = RelayPreferencePhase::FailedRolledBack;
@@ -2110,32 +2195,32 @@ async fn finalize_carrier_policy_group(
             .await;
     }
 
-    let mut all_propagated = true;
+    let mut all_applied = true;
     let mut terminal_error = None;
     for record in &preference.dns_records {
         let Some(sync) = db
             .find_dns_record_sync(record.rule_id, &record.line_key)
             .await?
         else {
-            all_propagated = false;
+            all_applied = false;
             continue;
         };
         if !sync_matches_action(&sync, record.target_action, record.target_value.as_deref()) {
-            all_propagated = false;
+            all_applied = false;
             continue;
         }
         if let Some(error) = terminal_dns_error(&sync) {
             terminal_error.get_or_insert(error);
             continue;
         }
-        if sync.state != "PROPAGATED" {
-            all_propagated = false;
+        if !transaction_record_provider_applied(db, &sync, record, false).await? {
+            all_applied = false;
         }
     }
     if let Some(error) = terminal_error {
         return begin_carrier_rollback(db, group_id, preference, &error).await;
     }
-    if !all_propagated {
+    if !all_applied {
         return Ok(FinalizeOutcome::Pending);
     }
 
@@ -2369,38 +2454,32 @@ async fn finalize_switching_group(
         .await;
     }
 
-    let mut all_propagated = true;
+    let mut all_applied = true;
     let mut terminal_error = None;
     for record in &preference.dns_records {
         let Some(sync) = db
             .find_dns_record_sync(record.rule_id, &record.line_key)
             .await?
         else {
-            all_propagated = false;
+            all_applied = false;
             continue;
         };
         if !sync_matches_action(&sync, record.target_action, record.target_value.as_deref()) {
-            all_propagated = false;
+            all_applied = false;
             continue;
         }
         if let Some(error) = terminal_dns_error(&sync) {
             terminal_error.get_or_insert(error);
             continue;
         }
-        if sync.state == "PROPAGATED"
-            && sync.last_error_category.as_deref() == Some("PUBLIC_DNS_MULTIPLE_ANSWERS")
-        {
-            terminal_error.get_or_insert_with(|| "PUBLIC_DNS_MULTIPLE_ANSWERS".into());
-            continue;
-        }
-        if sync.state != "PROPAGATED" {
-            all_propagated = false;
+        if !transaction_record_provider_applied(db, &sync, record, false).await? {
+            all_applied = false;
         }
     }
     if let Some(error) = terminal_error {
         return begin_rollback(db, group_id, preference, target_node_id, &error).await;
     }
-    if !all_propagated {
+    if !all_applied {
         return Ok(FinalizeOutcome::Pending);
     }
 
@@ -2583,18 +2662,26 @@ pub async fn get_relay_preference(
         let sync = db
             .find_dns_record_sync(record.rule_id, &record.line_key)
             .await?;
-        let propagated_value = sync
-            .as_ref()
-            .filter(|sync| sync.state == "PROPAGATED" && sync.last_error_category.is_none())
-            .and_then(|sync| sync.expected_value.as_deref());
-        let position = if propagated_value == record.rollback_value.as_deref() {
+        let provider_applied = match sync.as_ref() {
+            Some(sync) => sync_provider_readback_applied(db, sync).await?,
+            None => false,
+        };
+        let applied_value = provider_applied
+            .then(|| {
+                sync.as_ref()
+                    .and_then(|sync| sync.expected_value.as_deref())
+            })
+            .flatten();
+        let position = if provider_applied && applied_value == record.rollback_value.as_deref() {
             RelayDnsRecordPosition::Rollback
-        } else if propagated_value == record.target_value.as_deref()
+        } else if (provider_applied && applied_value == record.target_value.as_deref())
             || (matches!(
                 preference.state,
                 RelayPreferencePhase::RollingBack | RelayPreferencePhase::FailedManualIntervention
-            ) && record.target_state.as_deref() == Some("PROPAGATED")
-                && record.target_error.is_none())
+            ) && matches!(
+                record.target_state.as_deref(),
+                Some("MUTATION_VERIFIED" | "PROPAGATING" | "PROPAGATED")
+            ) && record.target_error.is_none())
         {
             RelayDnsRecordPosition::Target
         } else {
@@ -2613,6 +2700,7 @@ pub async fn get_relay_preference(
             last_error: sync
                 .as_ref()
                 .and_then(|sync| sync.last_error_category.clone())
+                .filter(|error| !is_legacy_public_dns_observation_error(error))
                 .or_else(|| record.target_error.clone()),
         });
     }
@@ -2752,7 +2840,7 @@ pub async fn get_carrier_affinity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::repo::{DnsRecordSyncRepository, KvsRepository};
+    use crate::db::repo::{DnsRecordBindingRepository, DnsRecordSyncRepository, KvsRepository};
     use relay_shared::models::ForwardRule;
 
     fn rule(id: i64, camouflage: bool) -> ForwardRule {
@@ -3396,6 +3484,82 @@ mod tests {
         (repo, connections, observed_rx.unwrap())
     }
 
+    async fn persist_test_provider_binding(
+        db: &crate::db::sqlite_repo::SqliteRepository,
+        sync: &crate::db::repo::DnsRecordSync,
+        observed_at: &str,
+    ) {
+        if sync.desired_action == "DELETE" {
+            if let Some(binding) = db
+                .find_dns_record_binding_for_rule(
+                    sync.rule_id,
+                    &sync.fqdn,
+                    &sync.record_type,
+                    &sync.line_key,
+                )
+                .await
+                .unwrap()
+            {
+                db.update_dns_record_binding_observation(
+                    binding.id,
+                    "MISSING",
+                    Some(observed_at),
+                    None,
+                    observed_at,
+                )
+                .await
+                .unwrap();
+            }
+            return;
+        }
+        if sync.desired_action != "UPSERT" {
+            return;
+        }
+        let expected = sync.expected_value.as_deref().unwrap();
+        match db
+            .find_dns_record_binding_for_rule(
+                sync.rule_id,
+                &sync.fqdn,
+                &sync.record_type,
+                &sync.line_key,
+            )
+            .await
+            .unwrap()
+        {
+            Some(binding) => {
+                db.rebind_verified_dns_record(
+                    binding.id,
+                    &binding.record_id,
+                    &sync.line,
+                    expected,
+                    observed_at,
+                    observed_at,
+                )
+                .await
+                .unwrap();
+            }
+            None => {
+                db.insert_dns_record_binding(&crate::db::repo::NewDnsRecordBinding {
+                    rule_id: Some(sync.rule_id),
+                    fqdn: sync.fqdn.clone(),
+                    zone_id: 7,
+                    zone_name: "example.com".into(),
+                    host: sync.fqdn.split('.').next().unwrap_or("@").into(),
+                    record_type: sync.record_type.clone(),
+                    line: sync.line.clone(),
+                    line_key: sync.line_key.clone(),
+                    record_id: format!("provider-record-{}-{}", sync.rule_id, sync.line_key),
+                    desired_value: expected.into(),
+                    state: "BOUND".into(),
+                    last_observed_at: Some(observed_at.into()),
+                    created_at: observed_at.into(),
+                })
+                .await
+                .unwrap();
+            }
+        }
+    }
+
     async fn set_sync_state(
         db: &crate::db::sqlite_repo::SqliteRepository,
         rule_id: i64,
@@ -3408,14 +3572,30 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let provider_applied = matches!(state, "MUTATION_VERIFIED" | "PROPAGATING" | "PROPAGATED");
+        if provider_applied {
+            persist_test_provider_binding(db, &sync, "2026-08-29T00:00:00Z").await;
+        }
         db.update_dns_record_sync_observation(
             &sync,
             &sync.state,
             state,
-            &sync.ownership,
-            sync.mutation_verified_at.as_deref(),
-            sync.last_observed_at.as_deref(),
-            (state == "PROPAGATED").then_some("2026-08-29T00:00:00Z"),
+            if provider_applied {
+                "PANEL"
+            } else {
+                &sync.ownership
+            },
+            if provider_applied {
+                Some("2026-08-29T00:00:00Z")
+            } else {
+                sync.mutation_verified_at.as_deref()
+            },
+            if provider_applied {
+                Some("2026-08-29T00:00:00Z")
+            } else {
+                sync.last_observed_at.as_deref()
+            },
+            None,
             error,
             sync.attempt_count,
             next_attempt_at,
@@ -3437,14 +3617,30 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let provider_applied = matches!(state, "MUTATION_VERIFIED" | "PROPAGATING" | "PROPAGATED");
+        if provider_applied {
+            persist_test_provider_binding(db, &sync, "2026-08-31T00:00:00Z").await;
+        }
         db.update_dns_record_sync_observation(
             &sync,
             &sync.state,
             state,
-            &sync.ownership,
-            sync.mutation_verified_at.as_deref(),
-            sync.last_observed_at.as_deref(),
-            (state == "PROPAGATED").then_some("2026-08-31T00:00:00Z"),
+            if provider_applied {
+                "PANEL"
+            } else {
+                &sync.ownership
+            },
+            if provider_applied {
+                Some("2026-08-31T00:00:00Z")
+            } else {
+                sync.mutation_verified_at.as_deref()
+            },
+            if provider_applied {
+                Some("2026-08-31T00:00:00Z")
+            } else {
+                sync.last_observed_at.as_deref()
+            },
+            None,
             error,
             sync.attempt_count,
             None,
@@ -4840,7 +5036,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_dns_finalizer_commits_only_exact_propagation_and_recovers_from_kvs() {
+    async fn strict_dns_finalizer_commits_only_exact_provider_readback_and_recovers_from_kvs() {
         let (repo, connections, _) = switch_fixture().await;
         start_relay_switch(&repo, &connections, 7, "node-b")
             .await
@@ -4873,6 +5069,116 @@ mod tests {
         assert_eq!(committed.pending_node_id, None);
         assert_eq!(committed.state, RelayPreferencePhase::Idle);
         assert_eq!(committed.started_at, None);
+    }
+
+    #[tokio::test]
+    async fn provider_readback_commits_even_while_public_dns_still_returns_the_old_value() {
+        let (repo, connections, _) = switch_fixture().await;
+        start_relay_switch(&repo, &connections, 7, "node-b")
+            .await
+            .unwrap();
+        for rule_id in [1, 3] {
+            set_sync_state(
+                &repo,
+                rule_id,
+                "PROPAGATING",
+                Some("PUBLIC_DNS_NOT_YET_PROPAGATED"),
+                Some("2026-09-06T02:00:05Z"),
+            )
+            .await;
+        }
+        let default_binding = repo
+            .find_dns_record_binding_for_rule(1, "op1.example.com", "A", "default")
+            .await
+            .unwrap()
+            .unwrap();
+        repo.rebind_verified_dns_record(
+            default_binding.id,
+            &default_binding.record_id,
+            "0",
+            "203.0.113.6",
+            "2026-09-06T02:00:00Z",
+            "2026-09-06T02:00:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::Committed { .. }
+        ));
+        let committed = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(committed.preferred_node_id.as_deref(), Some("node-b"));
+        assert_eq!(committed.state, RelayPreferencePhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn provider_readback_value_mismatch_does_not_commit() {
+        let (repo, connections, _) = switch_fixture().await;
+        start_relay_switch(&repo, &connections, 7, "node-b")
+            .await
+            .unwrap();
+        set_sync_state(&repo, 1, "PROPAGATED", None, None).await;
+        set_sync_state(&repo, 3, "PROPAGATED", None, None).await;
+        let binding = repo
+            .find_dns_record_binding_for_rule(3, "op3.example.com", "A", "default")
+            .await
+            .unwrap()
+            .unwrap();
+        repo.rebind_verified_dns_record(
+            binding.id,
+            &binding.record_id,
+            &binding.line,
+            "203.0.113.99",
+            "2026-09-06T02:01:00Z",
+            "2026-09-06T02:01:00Z",
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::Pending
+        ));
+        assert_eq!(
+            load_preference(&repo, 7)
+                .await
+                .unwrap()
+                .preferred_node_id
+                .as_deref(),
+            Some("node-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_readback_error_starts_existing_rollback_instead_of_committing() {
+        let (repo, connections, _) = switch_fixture().await;
+        start_relay_switch(&repo, &connections, 7, "node-b")
+            .await
+            .unwrap();
+        set_sync_state(&repo, 1, "PROPAGATED", None, None).await;
+        set_sync_state(
+            &repo,
+            3,
+            "MUTATION_OUTCOME_UNKNOWN",
+            Some("POST_WRITE_NOT_VERIFIED"),
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::RollbackStarted { .. }
+        ));
+        let rolling_back = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(rolling_back.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(rolling_back.state, RelayPreferencePhase::RollingBack);
     }
 
     #[tokio::test]
@@ -5221,26 +5527,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multiple_public_answers_trigger_rollback_and_are_terminal_during_rollback() {
+    async fn legacy_public_dns_observation_never_blocks_provider_applied_commit() {
         let (repo, connections, _) = switch_fixture().await;
         start_relay_switch(&repo, &connections, 7, "node-b")
             .await
             .unwrap();
-        set_sync_state(
-            &repo,
-            1,
-            "PROPAGATED",
-            Some("PUBLIC_DNS_MULTIPLE_ANSWERS"),
-            None,
-        )
-        .await;
-        assert!(matches!(
-            finalize_switching_group(&repo, &connections, 7)
-                .await
-                .unwrap(),
-            FinalizeOutcome::RollbackStarted { .. }
-        ));
-
         set_sync_state(
             &repo,
             1,
@@ -5254,29 +5545,10 @@ mod tests {
             finalize_switching_group(&repo, &connections, 7)
                 .await
                 .unwrap(),
-            FinalizeOutcome::ManualIntervention { .. }
+            FinalizeOutcome::Committed { .. }
         ));
-        let failed = load_preference(&repo, 7).await.unwrap();
-        assert_eq!(failed.state, RelayPreferencePhase::FailedManualIntervention);
-        assert_eq!(
-            failed.rollback_error.as_deref(),
-            Some("PUBLIC_DNS_MULTIPLE_ANSWERS")
-        );
-        let view = get_relay_preference(&repo, &connections, 7).await.unwrap();
-        let default_record = view
-            .dns_records
-            .iter()
-            .find(|record| record.rule_id == 1)
-            .unwrap();
-        assert_eq!(default_record.line_id, "default");
-        assert_eq!(default_record.line_key, "default");
-        assert_eq!(
-            view.dns_records
-                .iter()
-                .find(|record| record.rule_id == 1)
-                .map(|record| &record.position),
-            Some(&RelayDnsRecordPosition::Unknown),
-            "multiple public answers must never be presented as a confirmed target or rollback"
-        );
+        let committed = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(committed.state, RelayPreferencePhase::Idle);
+        assert_eq!(committed.preferred_node_id.as_deref(), Some("node-b"));
     }
 }

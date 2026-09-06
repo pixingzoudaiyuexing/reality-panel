@@ -101,6 +101,12 @@ export function DnsStatusCell({
     return <Text type="secondary">-</Text>;
   }
   const display = dnsSyncStateDisplay(status.sync_state, t);
+  const warningCategory = status.warning_category?.startsWith('PUBLIC_DNS_')
+    ? null
+    : status.warning_category;
+  const errorCategory = status.last_error_category?.startsWith('PUBLIC_DNS_')
+    ? null
+    : status.last_error_category;
   const color = display.tone === 'normal' ? 'green'
     : display.tone === 'warning' ? 'orange'
       : display.tone === 'error' ? 'red'
@@ -126,8 +132,8 @@ export function DnsStatusCell({
           {t('dnsOwnership')}: {dnsOwnershipDisplay(status.ownership, t)}
         </Text>
       </Tooltip>
-      {status.warning_category && <Text type="warning">{status.warning_category}</Text>}
-      {status.last_error_category && <Text type="danger">{status.last_error_category}</Text>}
+      {warningCategory && <Text type="warning">{warningCategory}</Text>}
+      {errorCategory && <Text type="danger">{errorCategory}</Text>}
       {retryable && onRetry && (
         <Button size="small" type="text" icon={<ReloadOutlined />} loading={retrying} onClick={onRetry}>
           {t('retryDnsSync')}

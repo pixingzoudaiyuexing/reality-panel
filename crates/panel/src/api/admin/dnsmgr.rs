@@ -272,15 +272,10 @@ fn status_from_sync(
         })
         .unwrap_or("NONE")
         .to_string();
-    let warning_category = matching
-        .as_ref()
-        .and_then(|sync| sync.last_error_category.as_deref())
-        .filter(|category| *category == "PUBLIC_DNS_MULTIPLE_ANSWERS")
-        .map(str::to_string);
     let last_error_category = matching
         .as_ref()
         .and_then(|sync| sync.last_error_category.clone())
-        .filter(|category| category != "PUBLIC_DNS_MULTIPLE_ANSWERS");
+        .filter(|category| !category.starts_with("PUBLIC_DNS_"));
 
     RuleDnsStatus {
         rule_id,
@@ -293,10 +288,19 @@ fn status_from_sync(
         sync_state: if !automation_enabled {
             "DISABLED".into()
         } else {
-            matching
-                .as_ref()
-                .map(|sync| sync.state.clone())
-                .unwrap_or_else(|| "PENDING".into())
+            matching.as_ref().map_or_else(
+                || "PENDING".into(),
+                |sync| {
+                    if sync.ownership == "PANEL"
+                        && sync.mutation_verified_at.is_some()
+                        && matches!(sync.state.as_str(), "MUTATION_VERIFIED" | "PROPAGATING")
+                    {
+                        "PROPAGATED".into()
+                    } else {
+                        sync.state.clone()
+                    }
+                },
+            )
         },
         last_observed_at: matching
             .as_ref()
@@ -308,7 +312,7 @@ fn status_from_sync(
             .as_ref()
             .and_then(|sync| sync.propagated_at.clone()),
         last_error_category,
-        warning_category,
+        warning_category: None,
     }
 }
 
@@ -326,15 +330,10 @@ fn status_from_frozen_sync(
         })
         .unwrap_or("NONE")
         .to_string();
-    let warning_category = sync
-        .as_ref()
-        .and_then(|sync| sync.last_error_category.as_deref())
-        .filter(|category| *category == "PUBLIC_DNS_MULTIPLE_ANSWERS")
-        .map(str::to_string);
     let last_error_category = sync
         .as_ref()
         .and_then(|sync| sync.last_error_category.clone())
-        .filter(|category| category != "PUBLIC_DNS_MULTIPLE_ANSWERS");
+        .filter(|category| !category.starts_with("PUBLIC_DNS_"));
 
     RuleDnsStatus {
         rule_id,
@@ -354,7 +353,7 @@ fn status_from_frozen_sync(
             .and_then(|sync| sync.mutation_verified_at.clone()),
         propagated_at: sync.as_ref().and_then(|sync| sync.propagated_at.clone()),
         last_error_category,
-        warning_category,
+        warning_category: None,
     }
 }
 
@@ -928,16 +927,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_dns_status_is_safe_and_separates_warning_from_error() {
+    async fn rule_dns_status_hides_legacy_public_dns_observation_errors() {
         let (state, pool) = test_state().await;
         add_eligible_rule(&pool, "op1.example.com").await;
         save_settings(&state, "https://dns.example.test".into(), API_KEY).await;
         sqlx::query(
-            "UPDATE dns_record_syncs SET state = 'PROPAGATED', ownership = 'PANEL', \
+            "UPDATE dns_record_syncs SET state = 'PROPAGATING', ownership = 'PANEL', \
              mutation_verified_at = '2026-08-26 01:00:00', \
              last_observed_at = '2026-08-26 01:01:00', \
-             propagated_at = '2026-08-26 01:01:00', \
-             last_error_category = 'PUBLIC_DNS_MULTIPLE_ANSWERS' WHERE rule_id = 100",
+             propagated_at = NULL, \
+             last_error_category = 'PUBLIC_DNS_NOT_YET_PROPAGATED' WHERE rule_id = 100",
         )
         .execute(&pool)
         .await
@@ -950,10 +949,7 @@ mod tests {
         assert!(status.automation_enabled);
         assert_eq!(status.sync_state, "PROPAGATED");
         assert_eq!(status.ownership, "PANEL_MANAGED");
-        assert_eq!(
-            status.warning_category.as_deref(),
-            Some("PUBLIC_DNS_MULTIPLE_ANSWERS")
-        );
+        assert_eq!(status.warning_category, None);
         assert_eq!(status.last_error_category, None);
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains(API_KEY));

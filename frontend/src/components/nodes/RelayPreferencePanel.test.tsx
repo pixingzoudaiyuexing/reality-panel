@@ -244,6 +244,17 @@ describe('RelayPreferencePanel', () => {
     expect(within(screen.getByTestId('default-line-candidate-node-c')).getByRole('button', { name: /setAsDefaultLine/ })).toBeEnabled();
   });
 
+  it('does not expose legacy public DNS observation codes as switch errors', async () => {
+    mockGet.mockResolvedValue(ok(preference({
+      state: 'failed_rolled_back',
+      pending_node_id: 'node-b',
+      last_error: 'PUBLIC_DNS_NOT_YET_PROPAGATED',
+    })));
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    expect(await screen.findByText(/relaySwitchPublicDnsIgnored/)).toBeInTheDocument();
+    expect(screen.queryByText('PUBLIC_DNS_NOT_YET_PROPAGATED')).toBeNull();
+  });
+
   it.each(['switching', 'rolling_back', 'failed_manual_intervention'] as const)('locks every switch action in %s', async (state) => {
     mockGet.mockResolvedValue(ok(preference({ state, pending_node_id: 'node-b' })));
     render(<RelayPreferencePanel groupId={10} t={t} />);

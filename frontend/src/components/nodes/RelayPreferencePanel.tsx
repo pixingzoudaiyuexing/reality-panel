@@ -25,8 +25,8 @@ interface Props {
 
 function switchErrorLabel(error: string | null, t: Tfn): string {
   if (!error) return t('relaySwitchUnknownError');
+  if (error.startsWith('PUBLIC_DNS_')) return t('relaySwitchPublicDnsIgnored');
   const labels: Record<string, Parameters<Tfn>[0]> = {
-    PUBLIC_DNS_MULTIPLE_ANSWERS: 'relaySwitchErrorMultipleAnswers',
     DNS_RECORD_CONFLICT: 'relaySwitchErrorRecordConflict',
     TARGET_STATUS_UNAVAILABLE: 'relaySwitchErrorTargetStatus',
     TARGET_PUBLIC_IPV4_UNAVAILABLE: 'relaySwitchErrorTargetIpv4',

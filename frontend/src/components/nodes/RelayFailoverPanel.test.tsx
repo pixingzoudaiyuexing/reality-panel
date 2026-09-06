@@ -98,6 +98,15 @@ describe('RelayFailoverPanel', () => {
     expect(within(excluded).getByRole('button', { name: /重新纳入备选/ })).toBeEnabled();
   });
 
+  it('uses a compact default switch and no longer describes fallback as random', async () => {
+    await renderPanel();
+    const toggle = screen.getByRole('switch', { name: '自动故障切换' });
+    expect(toggle).toHaveStyle({ alignSelf: 'flex-start' });
+    expect(toggle.closest('.rp-failover-toggle-setting')).toBeInTheDocument();
+    expect(screen.getByText(/同组已就绪且检查正常的可用节点/)).toBeInTheDocument();
+    expect(screen.queryByText(/随机选择/)).toBeNull();
+  });
+
   it('enables failover with the current validated settings', async () => {
     await renderPanel();
     fireEvent.click(screen.getByRole('switch', { name: '自动故障切换' }));

@@ -17,7 +17,7 @@ use crate::integrations::dnsmgr::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -28,7 +28,6 @@ const DNS_SYNC_MAX_BATCH: i64 = 16;
 const DNS_SYNC_MAX_ATTEMPTS: i32 = 6;
 const DNS_SYNC_BASE_BACKOFF_SECS: u64 = 5;
 const DNS_SYNC_MAX_BACKOFF_SECS: u64 = 300;
-const PUBLIC_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PROVIDER_LINE_ID_BYTES: usize = 256;
 static DNS_RECONCILE_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
 
@@ -1490,14 +1489,6 @@ pub(crate) enum LineRecordSnapshotError {
     OwnershipUnverified,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublicDnsObservation {
-    ExpectedPresent,
-    ExpectedPresentWithOtherAnswers,
-    ExpectedAbsent,
-    LookupFailed,
-}
-
 /// Resolve the desired DNS record without contacting DNSMgr. This keeps
 /// eligibility and target selection deterministic and independently testable.
 pub(crate) async fn derive_dns_desired(
@@ -2303,36 +2294,6 @@ fn is_transient_failure(failure: &EnsureRecordFailure) -> bool {
     }
 }
 
-fn public_dns_state(answers: &[Ipv4Addr], expected: Ipv4Addr) -> PublicDnsObservation {
-    if answers.contains(&expected) {
-        if answers.iter().any(|answer| *answer != expected) {
-            PublicDnsObservation::ExpectedPresentWithOtherAnswers
-        } else {
-            PublicDnsObservation::ExpectedPresent
-        }
-    } else {
-        PublicDnsObservation::ExpectedAbsent
-    }
-}
-
-async fn observe_public_dns(fqdn: &str, expected: Ipv4Addr) -> PublicDnsObservation {
-    let lookup = tokio::time::timeout(
-        PUBLIC_DNS_TIMEOUT,
-        tokio::net::lookup_host((fqdn.to_string(), 0)),
-    )
-    .await;
-    let Ok(Ok(addresses)) = lookup else {
-        return PublicDnsObservation::LookupFailed;
-    };
-    let answers = addresses
-        .filter_map(|address: SocketAddr| match address.ip() {
-            IpAddr::V4(ip) => Some(ip),
-            IpAddr::V6(_) => None,
-        })
-        .collect::<Vec<_>>();
-    public_dns_state(&answers, expected)
-}
-
 #[allow(clippy::too_many_arguments)] // 状态转移字段与持久化 CAS 参数一一对应，保持事务语义。
 async fn update_sync(
     db: &dyn Repository,
@@ -2376,115 +2337,6 @@ async fn update_sync(
     }
 }
 
-async fn observe_and_store(
-    db: &dyn Repository,
-    sync: &DnsRecordSync,
-    expected_state: &str,
-    ownership: &str,
-    mutation_verified_at: Option<&str>,
-    attempts: i32,
-) -> Option<DnsAuditTransition> {
-    let Some(expected_value) = sync.expected_value.as_deref() else {
-        return None;
-    };
-    let Ok(expected) = expected_value.parse::<Ipv4Addr>() else {
-        let updated = update_sync(
-            db,
-            sync,
-            expected_state,
-            "FAILED",
-            ownership,
-            mutation_verified_at,
-            None,
-            None,
-            Some("INVALID_RELAY_IPV4"),
-            attempts,
-            None,
-        )
-        .await;
-        return updated.then(|| {
-            DnsAuditTransition::from_sync(
-                "DNS_SYNC_FAILED",
-                sync,
-                ownership,
-                Some("INVALID_RELAY_IPV4"),
-            )
-        });
-    };
-    let observed_at = utc_now();
-    let observation = observe_public_dns(&sync.fqdn, expected).await;
-    match observation {
-        PublicDnsObservation::ExpectedPresent => {
-            let updated = update_sync(
-                db,
-                sync,
-                expected_state,
-                "PROPAGATED",
-                ownership,
-                mutation_verified_at,
-                Some(&observed_at),
-                Some(&observed_at),
-                None,
-                attempts,
-                None,
-            )
-            .await;
-            updated.then(|| DnsAuditTransition::from_sync("DNS_PROPAGATED", sync, ownership, None))
-        }
-        PublicDnsObservation::ExpectedPresentWithOtherAnswers => {
-            let updated = update_sync(
-                db,
-                sync,
-                expected_state,
-                "PROPAGATED",
-                ownership,
-                mutation_verified_at,
-                Some(&observed_at),
-                Some(&observed_at),
-                Some("PUBLIC_DNS_MULTIPLE_ANSWERS"),
-                attempts,
-                None,
-            )
-            .await;
-            updated.then(|| {
-                DnsAuditTransition::from_sync(
-                    "DNS_PROPAGATED",
-                    sync,
-                    ownership,
-                    Some("PUBLIC_DNS_MULTIPLE_ANSWERS"),
-                )
-            })
-        }
-        PublicDnsObservation::ExpectedAbsent | PublicDnsObservation::LookupFailed => {
-            // Propagation observation is read-only and may legitimately take
-            // longer than the bounded mutation retry window. Keep observing at
-            // the capped interval until the expected answer appears.
-            let next_attempt = retry_timestamp(attempts.max(1));
-            let error = match observation {
-                PublicDnsObservation::ExpectedAbsent => "PUBLIC_DNS_NOT_YET_PROPAGATED",
-                PublicDnsObservation::LookupFailed => "PUBLIC_DNS_LOOKUP_FAILED",
-                PublicDnsObservation::ExpectedPresent
-                | PublicDnsObservation::ExpectedPresentWithOtherAnswers => unreachable!(),
-            };
-            update_sync(
-                db,
-                sync,
-                expected_state,
-                "PROPAGATING",
-                ownership,
-                mutation_verified_at,
-                Some(&observed_at),
-                None,
-                Some(error),
-                attempts.saturating_add(1),
-                Some(&next_attempt),
-            )
-            .await;
-            None
-        }
-    }
-}
-
 async fn reconcile_one(
     db: &dyn Repository,
     sync: DnsRecordSync,
@@ -2494,24 +2346,6 @@ async fn reconcile_one(
         return reconcile_delete(db, sync, client).await;
     }
     let mut audits = Vec::new();
-    if sync.line_key == DEFAULT_LINE_KEY
-        && matches!(sync.state.as_str(), "PROPAGATING" | "MUTATION_VERIFIED")
-    {
-        if let Some(audit) = observe_and_store(
-            db,
-            &sync,
-            &sync.state,
-            &sync.ownership,
-            sync.mutation_verified_at.as_deref(),
-            sync.attempt_count,
-        )
-        .await
-        {
-            audits.push(audit);
-        }
-        return audits;
-    }
-
     let attempt = sync.attempt_count.saturating_add(1);
     let in_flight_recovery_at = retry_timestamp(attempt);
     if !update_sync(
@@ -2545,21 +2379,25 @@ async fn reconcile_one(
         | EnsureRecordResult::Recreated { .. }
         | EnsureRecordResult::Updated { .. }) => {
             let verified_at = utc_now();
-            let mutation_state_saved = update_sync(
+            // `ensure_record` has already re-read the provider and verified the
+            // exact fqdn/line/record identity/value before returning success.
+            // Keep the legacy terminal state name for database compatibility;
+            // it now means provider-applied, not public-recursive propagation.
+            let provider_applied_saved = update_sync(
                 db,
                 &sync,
                 "SYNCING",
-                "MUTATION_VERIFIED",
+                "PROPAGATED",
                 "PANEL",
                 Some(&verified_at),
-                None,
+                Some(&verified_at),
                 None,
                 None,
                 0,
-                Some(&verified_at),
+                None,
             )
             .await;
-            if mutation_state_saved {
+            if provider_applied_saved {
                 let mutation_action = result.audit_outcome();
                 if mutation_action != DnsMutationAuditOutcome::NoMutation {
                     audits.push(DnsAuditTransition::from_sync(
@@ -2569,46 +2407,17 @@ async fn reconcile_one(
                         None,
                     ));
                 }
-                if sync.line_key == DEFAULT_LINE_KEY {
-                    notify_certificate_reconcile_on_ownership(
-                        &sync.line_key,
-                        true,
-                        crate::service::panel_certificate::notify_reconcile,
-                    );
-                    if let Some(audit) = observe_and_store(
-                        db,
-                        &sync,
-                        "MUTATION_VERIFIED",
-                        "PANEL",
-                        Some(&verified_at),
-                        0,
-                    )
-                    .await
-                    {
-                        audits.push(audit);
-                    }
-                } else if update_sync(
-                    db,
+                audits.push(DnsAuditTransition::from_sync(
+                    "DNS_PROVIDER_APPLIED",
                     &sync,
-                    "MUTATION_VERIFIED",
-                    "PROPAGATED",
                     "PANEL",
-                    Some(&verified_at),
-                    Some(&verified_at),
-                    Some(&verified_at),
                     None,
-                    0,
-                    None,
-                )
-                .await
-                {
-                    audits.push(DnsAuditTransition::from_sync(
-                        "DNS_PROPAGATED",
-                        &sync,
-                        "PANEL",
-                        None,
-                    ));
-                }
+                ));
+                notify_certificate_reconcile_on_ownership(
+                    &sync.line_key,
+                    true,
+                    crate::service::panel_certificate::notify_reconcile,
+                );
             }
         }
         EnsureRecordResult::Conflict(_) => {
@@ -2777,7 +2586,7 @@ async fn reconcile_delete(
                 "PANEL",
                 Some(&verified_at),
                 Some(&verified_at),
-                Some(&verified_at),
+                None,
                 None,
                 0,
                 None,
@@ -3411,7 +3220,9 @@ mod tests {
                 .map(String::as_str),
             Some("Dianxin_Shandong")
         );
-        assert!(audits.iter().any(|audit| audit.action == "DNS_PROPAGATED"));
+        assert!(audits
+            .iter()
+            .any(|audit| audit.action == "DNS_PROVIDER_APPLIED"));
         assert!(db
             .find_dns_record_binding_for_rule(
                 100,
@@ -4947,24 +4758,6 @@ mod tests {
     }
 
     #[test]
-    fn public_dns_observation_accepts_expected_ip_with_other_answers() {
-        assert_eq!(
-            public_dns_state(
-                &["192.0.2.10".parse().unwrap(), "192.0.2.11".parse().unwrap()],
-                "192.0.2.10".parse().unwrap(),
-            ),
-            PublicDnsObservation::ExpectedPresentWithOtherAnswers
-        );
-        assert_eq!(
-            public_dns_state(
-                &["192.0.2.11".parse().unwrap()],
-                "192.0.2.10".parse().unwrap(),
-            ),
-            PublicDnsObservation::ExpectedAbsent
-        );
-    }
-
-    #[test]
     fn dns_retry_backoff_is_exponential_and_bounded() {
         assert_eq!(retry_delay(1), Duration::from_secs(5));
         assert_eq!(retry_delay(2), Duration::from_secs(10));
@@ -5510,9 +5303,12 @@ mod tests {
         let created_audits =
             reconcile_one(&created_db, sync_row(&created_db).await, &created.client).await;
         let created_state = sync_row(&created_db).await;
-        assert_eq!(created_state.state, "PROPAGATING");
+        assert_eq!(created_state.state, "PROPAGATED");
         assert_eq!(created_state.ownership, "PANEL");
         assert!(created_state.mutation_verified_at.is_some());
+        assert!(created_state.last_observed_at.is_some());
+        assert_eq!(created_state.propagated_at, None);
+        assert_eq!(created_state.last_error_category, None);
         assert_eq!(created.state.add_attempts.load(Ordering::SeqCst), 1);
         assert!(created_audits
             .iter()
@@ -5530,6 +5326,7 @@ mod tests {
         let external_audits =
             reconcile_one(&external_db, sync_row(&external_db).await, &external.client).await;
         let external_state = sync_row(&external_db).await;
+        assert_eq!(external_state.state, "PROPAGATED");
         assert_eq!(external_state.ownership, "PANEL");
         assert!(external_db
             .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "default")
@@ -5566,7 +5363,7 @@ mod tests {
         let conflict_audits =
             reconcile_one(&conflict_db, sync_row(&conflict_db).await, &conflict.client).await;
         let conflict_state = sync_row(&conflict_db).await;
-        assert_eq!(conflict_state.state, "PROPAGATING");
+        assert_eq!(conflict_state.state, "PROPAGATED");
         assert_eq!(conflict_state.ownership, "PANEL");
         assert_eq!(conflict.state.update_attempts.load(Ordering::SeqCst), 1);
         assert!(conflict_audits
@@ -5635,6 +5432,7 @@ mod tests {
         .await;
         reconcile_one(&updated_db, sync_row(&updated_db).await, &updated.client).await;
         let updated_state = sync_row(&updated_db).await;
+        assert_eq!(updated_state.state, "PROPAGATED");
         assert_eq!(updated_state.ownership, "PANEL");
         assert!(updated_state.mutation_verified_at.is_some());
         assert_eq!(updated.state.update_attempts.load(Ordering::SeqCst), 1);
@@ -5657,6 +5455,7 @@ mod tests {
         .await;
         reconcile_one(&noop_db, sync_row(&noop_db).await, &noop.client).await;
         let noop_state = sync_row(&noop_db).await;
+        assert_eq!(noop_state.state, "PROPAGATED");
         assert_eq!(noop_state.ownership, "PANEL");
         assert!(noop_state.mutation_verified_at.is_some());
         assert_eq!(noop.state.total_mutations(), 0);
@@ -5709,45 +5508,6 @@ mod tests {
         let disabled = sync_row(&disabled_db).await;
         assert_eq!(disabled.state, "DISABLED");
         assert_eq!(disabled_mock.state.total_mutations(), 0);
-    }
-
-    #[tokio::test]
-    async fn propagation_observation_continues_after_mutation_retry_limit() {
-        let db = ensure_db().await;
-        configure_eligible_rule(&db, "localhost", "192.0.2.10").await;
-        insert_sync(&db).await;
-        let now = utc_now();
-        db.update_dns_record_sync_desired(
-            100,
-            "localhost",
-            "A",
-            Some("192.0.2.10"),
-            "default",
-            "default",
-            "UPSERT",
-            "PROPAGATING",
-            "PANEL",
-            None,
-            Some(&now),
-            &now,
-        )
-        .await
-        .unwrap();
-        let sync = sync_row(&db).await;
-        let audit = observe_and_store(
-            &db,
-            &sync,
-            "PROPAGATING",
-            "PANEL",
-            Some(&now),
-            DNS_SYNC_MAX_ATTEMPTS,
-        )
-        .await;
-        assert_eq!(audit, None, "propagation polling must not emit audit spam");
-        let observed = sync_row(&db).await;
-        assert_eq!(observed.state, "PROPAGATING");
-        assert_eq!(observed.attempt_count, DNS_SYNC_MAX_ATTEMPTS + 1);
-        assert!(observed.next_attempt_at.is_some());
     }
 
     #[tokio::test]

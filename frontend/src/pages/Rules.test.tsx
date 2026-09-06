@@ -489,13 +489,13 @@ describe('rule DNS status', () => {
     unmount();
   });
 
-  it('shows external ownership and a multiple-answer propagation warning', () => {
+  it('shows external ownership without legacy public DNS propagation warnings', () => {
     render(<DnsStatusCell status={status('PROPAGATED', {
       ownership: 'EXTERNAL',
       warning_category: 'PUBLIC_DNS_MULTIPLE_ANSWERS',
     })} t={t} />);
     expect(screen.getByText('dnsOwnership: dnsOwnershipExternal')).toHaveAttribute('data-raw-ownership', 'EXTERNAL');
-    expect(screen.getByText('PUBLIC_DNS_MULTIPLE_ANSWERS')).toBeInTheDocument();
+    expect(screen.queryByText('PUBLIC_DNS_MULTIPLE_ANSWERS')).toBeNull();
   });
 
   it('offers retry for safe terminal states but not unknown mutation outcomes', () => {

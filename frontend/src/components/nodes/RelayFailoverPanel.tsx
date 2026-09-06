@@ -136,12 +136,13 @@ export function RelayFailoverPanel({ groupId, t }: Props) {
       {view ? (
         <>
           <div className="rp-failover-settings">
-            <div className="rp-failover-setting">
+            <div className="rp-failover-setting rp-failover-toggle-setting">
               <Text>{t('relayFailoverEnabled')}</Text>
               <Switch
                 aria-label={t('relayFailoverEnabled')}
                 checked={view.enabled}
                 loading={saving}
+                style={{ alignSelf: 'flex-start' }}
                 onChange={(checked) => void update(checked)}
               />
             </div>
