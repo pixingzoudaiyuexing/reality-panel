@@ -80,6 +80,12 @@ async function renderPanel(items: RelaySchedule[] = [], props: { topologyState?:
   mockGet.mockResolvedValue(ok(items));
   render(<RelaySchedulePanel groupId={10} nodes={nodes} t={t} carrierPolicy={props.withPolicy ? carrierPolicy : undefined} carrierCatalog={props.withPolicy ? carrierCatalog : undefined} topologyState={props.topologyState} />);
   await waitFor(() => expect(mockGet).toHaveBeenCalledWith('/admin/relay-schedules'));
+  const visibleItems = items.filter((item) => item.group_id === 10);
+  if (visibleItems.length === 0) {
+    await screen.findByText(zhCN.relayScheduleEmpty);
+  } else {
+    await Promise.all(visibleItems.map((item) => screen.findByTestId(`relay-schedule-${item.id}`)));
+  }
 }
 
 async function choose(label: string, optionText: RegExp | string) {
@@ -139,7 +145,7 @@ describe('RelaySchedulePanel', () => {
     })));
   });
 
-  it('creates daily and weekly payloads with fixed offset fields', async () => {
+  it('creates a daily payload with fixed offset fields', async () => {
     await renderPanel();
     await openCreate();
     await choose('目标线路', /64\.118\.154\.53 · node-a/);
@@ -147,12 +153,14 @@ describe('RelaySchedulePanel', () => {
     fireEvent.change(await screen.findByLabelText('时间'), { target: { value: '08:30' } });
     await chooseOffset('UTC+08:00');
     fireEvent.click(screen.getByRole('button', { name: '保 存' }));
-    await waitFor(() => expect(mockPost).toHaveBeenLastCalledWith('/admin/relay-schedules', expect.objectContaining({
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/relay-schedules', expect.objectContaining({
       schedule_type: 'daily', time: '08:30', utc_offset_minutes: 480,
     })));
+  });
 
-    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
-    fireEvent.click(screen.getByRole('button', { name: /新建定时切换/ }));
+  it('creates a weekly payload with fixed offset fields', async () => {
+    await renderPanel();
+    await openCreate();
     await choose('目标线路', /64\.118\.154\.53 · node-a/);
     await choose('计划类型', '每周');
     fireEvent.change(await screen.findByLabelText('时间'), { target: { value: '20:00' } });
@@ -160,7 +168,7 @@ describe('RelaySchedulePanel', () => {
     fireEvent.click(screen.getByLabelText('周一'));
     fireEvent.click(screen.getByLabelText('周五'));
     fireEvent.click(screen.getByRole('button', { name: '保 存' }));
-    await waitFor(() => expect(mockPost).toHaveBeenLastCalledWith('/admin/relay-schedules', expect.objectContaining({
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/relay-schedules', expect.objectContaining({
       schedule_type: 'weekly', time: '20:00', utc_offset_minutes: -300, weekdays: [1, 5],
     })));
   });
