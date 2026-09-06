@@ -7,6 +7,22 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.6] - 2026-09-07
+
+证书资源模型修复：managed certificate 改为 Panel 全局资源。
+
+### 修复
+
+- Certificate storage、inventory lookup、wildcard reuse 和 generation 不再按 Group 隔离。
+- 已有有效 wildcard certificate 可被其他 Group 中被其覆盖的 SNI 直接复用，不再重复调用 Certbot。
+- 启动后兼容导入 legacy `groups/{group_id}/scopes` 证书；同域选择有效期更新的一份，旧数据保持不变以支持回滚。
+
+### 兼容性
+
+- 无数据库 migration。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.5 可直接升级到 v1.1.6。
+
 ## [1.1.5] - 2026-09-06
 
 生产可靠性热修复：修复 relay-node 故障恢复后 LKG 与 Panel desired 的重新收敛。

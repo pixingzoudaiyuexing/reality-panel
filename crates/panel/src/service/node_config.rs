@@ -371,7 +371,7 @@ async fn build_node_config_snapshot_for_node_inner(
             })
             .collect();
         let resolved = crate::service::panel_certificate::resolve_managed_certificate_scopes(
-            state_dir, group_id, scopes,
+            state_dir, scopes,
         )
         .await
         .map_err(NodeConfigBuildError::InvalidConfig)?;

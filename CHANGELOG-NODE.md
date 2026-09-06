@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.6] - 2026-09-07
+
+统一版本发布。证书全局资源修复位于 Panel，Relay Node runtime 和协议不变。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.5 relay-node 可直接升级到 v1.1.6。
+
 ## [1.1.5] - 2026-09-06
 
 relay-node 本地恢复与 Panel 权威配置重新收敛热修复。

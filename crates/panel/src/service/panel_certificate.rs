@@ -36,6 +36,13 @@ const ISSUANCE_RECEIPT_ENV: &str = "RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIP
 const RETRY_DELAYS_SECS: &[i64] = &[30, 120, 300, 900, 1_800, 3_600];
 static CERTIFICATE_ISSUANCE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static CERTIFICATE_RECONCILE_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+static CERTIFICATE_STORAGE_STATE: OnceLock<std::sync::Mutex<CertificateStorageState>> =
+    OnceLock::new();
+
+#[derive(Default)]
+struct CertificateStorageState {
+    migrated_state_dirs: HashSet<PathBuf>,
+}
 
 #[derive(Clone)]
 pub struct PanelCertificateManager {
@@ -110,7 +117,7 @@ impl PanelCertificateManager {
     pub async fn group_manifest(&self, group_id: i64) -> Result<GroupCertificateManifest, String> {
         let scopes = self.certificate_scopes(group_id).await?;
         let state_dir = self.state_dir.clone();
-        tokio::task::spawn_blocking(move || build_group_manifest(&state_dir, group_id, &scopes))
+        tokio::task::spawn_blocking(move || build_group_manifest(&state_dir, &scopes))
             .await
             .map_err(|error| error.to_string())?
     }
@@ -122,7 +129,7 @@ impl PanelCertificateManager {
         let scopes = certificate_scopes_for_group(self.db.as_ref(), group_id)
             .await
             .map_err(|error| error.to_string())?;
-        resolve_managed_certificate_scopes(&self.state_dir, group_id, scopes).await
+        resolve_managed_certificate_scopes(&self.state_dir, scopes).await
     }
 
     async fn reconcile_all(&self) -> HashSet<i64> {
@@ -170,7 +177,7 @@ impl PanelCertificateManager {
         group: &DeviceGroup,
         scope: &GroupCertificateScope,
     ) -> Result<bool, String> {
-        let scope_root = scope_root(&self.state_dir, group.id, &scope.domain);
+        let scope_root = scope_root(&self.state_dir, &scope.domain);
         let current = recover_current(&scope_root, &scope.domain)?;
         if current
             .as_ref()
@@ -180,7 +187,6 @@ impl PanelCertificateManager {
             return Ok(false);
         }
         if !self.issuance_authorized(group.id, &scope.domain).await? {
-            clear_retry(&scope_root);
             return Ok(false);
         }
         if !retry_due(&scope_root)? {
@@ -197,7 +203,6 @@ impl PanelCertificateManager {
             return Ok(false);
         }
         if !self.issuance_authorized(group.id, &scope.domain).await? {
-            clear_retry(&scope_root);
             return Ok(false);
         }
         if !retry_due(&scope_root)? {
@@ -227,7 +232,6 @@ impl PanelCertificateManager {
                     .and_then(|_| {
                         publish_candidate(
                             &state_dir,
-                            group_id,
                             &publish_domain,
                             &candidate.cert_source,
                             &candidate.key_source,
@@ -270,7 +274,7 @@ impl PanelCertificateManager {
         ensure_private_dir(&work_dir)?;
         ensure_private_dir(&logs_dir)?;
 
-        let certificate_name = format!("reality-panel-g{group_id}-{}", &scope_id(domain)[..16]);
+        let certificate_name = format!("reality-panel-{}", &scope_id(domain)[..16]);
         let actor = format!("panel-certificate-g{group_id}-{}", &scope_id(domain)[..16]);
         let issuance_id = uuid::Uuid::new_v4().to_string();
         let issuance_dir = self.state_dir.join("issuance");
@@ -548,12 +552,12 @@ fn validate_issuance_receipt(path: &Path, attempt: &IssuanceAttempt) -> Result<(
 
 pub(crate) async fn resolve_managed_certificate_scopes(
     state_dir: &Path,
-    group_id: i64,
     scopes: Vec<GroupCertificateScope>,
 ) -> Result<Vec<GroupCertificateScope>, String> {
     let state_dir = state_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let inventory = managed_certificate_inventory(&state_dir, group_id)?;
+        migrate_legacy_certificates(&state_dir)?;
+        let inventory = managed_certificate_inventory(&state_dir)?;
         let mut resolved = BTreeMap::<String, BTreeSet<String>>::new();
         for scope in scopes {
             for sni in scope.snis {
@@ -574,14 +578,150 @@ pub(crate) async fn resolve_managed_certificate_scopes(
     .map_err(|error| error.to_string())?
 }
 
-fn managed_certificate_inventory(
-    state_dir: &Path,
+#[derive(Clone)]
+struct LegacyCertificateCandidate {
     group_id: i64,
-) -> Result<Vec<CurrentCertificate>, String> {
-    let scopes_root = state_dir
-        .join("groups")
-        .join(group_id.to_string())
-        .join("scopes");
+    current: CurrentCertificate,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+}
+
+fn certificate_storage_state(
+) -> Result<std::sync::MutexGuard<'static, CertificateStorageState>, String> {
+    CERTIFICATE_STORAGE_STATE
+        .get_or_init(|| std::sync::Mutex::new(CertificateStorageState::default()))
+        .lock()
+        .map_err(|_| "certificate storage lock is unavailable".to_string())
+}
+
+fn migrate_legacy_certificates(state_dir: &Path) -> Result<(), String> {
+    let mut storage = certificate_storage_state()?;
+    if storage.migrated_state_dirs.contains(state_dir) {
+        return Ok(());
+    }
+    let candidates = legacy_certificate_candidates(state_dir)?;
+    for candidate in candidates.into_values() {
+        let root = scope_root(state_dir, &candidate.current.domain);
+        let global_current = recover_current(&root, &candidate.current.domain)?;
+        let legacy_expiry = certificate_expiry(&candidate.current)?;
+        let import = match global_current.as_ref() {
+            Some(current) if current.fingerprint == candidate.current.fingerprint => false,
+            Some(current) => legacy_expiry > certificate_expiry(current)?,
+            None => true,
+        };
+        if import
+            && publish_candidate_at_root(
+                &root,
+                &candidate.current.domain,
+                &candidate.cert_path,
+                &candidate.key_path,
+                false,
+            )?
+        {
+            tracing::info!(
+                legacy_group_id = candidate.group_id,
+                domain = %candidate.current.domain,
+                "imported legacy managed certificate into global inventory"
+            );
+        }
+    }
+    storage.migrated_state_dirs.insert(state_dir.to_path_buf());
+    Ok(())
+}
+
+fn legacy_certificate_candidates(
+    state_dir: &Path,
+) -> Result<BTreeMap<String, LegacyCertificateCandidate>, String> {
+    let groups_root = state_dir.join("groups");
+    let groups = match fs::read_dir(&groups_root) {
+        Ok(groups) => groups,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut candidates = BTreeMap::<String, LegacyCertificateCandidate>::new();
+    for group in groups.flatten() {
+        let Ok(group_id) = group.file_name().to_string_lossy().parse::<i64>() else {
+            continue;
+        };
+        if group_id <= 0 {
+            continue;
+        }
+        let Ok(group_metadata) = fs::symlink_metadata(group.path()) else {
+            continue;
+        };
+        if !group_metadata.is_dir() || group_metadata.file_type().is_symlink() {
+            continue;
+        }
+        let scopes_root = group.path().join("scopes");
+        let Ok(scopes) = fs::read_dir(scopes_root) else {
+            continue;
+        };
+        for scope in scopes.flatten() {
+            let Ok(scope_metadata) = fs::symlink_metadata(scope.path()) else {
+                continue;
+            };
+            if !scope_metadata.is_dir() || scope_metadata.file_type().is_symlink() {
+                continue;
+            }
+            let scope_name = scope.file_name().to_string_lossy().to_string();
+            for pointer in ["current.json", "current.backup.json"] {
+                let pointer_path = scope.path().join(pointer);
+                if validate_private_file(&pointer_path, false).is_err() {
+                    continue;
+                }
+                let Ok(metadata) = read_json::<CurrentCertificate>(&pointer_path) else {
+                    continue;
+                };
+                let legacy_root = legacy_scope_root(state_dir, group_id, &metadata.domain);
+                if scope_id(&metadata.domain) != scope_name || legacy_root != scope.path() {
+                    continue;
+                }
+                let Ok(current) =
+                    read_and_validate_current(&legacy_root, &pointer_path, &metadata.domain)
+                else {
+                    continue;
+                };
+                let generation = legacy_root
+                    .join("generations")
+                    .join(current.generation.to_string());
+                let candidate = LegacyCertificateCandidate {
+                    group_id,
+                    current,
+                    cert_path: generation.join("fullchain.pem"),
+                    key_path: generation.join("privkey.pem"),
+                };
+                let replace = match candidates.get(&candidate.current.domain) {
+                    Some(existing) => legacy_candidate_is_newer(&candidate, existing)?,
+                    None => true,
+                };
+                if replace {
+                    candidates.insert(candidate.current.domain.clone(), candidate);
+                }
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn legacy_candidate_is_newer(
+    candidate: &LegacyCertificateCandidate,
+    existing: &LegacyCertificateCandidate,
+) -> Result<bool, String> {
+    let candidate_expiry = certificate_expiry(&candidate.current)?;
+    let existing_expiry = certificate_expiry(&existing.current)?;
+    Ok(candidate_expiry > existing_expiry
+        || (candidate_expiry == existing_expiry
+            && candidate.current.fingerprint > existing.current.fingerprint))
+}
+
+fn certificate_expiry(current: &CurrentCertificate) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(&current.expires_at)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| "invalid current certificate expiry".to_string())
+}
+
+fn managed_certificate_inventory(state_dir: &Path) -> Result<Vec<CurrentCertificate>, String> {
+    let scopes_root = state_dir.join("scopes");
     let entries = match fs::read_dir(&scopes_root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -656,7 +796,6 @@ fn internal_panel_url(listen: &str) -> Result<String, String> {
 
 fn build_group_manifest(
     state_dir: &Path,
-    group_id: i64,
     scopes: &[GroupCertificateScope],
 ) -> Result<GroupCertificateManifest, String> {
     if scopes.len() > MAX_GROUP_CERTIFICATE_SCOPES {
@@ -665,7 +804,7 @@ fn build_group_manifest(
     let mut certificates = Vec::new();
     let mut missing_domains = Vec::new();
     for scope in scopes {
-        let root = scope_root(state_dir, group_id, &scope.domain);
+        let root = scope_root(state_dir, &scope.domain);
         match recover_current(&root, &scope.domain)? {
             Some(current) => {
                 let generation = root
@@ -741,21 +880,33 @@ fn build_group_manifest(
 
 fn publish_candidate(
     state_dir: &Path,
-    group_id: i64,
     domain: &str,
     cert_path: &Path,
     key_path: &Path,
+) -> Result<bool, String> {
+    let _storage = certificate_storage_state()?;
+    let root = scope_root(state_dir, domain);
+    publish_candidate_at_root(&root, domain, cert_path, key_path, true)
+}
+
+fn publish_candidate_at_root(
+    root: &Path,
+    domain: &str,
+    cert_path: &Path,
+    key_path: &Path,
+    require_renewal_window: bool,
 ) -> Result<bool, String> {
     let inspected = validate_bundle_paths(cert_path, key_path, domain)?;
     let candidate_expiry = DateTime::parse_from_rfc3339(&inspected.expires_at)
         .map_err(|_| "invalid candidate certificate expiry")?
         .with_timezone(&Utc);
-    if candidate_expiry <= Utc::now() + ChronoDuration::days(RENEW_BEFORE_DAYS) {
+    if require_renewal_window
+        && candidate_expiry <= Utc::now() + ChronoDuration::days(RENEW_BEFORE_DAYS)
+    {
         return Err("candidate certificate is inside the renewal threshold".into());
     }
-    let root = scope_root(state_dir, group_id, domain);
-    ensure_private_dir(&root)?;
-    let current = recover_current(&root, domain)?;
+    ensure_private_dir(root)?;
+    let current = recover_current(root, domain)?;
     if let Some(current) = current.as_ref() {
         if current.fingerprint == inspected.fingerprint {
             return Ok(false);
@@ -768,7 +919,7 @@ fn publish_candidate(
         }
     }
 
-    let generation = next_generation(&root, current.as_ref().map(|value| value.generation))?;
+    let generation = next_generation(root, current.as_ref().map(|value| value.generation))?;
     let generations = root.join("generations");
     ensure_private_dir(&generations)?;
     let staged = generations.join(format!(".{generation}.staging"));
@@ -808,7 +959,7 @@ fn publish_candidate(
     fs::rename(root.join("current.json.tmp"), root.join("current.json"))
         .map_err(|error| error.to_string())?;
     sync_parent(&root.join("current.json")).map_err(|error| error.to_string())?;
-    cleanup_generations(&root, &metadata)?;
+    cleanup_generations(root, &metadata)?;
     Ok(true)
 }
 
@@ -939,7 +1090,11 @@ fn renewal_due(current: &CurrentCertificate) -> bool {
         .unwrap_or(true)
 }
 
-fn scope_root(state_dir: &Path, group_id: i64, domain: &str) -> PathBuf {
+fn scope_root(state_dir: &Path, domain: &str) -> PathBuf {
+    state_dir.join("scopes").join(scope_id(domain))
+}
+
+fn legacy_scope_root(state_dir: &Path, group_id: i64, domain: &str) -> PathBuf {
     state_dir
         .join("groups")
         .join(group_id.to_string())
@@ -1308,6 +1463,13 @@ mod tests {
     async fn issuance_fixture(
         label: &str,
     ) -> (PanelCertificateManager, DeviceGroup, SqlitePool, PathBuf) {
+        issuance_fixture_for_group(label, 10).await
+    }
+
+    async fn issuance_fixture_for_group(
+        label: &str,
+        group_id: i64,
+    ) -> (PanelCertificateManager, DeviceGroup, SqlitePool, PathBuf) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1322,8 +1484,9 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO device_groups (id, name, group_type, token, uid) \
-             VALUES (10, 'inbound', 'in', 'group-token', 2)",
+             VALUES (?1, 'inbound', 'in', 'group-token', 2)",
         )
+        .bind(group_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -1331,9 +1494,10 @@ mod tests {
             "INSERT INTO forward_rules \
              (id, name, uid, listen_port, device_group_in, target_addr, target_port, protocol, \
               public_transport, node_transport, entry_transport, sni, camouflage_enabled) \
-             VALUES (100, 'reality', 2, 443, 10, '192.0.2.20', 443, 'tcp', \
+             VALUES (100, 'reality', 2, 443, ?1, '192.0.2.20', 443, 'tcp', \
                      'nginx_sni', 'nginx_sni', 'nginx_sni', 'b.example.com', 1)",
         )
+        .bind(group_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -1352,7 +1516,7 @@ mod tests {
         .unwrap();
         fs::set_permissions(&certbot, fs::Permissions::from_mode(0o700)).unwrap();
         let db: Arc<dyn Repository> = Arc::new(SqliteRepository::new(pool.clone()));
-        let group = GroupRepository::find_by_id(db.as_ref(), 10, &ResourceScope::All)
+        let group = GroupRepository::find_by_id(db.as_ref(), group_id, &ResourceScope::All)
             .await
             .unwrap()
             .unwrap();
@@ -1406,7 +1570,6 @@ mod tests {
         let wildcard = candidate(&manager.state_dir, "wildcard", "*.example.com", 90);
         publish_candidate(
             &manager.state_dir,
-            group.id,
             "*.example.com",
             &wildcard.0,
             &wildcard.1,
@@ -1442,7 +1605,7 @@ mod tests {
         key_path: &Path,
         write_receipt: bool,
     ) {
-        let certificate_name = format!("reality-panel-g10-{}", &scope_id("*.example.com")[..16]);
+        let certificate_name = format!("reality-panel-{}", &scope_id("*.example.com")[..16]);
         let script = manager.state_dir.join(if write_receipt {
             "certbot-with-receipt.sh"
         } else {
@@ -1493,7 +1656,7 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
             "unexpected error: {error}"
         );
         assert!(recover_current(
-            &scope_root(&manager.state_dir, group.id, "*.example.com"),
+            &scope_root(&manager.state_dir, "*.example.com"),
             "*.example.com"
         )
         .unwrap()
@@ -1510,7 +1673,7 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
         let scopes = manager.certificate_scopes(group.id).await.unwrap();
         assert!(manager.reconcile_scope(&group, &scopes[0]).await.unwrap());
         assert!(recover_current(
-            &scope_root(&manager.state_dir, group.id, "*.example.com"),
+            &scope_root(&manager.state_dir, "*.example.com"),
             "*.example.com"
         )
         .unwrap()
@@ -1522,20 +1685,87 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
     async fn managed_wildcard_inventory_is_reused_before_public_a_propagation() {
         let dir = unique_dir("managed-wildcard-reuse");
         let wildcard = candidate(&dir, "wildcard", "*.example.com", 90);
-        publish_candidate(&dir, 7, "*.example.com", &wildcard.0, &wildcard.1).unwrap();
+        publish_candidate(&dir, "*.example.com", &wildcard.0, &wildcard.1).unwrap();
 
-        let resolved = resolve_managed_certificate_scopes(
-            &dir,
-            7,
-            vec![scope("b.example.com", "b.example.com")],
-        )
-        .await
-        .unwrap();
+        let resolved =
+            resolve_managed_certificate_scopes(&dir, vec![scope("b.example.com", "b.example.com")])
+                .await
+                .unwrap();
         assert_eq!(resolved, vec![scope("*.example.com", "b.example.com")]);
-        let manifest = build_group_manifest(&dir, 7, &resolved).unwrap();
+        let manifest = build_group_manifest(&dir, &resolved).unwrap();
         assert_eq!(manifest.response.certificates.len(), 1);
         assert_eq!(manifest.response.certificates[0].domain, "*.example.com");
         assert!(manifest.response.missing_domains.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn group_three_reuses_group_one_legacy_wildcard_without_certbot() {
+        let (manager, group, _pool, marker) =
+            issuance_fixture_for_group("cross-group-wildcard", 3).await;
+        let wildcard = candidate(
+            &manager.state_dir,
+            "group-one-wildcard",
+            "*.example.com",
+            90,
+        );
+        publish_candidate_at_root(
+            &legacy_scope_root(&manager.state_dir, 1, "*.example.com"),
+            "*.example.com",
+            &wildcard.0,
+            &wildcard.1,
+            false,
+        )
+        .unwrap();
+
+        let scopes = manager.certificate_scopes(group.id).await.unwrap();
+        assert_eq!(scopes, vec![scope("*.example.com", "b.example.com")]);
+        assert!(!manager.reconcile_scope(&group, &scopes[0]).await.unwrap());
+        assert!(
+            !marker.exists(),
+            "cross-group reuse must not invoke Certbot"
+        );
+
+        let manifest = manager.group_manifest(group.id).await.unwrap();
+        assert_eq!(manifest.response.certificates.len(), 1);
+        assert_eq!(manifest.response.certificates[0].domain, "*.example.com");
+        assert!(manifest.response.missing_domains.is_empty());
+        assert!(legacy_scope_root(&manager.state_dir, 1, "*.example.com")
+            .join("current.json")
+            .is_file());
+        assert!(scope_root(&manager.state_dir, "*.example.com")
+            .join("current.json")
+            .is_file());
+        let _ = fs::remove_dir_all(&manager.state_dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_import_keeps_old_data_and_selects_newest_valid_domain_copy() {
+        let dir = unique_dir("legacy-newest");
+        let older = candidate(&dir, "legacy-older", "*.example.com", 60);
+        let newer = candidate(&dir, "legacy-newer", "*.example.com", 90);
+        let older_root = legacy_scope_root(&dir, 1, "*.example.com");
+        let newer_root = legacy_scope_root(&dir, 2, "*.example.com");
+        publish_candidate_at_root(&older_root, "*.example.com", &older.0, &older.1, false).unwrap();
+        publish_candidate_at_root(&newer_root, "*.example.com", &newer.0, &newer.1, false).unwrap();
+
+        let resolved =
+            resolve_managed_certificate_scopes(&dir, vec![scope("b.example.com", "b.example.com")])
+                .await
+                .unwrap();
+
+        assert_eq!(resolved, vec![scope("*.example.com", "b.example.com")]);
+        let current = recover_current(&scope_root(&dir, "*.example.com"), "*.example.com")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.fingerprint,
+            validate_bundle_paths(&newer.0, &newer.1, "*.example.com")
+                .unwrap()
+                .fingerprint
+        );
+        assert!(older_root.join("current.json").is_file());
+        assert!(newer_root.join("current.json").is_file());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1544,7 +1774,7 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
         let empty = unique_dir("managed-empty");
         let requested = vec![scope("b.example.com", "b.example.com")];
         assert_eq!(
-            resolve_managed_certificate_scopes(&empty, 7, requested.clone())
+            resolve_managed_certificate_scopes(&empty, requested.clone())
                 .await
                 .unwrap(),
             requested,
@@ -1552,9 +1782,9 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
         );
 
         let wrong = candidate(&empty, "wrong", "*.other.example", 90);
-        publish_candidate(&empty, 7, "*.other.example", &wrong.0, &wrong.1).unwrap();
+        publish_candidate(&empty, "*.other.example", &wrong.0, &wrong.1).unwrap();
         assert_eq!(
-            resolve_managed_certificate_scopes(&empty, 7, requested.clone())
+            resolve_managed_certificate_scopes(&empty, requested.clone())
                 .await
                 .unwrap(),
             requested,
@@ -1562,8 +1792,8 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
         );
 
         let wildcard = candidate(&empty, "valid", "*.example.com", 90);
-        publish_candidate(&empty, 7, "*.example.com", &wildcard.0, &wildcard.1).unwrap();
-        let root = scope_root(&empty, 7, "*.example.com");
+        publish_candidate(&empty, "*.example.com", &wildcard.0, &wildcard.1).unwrap();
+        let root = scope_root(&empty, "*.example.com");
         let current = recover_current(&root, "*.example.com").unwrap().unwrap();
         let key_path = root
             .join("generations")
@@ -1572,7 +1802,7 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
         let mismatch = candidate(&empty, "mismatch", "*.example.com", 90);
         fs::copy(mismatch.1, &key_path).unwrap();
         assert_eq!(
-            resolve_managed_certificate_scopes(&empty, 7, requested.clone())
+            resolve_managed_certificate_scopes(&empty, requested.clone())
                 .await
                 .unwrap(),
             requested,
@@ -1581,7 +1811,7 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
 
         let expired_dir = unique_dir("managed-expired");
         let expired = candidate(&expired_dir, "expired", "*.example.com", -1);
-        let expired_root = scope_root(&expired_dir, 7, "*.example.com");
+        let expired_root = scope_root(&expired_dir, "*.example.com");
         let generation = expired_root.join("generations/1");
         ensure_private_dir(&generation).unwrap();
         fs::copy(&expired.0, generation.join("fullchain.pem")).unwrap();
@@ -1597,7 +1827,7 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
         )
         .unwrap();
         assert_eq!(
-            resolve_managed_certificate_scopes(&expired_dir, 7, requested.clone())
+            resolve_managed_certificate_scopes(&expired_dir, requested.clone())
                 .await
                 .unwrap(),
             requested,
@@ -1612,8 +1842,8 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
     fn publish_starts_at_one_and_advances_only_for_newer_certificate() {
         let dir = unique_dir("generation");
         let first = candidate(&dir, "first", "*.example.com", 60);
-        assert!(publish_candidate(&dir, 7, "*.example.com", &first.0, &first.1).unwrap());
-        let root = scope_root(&dir, 7, "*.example.com");
+        assert!(publish_candidate(&dir, "*.example.com", &first.0, &first.1).unwrap());
+        let root = scope_root(&dir, "*.example.com");
         assert_eq!(
             recover_current(&root, "*.example.com")
                 .unwrap()
@@ -1621,10 +1851,10 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
                 .generation,
             1
         );
-        assert!(!publish_candidate(&dir, 7, "*.example.com", &first.0, &first.1).unwrap());
+        assert!(!publish_candidate(&dir, "*.example.com", &first.0, &first.1).unwrap());
 
         let second = candidate(&dir, "second", "*.example.com", 90);
-        assert!(publish_candidate(&dir, 7, "*.example.com", &second.0, &second.1).unwrap());
+        assert!(publish_candidate(&dir, "*.example.com", &second.0, &second.1).unwrap());
         assert_eq!(
             recover_current(&root, "*.example.com")
                 .unwrap()
@@ -1639,10 +1869,10 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
     fn failed_candidate_keeps_generation_and_backup_recovers_current() {
         let dir = unique_dir("failure-recovery");
         let first = candidate(&dir, "first", "*.example.com", 60);
-        publish_candidate(&dir, 9, "*.example.com", &first.0, &first.1).unwrap();
-        let root = scope_root(&dir, 9, "*.example.com");
+        publish_candidate(&dir, "*.example.com", &first.0, &first.1).unwrap();
+        let root = scope_root(&dir, "*.example.com");
         let bad_key = candidate(&dir, "mismatch", "*.example.com", 90).1;
-        assert!(publish_candidate(&dir, 9, "*.example.com", &first.0, &bad_key).is_err());
+        assert!(publish_candidate(&dir, "*.example.com", &first.0, &bad_key).is_err());
         assert_eq!(
             recover_current(&root, "*.example.com")
                 .unwrap()
@@ -1652,7 +1882,7 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
         );
 
         let second = candidate(&dir, "second", "*.example.com", 90);
-        publish_candidate(&dir, 9, "*.example.com", &second.0, &second.1).unwrap();
+        publish_candidate(&dir, "*.example.com", &second.0, &second.1).unwrap();
         fs::write(root.join("current.json"), b"broken").unwrap();
         assert_eq!(
             recover_current(&root, "*.example.com")
@@ -1690,8 +1920,8 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
         assert!(cert_source.is_file());
         assert!(key_source.is_file());
 
-        assert!(publish_candidate(&dir, 7, "*.example.com", &cert_source, &key_source,).unwrap());
-        let root = scope_root(&dir, 7, "*.example.com");
+        assert!(publish_candidate(&dir, "*.example.com", &cert_source, &key_source,).unwrap());
+        let root = scope_root(&dir, "*.example.com");
         let current = recover_current(&root, "*.example.com").unwrap().unwrap();
         let generation = root
             .join("generations")
@@ -1749,8 +1979,8 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
     fn panel_generation_symlink_remains_rejected_after_certbot_fix() {
         let dir = unique_dir("panel-generation-symlink");
         let source = candidate(&dir, "source", "*.example.com", 90);
-        publish_candidate(&dir, 8, "*.example.com", &source.0, &source.1).unwrap();
-        let root = scope_root(&dir, 8, "*.example.com");
+        publish_candidate(&dir, "*.example.com", &source.0, &source.1).unwrap();
+        let root = scope_root(&dir, "*.example.com");
         let current = recover_current(&root, "*.example.com").unwrap().unwrap();
         let generation = root
             .join("generations")
@@ -1776,7 +2006,7 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
     #[test]
     fn unusable_pointers_become_missing_and_invalid_retry_gets_bounded_backoff() {
         let dir = unique_dir("corrupt-state");
-        let root = scope_root(&dir, 11, "*.example.com");
+        let root = scope_root(&dir, "*.example.com");
         ensure_private_dir(&root).unwrap();
         fs::write(root.join("current.json"), b"broken").unwrap();
         fs::write(root.join("current.backup.json"), b"also-broken").unwrap();
