@@ -7,6 +7,23 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.3] - 2026-09-06
+
+生产热修复：修复 relay-node 已升级并重新认证上线后，Panel 仍可能因未观察到旧 WebSocket disconnect 而长期停留“等待上线”的生命周期竞态。
+
+### 修复
+
+- Restart / Upgrade 收到经过认证且 operation / group / node / action 精确关联的 boot confirmation 后，不再把旧连接 disconnect 作为成功硬门槛。
+- Upgrade 仍严格要求 boot confirmation 的 node version 与 target version 完全一致；版本不匹配会立即失败并 ACK，不再等待 disconnect。
+- 保留重复 confirmation 幂等 ACK、Timeout 不重开、普通 reconnect 不可单独完成操作等既有安全边界。
+
+### 兼容性
+
+- 无数据库 migration。
+- Config Protocol 保持 `10`。
+- Lifecycle Protocol 保持 `1`。
+- v1.1.2 可直接升级到 v1.1.3。
+
 ## [1.1.2] - 2026-09-06
 
 兼容升级：无数据库 migration，Config Protocol 保持 `10`。

@@ -218,24 +218,21 @@ impl NodeOperationRegistry {
                         && event.node_version.as_deref()
                             != entry.operation.target_version.as_deref()
                     {
-                        if entry.saw_disconnect {
-                            entry.operation.status = OperationStatus::Failed;
-                            entry.operation.message = format!(
-                                "relay-node restarted with version {}, expected {}",
-                                event.node_version.as_deref().unwrap_or("unknown"),
-                                entry
-                                    .operation
-                                    .target_version
-                                    .as_deref()
-                                    .unwrap_or("unknown")
-                            );
-                            entry.operation.updated_at = now();
-                            return LifecycleEventOutcome {
-                                operation: Some(entry.operation.clone()),
-                                boot_ack: Some(lifecycle_ack(&event)),
-                            };
-                        }
-                        return LifecycleEventOutcome::default();
+                        entry.operation.status = OperationStatus::Failed;
+                        entry.operation.message = format!(
+                            "relay-node restarted with version {}, expected {}",
+                            event.node_version.as_deref().unwrap_or("unknown"),
+                            entry
+                                .operation
+                                .target_version
+                                .as_deref()
+                                .unwrap_or("unknown")
+                        );
+                        entry.operation.updated_at = now();
+                        return LifecycleEventOutcome {
+                            operation: Some(entry.operation.clone()),
+                            boot_ack: Some(lifecycle_ack(&event)),
+                        };
                     }
                     entry
                         .matching_boot_confirmation
@@ -439,7 +436,7 @@ fn lifecycle_ack(event: &NodeLifecycleEvent) -> NodeLifecycleAck {
 }
 
 fn complete_if_ready(entry: &mut RegistryEntry) -> bool {
-    if !entry.saw_disconnect || entry.matching_boot_confirmation.is_none() {
+    if entry.matching_boot_confirmation.is_none() {
         return false;
     }
     if !matches!(
@@ -1208,6 +1205,24 @@ mod tests {
     }
 
     #[test]
+    fn restart_exact_boot_confirmation_succeeds_without_observed_disconnect() {
+        let registry = NodeOperationRegistry::new();
+        let operation = start(&registry, "a", NodeLifecycleAction::Restart);
+        registry.event(
+            1,
+            lifecycle_event(&operation, NodeLifecycleEventStatus::Restarting),
+        );
+        let outcome = registry.event_from_authenticated_node(
+            1,
+            Some("a"),
+            lifecycle_event(&operation, NodeLifecycleEventStatus::Completed),
+        );
+        assert_eq!(outcome.operation.unwrap().status, OperationStatus::Success);
+        assert!(outcome.boot_ack.is_some());
+        assert!(registry.disconnected(1, "a").is_empty());
+    }
+
+    #[test]
     fn upgrade_reconnect_requires_exact_target_version() {
         let registry = NodeOperationRegistry::new();
         let operation = registry
@@ -1306,13 +1321,10 @@ mod tests {
         assert!(outcome.boot_ack.is_some());
         assert_eq!(
             outcome.operation.unwrap().status,
-            OperationStatus::Verifying,
-            "confirmation alone must not complete an upgrade"
+            OperationStatus::Success,
+            "exact authenticated confirmation is decisive even if disconnect was not observed"
         );
-        assert_eq!(
-            confirmation_first.disconnected(1, "node-a")[0].status,
-            OperationStatus::Success
-        );
+        assert!(confirmation_first.disconnected(1, "node-a").is_empty());
 
         let disconnect_first = NodeOperationRegistry::new();
         let operation = upgrade_operation(&disconnect_first);
@@ -1333,6 +1345,25 @@ mod tests {
                 .unwrap()
                 .status,
             OperationStatus::Success
+        );
+    }
+
+    #[test]
+    fn upgrade_boot_confirmation_wrong_version_fails_without_disconnect() {
+        let registry = NodeOperationRegistry::new();
+        let operation = upgrade_operation(&registry);
+        registry.event(
+            1,
+            lifecycle_event(&operation, NodeLifecycleEventStatus::Restarting),
+        );
+        let mut wrong_version = matching_upgrade_boot(&operation);
+        wrong_version.node_version = Some("9.9.9".into());
+        let outcome = registry.event_from_authenticated_node(1, Some("node-a"), wrong_version);
+        assert_eq!(outcome.operation.unwrap().status, OperationStatus::Failed);
+        assert!(outcome.boot_ack.is_some());
+        assert_eq!(
+            registry.get(&operation.id).unwrap().status,
+            OperationStatus::Failed
         );
     }
 
@@ -1367,33 +1398,28 @@ mod tests {
         let outcome = registry.event_from_authenticated_node(1, Some("node-a"), wrong_action);
         assert!(outcome.operation.is_none());
         assert!(outcome.boot_ack.is_none());
-        let mut wrong_version = matching_upgrade_boot(&operation);
-        wrong_version.node_version = Some("9.9.9".into());
-        let outcome = registry.event_from_authenticated_node(1, Some("node-a"), wrong_version);
-        assert!(outcome.operation.is_none());
-        assert!(outcome.boot_ack.is_none());
-
         let first = registry.event_from_authenticated_node(
             1,
             Some("node-a"),
             matching_upgrade_boot(&operation),
         );
+        assert_eq!(
+            first.operation.as_ref().unwrap().status,
+            OperationStatus::Success
+        );
+        assert!(first.boot_ack.is_some());
         let duplicate = registry.event_from_authenticated_node(
             1,
             Some("node-a"),
             matching_upgrade_boot(&operation),
         );
-        assert!(first.boot_ack.is_some());
+        assert!(duplicate.operation.is_none());
         assert!(duplicate.boot_ack.is_some());
-        assert_eq!(
-            registry.get(&operation.id).unwrap().status,
-            OperationStatus::Verifying
-        );
-        registry.disconnected(1, "node-a");
         assert_eq!(
             registry.get(&operation.id).unwrap().status,
             OperationStatus::Success
         );
+        assert!(registry.disconnected(1, "node-a").is_empty());
         assert!(registry
             .event_from_authenticated_node(1, Some("node-a"), matching_upgrade_boot(&operation))
             .boot_ack
