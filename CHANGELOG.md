@@ -7,6 +7,24 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.5] - 2026-09-06
+
+生产可靠性热修复：修复 relay-node 故障恢复后 LKG 与 Panel desired 的重新收敛。
+
+### 修复
+
+- 修复依赖暂缓导致 effective LKG 与 Panel desired fingerprint 不同，却被错误判定为缓存损坏的问题。
+- 防止有效的新 revision 被丢弃后回退到更旧的 0-listener backup。
+- 保证相同 revision 的 Panel 权威配置在 Local Recovery 后仍可重新应用并恢复监听。
+- 完整包含 v1.1.4 Node ID 身份一致性热修复。
+
+### 兼容性
+
+- 无数据库 migration。
+- Config Protocol 保持 `10`。
+- Lifecycle Protocol 保持 `1`。
+- v1.1.3 / v1.1.4 可直接升级到 v1.1.5。
+
 ## [1.1.4] - 2026-09-06
 
 生产热修复：统一 relay-node 常驻进程中的 Node ID 来源。

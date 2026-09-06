@@ -7,6 +7,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.5] - 2026-09-06
+
+relay-node 本地恢复与 Panel 权威配置重新收敛热修复。
+
+### 修复
+
+- 修复 Config Protocol v10 的 LKG 在依赖暂缓时“desired fingerprint 与 effective config 不同”被误判为缓存损坏的问题。
+- 本地恢复现在保留 Panel desired fingerprint 与 revision，不再错误回退到更旧的空 listener backup。
+- 同 revision 的 Panel 权威配置在本地恢复后可以重新收敛到当前 desired runtime。
+- 包含 v1.1.4 的 Node ID 单一事实来源修复。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- 无数据库 migration。
+- v1.1.3 / v1.1.4 relay-node 可直接升级到 v1.1.5。
+
 ## [1.1.4] - 2026-09-06
 
 relay-node Node ID 单一事实来源热修复。

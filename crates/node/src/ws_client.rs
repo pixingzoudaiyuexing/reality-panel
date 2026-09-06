@@ -181,6 +181,7 @@ fn classify_ws_connect_error(e: tokio_tungstenite::tungstenite::Error) -> WsExit
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Keep control-channel dependencies explicit, including immutable startup node_id.
 async fn connect_and_run(
     ws_url: &str,
     token: &str,

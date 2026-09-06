@@ -1758,7 +1758,7 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
         let outside = dir.join("outside.pem");
         fs::write(
             &outside,
-            fs::read(&generation.join("fullchain.pem")).unwrap(),
+            fs::read(generation.join("fullchain.pem")).unwrap(),
         )
         .unwrap();
         fs::remove_file(generation.join("fullchain.pem")).unwrap();

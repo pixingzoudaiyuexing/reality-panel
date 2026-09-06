@@ -116,10 +116,30 @@ impl TrustedSnapshot {
         snapshot: NodeConfigSnapshot,
     ) -> Result<Self, String> {
         poller::validate_config(&snapshot.config)?;
-        let fingerprint = config_fingerprint(&snapshot.config);
-        if snapshot.config_revision > 0 && snapshot.config_fingerprint != fingerprint.as_str() {
-            return Err("config snapshot fingerprint mismatch".into());
-        }
+        let effective_fingerprint = config_fingerprint(&snapshot.config);
+        let fingerprint = if snapshot.config_revision > 0 {
+            match source {
+                AuthoritySource::ValidatedPanel => {
+                    if snapshot.config_fingerprint != effective_fingerprint.as_str() {
+                        return Err("config snapshot fingerprint mismatch".into());
+                    }
+                    effective_fingerprint
+                }
+                AuthoritySource::LocalRecovery => {
+                    if snapshot.config_fingerprint.len() != 64
+                        || !snapshot
+                            .config_fingerprint
+                            .chars()
+                            .all(|c| c.is_ascii_hexdigit())
+                    {
+                        return Err("invalid local recovery desired fingerprint".into());
+                    }
+                    ConfigFingerprint::from_string(snapshot.config_fingerprint.clone())
+                }
+            }
+        } else {
+            effective_fingerprint
+        };
         Ok(Self {
             source,
             recovery_source,
@@ -1201,6 +1221,98 @@ mod tests {
         assert!(!second.apply_required);
         assert_eq!(second.state, third.state);
         assert_eq!(second.applied_fingerprint, third.applied_fingerprint);
+    }
+
+    #[test]
+    fn local_recovery_accepts_effective_config_with_panel_desired_fingerprint() {
+        let effective = empty();
+        let desired = raw_config(23456);
+        let desired_fingerprint = config_fingerprint(&desired);
+        let snapshot = NodeConfigSnapshot {
+            config_revision: 6,
+            config_fingerprint: desired_fingerprint.as_str().to_string(),
+            config: effective,
+        };
+
+        let input =
+            ReconciliationInput::local_recovery_snapshot(snapshot, LocalRecoverySource::PrimaryLkg)
+                .unwrap();
+        let ReconciliationInput::Trusted(snapshot) = input else {
+            panic!("expected trusted local recovery");
+        };
+        assert_eq!(snapshot.config_revision(), 6);
+        assert_eq!(snapshot.fingerprint(), &desired_fingerprint);
+        assert!(snapshot.config().listeners.is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_revision_panel_authority_reconverges_after_effective_local_recovery() {
+        let dir = unique_runtime_dir("same-revision-reconverge");
+        let paths = runtime_paths(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+        let desired = raw_config(port);
+        let desired_fingerprint = config_fingerprint(&desired);
+        let local = NodeConfigSnapshot {
+            config_revision: 6,
+            config_fingerprint: desired_fingerprint.as_str().to_string(),
+            config: empty(),
+        };
+
+        let mut inner = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        inner.set_listen_addresses_for_test("127.0.0.1", "");
+        let manager = Arc::new(Mutex::new(inner));
+        let camouflage = Arc::new(Mutex::new(test_camouflage_manager(&dir)));
+        let mut reconciler = Reconciler::new();
+
+        let recovered = reconciler
+            .reconcile_with_test_paths(
+                &manager,
+                &camouflage,
+                ReconciliationInput::local_recovery_snapshot(
+                    local,
+                    LocalRecoverySource::PrimaryLkg,
+                )
+                .unwrap(),
+                paths.clone(),
+            )
+            .await;
+        assert_eq!(recovered.state, ReconciliationState::DegradedLocalRecovery);
+        assert!(manager.lock().await.listener_info_for_rule_tcp(7).is_none());
+
+        let panel = NodeConfigSnapshot {
+            config_revision: 6,
+            config_fingerprint: desired_fingerprint.as_str().to_string(),
+            config: desired.clone(),
+        };
+        let converged = reconciler
+            .reconcile_with_test_paths(
+                &manager,
+                &camouflage,
+                ReconciliationInput::validated_panel_snapshot(panel).unwrap(),
+                paths.clone(),
+            )
+            .await;
+        assert_eq!(converged.state, ReconciliationState::Converged);
+        assert!(!converged.apply_required);
+        assert!(manager.lock().await.listener_info_for_rule_tcp(7).is_some());
+
+        let lkg = poller::load_cache_state_at(&paths).expect("reconverged LKG");
+        assert_eq!(lkg.config_revision, 6);
+        assert_eq!(lkg.config_fingerprint, desired_fingerprint);
+        assert_eq!(
+            config_fingerprint(&lkg.config),
+            config_fingerprint(&desired)
+        );
+
+        manager.lock().await.apply_config(&empty()).await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

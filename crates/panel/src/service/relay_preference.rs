@@ -61,6 +61,7 @@ pub struct CarrierPolicy {
 
 #[allow(dead_code)] // RC9-S4 persisted model; consumed by the Carrier Policy API in S5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // Public error vocabulary intentionally names the validated ID field.
 pub enum CarrierPolicyValidationError {
     InvalidLineId,
     DuplicateLineId,
@@ -119,6 +120,7 @@ pub enum RelayDnsAction {
     Delete,
 }
 
+#[allow(clippy::derivable_impls)] // Keep the explicit default stable for serialized DNS action semantics.
 impl Default for RelayDnsAction {
     fn default() -> Self {
         Self::Upsert
