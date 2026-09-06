@@ -672,10 +672,13 @@ pub(crate) fn load_cache_state_at(paths: &CachePaths) -> Option<CacheLoad> {
 
 fn repair_primary_from_backup(paths: &CachePaths) -> Result<(), String> {
     let bytes = fs::read(&paths.backup).map_err(|error| error.to_string())?;
-    let config = serde_json::from_slice::<NodeConfigResponse>(&bytes).map_err(|e| e.to_string())?;
-    validate_config(&config)?;
+    // A revision-bearing cache may intentionally store an effective config whose
+    // semantic fingerprint differs from the Panel desired fingerprint while a
+    // camouflage dependency is withheld. Validate the cache envelope, not just
+    // the flattened NodeConfigResponse, before restoring it.
+    read_valid_cache_snapshot(&paths.backup)?;
     replace_durably(&paths.primary, &bytes).map_err(|error| error.to_string())?;
-    read_valid_cache(&paths.primary).map(|_| ())
+    read_valid_cache_snapshot(&paths.primary).map(|_| ())
 }
 
 fn remove_tmp_if_safe(path: &Path) {
@@ -721,14 +724,14 @@ pub(crate) fn commit_cache_with_metadata_at(
     let _: NodeConfigSnapshot = serde_json::from_slice(&json).map_err(|e| e.to_string())?;
 
     write_durable(&paths.tmp, &json).map_err(|e| e.to_string())?;
-    if let Err(e) = read_valid_cache(&paths.tmp) {
+    if let Err(e) = read_valid_cache_snapshot(&paths.tmp) {
         let _ = fs::remove_file(&paths.tmp);
         return Err(format!("temporary cache validation failed: {}", e));
     }
 
     // A corrupt primary is never promoted into backup. Preserve any healthy
-    // backup for recovery before replacing the primary.
-    if read_valid_cache(&paths.primary).is_ok() {
+    // revision-bearing LKG, including a dependency-withheld effective config.
+    if read_valid_cache_snapshot(&paths.primary).is_ok() {
         let old_primary = fs::read(&paths.primary).map_err(|e| e.to_string())?;
         if let Err(e) = replace_durably(&paths.backup, &old_primary) {
             let _ = fs::remove_file(&paths.tmp);
@@ -833,11 +836,16 @@ fn valid_domain(value: &str) -> bool {
         })
 }
 
+#[allow(dead_code)] // Legacy/fixture helper; production cache validation uses revision-aware snapshots.
 fn read_valid_cache(path: &Path) -> Result<NodeConfigResponse, String> {
     let data = fs::read(path).map_err(|e| e.to_string())?;
     let config = serde_json::from_slice::<NodeConfigResponse>(&data).map_err(|e| e.to_string())?;
     validate_config(&config)?;
     Ok(config)
+}
+
+fn valid_persisted_config_fingerprint(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn read_valid_cache_snapshot(
@@ -846,11 +854,24 @@ fn read_valid_cache_snapshot(
     let data = fs::read(path).map_err(|e| e.to_string())?;
     if let Ok(snapshot) = serde_json::from_slice::<NodeConfigSnapshot>(&data) {
         validate_config(&snapshot.config)?;
-        let fingerprint = relay_shared::reconciliation::config_fingerprint(&snapshot.config);
-        if snapshot.config_revision > 0 && snapshot.config_fingerprint != fingerprint.as_str() {
-            return Err("cached config fingerprint mismatch".into());
+        let effective_fingerprint =
+            relay_shared::reconciliation::config_fingerprint(&snapshot.config);
+        if snapshot.config_revision > 0 {
+            // Config Protocol v10 deliberately stores the Panel DESIRED
+            // fingerprint beside the EFFECTIVE cached config. They may differ
+            // while a camouflage/certificate dependency is withheld. Treating
+            // that legitimate mismatch as corruption makes local recovery fall
+            // back to an older backup and can remove a healthy listener.
+            if !valid_persisted_config_fingerprint(&snapshot.config_fingerprint) {
+                return Err("invalid cached desired config fingerprint".into());
+            }
+            return Ok((
+                snapshot.config,
+                snapshot.config_revision,
+                ConfigFingerprint::from_string(snapshot.config_fingerprint),
+            ));
         }
-        return Ok((snapshot.config, snapshot.config_revision, fingerprint));
+        return Ok((snapshot.config, 0, effective_fingerprint));
     }
     let config = serde_json::from_slice::<NodeConfigResponse>(&data).map_err(|e| e.to_string())?;
     validate_config(&config)?;
@@ -1419,6 +1440,47 @@ mod tests {
 
         assert!(load_cache_state_at(&paths).is_none());
         assert!(!paths.tmp.exists());
+        cleanup_cache(&paths);
+    }
+
+    #[test]
+    fn revision_cache_preserves_dependency_withheld_desired_fingerprint() {
+        let paths = cache_paths_for_test("withheld-desired-fingerprint");
+        let effective = NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners: vec![],
+        };
+        let desired = cache_config(77);
+        let desired_fingerprint = relay_shared::reconciliation::config_fingerprint(&desired);
+
+        commit_cache_with_metadata_at(&effective, &paths, 42, desired_fingerprint.as_str())
+            .unwrap();
+
+        let loaded = load_cache_state_at(&paths).expect("dependency-withheld LKG");
+        assert_eq!(loaded.source, CacheRecoverySource::PrimaryLkg);
+        assert_eq!(loaded.config_revision, 42);
+        assert!(loaded.config.listeners.is_empty());
+        assert_eq!(loaded.config_fingerprint, desired_fingerprint);
+        cleanup_cache(&paths);
+    }
+
+    #[test]
+    fn malformed_revision_fingerprint_is_not_accepted_as_primary_lkg() {
+        let paths = cache_paths_for_test("malformed-desired-fingerprint");
+        let old = cache_config(1);
+        commit_cache_at(&old, &paths).unwrap();
+        commit_cache_at(&cache_config(2), &paths).unwrap();
+
+        let broken = NodeConfigSnapshot {
+            config_revision: 9,
+            config_fingerprint: "not-a-sha256".into(),
+            config: cache_config(3),
+        };
+        std::fs::write(&paths.primary, serde_json::to_vec_pretty(&broken).unwrap()).unwrap();
+
+        let loaded = load_cache_state_at(&paths).expect("healthy backup fallback");
+        assert_eq!(loaded.source, CacheRecoverySource::RepairedFromBackup);
+        assert_eq!(loaded.config.listeners[0].rule_id, 1);
         cleanup_cache(&paths);
     }
 
