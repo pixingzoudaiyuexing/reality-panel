@@ -7,6 +7,28 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.2] - 2026-09-06
+
+兼容升级：无数据库 migration，Config Protocol 保持 `10`。
+
+### 新增
+
+- Group 级自动故障切换，支持 TCP 健康检查、端口配置、连续故障阈值、确定性备用节点切换和故障节点隔离。
+- 支持人工重新纳入备选、无候选时的明确故障状态，以及 Failover / Carrier / Schedule 策略互斥。
+
+### 改进
+
+- Relay DNS 切换改为 DNS Provider 写入后的 Read-back 确认，不再等待公网递归 DNS 缓存传播。
+- 保留原有 DNS rollback、retry 和 finalizer 安全事务机制，并为 Failover 重试增加退避保护。
+- 优化故障切换页面 UI 和状态文案。
+
+### 兼容性
+
+- 无数据库 migration。
+- 无 `CONFIG_PROTOCOL_VERSION` 变化。
+- 无 Relay Node 协议变化。
+- v1.1.1 可直接升级到 v1.1.2。
+
 ## [1.1.1] - 2026-09-05
 
 Production hotfix and convergence optimization release. Config Protocol remains

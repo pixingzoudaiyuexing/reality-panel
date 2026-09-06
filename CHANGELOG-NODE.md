@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.2] - 2026-09-06
+
+统一版本发布。Relay Node 无运行时或协议变化；Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+
+### 兼容性
+
+- v1.1.1 可直接升级到 v1.1.2。
+
 ## [1.1.1] - 2026-09-05
 
 Unified v1.1.1 relay-node release. Config Protocol remains 10 and Lifecycle
