@@ -7,6 +7,23 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.4] - 2026-09-06
+
+生产热修复：统一 relay-node 常驻进程中的 Node ID 来源。
+
+### 修复
+
+- 修复运行期间 Node ID 文件变化导致控制通道身份分裂的问题。
+- HTTP 配置拉取、WebSocket、状态上报和证书同步统一使用启动时解析的稳定 Node ID。
+- 防止身份分裂引发配置请求 503、错误回退空 LKG 以及监听规则被撤销。
+
+### 兼容性
+
+- 无数据库 migration。
+- Config Protocol 保持 `10`。
+- Lifecycle Protocol 保持 `1`。
+- v1.1.3 可直接升级到 v1.1.4。
+
 ## [1.1.3] - 2026-09-06
 
 生产热修复：修复 relay-node 已升级并重新认证上线后，Panel 仍可能因未观察到旧 WebSocket disconnect 而长期停留“等待上线”的生命周期竞态。

@@ -432,7 +432,7 @@ async fn run() {
     loop {
         interval.tick().await;
 
-        match poller::fetch_config(&config).await {
+        match poller::fetch_config(&config, &node_id).await {
             poller::FetchResult::Ok(resp) => {
                 match reconciler::ReconciliationInput::validated_panel_snapshot(resp) {
                     Ok(input) => {

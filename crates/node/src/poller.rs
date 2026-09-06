@@ -36,18 +36,27 @@ pub enum FetchResult {
     Transient,
 }
 
-pub async fn fetch_config(config: &NodeConfig) -> FetchResult {
+fn build_config_request(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    node_id: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .get(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Node-ID", node_id)
+        .header("X-Config-Protocol-Version", CONFIG_PROTOCOL_VERSION)
+}
+
+pub async fn fetch_config(config: &NodeConfig, node_id: &str) -> FetchResult {
     let url = format!("{}/api/v1/node/config", config.panel_url);
     let client = reqwest::Client::new();
 
-    let resp = match client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", config.token))
-        .header("X-Node-ID", get_or_create_node_id())
-        // v0.4.0: send our config-protocol version so the panel can refuse to
-        // send config we can't deserialize (keeps old nodes on their cached
-        // config instead of crashing on unknown fields/enum variants).
-        .header("X-Config-Protocol-Version", CONFIG_PROTOCOL_VERSION)
+    // `node_id` is resolved exactly once at process startup. Re-reading the
+    // persistence file here can split HTTP from the long-lived WS/status
+    // identity if that file changes while relay-node is still running.
+    let resp = match build_config_request(&client, &url, &config.token, node_id)
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
@@ -1063,6 +1072,73 @@ mod tests {
         let id = get_or_create_node_id_at(&path);
         assert_eq!(id, "my-fixed-id-12345");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_new_process_start_reads_the_current_persisted_node_id() {
+        let dir = unique_dir("node-id-process-restart");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node-id");
+        std::fs::write(&path, "AAA").unwrap();
+        let first_process_id = get_or_create_node_id_at(&path);
+
+        std::fs::write(&path, "BBB").unwrap();
+        let restarted_process_id = get_or_create_node_id_at(&path);
+
+        assert_eq!(first_process_id, "AAA");
+        assert_eq!(restarted_process_id, "BBB");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn request_node_id(startup_node_id: &str) -> String {
+        let request = build_config_request(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:18888/api/v1/node/config",
+            "test-token",
+            startup_node_id,
+        )
+        .build()
+        .unwrap();
+        request
+            .headers()
+            .get("X-Node-ID")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn config_request_keeps_startup_identity_after_node_id_file_changes() {
+        let dir = unique_dir("node-id-runtime-change");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node-id");
+        std::fs::write(&path, "AAA").unwrap();
+        let startup_node_id = get_or_create_node_id_at(&path);
+
+        std::fs::write(&path, "BBB").unwrap();
+
+        assert_eq!(request_node_id(&startup_node_id), "AAA");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "BBB");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_request_does_not_regenerate_deleted_node_id_during_runtime() {
+        let dir = unique_dir("node-id-runtime-delete");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node-id");
+        std::fs::write(&path, "AAA").unwrap();
+        let startup_node_id = get_or_create_node_id_at(&path);
+
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(request_node_id(&startup_node_id), "AAA");
+        assert!(
+            !path.exists(),
+            "runtime HTTP refresh must not recreate node-id"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn cache_paths_for_test(label: &str) -> CachePaths {

@@ -353,7 +353,7 @@ async fn connect_and_run(
                             }
                         } else if text.contains("config_changed") {
                             tracing::info!("websocket: config_changed received, re-fetching");
-                            match poller::fetch_config(config).await {
+                            match poller::fetch_config(config, node_id).await {
                                 poller::FetchResult::Ok(resp) => {
                                     if apply_snapshot(manager, camouflage, reconciler, resp).await {
                                         tracing::info!("websocket: config applied after config_changed");

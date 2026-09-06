@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.4] - 2026-09-06
+
+relay-node Node ID 单一事实来源热修复。
+
+### 修复
+
+- HTTP 配置拉取和 WebSocket `config_changed` 刷新不再运行期重读 Node ID 文件。
+- 所有常驻控制通道统一使用进程启动时解析的 Node ID，避免配置请求 503、空 LKG 回退和监听撤销。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.3 relay-node 可直接升级到 v1.1.4。
+
 ## [1.1.3] - 2026-09-06
 
 统一版本热修复。Relay Node 运行时逻辑与协议不变；版本随 Panel 统一提升至 `1.1.3`。
