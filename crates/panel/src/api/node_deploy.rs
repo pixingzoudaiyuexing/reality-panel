@@ -27,12 +27,13 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_LOGS: usize = 100;
+const MAX_CONCURRENT_DEPLOYMENTS: usize = 4;
 #[derive(Deserialize)]
 pub struct TestSshRequest {
     pub host: String,
@@ -109,6 +110,7 @@ pub struct DeploymentRegistry {
     runner: Arc<dyn DeploymentRunner>,
     total_timeout: Duration,
     online_timeout: Duration,
+    permits: Arc<Semaphore>,
 }
 
 impl Default for DeploymentRegistry {
@@ -118,6 +120,7 @@ impl Default for DeploymentRegistry {
             runner: Arc::new(SystemSshRunner),
             total_timeout: TOTAL_TIMEOUT,
             online_timeout: ONLINE_TIMEOUT,
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DEPLOYMENTS)),
         }
     }
 }
@@ -635,6 +638,10 @@ async fn run_task(
     let secrets = Secrets {
         password: ssh.password.clone(),
         node_token: token.clone(),
+    };
+    let _permit = match state.deployments.permits.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return,
     };
     let host = ssh.host.clone();
     let group_id = state
@@ -1800,6 +1807,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             runner,
             total_timeout,
             online_timeout,
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DEPLOYMENTS)),
         }
     }
 

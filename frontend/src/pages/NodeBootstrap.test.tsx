@@ -33,8 +33,30 @@ describe('Node Bootstrap deployment modes', () => {
   it('keeps the SSH form available with the Device Group preselected', async () => {
     renderPage();
     await waitFor(() => expect(screen.getAllByText('relay-group').length).toBeGreaterThan(0));
-    expect(screen.getByLabelText('nodeBootstrapHost')).toBeInTheDocument();
+    expect(screen.getByLabelText('nodeBootstrapHost 1')).toBeInTheDocument();
     expect(screen.getByText('nodeBootstrapSshRecommended')).toBeInTheDocument();
+  });
+
+  it('tests dynamic rows concurrently and deploys every passed row without another confirmation', async () => {
+    const user = userEvent.setup();
+    mockPost.mockImplementation((url: string, body: { host: string }) => {
+      if (url.endsWith('/fingerprint')) return Promise.resolve(ok({ fingerprint: `SHA256:${body.host}`, os: 'Debian', architecture: 'x86_64' }));
+      if (url === '/admin/node-deployments') return Promise.resolve(ok({ id: `task-${body.host}`, group_id: 7, host: body.host, stage: 'PENDING', status: 'PENDING', message: 'queued', profile: 'reality_camouflage' }));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getAllByText('relay-group').length).toBeGreaterThan(0));
+    await user.click(screen.getByRole('button', { name: /nodeBootstrapAddServer/ }));
+    await user.type(screen.getByLabelText('nodeBootstrapHost 1'), 'node-a');
+    await user.type(screen.getByLabelText('nodeBootstrapPassword 1'), 'secret-a');
+    await user.type(screen.getByLabelText('nodeBootstrapHost 2'), 'node-b');
+    await user.type(screen.getByLabelText('nodeBootstrapPassword 2'), 'secret-b');
+    await user.click(screen.getByRole('button', { name: /nodeBootstrapTestConnection/ }));
+    await waitFor(() => expect(screen.getAllByText('nodeBootstrapRowPASSED')).toHaveLength(2));
+    await user.click(screen.getByRole('button', { name: /nodeBootstrapDeploy/ }));
+    await waitFor(() => expect(mockPost.mock.calls.filter(([url]) => url === '/admin/node-deployments')).toHaveLength(2));
+    expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ host: 'node-a', confirmed_fingerprint: 'SHA256:node-a' }));
+    expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ host: 'node-b', confirmed_fingerprint: 'SHA256:node-b' }));
   });
 
   it('creates a Manual Bootstrap enrollment without putting the secret in its launcher command', async () => {

@@ -823,6 +823,25 @@ html, body, #root {
   gap: 12px 20px;
 }
 
+.rp-ssh-batch {
+  border-top: 1px solid var(--rp-border);
+}
+
+.rp-ssh-row {
+  display: grid;
+  grid-template-columns: 32px minmax(150px, 1.2fr) 94px minmax(110px, 0.7fr) minmax(150px, 1fr) minmax(150px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--rp-border);
+}
+
+.rp-ssh-row-message {
+  grid-column: 2 / -1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .rp-failover-setting {
   display: flex;
   min-width: 150px;
@@ -974,6 +993,14 @@ html, body, #root {
 }
 
 @media (max-width: 720px) {
+  .rp-ssh-row {
+    grid-template-columns: 28px minmax(0, 1fr);
+  }
+
+  .rp-ssh-row > :not(:first-child),
+  .rp-ssh-row-message {
+    grid-column: 2;
+  }
   .rp-routing-grid-head {
     display: none;
   }
