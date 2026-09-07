@@ -1274,6 +1274,8 @@ pub struct RealityCertificateDiagnosis {
     /// failed and will be retried.
     pub renewal: RealityCheck,
     pub certificate_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_domain: Option<String>,
     pub cert_path: Option<String>,
     pub key_path: Option<String>,
     pub san_match: bool,
@@ -1315,7 +1317,8 @@ pub struct RealityDiagnosis {
     pub vless_authentication: RealityCheck,
 }
 
-/// Outcome of probing ONE target from the node (TCP-only since v0.4.9).
+/// Outcome of probing one target from the node. TCP uses a real connection;
+/// protocols without a reliable generic handshake return `NotTested`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetProbeOutcome {
@@ -2314,6 +2317,7 @@ mod tests {
                 detail: Some("renewal failed; existing certificate retained".into()),
             },
             certificate_status: "active".into(),
+            certificate_domain: Some("*.example.com".into()),
             cert_path: Some("/etc/relay-panel/cert.pem".into()),
             key_path: Some("/etc/relay-panel/key.pem".into()),
             san_match: true,

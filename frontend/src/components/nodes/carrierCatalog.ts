@@ -1,8 +1,16 @@
 import type { CarrierLineBinding, CarrierLineCatalogItem } from '../../api/types';
 
-export function assignCarrierLines(bindings: CarrierLineBinding[], nodeId: string, selected: string[]): CarrierLineBinding[] {
+export function assignCarrierLines(
+  bindings: CarrierLineBinding[],
+  nodeId: string,
+  selected: string[],
+  defaultNodeId?: string | null,
+): CarrierLineBinding[] {
   const selectedSet = new Set(selected);
-  const next = bindings.filter((binding) => binding.node_id !== nodeId && !selectedSet.has(binding.line_id));
+  const next = bindings.filter((binding) => {
+    const effectiveNodeId = binding.mode === 'node' ? binding.node_id : defaultNodeId;
+    return effectiveNodeId !== nodeId && !selectedSet.has(binding.line_id);
+  });
   next.push(...selected.map((lineId) => ({ line_id: lineId, mode: 'node' as const, node_id: nodeId })));
   return next.sort((left, right) => left.line_id < right.line_id ? -1 : left.line_id > right.line_id ? 1 : 0);
 }

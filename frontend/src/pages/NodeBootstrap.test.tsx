@@ -55,6 +55,8 @@ describe('Node Bootstrap deployment modes', () => {
     await waitFor(() => expect(screen.getAllByText('nodeBootstrapRowPASSED')).toHaveLength(2));
     await user.click(screen.getByRole('button', { name: /nodeBootstrapDeploy/ }));
     await waitFor(() => expect(mockPost.mock.calls.filter(([url]) => url === '/admin/node-deployments')).toHaveLength(2));
+    expect(screen.getByRole('button', { name: /nodeBootstrapAddServer/ })).toBeDisabled();
+    expect(screen.getByLabelText('nodeBootstrapHost 1')).toBeDisabled();
     expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ host: 'node-a', confirmed_fingerprint: 'SHA256:node-a' }));
     expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ host: 'node-b', confirmed_fingerprint: 'SHA256:node-b' }));
   });

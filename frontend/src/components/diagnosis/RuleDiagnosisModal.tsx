@@ -138,7 +138,7 @@ function EvidenceLine({ label, children }: { label: string; children: ReactNode 
 }
 
 function blockedDescription(check: RealityCheck, t: Tfn) {
-  if (check.detail === 'Public DNS is not ready') return t('diagnosisTableWaitingDns');
+  if (check.detail === 'Provider DNS record is not ready') return t('diagnosisTableWaitingDns');
   if (check.detail === 'A usable certificate is not ready') return t('diagnosisTableWaitingCertificate');
   if (check.detail === 'DNSMgr is not ready') return t('diagnosisTableWaitingDnsmgr');
   return t('diagnosisTableWaitingPrerequisite');
@@ -163,30 +163,108 @@ function checkDescription(
 function DNSDetails({ rule, result, t }: { rule: ForwardRule; result: DiagnoseResponse; t: Tfn }) {
   const dependencies = result.dependencies;
   if (!dependencies) return <Text type="secondary">{t('diagnosisNoTechnicalEvidence')}</Text>;
+  const records = dependencies.dns_records ?? [];
+  const syncLabel = (state: string) => {
+    if (state === 'PROPAGATED' || state === 'MUTATION_VERIFIED') return t('diagnosisDnsApplied');
+    if (['FAILED', 'CONFLICT', 'INVALID_CONFIG', 'MUTATION_OUTCOME_UNKNOWN'].includes(state)) return t('diagnosisDnsSyncFailed');
+    if (state === 'FROZEN') return t('diagnosisDnsFrozen');
+    return t('diagnosisDnsApplying');
+  };
   return (
     <div className="rp-diagnosis-evidence">
-      {rule.sni ? <EvidenceLine label="FQDN"><Text className="rp-mono">{rule.sni}</Text></EvidenceLine> : null}
-      <EvidenceLine label="DNSMgr"><Text className="rp-mono">{rawCheck(dependencies.dnsmgr)}</Text></EvidenceLine>
-      <EvidenceLine label="dns_sync"><Text className="rp-mono">{rawCheck(dependencies.dns_sync)}</Text></EvidenceLine>
-      {dependencies.blocking_chain.length > 0 ? (
-        <EvidenceLine label="blocking_chain">
-          <Space orientation="vertical" size={2}>
-            {dependencies.blocking_chain.map((item, index) => (
-              <Text className="rp-mono" key={`${item}-${index}`}>{index + 1}. {item}</Text>
-            ))}
-          </Space>
-        </EvidenceLine>
-      ) : null}
+      <EvidenceLine label={t('diagnosisCheckContent')}><Text>{t('diagnosisDnsCheckDescription')}</Text></EvidenceLine>
+      {rule.sni ? <EvidenceLine label={t('diagnosisDnsDomain')}><Text code>{rule.sni}</Text></EvidenceLine> : null}
+      {records.length > 0 ? records.map((record, index) => {
+        const providerConfirmed = record.sync_state === 'PROPAGATED' || record.sync_state === 'MUTATION_VERIFIED';
+        const valuesMatch = providerConfirmed && (record.expected_value ?? null) === (record.actual_value ?? null);
+        return <div className="rp-diagnosis-target" key={`${record.line}:${index}`}>
+        <EvidenceLine label={t('diagnosisDnsLine')}><Text>{record.line === 'default' ? t('relayPreferenceDefaultLine') : record.line}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisDnsExpected')}><Text code>{record.expected_value ?? t('diagnosisRecordAbsent')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisDnsActual')}><Text code>{record.actual_value ?? t('diagnosisNotConfirmed')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisDnsProvider')}><Text>{record.provider ?? t('diagnosisNotConfirmed')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisDnsManaged')}><Text>{record.ownership === 'PANEL' ? t('diagnosisPanelManaged') : record.ownership === 'EXTERNAL' ? t('diagnosisExternalManaged') : t('diagnosisNotConfirmed')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisDnsSyncState')}><Text>{syncLabel(record.sync_state)}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisDnsLastSync')}><Text>{record.last_observed_at ?? t('diagnosisNotConfirmed')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisDnsMatches')}><Text type={valuesMatch ? 'success' : providerConfirmed ? 'danger' : 'secondary'}>{valuesMatch ? t('yes') : providerConfirmed ? t('no') : t('diagnosisNotConfirmed')}</Text></EvidenceLine>
+        {providerConfirmed && !valuesMatch ? <Alert type="error" showIcon title={t('diagnosisDnsMismatch')} /> : null}
+        {record.last_error ? <EvidenceLine label={t('diagnosisTechnicalInfo')}><Text code>{record.last_error}</Text></EvidenceLine> : null}
+        <EvidenceLine label={t('diagnosisTechnicalInfo')}><Text code>{record.sync_state}</Text></EvidenceLine>
+      </div>;
+      }) : <Text type="secondary">{t('diagnosisNoTechnicalEvidence')}</Text>}
+      <EvidenceLine label={t('diagnosisTechnicalInfo')}>
+        <Space orientation="vertical" size={2}>
+          <Text>DNSMgr</Text><Text code>{rawCheck(dependencies.dnsmgr)}</Text>
+          <Text>dns_sync</Text><Text code>{rawCheck(dependencies.dns_sync)}</Text>
+        </Space>
+      </EvidenceLine>
     </div>
   );
 }
 
-function ControlCheckDetails({ label, check }: { label: string; check?: RealityCheck }) {
-  return (
-    <div className="rp-diagnosis-evidence">
-      <EvidenceLine label={label}><Text className="rp-mono">{rawCheck(check)}</Text></EvidenceLine>
-    </div>
-  );
+function ListenerDetails({ rule, nodes, t }: { rule: ForwardRule; nodes: NodeDiagnoseStatus[]; t: Tfn }) {
+  const realityRule = isRealityRule(rule);
+  return <div className="rp-diagnosis-evidence">
+    <EvidenceLine label={t('diagnosisCheckContent')}><Text>{t('diagnosisListenerCheckDescription')}</Text></EvidenceLine>
+    {nodes.map((node) => {
+      const reality = node.status === 'result' ? node.reality : undefined;
+      return <div className="rp-diagnosis-target" key={node.node_id}>
+      <EvidenceLine label={t('diagnosisRelayNode')}><Text code>{node.public_ip || node.node_id}</Text></EvidenceLine>
+      <EvidenceLine label={t('diagnosisCurrentRule')}><Text>Rule {rule.id} · {rule.name}</Text></EvidenceLine>
+      {rule.sni ? <EvidenceLine label="SNI"><Text code>{rule.sni}</Text></EvidenceLine> : null}
+      {realityRule && reality ? <>
+        <EvidenceLine label={`${reality.config.listen_port}/TCP`}><Space><Text>{t('diagnosisRealityEntryPurpose')}</Text><Tag color={reality.runtime.listen_443 ? 'green' : 'red'}>{reality.runtime.listen_443 ? t('diagnosisListening') : t('diagnosisNotListening')}</Tag></Space></EvidenceLine>
+        <EvidenceLine label={`${reality.camouflage.tls_listener_port}/TCP`}><Space><Text>{t('diagnosisFallbackPurpose')}</Text><Tag color={reality.runtime.listen_8443 ? 'green' : 'red'}>{reality.runtime.listen_8443 ? t('diagnosisListening') : t('diagnosisNotListening')}</Tag></Space></EvidenceLine>
+        {!reality.runtime.listen_443 ? <Alert type="error" showIcon title={t('diagnosisListenerMissing').replace('{rule}', String(rule.id)).replace('{port}', String(reality.config.listen_port))} /> : null}
+      </> : <>
+        <EvidenceLine label={t('diagnosisListenerPort')}><Text>{node.status === 'result' ? node.listen_port || rule.listen_port : rule.listen_port}/{rule.protocol.toUpperCase()}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisCurrentStatus')}><Text type={node.status === 'result' && node.listener_running ? undefined : 'danger'}>{node.status === 'result' ? (node.listener_running ? t('diagnosisListening') : t('diagnosisNotListening')) : unavailableNodeReason(node, t)}</Text></EvidenceLine>
+        {node.status === 'result' && !node.listener_running ? <Alert type="error" showIcon title={t('diagnosisListenerMissing').replace('{rule}', String(rule.id)).replace('{port}', String(rule.listen_port))} /> : null}
+      </>}
+    </div>;
+    })}
+  </div>;
+}
+
+function CertificateDetails({ result, t }: { result: DiagnoseResponse; t: Tfn }) {
+  const nodes = result.nodes.filter((node): node is Extract<NodeDiagnoseStatus, { status: 'result' }> => node.status === 'result' && !!node.reality);
+  return <div className="rp-diagnosis-evidence">
+    <EvidenceLine label={t('diagnosisCheckContent')}><Text>{t('diagnosisCertificateCheckDescription')}</Text></EvidenceLine>
+    {nodes.length > 0 ? nodes.map((node) => {
+      const certificate = node.reality!.certificate;
+      const panelCertificate = result.dependencies?.certificate;
+      return <div className="rp-diagnosis-target" key={node.node_id}>
+        <EvidenceLine label={t('diagnosisRelayNode')}><Text code>{node.public_ip || node.node_id}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisCertificateDomain')}><Text code>{certificate.certificate_domain ?? t('diagnosisNotConfirmed')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisCertificateCoverage')}><Text>{certificate.san_match ? t('diagnosisCovered') : t('diagnosisNotCovered')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisCertificateIssuance')}><Text>{certificate.certificate_status === 'active' || certificate.certificate_status === 'renewal_warning' ? t('diagnosisIssued') : certificate.certificate_status === 'pending' ? t('diagnosisWaiting') : t('diagnosisFailedState')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisCertificateIssuer')}><Text>{certificate.issuer ?? t('diagnosisNotConfirmed')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisCertificateExpiry')}><Text>{certificate.valid_until ?? t('diagnosisNotConfirmed')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisCertificatePanelPublish')}><Text>{t('diagnosisNotConfirmed')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisCertificateNodeSync')}><Text>{certificate.check.state === 'pass' ? t('diagnosisSynced') : t('diagnosisNotSynced')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisCertificatePath')}><Text code>{certificate.cert_path ?? t('diagnosisNotConfirmed')} / {certificate.key_path ?? t('diagnosisNotConfirmed')}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisCertificateBlocking')}><Text>{panelCertificate?.state === 'blocked' || panelCertificate?.state === 'fail' ? t('yes') : panelCertificate?.state === 'pass' ? t('no') : t('diagnosisNotConfirmed')}</Text></EvidenceLine>
+        {certificate.check.detail ? <EvidenceLine label={t('diagnosisTechnicalInfo')}><Text code>{certificate.check.detail}</Text></EvidenceLine> : null}
+      </div>;
+    }) : <Text type="secondary">{t('diagnosisNoTechnicalEvidence')}</Text>}
+  </div>;
+}
+
+function RouteDetails({ rule, result, t }: { rule: ForwardRule; result: DiagnoseResponse; t: Tfn }) {
+  const nodes = result.nodes.filter((node): node is Extract<NodeDiagnoseStatus, { status: 'result' }> => node.status === 'result' && !!node.reality);
+  return <div className="rp-diagnosis-evidence">
+    <EvidenceLine label={t('diagnosisCheckContent')}><Text>{t('diagnosisRouteCheckDescription')}</Text></EvidenceLine>
+    <EvidenceLine label={t('diagnosisCurrentRule')}><Text>Rule {rule.id} · {rule.name}</Text></EvidenceLine>
+    <EvidenceLine label="SNI"><Text code>{rule.sni ?? '-'}</Text></EvidenceLine>
+    <EvidenceLine label={t('diagnosisListenerPort')}><Text>{rule.listen_port}/TCP</Text></EvidenceLine>
+    {nodes.map((node) => <div className="rp-diagnosis-target" key={node.node_id}>
+      <EvidenceLine label={t('diagnosisRelayNode')}><Text code>{node.public_ip || node.node_id}</Text></EvidenceLine>
+      <EvidenceLine label={t('diagnosisCurrentForward')}><Text code>{node.reality!.config.sni ?? '-'} -&gt; {node.reality!.config.targets.join(', ') || '-'}</Text></EvidenceLine>
+      <EvidenceLine label={t('diagnosisRouteMapping')}><Text>{node.reality!.nginx.plan_contains_rule && node.reality!.nginx.mapping_matches ? t('diagnosisMappingPresent') : t('diagnosisMappingMissing')}</Text></EvidenceLine>
+      <EvidenceLine label={t('diagnosisCurrentStatus')}><Text>{node.reality!.runtime.check.state === 'pass' ? t('diagnosisNormal') : t('diagnosisAbnormal')}</Text></EvidenceLine>
+      {!(node.reality!.nginx.plan_contains_rule && node.reality!.nginx.mapping_matches) ? <Alert type="error" showIcon title={t('diagnosisRouteMissing')} /> : null}
+      {node.reality!.nginx.check.detail ? <EvidenceLine label={t('diagnosisTechnicalInfo')}><Text code>{node.reality!.nginx.check.detail}</Text></EvidenceLine> : null}
+    </div>)}
+  </div>;
 }
 
 function FullPathDetails({ nodes }: { nodes: NodeDiagnoseStatus[] }) {
@@ -228,7 +306,7 @@ function RealityTechnicalEvidence({ diagnosis }: { diagnosis: RealityDiagnosis }
       </EvidenceLine>
       <EvidenceLine label="Certificate"><Text className="rp-mono">{rawCheck(diagnosis.certificate.check)}</Text></EvidenceLine>
       <EvidenceLine label="Certificate values">
-        <Text className="rp-mono">status={diagnosis.certificate.certificate_status} · cert={diagnosis.certificate.cert_path ?? '-'} · key={diagnosis.certificate.key_path ?? '-'} · SAN={String(diagnosis.certificate.san_match)} · cert_key_match={String(diagnosis.certificate.cert_key_match)} · issuer={diagnosis.certificate.issuer ?? '-'} · valid_until={diagnosis.certificate.valid_until ?? '-'}</Text>
+        <Text className="rp-mono">status={diagnosis.certificate.certificate_status} · domain={diagnosis.certificate.certificate_domain ?? '-'} · cert={diagnosis.certificate.cert_path ?? '-'} · key={diagnosis.certificate.key_path ?? '-'} · SAN={String(diagnosis.certificate.san_match)} · cert_key_match={String(diagnosis.certificate.cert_key_match)} · issuer={diagnosis.certificate.issuer ?? '-'} · valid_until={diagnosis.certificate.valid_until ?? '-'}</Text>
       </EvidenceLine>
       <EvidenceLine label="TLS"><Text className="rp-mono">{rawCheck(diagnosis.certificate.tls_handshake)}</Text></EvidenceLine>
       {diagnosis.certificate.renewal ? <EvidenceLine label="Renewal"><Text className="rp-mono">{rawCheck(diagnosis.certificate.renewal)}</Text></EvidenceLine> : null}
@@ -426,6 +504,7 @@ function buildCheckRows(rule: ForwardRule, result: DiagnoseResponse, t: Tfn): Ch
           : listeners.status === 'not_tested'
             ? t('diagnosisTableListenerNotTested')
             : t('diagnosisTableUnknown'),
+    evidence: <ListenerDetails rule={rule} nodes={result.nodes} t={t} />,
   });
 
   if (realityRule) {
@@ -446,7 +525,7 @@ function buildCheckRows(rule: ForwardRule, result: DiagnoseResponse, t: Tfn): Ch
     rows.push({
       key: 'certificate', label: t('diagnosisCertificate'), status: certificateStatus,
       description: checkDescription(certificateStatus, t('diagnosisTableCertificateNormal'), t('diagnosisTableCertificateFailed'), certificate, t),
-      evidence: <ControlCheckDetails label="certificate" check={certificate} />,
+      evidence: <CertificateDetails result={result} t={t} />,
     });
 
     const route = result.dependencies?.route;
@@ -472,7 +551,7 @@ function buildCheckRows(rule: ForwardRule, result: DiagnoseResponse, t: Tfn): Ch
       description: routeStatus !== 'normal' && routeStatus !== 'not_tested'
         ? routeIssueDescription(result.nodes, routeFallback, t)
         : routeFallback,
-      evidence: <ControlCheckDetails label="route" check={route} />,
+      evidence: <RouteDetails rule={rule} result={result} t={t} />,
     });
   }
 

@@ -141,6 +141,11 @@ pub async fn diagnose_node(
     let protocol = status
         .get("config_protocol_version")
         .and_then(|value| value.as_u64());
+    let public_ipv4 = status
+        .get("public_ipv4")
+        .or_else(|| status.get("public_ip"))
+        .and_then(|value| value.as_str());
+    let public_ipv6 = status.get("public_ipv6").and_then(|value| value.as_str());
     let reconciliation = status.get("reconciliation");
     let reconciliation_state = reconciliation
         .and_then(|value| value.get("state"))
@@ -310,6 +315,32 @@ pub async fn diagnose_node(
     } else {
         node_not_observed("resources", "取得 CPU、内存和磁盘遥测")
     });
+    checks.push(if public_ipv4.is_some() || public_ipv6.is_some() {
+        node_check(
+            "network",
+            true,
+            "能够取得节点公网地址",
+            format!(
+                "IPv4 {} / IPv6 {}",
+                public_ipv4.unwrap_or("未取得"),
+                public_ipv6.unwrap_or("未取得")
+            ),
+            None,
+            status
+                .get("network_interface")
+                .and_then(|value| value.as_str())
+                .map(|interface| format!("network_interface={interface}")),
+        )
+    } else {
+        node_not_observed("network", "取得节点公网地址")
+    });
+    // Status telemetry does not currently include process-manager or Nginx
+    // process health. Keep these explicit rather than inferring from listeners.
+    checks.push(node_not_observed(
+        "systemd",
+        "取得 relay-node systemd 服务状态",
+    ));
+    checks.push(node_not_observed("nginx", "取得 Nginx 进程状态"));
     let healthy = checks.iter().all(|check| check.status != "abnormal");
     checks.shrink_to_fit();
     Json(ApiResponse::success(NodeDiagnosisResponse {
@@ -618,7 +649,21 @@ pub struct RealityDependencyDiagnosis {
     pub dns_sync: RealityCheck,
     pub certificate: RealityCheck,
     pub route: RealityCheck,
+    pub dns_records: Vec<RuleDnsDiagnosisRecord>,
     pub blocking_chain: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RuleDnsDiagnosisRecord {
+    pub fqdn: String,
+    pub line: String,
+    pub expected_value: Option<String>,
+    pub actual_value: Option<String>,
+    pub provider: Option<String>,
+    pub ownership: String,
+    pub sync_state: String,
+    pub last_observed_at: Option<String>,
+    pub last_error: Option<String>,
 }
 
 fn dependency_check(state: &str, detail: impl Into<String>) -> RealityCheck {
@@ -699,6 +744,45 @@ async fn reality_dependencies(
         ),
         None => dependency_check("blocked", "DNS synchronization state is unavailable"),
     };
+    let mut dns_records = Vec::new();
+    if let Ok(syncs) = state.db.list_dns_record_syncs_for_rule(rule_id).await {
+        for sync in syncs {
+            let binding = state
+                .db
+                .find_dns_record_binding_for_rule(
+                    rule_id,
+                    &sync.fqdn,
+                    &sync.record_type,
+                    &sync.line_key,
+                )
+                .await
+                .ok()
+                .flatten();
+            dns_records.push(RuleDnsDiagnosisRecord {
+                fqdn: sync.fqdn,
+                line: if sync.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY {
+                    "default".into()
+                } else {
+                    sync.line
+                },
+                expected_value: sync.expected_value,
+                actual_value: binding
+                    .as_ref()
+                    .filter(|binding| binding.state == "BOUND")
+                    .map(|binding| binding.desired_value.clone()),
+                // The persisted sync row identifies the DNSMgr line, but does
+                // not retain the upstream provider identity. Do not label the
+                // management service itself as the DNS provider.
+                provider: None,
+                ownership: sync.ownership,
+                sync_state: sync.state,
+                last_observed_at: binding
+                    .and_then(|binding| binding.last_observed_at)
+                    .or(sync.last_observed_at),
+                last_error: sync.last_error_category,
+            });
+        }
+    }
 
     let any_certificate_pass = result_reality_checks(nodes).any(|diagnosis| {
         diagnosis.certificate.check.state == "pass" && diagnosis.convergence.check.state == "pass"
@@ -708,7 +792,7 @@ async fn reality_dependencies(
     let certificate = if any_certificate_pass {
         dependency_check("pass", "At least one Relay reports a usable certificate")
     } else if dns_sync.state != "pass" {
-        dependency_check("blocked", "Public DNS is not ready")
+        dependency_check("blocked", "Provider DNS record is not ready")
     } else if any_certificate_fail {
         dependency_check("fail", "Relay certificate check failed")
     } else {
@@ -740,6 +824,7 @@ async fn reality_dependencies(
         dns_sync,
         certificate,
         route,
+        dns_records,
         blocking_chain,
     })
 }
@@ -1905,6 +1990,8 @@ mod tests {
                     "cpu": 12.0,
                     "mem": 24.0,
                     "disk_usage_percent": 30.0,
+                    "public_ipv4": "192.0.2.10",
+                    "network_interface": "eth0",
                     "reconciliation": { "state": "CONVERGED" }
                 })
                 .to_string(),
@@ -1924,7 +2011,24 @@ mod tests {
         let result = response.data.expect("node diagnosis result");
         assert!(result.healthy);
         assert_eq!(result.node_id, "node-a");
-        assert!(result.checks.iter().all(|check| check.status == "normal"));
+        assert!(result.checks.iter().all(|check| check.status != "abnormal"));
+        assert_eq!(
+            result
+                .checks
+                .iter()
+                .find(|check| check.key == "network")
+                .map(|check| (check.status, check.actual.as_str())),
+            Some(("normal", "IPv4 192.0.2.10 / IPv6 未取得"))
+        );
+        for key in ["systemd", "nginx"] {
+            let check = result
+                .checks
+                .iter()
+                .find(|check| check.key == key)
+                .expect("explicit unavailable system check");
+            assert_eq!(check.status, "not_observed");
+            assert_eq!(check.actual, "未取得");
+        }
         assert!(result
             .checks
             .iter()

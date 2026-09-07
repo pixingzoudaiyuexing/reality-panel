@@ -22,7 +22,7 @@ function reality(overrides: Record<string, unknown> = {}) {
     nginx: { check: { state: 'pass' }, plan_contains_rule: true, mapping_matches: true, expected_fingerprint: 'expected-nginx', deployed_fingerprint: 'deployed-nginx', managed_file_matches: true, config_valid: true, service_healthy: true },
     runtime: { check: { state: 'pass' }, listen_443: true, listen_8443: true },
     backends: [{ address: '192.0.2.1:443', check: { state: 'pass' }, elapsed_ms: 10 }],
-    certificate: { check: { state: 'pass' }, renewal: { state: 'pass' }, certificate_status: 'active', san_match: true, cert_key_match: true, tls_handshake: { state: 'pass' }, remaining_days: 80, cert_path: '/cert/fullchain.pem', key_path: '/cert/privkey.pem' },
+    certificate: { check: { state: 'pass' }, renewal: { state: 'pass' }, certificate_status: 'active', certificate_domain: '*.example.com', san_match: true, cert_key_match: true, tls_handshake: { state: 'pass' }, remaining_days: 80, cert_path: '/cert/fullchain.pem', key_path: '/cert/privkey.pem' },
     camouflage: { check: { state: 'pass' }, site_status: 'active', tls_listener_port: 8443, local_backend: '127.0.0.1:5244', http_status: 200 },
     fallback: { check: { state: 'pass' }, http_status: 200, authenticated_reality_path: false },
     vless_authentication: { state: 'not_tested' },
@@ -152,9 +152,9 @@ describe('RuleDiagnosisModal table diagnosis', () => {
   it('renders blocked certificate and route as waiting, not abnormal', async () => {
     mockPost.mockResolvedValue(response(undefined, {
       dnsmgr: { state: 'pass' }, dns_sync: { state: 'fail' },
-      certificate: { state: 'blocked', detail: 'Public DNS is not ready' },
-      route: { state: 'blocked', detail: 'Public DNS is not ready' },
-      blocking_chain: ['Public DNS is not ready'],
+      certificate: { state: 'blocked', detail: 'Provider DNS record is not ready' },
+      route: { state: 'blocked', detail: 'Provider DNS record is not ready' },
+      blocking_chain: ['Provider DNS record is not ready'],
     }));
     renderModal(realityRule, zhT);
     await settle();
@@ -175,6 +175,47 @@ describe('RuleDiagnosisModal table diagnosis', () => {
     expect(within(checkTable).getByText('监听服务').closest('tr')).toHaveTextContent('正常');
     expect(screen.getByTestId('diagnosis-conclusion')).toHaveTextContent('诊断结论: 正常');
     expect(screen.getByTestId('diagnosis-conclusion')).toHaveTextContent('未发现异常');
+  });
+
+  it('shows the actual Reality ingress and fallback listener observations', async () => {
+    mockPost.mockResolvedValue(response());
+    renderModal(realityRule, zhT);
+    await settle();
+    const row = within(screen.getByTestId('diagnosis-check-table')).getByText('监听服务').closest('tr') as HTMLElement;
+    fireEvent.click(within(row).getByRole('button', { name: '查看详情' }));
+    expect(screen.getByText('443/TCP')).toBeInTheDocument();
+    expect(screen.getByText('8443/TCP')).toBeInTheDocument();
+    expect(screen.getByText('用途：Reality 规则入口')).toBeInTheDocument();
+    expect(screen.getByText('用途：伪装站 fallback')).toBeInTheDocument();
+  });
+
+  it('shows provider read-back state without pretending DNSMgr is the provider', async () => {
+    mockPost.mockResolvedValue(response(undefined, {
+      dnsmgr: { state: 'pass' }, dns_sync: { state: 'pass' }, certificate: { state: 'pass' }, route: { state: 'pass' },
+      dns_records: [{
+        fqdn: 'q1.example.com', line: 'default', expected_value: '192.0.2.10', actual_value: '192.0.2.10',
+        provider: null, ownership: 'PANEL', sync_state: 'PROPAGATED', last_observed_at: '2026-09-07T00:00:00Z',
+      }],
+      blocking_chain: [],
+    }));
+    renderModal(realityRule, zhT);
+    await settle();
+    const row = screen.getByText('DNS 解析').closest('tr') as HTMLElement;
+    fireEvent.click(within(row).getByRole('button', { name: '查看详情' }));
+    expect(screen.getByText('已应用（Provider Read-back 已确认）')).toBeInTheDocument();
+    expect(screen.getByText('DNS Provider').parentElement).toHaveTextContent('未取得');
+    expect(screen.getByText('是否一致').parentElement).toHaveTextContent('是');
+  });
+
+  it('shows the actual wildcard certificate and does not invent Panel publication evidence', async () => {
+    mockPost.mockResolvedValue(response());
+    renderModal(realityRule, zhT);
+    await settle();
+    const row = screen.getByText('证书').closest('tr') as HTMLElement;
+    fireEvent.click(within(row).getByRole('button', { name: '查看详情' }));
+    expect(screen.getByText('*.example.com')).toBeInTheDocument();
+    expect(screen.getByText('Panel 发布状态').parentElement).toHaveTextContent('未取得');
+    expect(screen.getByText('Node 同步').parentElement).toHaveTextContent('已同步且可用');
   });
 
   it('shows mixed Reality runtime listeners as partial and all failed runtimes as abnormal', async () => {

@@ -105,7 +105,7 @@ pub async fn group_catalog(
         return Ok(CarrierLineCatalog {
             lines: vec![CarrierLine {
                 id: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
-                name: "全网默认".into(),
+                name: "default".into(),
                 parent: None,
             }],
             stale: false,
@@ -206,7 +206,7 @@ async fn fetch_catalog(
         0,
         CarrierLine {
             id: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
-            name: "全网默认".into(),
+            name: "default".into(),
             parent: None,
         },
     );

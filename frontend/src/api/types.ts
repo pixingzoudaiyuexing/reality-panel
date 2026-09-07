@@ -857,7 +857,7 @@ export interface RealityDiagnosis {
   nginx: { check: RealityCheck; plan_contains_rule: boolean; mapping_matches: boolean; expected_fingerprint?: string | null; deployed_fingerprint?: string | null; managed_file_matches: boolean; config_valid: boolean; service_healthy: boolean };
   runtime: { check: RealityCheck; listen_443: boolean; listen_8443: boolean };
   backends: { address: string; check: RealityCheck; elapsed_ms?: number | null }[];
-  certificate: { check: RealityCheck; renewal?: RealityCheck; certificate_status: string; cert_path?: string | null; key_path?: string | null; san_match: boolean; cert_key_match: boolean; issuer?: string | null; valid_until?: string | null; remaining_days?: number | null; tls_handshake: RealityCheck };
+  certificate: { check: RealityCheck; renewal?: RealityCheck; certificate_status: string; certificate_domain?: string | null; cert_path?: string | null; key_path?: string | null; san_match: boolean; cert_key_match: boolean; issuer?: string | null; valid_until?: string | null; remaining_days?: number | null; tls_handshake: RealityCheck };
   camouflage: { check: RealityCheck; site_status: string; tls_listener_port: number; local_backend: string; http_status?: number | null };
   fallback: { check: RealityCheck; http_status?: number | null; authenticated_reality_path: boolean };
   vless_authentication: RealityCheck;
@@ -890,6 +890,11 @@ export interface DiagnoseResponse {
     dns_sync: RealityCheck;
     certificate: RealityCheck;
     route: RealityCheck;
+    dns_records?: Array<{
+      fqdn: string; line: string; expected_value?: string | null; actual_value?: string | null;
+      provider?: string | null; ownership: string; sync_state: string; last_observed_at?: string | null;
+      last_error?: string | null;
+    }>;
     blocking_chain: string[];
   };
 }

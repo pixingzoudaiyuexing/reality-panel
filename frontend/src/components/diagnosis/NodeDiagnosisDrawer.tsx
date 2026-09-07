@@ -16,7 +16,8 @@ interface Props {
 const checkNames: Record<string, string> = {
   heartbeat: '节点心跳', websocket: 'Panel 控制连接', identity: '节点身份', version: '节点版本',
   protocol: '配置协议', config_sync: '配置同步', runtime: '监听运行状态', camouflage: '伪装站总体状态',
-  certificate_sync: '证书同步总体状态', resources: '系统资源',
+  certificate_sync: '证书同步总体状态', resources: '系统资源', network: '节点网络',
+  systemd: 'relay-node 服务', nginx: 'Nginx 进程',
 };
 
 function stateTag(check: NodeDiagnosisCheck, t: Tfn) {

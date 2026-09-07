@@ -233,6 +233,21 @@ impl ForwarderManager {
         None
     }
 
+    pub fn listener_info_for_rule_udp(&self, rule_id: i64) -> Option<ListenerInfo> {
+        for ((port, proto, transport), managed) in &self.listeners {
+            if managed.fingerprint.rule_id == rule_id && *proto == Protocol::Udp {
+                return Some(ListenerInfo {
+                    port: *port,
+                    protocol: "udp".to_string(),
+                    transport: format!("{:?}", transport).to_lowercase(),
+                    targets: managed.fingerprint.targets.clone(),
+                    running: !managed.handle.is_finished(),
+                });
+            }
+        }
+        None
+    }
+
     /// v0.4.1: set the shared TLS acceptor for tls_simple listeners. Called at
     /// startup after loading the cert+key (or starting the CertReloader).
     /// None = no cert (tls_simple rules skipped).
@@ -2342,6 +2357,12 @@ mod tests {
             },
         );
         assert!(mgr.listener_info_for_rule_tcp(9).is_none());
+        let udp = mgr
+            .listener_info_for_rule_udp(9)
+            .expect("rule 9 has a UDP listener");
+        assert_eq!(udp.protocol, "udp");
+        assert_eq!(udp.port, 40090);
+        assert!(udp.running);
         // An unknown rule_id also returns None.
         assert!(mgr.listener_info_for_rule_tcp(999).is_none());
     }

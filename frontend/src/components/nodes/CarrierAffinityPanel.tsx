@@ -86,7 +86,10 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const mutationLocked = transactionBusy || view?.transaction.state === 'failed_manual_intervention';
   const catalogUnavailable = !catalog || catalog.stale;
   const status = view ? transactionLabel(view, t) : null;
-  const names = useMemo(() => new Map((catalog?.lines ?? []).map((line) => [line.id, line.name || line.id])), [catalog]);
+  const names = useMemo(() => new Map((catalog?.lines ?? []).map((line) => [
+    line.id,
+    line.id === 'default' ? t('relayPreferenceDefaultLine') : line.name || line.id,
+  ])), [catalog, t]);
   const allLineIds = useMemo(() => {
     const ids = new Set((catalog?.lines ?? []).map((line) => line.id));
     draft.forEach((binding) => ids.add(binding.line_id));
@@ -94,7 +97,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   }, [catalog, draft, names]);
 
   const assignLines = (nodeId: string, selected: string[]) => {
-    setDraft((current) => assignCarrierLines(current, nodeId, selected));
+    setDraft((current) => assignCarrierLines(current, nodeId, selected, view?.default_node_id));
   };
 
   const save = async () => {

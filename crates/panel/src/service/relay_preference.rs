@@ -1064,19 +1064,18 @@ pub(crate) async fn carrier_line_desired_for_rule(
         },
         None => RelayPreferenceState::default(),
     };
-    let default_value =
-        match resolve_dns_target_for_rule(db, rule.device_group_in, Some(rule_id)).await? {
-            RelayDnsTarget::Resolved(value) => valid_public_ipv4(Some(&value)),
-            RelayDnsTarget::NotSet => valid_public_ipv4(Some(&group.connect_host)),
-            RelayDnsTarget::Frozen | RelayDnsTarget::Invalid(_) => None,
-        };
-
     let mut desired = BTreeMap::new();
     let mut configured_lines = HashSet::new();
     for binding in &preference.carrier_policy.bindings {
         configured_lines.insert(binding.line_id.clone());
         let value = match binding.mode {
-            CarrierLineMode::FollowDefault => default_value.clone(),
+            CarrierLineMode::FollowDefault => {
+                match resolve_dns_target_for_rule(db, rule.device_group_in, Some(rule_id)).await? {
+                    RelayDnsTarget::Resolved(value) => valid_public_ipv4(Some(&value)),
+                    RelayDnsTarget::NotSet => valid_public_ipv4(Some(&group.connect_host)),
+                    RelayDnsTarget::Frozen | RelayDnsTarget::Invalid(_) => None,
+                }
+            }
             CarrierLineMode::Node => match binding.node_id.as_deref() {
                 Some(node_id) => {
                     match stored_node_public_ipv4(db, rule.device_group_in, node_id).await? {
@@ -1456,10 +1455,7 @@ pub(crate) async fn refresh_carrier_desired(
         let preference: RelayPreferenceState =
             serde_json::from_str(&raw).map_err(RelayPreferenceError::InvalidPreference)?;
         if preference.carrier_policy.bindings.is_empty()
-            || matches!(
-                preference.state,
-                RelayPreferencePhase::Switching | RelayPreferencePhase::RollingBack
-            )
+            || preference.state != RelayPreferencePhase::Idle
         {
             continue;
         }

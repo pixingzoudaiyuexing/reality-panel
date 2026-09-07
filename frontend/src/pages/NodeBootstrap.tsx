@@ -89,6 +89,7 @@ export default function NodeBootstrap() {
 
   const updateRow = (id: number, patch: Partial<Values>) => setRows((current) => current.map((row) => row.id === id ? { ...row, values: { ...row.values, ...patch }, state: 'WAITING', probe: null, deployment: null, logs: [], error: null } : row));
   const rowValid = (row: SshRow) => Boolean(row.values.group_id && row.values.host.trim() && row.values.username.trim() && row.values.password && row.values.port >= 1 && row.values.port <= 65535);
+  const rowsLocked = batchBusy || rows.some((row) => row.state === 'DEPLOYING');
 
   const testAll = async () => {
     if (!rows.every(rowValid)) { message.error(t('nodeBootstrapRowsIncomplete')); return; }
@@ -102,7 +103,8 @@ export default function NodeBootstrap() {
       } catch (error) { return { id: row.id, probe: null, error: errorText(error, t('nodeBootstrapSshFailed')) }; }
     }));
     setRows((current) => current.map((row) => {
-      const result = results.find((item) => item.id === row.id)!;
+      const result = results.find((item) => item.id === row.id);
+      if (!result) return row;
       return { ...row, probe: result.probe, state: result.probe ? 'PASSED' : 'FAILED', error: result.error };
     }));
     setBatchBusy(false);
@@ -120,7 +122,8 @@ export default function NodeBootstrap() {
       } catch (error) { return { id: row.id, deployment: null, error: errorText(error, t('nodeBootstrapStartFailed')) }; }
     }));
     setRows((current) => current.map((row) => {
-      const result = results.find((item) => item.id === row.id)!;
+      const result = results.find((item) => item.id === row.id);
+      if (!result) return row;
       return { ...row, deployment: result.deployment, state: result.deployment ? 'DEPLOYING' : 'FAILED', error: result.error, values: { ...row.values, password: '' } };
     }));
     setBatchBusy(false);
@@ -147,17 +150,17 @@ export default function NodeBootstrap() {
     <div className="rp-ssh-batch" data-testid="ssh-batch">
       {rows.map((row, index) => <div className="rp-ssh-row" data-testid={`ssh-row-${row.id}`} key={row.id}>
         <Text type="secondary">#{index + 1}</Text>
-        <Input aria-label={`${t('nodeBootstrapHost')} ${index + 1}`} value={row.values.host} placeholder={t('nodeBootstrapHost')} onChange={(event) => updateRow(row.id, { host: event.target.value })} />
-        <InputNumber aria-label={`${t('nodeBootstrapPort')} ${index + 1}`} min={1} max={65535} value={row.values.port} onChange={(value) => updateRow(row.id, { port: value ?? 22 })} />
-        <Input aria-label={`${t('nodeBootstrapUser')} ${index + 1}`} value={row.values.username} onChange={(event) => updateRow(row.id, { username: event.target.value })} />
-        <Input.Password aria-label={`${t('nodeBootstrapPassword')} ${index + 1}`} value={row.values.password} autoComplete="new-password" onChange={(event) => updateRow(row.id, { password: event.target.value })} />
-        <Select aria-label={`${t('nodeBootstrapGroup')} ${index + 1}`} value={row.values.group_id} options={groups.map((group) => ({ value: group.id, label: group.name }))} onChange={(group_id) => updateRow(row.id, { group_id })} />
-        <Space size={4}><Tag color={rowColor[row.state]}>{t(`nodeBootstrapRow${row.state}` as keyof Dict)}</Tag>{rows.length > 1 ? <Button type="text" danger icon={<DeleteOutlined />} aria-label={`${t('delete')} ${index + 1}`} onClick={() => setRows((current) => current.filter((item) => item.id !== row.id))} /> : null}</Space>
+        <Input disabled={rowsLocked} aria-label={`${t('nodeBootstrapHost')} ${index + 1}`} value={row.values.host} placeholder={t('nodeBootstrapHost')} onChange={(event) => updateRow(row.id, { host: event.target.value })} />
+        <InputNumber disabled={rowsLocked} aria-label={`${t('nodeBootstrapPort')} ${index + 1}`} min={1} max={65535} value={row.values.port} onChange={(value) => updateRow(row.id, { port: value ?? 22 })} />
+        <Input disabled={rowsLocked} aria-label={`${t('nodeBootstrapUser')} ${index + 1}`} value={row.values.username} onChange={(event) => updateRow(row.id, { username: event.target.value })} />
+        <Input.Password disabled={rowsLocked} aria-label={`${t('nodeBootstrapPassword')} ${index + 1}`} value={row.values.password} autoComplete="new-password" onChange={(event) => updateRow(row.id, { password: event.target.value })} />
+        <Select disabled={rowsLocked} aria-label={`${t('nodeBootstrapGroup')} ${index + 1}`} value={row.values.group_id} options={groups.map((group) => ({ value: group.id, label: group.name }))} onChange={(group_id) => updateRow(row.id, { group_id })} />
+        <Space size={4}><Tag color={rowColor[row.state]}>{t(`nodeBootstrapRow${row.state}` as keyof Dict)}</Tag>{rows.length > 1 ? <Button disabled={rowsLocked} type="text" danger icon={<DeleteOutlined />} aria-label={`${t('delete')} ${index + 1}`} onClick={() => setRows((current) => current.filter((item) => item.id !== row.id))} /> : null}</Space>
         {row.error ? <Text type="danger" className="rp-ssh-row-message">{row.error}</Text> : row.deployment ? <Text className="rp-ssh-row-message">{row.deployment.message}</Text> : row.probe ? <Text type="secondary" className="rp-ssh-row-message">{row.probe.os} · {row.probe.architecture} · {row.probe.fingerprint}</Text> : null}
       </div>)}
     </div>
     <Space wrap style={{ marginTop: 12 }}>
-      <Button icon={<PlusOutlined />} onClick={() => setRows((current) => [...current, newRow(nextId.current++, current[0]?.values.group_id)])}>{t('nodeBootstrapAddServer')}</Button>
+      <Button disabled={rowsLocked} icon={<PlusOutlined />} onClick={() => setRows((current) => [...current, newRow(nextId.current++, current[0]?.values.group_id)])}>{t('nodeBootstrapAddServer')}</Button>
       <Button icon={<SafetyCertificateOutlined />} loading={batchBusy} onClick={() => void testAll()}>{t('nodeBootstrapTestConnection')}</Button>
       <Button type="primary" icon={<CloudUploadOutlined />} loading={batchBusy} disabled={!rows.every((row) => row.state === 'PASSED' && row.probe)} onClick={() => void deployAll()}>{t('nodeBootstrapDeploy')}</Button>
     </Space>

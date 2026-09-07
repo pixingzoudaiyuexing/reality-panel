@@ -125,7 +125,12 @@ async fn diagnose(
             })
             .cloned()
             .map(|listener| (config.clone(), listener));
-        (manager.listener_info_for_rule_tcp(rule_id), reality)
+        let info = if desired_protocol == "udp" {
+            manager.listener_info_for_rule_udp(rule_id)
+        } else {
+            manager.listener_info_for_rule_tcp(rule_id)
+        };
+        (info, reality)
     };
     let reality = if let Some((config, listener)) = reality {
         // Certificate/OpenSSL inspection uses an immutable snapshot so a
@@ -510,6 +515,7 @@ fn certificate_and_camouflage(
         },
         renewal,
         certificate_status: status.certificate_status.clone(),
+        certificate_domain: desired.map(|site| site.certificate.domain.clone()),
         cert_path,
         key_path,
         san_match,
@@ -1044,8 +1050,7 @@ mod tests {
     async fn probe_targets_caps_concurrency_and_count() {
         // 50 dummy targets; must return at most MAX_TARGETS (32) results. We
         // don't assert outcomes — port availability is environment-dependent —
-        // only the cap and that it returns without hanging. v0.4.9: TCP-only,
-        // no is_udp flag.
+        // only the cap and that it returns without hanging.
         let addrs: Vec<String> = (0..50).map(|i| format!("127.0.0.1:{}", 1000 + i)).collect();
         let out = probe_targets(&addrs).await;
         assert!(
@@ -1135,6 +1140,10 @@ mod tests {
             let (certificate, _) =
                 certificate_and_camouflage(&manager, Some("q1.example.com"), Some(&desired));
             assert_eq!(certificate.check.state, "fail");
+            assert_eq!(
+                certificate.certificate_domain.as_deref(),
+                Some("q1.example.com")
+            );
             std::fs::remove_dir_all(case_dir).unwrap();
         }
         std::fs::remove_dir_all(dir).unwrap();

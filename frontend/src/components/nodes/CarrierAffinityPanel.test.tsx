@@ -54,15 +54,24 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
   });
 
   it('moves one unique line between Relays', () => {
-    expect(assignCarrierLines(view.active_policy.bindings, 'node-a', ['default', 'Dianxin'])).toEqual([
+    expect(assignCarrierLines(view.active_policy.bindings, 'node-a', ['default', 'Dianxin'], view.default_node_id)).toEqual([
       { line_id: 'Dianxin', mode: 'node', node_id: 'node-a' },
       { line_id: 'default', mode: 'node', node_id: 'node-a' },
     ]);
   });
 
+  it('removes a deselected legacy FollowDefault line from the default Relay', () => {
+    expect(assignCarrierLines([
+      { line_id: 'default', mode: 'follow_default', node_id: null },
+      { line_id: 'Dianxin', mode: 'node', node_id: 'node-b' },
+    ], 'node-a', [], 'node-a')).toEqual([
+      { line_id: 'Dianxin', mode: 'node', node_id: 'node-b' },
+    ]);
+  });
+
   it('exposes default as an ordinary assignable line', async () => {
     arrange();
-    expect(await screen.findByTestId('carrier-node-node-a')).toHaveTextContent('全网默认');
+    expect(await screen.findByTestId('carrier-node-node-a')).toHaveTextContent('relayPreferenceDefaultLine');
   });
 
   it('locks edits while the existing DNS transaction is active', async () => {
