@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import api from '../../api/client';
 import type { ApiEnvelope, CarrierAffinityView, CarrierLineBinding, CarrierLineCatalog, RelayDnsRecordView, RelayReadyNode } from '../../api/types';
 import type { Tfn } from './types';
+import { assignCarrierLines } from './carrierCatalog';
 
 const { Text } = Typography;
 
@@ -39,13 +40,6 @@ function nodeLines(bindings: CarrierLineBinding[], nodeId: string, defaultNodeId
     .filter((binding) => binding.mode === 'node' ? binding.node_id === nodeId : defaultNodeId === nodeId)
     .map((binding) => binding.line_id)
     .sort((left, right) => left.localeCompare(right));
-}
-
-export function assignCarrierLines(bindings: CarrierLineBinding[], nodeId: string, selected: string[]): CarrierLineBinding[] {
-  const selectedSet = new Set(selected);
-  const next = bindings.filter((binding) => binding.node_id !== nodeId && !selectedSet.has(binding.line_id));
-  next.push(...selected.map((lineId) => ({ line_id: lineId, mode: 'node' as const, node_id: nodeId })));
-  return next.sort((left, right) => left.line_id < right.line_id ? -1 : left.line_id > right.line_id ? 1 : 0);
 }
 
 export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalogChange, onAvailabilityChange }: Props) {

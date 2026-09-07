@@ -6,7 +6,8 @@ import type { Tfn } from './types';
 const { mockGet, mockPut } = vi.hoisted(() => ({ mockGet: vi.fn(), mockPut: vi.fn() }));
 vi.mock('../../api/client', () => ({ default: { get: mockGet, put: mockPut } }));
 
-import { assignCarrierLines, CarrierAffinityPanel } from './CarrierAffinityPanel';
+import { CarrierAffinityPanel } from './CarrierAffinityPanel';
+import { assignCarrierLines } from './carrierCatalog';
 
 const t = ((key: string) => key) as Tfn;
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });

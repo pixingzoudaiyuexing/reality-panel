@@ -1,4 +1,11 @@
-import type { CarrierLineCatalogItem } from '../../api/types';
+import type { CarrierLineBinding, CarrierLineCatalogItem } from '../../api/types';
+
+export function assignCarrierLines(bindings: CarrierLineBinding[], nodeId: string, selected: string[]): CarrierLineBinding[] {
+  const selectedSet = new Set(selected);
+  const next = bindings.filter((binding) => binding.node_id !== nodeId && !selectedSet.has(binding.line_id));
+  next.push(...selected.map((lineId) => ({ line_id: lineId, mode: 'node' as const, node_id: nodeId })));
+  return next.sort((left, right) => left.line_id < right.line_id ? -1 : left.line_id > right.line_id ? 1 : 0);
+}
 
 export interface CatalogTreeNode {
   value: string;
