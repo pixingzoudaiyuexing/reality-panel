@@ -228,18 +228,9 @@ describe('NodeStatus targeted diagnosis entry point', () => {
     nodes,
   });
 
-  const rule = (id: number, protocol = 'tcp') => ({
-    id,
-    name: `rule-${id}`,
-    device_group_in: 1,
-    protocol,
-    listen_port: 443,
-    sni: 'q1.example.com',
-  });
-
-  function setup(rules: ReturnType<typeof rule>[]) {
+  function setup() {
     mockUseAuth.mockReturnValue({ isAdmin: true });
-    mockPost.mockResolvedValue(ok({ request_id: 'request-1', rule_id: rules[0]?.id ?? 1, nodes: [] }));
+    mockPost.mockResolvedValue(ok({ group_id: 1, node_id: 'n1', healthy: true, checks: [] }));
     mockGet.mockImplementation((url: string) => {
       if (url === '/nodes') return Promise.resolve(ok([adminNode]));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
@@ -256,13 +247,12 @@ describe('NodeStatus targeted diagnosis entry point', () => {
       }));
       if (url === '/groups/1/carrier-lines') return Promise.resolve(ok({ lines: [], stale: false }));
       if (url === '/admin/relay-schedules') return Promise.resolve(ok([]));
-      if (url === '/rules') return Promise.resolve(ok(rules));
       return Promise.reject(new Error(`unexpected ${url}`));
     });
   }
 
   it('shows diagnosis for the preferred node and keeps it enabled for a not-ready node', async () => {
-    setup([rule(1)]);
+    setup();
     renderPage();
     await flush();
 
@@ -272,42 +262,16 @@ describe('NodeStatus targeted diagnosis entry point', () => {
     expect(within(notReady).getByRole('button', { name: /diagnose/ })).toBeEnabled();
   });
 
-  it('targets the only TCP rule with the selected node id', async () => {
-    setup([rule(1)]);
+  it('opens the node-only diagnosis without loading or selecting a Rule', async () => {
+    setup();
     renderPage();
     await flush();
     const row = screen.getByTestId('default-line-candidate-n1');
     fireEvent.click(within(row).getByRole('button', { name: /diagnose/ }));
     await flush();
 
-    expect(mockPost).toHaveBeenCalledWith('/rules/1/diagnose?node_id=n1');
-  });
-
-  it('opens a rule picker for multiple TCP rules and excludes UDP-only rules', async () => {
-    setup([rule(1), rule(2), rule(3, 'udp')]);
-    renderPage();
-    await flush();
-    const row = screen.getByTestId('default-line-candidate-n1');
-    fireEvent.click(within(row).getByRole('button', { name: /diagnose/ }));
-    await flush();
-
-    const picker = screen.getAllByRole('dialog').find((dialog) => within(dialog).queryByRole('button', { name: /#1 rule-1/ }));
-    expect(picker).toBeDefined();
-    expect(screen.getByRole('button', { name: /#1 rule-1/ })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /#2 rule-2/ })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /#3 rule-3/ })).toBeNull();
-    expect(mockPost).not.toHaveBeenCalled();
-  });
-
-  it('does not post when the node group has only UDP rules', async () => {
-    setup([rule(3, 'udp')]);
-    renderPage();
-    await flush();
-    const row = screen.getByTestId('default-line-candidate-n1');
-    fireEvent.click(within(row).getByRole('button', { name: /diagnose/ }));
-    await flush();
-
-    expect(mockPost).not.toHaveBeenCalled();
+    expect(mockPost).toHaveBeenCalledWith('/admin/nodes/1/n1/diagnose', {});
+    expect(mockGet).not.toHaveBeenCalledWith('/rules');
   });
 });
 

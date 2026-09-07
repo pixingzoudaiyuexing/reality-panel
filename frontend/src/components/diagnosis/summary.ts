@@ -126,6 +126,9 @@ export function combineDiagnosisChecks(checks: Array<RealityCheck | undefined | 
 
 function backendCheck(results: DiagnoseTargetResult[]): RealityCheck {
   if (results.length === 0) return { state: 'not_tested' };
+  if (results.every((result) => result.outcome !== 'timeout' && 'not_tested' in result.outcome)) {
+    return { state: 'not_tested' };
+  }
   const reachable = results.filter((result) => result.outcome !== 'timeout' && 'reachable' in result.outcome).length;
   if (reachable === results.length) return { state: 'pass' };
   if (reachable === 0) {
@@ -167,12 +170,11 @@ export function aggregateNodeChecks(checks: RealityCheck[]): DiagnosisDisplaySta
 
 function realityBackendCheck(node: Extract<NodeDiagnoseStatus, { status: 'result' }>): RealityCheck {
   const backends = node.reality?.backends ?? [];
-  if (backends.length === 0) return { state: 'not_tested' };
+  if (backends.length === 0) return backendCheck(node.results);
   const passed = backends.filter((backend) => backend.check.state === 'pass').length;
   if (passed === backends.length) return { state: 'pass' };
   if (passed === 0) return combineDiagnosisChecks(backends.map((backend) => backend.check));
-  const detail = backends.find((backend) => backend.check.state !== 'pass')?.check.detail;
-  return { state: 'warning', detail };
+  return { state: 'warning', detail: backends.find((backend) => backend.check.state !== 'pass')?.check.detail };
 }
 
 export function nodeDiagnosisChecks(node: NodeDiagnoseStatus): DiagnosisCheckSummary[] {
@@ -237,7 +239,7 @@ export function nodeDiagnosisIssues(node: NodeDiagnoseStatus): DiagnosisCheckSum
     if (service.check.state !== 'pass' && service.check.state !== 'not_tested') {
       highlights.push({ key: 'reality_service', check: service.check, causeKey: service.causeKey });
     }
-    const backend = realityBackendCheck(node);
+    const backend = backendCheck(node.results);
     if (backend.state !== 'pass') {
       highlights.push({ key: 'backend', check: backend });
     }

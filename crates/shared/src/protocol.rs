@@ -921,6 +921,10 @@ pub struct DiagnoseRuleMessage {
     pub config_revision: u64,
     #[serde(default)]
     pub config_fingerprint: String,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default)]
+    pub protocol: String,
     /// v0.4.9: opaque per-run challenge the node MUST echo back in its
     /// DiagnoseResult. `#[serde(default)]` so a v0.4.8 node still deserializes
     /// the message (it just ignores the field); the panel never sends a probe
@@ -1048,6 +1052,8 @@ impl DiagnoseRuleMessage {
         desired_sni: Option<String>,
         config_revision: u64,
         config_fingerprint: String,
+        targets: Vec<String>,
+        protocol: String,
         challenge: String,
     ) -> Self {
         Self {
@@ -1057,6 +1063,8 @@ impl DiagnoseRuleMessage {
             desired_sni,
             config_revision,
             config_fingerprint,
+            targets,
+            protocol,
             challenge,
         }
     }
@@ -1317,6 +1325,19 @@ pub enum TargetProbeOutcome {
     Failed { error: String },
     /// Connect did not complete within the deadline.
     Timeout,
+    /// UDP and other protocols without a reliable generic handshake.
+    NotTested { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetProbeErrorKind {
+    DnsResolveFailed,
+    ConnectionRefused,
+    Timeout,
+    NetworkUnreachable,
+    InvalidTarget,
+    Other,
 }
 
 /// One target's diagnosis entry in the result.
@@ -1324,6 +1345,18 @@ pub enum TargetProbeOutcome {
 pub struct DiagnoseTargetResult {
     /// The target address the node actually probed (host:port).
     pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_address: Option<String>,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<TargetProbeErrorKind>,
     pub outcome: TargetProbeOutcome,
 }
 
@@ -2088,6 +2121,8 @@ mod tests {
             None,
             0,
             String::new(),
+            Vec::new(),
+            "tcp".into(),
             "chal".into(),
         ))
         .unwrap();

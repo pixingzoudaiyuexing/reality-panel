@@ -239,13 +239,51 @@ function RealityTechnicalEvidence({ diagnosis }: { diagnosis: RealityDiagnosis }
   );
 }
 
-function ProbeOutcome({ outcome }: { outcome: DiagnoseTargetResult['outcome'] }) {
-  if (outcome === 'timeout') return <Text className="rp-mono">timeout</Text>;
-  if ('reachable' in outcome) return <Text className="rp-mono">reachable · {outcome.reachable.elapsed_ms}ms</Text>;
-  return <Text className="rp-mono">failed · {outcome.failed.error}</Text>;
+function targetError(result: DiagnoseTargetResult, t: Tfn) {
+  const keys: Record<string, Parameters<Tfn>[0]> = {
+    dns_resolve_failed: 'diagnosisTargetDnsFailed', connection_refused: 'diagnosisTargetRefused',
+    timeout: 'diagnosisTargetTimeout', network_unreachable: 'diagnosisTargetUnreachable',
+    invalid_target: 'diagnosisTargetInvalid', other: 'diagnosisTargetOtherError',
+  };
+  return t(keys[result.error_kind ?? 'other'] ?? 'diagnosisTargetOtherError');
 }
 
-function NodeTechnicalEvidence({ node }: { node: NodeDiagnoseStatus }) {
+function ProbeOutcome({ result, t }: { result: DiagnoseTargetResult; t: Tfn }) {
+  const { outcome } = result;
+  if (outcome === 'timeout') return <Text type="danger">{t('diagnosisTargetTimeout')}</Text>;
+  if ('not_tested' in outcome) return <Text type="secondary">{t('diagnosisNotTested')}</Text>;
+  if ('reachable' in outcome) return <Text>{t('diagnosisNormal')} · {outcome.reachable.elapsed_ms}ms</Text>;
+  return <Text type="danger">{targetError(result, t)}</Text>;
+}
+
+function TargetConnectionDetails({ rule, nodes, t }: { rule: ForwardRule; nodes: NodeDiagnoseStatus[]; t: Tfn }) {
+  const results = nodes.flatMap((node) => node.status === 'result'
+    ? node.results.map((target) => ({ node, target }))
+    : []);
+  if (rule.protocol === 'udp') return <Alert type="info" showIcon title={t('diagnosisUdpTargetNotTested')} />;
+  if (results.length === 0) return <Text type="secondary">{t('diagnosisTableBackendNotTested')}</Text>;
+  return <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+    {results.map(({ node, target }, index) => {
+      const failed = target.outcome === 'timeout' || ('failed' in target.outcome);
+      const latency = target.outcome !== 'timeout' && 'reachable' in target.outcome ? target.outcome.reachable.elapsed_ms : null;
+      const rawError = target.outcome !== 'timeout' && 'failed' in target.outcome ? target.outcome.failed.error : null;
+      return <div className="rp-diagnosis-target" key={`${node.node_id}:${target.address}:${index}`}>
+        <EvidenceLine label={t('diagnosisCurrentRule')}><Text>Rule {rule.id} · {rule.name}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisRelayNode')}><Text code>{node.public_ip || node.node_id}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisTargetHost')}><Text code>{target.hostname ?? target.address}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisTargetResolvedIp')}><Text code>{target.resolved_ip ?? '-'}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisTargetActualSocket')}><Text code>{target.actual_address ?? '-'}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisTargetProtocol')}><Text>{(target.protocol || rule.protocol).toUpperCase()}</Text></EvidenceLine>
+        <EvidenceLine label={t('diagnosisCurrentStatus')}><ProbeOutcome result={target} t={t} /></EvidenceLine>
+        {latency !== null ? <EvidenceLine label={t('diagnosisTargetLatency')}><Text>{latency}ms</Text></EvidenceLine> : null}
+        {failed ? <Alert type="error" showIcon title={targetError(target, t)} description={t('diagnosisTargetFailureImpact')} /> : null}
+        {rawError ? <EvidenceLine label={t('diagnosisTechnicalInfo')}><Text code>{rawError}</Text></EvidenceLine> : null}
+      </div>;
+    })}
+  </Space>;
+}
+
+function NodeTechnicalEvidence({ node, t }: { node: NodeDiagnoseStatus; t: Tfn }) {
   if (node.status !== 'result') {
     return (
       <div className="rp-diagnosis-evidence">
@@ -270,7 +308,7 @@ function NodeTechnicalEvidence({ node }: { node: NodeDiagnoseStatus }) {
               scroll={{ x: 460 }}
               columns={[
                 { title: 'address', dataIndex: 'address', key: 'address', render: (value: string) => <Text className="rp-mono">{value}</Text> },
-                { title: 'outcome', key: 'outcome', render: (_: unknown, row: DiagnoseTargetResult) => <ProbeOutcome outcome={row.outcome} /> },
+                { title: 'outcome', key: 'outcome', render: (_: unknown, row: DiagnoseTargetResult) => <ProbeOutcome result={row} t={t} /> },
               ]}
             />
           ) : <Text className="rp-mono">not_tested</Text>}
@@ -451,6 +489,7 @@ function buildCheckRows(rule: ForwardRule, result: DiagnoseResponse, t: Tfn): Ch
             : backends.status === 'attention'
               ? t('diagnosisTableBackendAttention')
               : t('diagnosisTableUnknown'),
+    evidence: <TargetConnectionDetails rule={rule} nodes={result.nodes} t={t} />,
   });
 
   if (realityRule) {
@@ -691,7 +730,7 @@ export function RuleDiagnosisModal({ rule, open, onClose, isAdmin, t, nodeId, no
                 showExpandColumn: false,
                 expandedRowKeys: expandedKey?.startsWith('node:') ? [expandedKey] : [],
                 expandedRowRender: (row) => expandedKey === `node:${row.key}`
-                  ? <NodeTechnicalEvidence node={row.node} />
+                  ? <NodeTechnicalEvidence node={row.node} t={t} />
                   : null,
               }}
             />

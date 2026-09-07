@@ -35,6 +35,291 @@ use relay_shared::protocol::ApiResponse;
 /// How long a diagnosis run waits for node results before giving up.
 pub const DIAGNOSE_TIMEOUT: Duration = Duration::from_secs(8);
 
+#[derive(Debug, serde::Serialize)]
+pub struct NodeDiagnosisCheck {
+    pub key: &'static str,
+    pub status: &'static str,
+    pub expected: String,
+    pub actual: String,
+    pub impact: Option<String>,
+    pub technical: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct NodeDiagnosisResponse {
+    pub group_id: i64,
+    pub node_id: String,
+    pub healthy: bool,
+    pub checks: Vec<NodeDiagnosisCheck>,
+}
+
+fn node_check(
+    key: &'static str,
+    ok: bool,
+    expected: impl Into<String>,
+    actual: impl Into<String>,
+    impact: Option<&str>,
+    technical: Option<String>,
+) -> NodeDiagnosisCheck {
+    NodeDiagnosisCheck {
+        key,
+        status: if ok { "normal" } else { "abnormal" },
+        expected: expected.into(),
+        actual: actual.into(),
+        impact: (!ok).then(|| impact.unwrap_or_default().to_string()),
+        technical,
+    }
+}
+
+fn node_not_observed(key: &'static str, expected: impl Into<String>) -> NodeDiagnosisCheck {
+    NodeDiagnosisCheck {
+        key,
+        status: "not_observed",
+        expected: expected.into(),
+        actual: "未取得".into(),
+        impact: None,
+        technical: None,
+    }
+}
+
+pub async fn diagnose_node(
+    _admin: crate::api::middleware::AdminOnly,
+    State(state): State<AppState>,
+    Path((group_id, node_id)): Path<(i64, String)>,
+) -> Json<ApiResponse<NodeDiagnosisResponse>> {
+    let node_id = node_id.trim().to_string();
+    if node_id.is_empty() {
+        return Json(ApiResponse {
+            code: 400,
+            message: "node_id required".into(),
+            data: None,
+        });
+    }
+    let key = format!("node_status:{group_id}:{node_id}");
+    let raw = match state.db.get(&key).await {
+        Ok(Some(raw)) => raw,
+        Ok(None) => {
+            return Json(ApiResponse {
+                code: 404,
+                message: "Node not found".into(),
+                data: None,
+            })
+        }
+        Err(error) => {
+            tracing::error!(
+                group_id,
+                node_id,
+                "node diagnosis status read failed: {error}"
+            );
+            return Json(ApiResponse {
+                code: 500,
+                message: "database error".into(),
+                data: None,
+            });
+        }
+    };
+    let status: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(status) => status,
+        Err(_) => {
+            return Json(ApiResponse {
+                code: 500,
+                message: "invalid node status".into(),
+                data: None,
+            })
+        }
+    };
+    let online = crate::api::stats::status_is_online(&raw, chrono::Utc::now());
+    let ws_online = state
+        .node_connections
+        .config_online_node_ids(group_id)
+        .await
+        .contains(&node_id);
+    let reported_id = status
+        .get("node_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let protocol = status
+        .get("config_protocol_version")
+        .and_then(|value| value.as_u64());
+    let reconciliation = status.get("reconciliation");
+    let reconciliation_state = reconciliation
+        .and_then(|value| value.get("state"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("未取得");
+    let reconciliation_ok = matches!(reconciliation_state, "CONVERGED" | "DEPENDENCY_WITHHELD");
+    let listener_errors = status
+        .get("listener_errors")
+        .and_then(|value| value.as_array());
+    let listener_ok = listener_errors.is_none_or(Vec::is_empty);
+    let listener_count = status
+        .get("active_listener_rule_ids")
+        .and_then(|value| value.as_array())
+        .map(Vec::len);
+    let sites = status
+        .get("camouflage_sites")
+        .and_then(|value| value.as_array());
+    let sites_ok = sites.is_none_or(|sites| {
+        sites
+            .iter()
+            .all(|site| site.get("site_status").and_then(|value| value.as_str()) == Some("active"))
+    });
+    let certificates_ok = sites.is_none_or(|sites| {
+        sites.iter().all(|site| {
+            matches!(
+                site.get("certificate_status")
+                    .and_then(|value| value.as_str()),
+                Some("active" | "renewal_warning")
+            )
+        })
+    });
+    let mut checks = vec![
+        node_check(
+            "heartbeat",
+            online,
+            "节点状态持续更新",
+            status
+                .get("last_seen")
+                .and_then(|value| value.as_str())
+                .unwrap_or("未取得"),
+            Some("Panel 无法确认节点当前状态。"),
+            None,
+        ),
+        node_check(
+            "websocket",
+            ws_online,
+            "WebSocket 控制通道在线",
+            if ws_online { "已连接" } else { "未连接" },
+            Some("实时配置和管理命令无法下发。"),
+            None,
+        ),
+        node_check(
+            "identity",
+            reported_id == node_id,
+            format!("Node ID 为 {node_id}"),
+            if reported_id.is_empty() {
+                String::from("未取得")
+            } else {
+                reported_id.to_string()
+            },
+            Some("节点身份与 Panel 记录不一致。"),
+            None,
+        ),
+        node_check(
+            "version",
+            status
+                .get("node_version")
+                .and_then(|value| value.as_str())
+                .is_some(),
+            "能够取得节点版本",
+            status
+                .get("node_version")
+                .and_then(|value| value.as_str())
+                .unwrap_or("未取得"),
+            Some("无法判断节点能力和升级状态。"),
+            None,
+        ),
+        node_check(
+            "protocol",
+            protocol == Some(relay_shared::protocol::CONFIG_PROTOCOL_VERSION as u64),
+            format!(
+                "配置协议 v{}",
+                relay_shared::protocol::CONFIG_PROTOCOL_VERSION
+            ),
+            protocol
+                .map(|value| format!("v{value}"))
+                .unwrap_or_else(|| "未取得".into()),
+            Some("节点可能无法接收当前配置。"),
+            None,
+        ),
+        node_check(
+            "config_sync",
+            reconciliation_ok,
+            "配置已收敛或仅等待证书依赖",
+            reconciliation_state,
+            Some("节点当前运行配置可能与 Panel 期望不一致。"),
+            reconciliation
+                .and_then(|value| value.get("last_error"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        ),
+    ];
+    checks.push(match listener_count {
+        Some(count) => node_check(
+            "runtime",
+            listener_ok,
+            "没有 listener error",
+            format!(
+                "当前 {count} 条规则监听；错误 {} 条",
+                listener_errors.map_or(0, Vec::len)
+            ),
+            Some("一个或多个监听服务未能正常启动。"),
+            listener_errors
+                .filter(|errors| !errors.is_empty())
+                .and_then(|errors| serde_json::to_string(errors).ok()),
+        ),
+        None => node_not_observed("runtime", "取得当前监听服务状态"),
+    });
+    checks.push(match sites {
+        Some(items) => node_check(
+            "camouflage",
+            sites_ok,
+            "伪装站总体正常",
+            format!("{} 个站点", items.len()),
+            Some("依赖伪装站的 Reality 规则可能不可用。"),
+            None,
+        ),
+        None => node_not_observed("camouflage", "取得伪装站总体状态"),
+    });
+    checks.push(match sites {
+        Some(items) => node_check(
+            "certificate_sync",
+            certificates_ok,
+            "节点证书总体可用",
+            format!("检查 {} 个站点", items.len()),
+            Some("依赖证书的 Reality 规则可能被暂缓。"),
+            None,
+        ),
+        None => node_not_observed("certificate_sync", "取得证书同步总体状态"),
+    });
+    let has_resources = ["cpu", "mem", "disk_usage_percent"]
+        .iter()
+        .any(|key| status.get(key).is_some());
+    checks.push(if has_resources {
+        node_check(
+            "resources",
+            true,
+            "资源遥测可读取",
+            format!(
+                "CPU {} / 内存 {} / 磁盘 {}",
+                status
+                    .get("cpu")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "未取得".into()),
+                status
+                    .get("mem")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "未取得".into()),
+                status
+                    .get("disk_usage_percent")
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "未取得".into())
+            ),
+            None,
+            None,
+        )
+    } else {
+        node_not_observed("resources", "取得 CPU、内存和磁盘遥测")
+    });
+    let healthy = checks.iter().all(|check| check.status != "abnormal");
+    checks.shrink_to_fit();
+    Json(ApiResponse::success(NodeDiagnosisResponse {
+        group_id,
+        node_id,
+        healthy,
+        checks,
+    }))
+}
+
 /// One in-flight (or recently-finished) diagnosis run.
 #[derive(Debug)]
 pub struct DiagnoseRun {
@@ -556,17 +841,6 @@ pub async fn diagnose_rule(
         }
     };
 
-    // v0.4.9: diagnosis is TCP-only. Reject a pure-UDP rule before doing any
-    // work — there's no TCP listener to probe and UDP liveness can't be
-    // verified cheaply. (tcp_udp rules are fine: they have a TCP listener.)
-    if rule.protocol == "udp" {
-        return Json(ApiResponse {
-            code: 400,
-            message: "UDP 暂不支持诊断".into(),
-            data: None,
-        });
-    }
-
     let group_id = rule.device_group_in;
     let reality_rule = rule.public_transport == "nginx_sni"
         || rule.node_transport == "nginx_sni"
@@ -722,12 +996,31 @@ pub async fn diagnose_rule(
             .as_ref()
             .map(|snapshot| snapshot.config_fingerprint.clone())
             .unwrap_or_default();
+        let desired_listener = desired_snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .listeners
+                .iter()
+                .find(|listener| listener.rule_id == rule_id)
+        });
+        let desired_targets = desired_listener
+            .map(|listener| listener.targets.clone())
+            .unwrap_or_default();
+        let desired_protocol = desired_listener
+            .map(|listener| match listener.protocol {
+                relay_shared::protocol::Protocol::Tcp => "tcp",
+                relay_shared::protocol::Protocol::Udp => "udp",
+                relay_shared::protocol::Protocol::TcpUdp => "tcp_udp",
+            })
+            .unwrap_or(rule.protocol.as_str())
+            .to_string();
         let msg = serde_json::to_string(&DiagnoseRuleMessage::new(
             request_id.clone(),
             rule_id,
             desired_sni,
             desired_revision,
             desired_fingerprint,
+            desired_targets,
+            desired_protocol,
             challenge.clone(),
         ))
         .unwrap_or_default();
@@ -1592,6 +1885,50 @@ mod tests {
             classify_node(&row("n1", Some("0.4.14"), Some("1.1.1.1")), &online),
             ClassifyOutcome::Candidate(n) if n == "n1"
         ));
+    }
+
+    #[tokio::test]
+    async fn node_diagnosis_uses_node_telemetry_without_selecting_a_rule() {
+        let (state, _) = test_state().await;
+        state
+            .db
+            .set(
+                "node_status:10:node-a",
+                &serde_json::json!({
+                    "node_id": "node-a",
+                    "last_seen": chrono::Utc::now().to_rfc3339(),
+                    "node_version": "1.1.7",
+                    "config_protocol_version": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+                    "active_listener_rule_ids": [100],
+                    "listener_errors": [],
+                    "camouflage_sites": [],
+                    "cpu": 12.0,
+                    "mem": 24.0,
+                    "disk_usage_percent": 30.0,
+                    "reconciliation": { "state": "CONVERGED" }
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let (_connection, _receiver) = state
+            .node_connections
+            .register(10, Some("node-a".into()))
+            .await;
+        let Json(response) = diagnose_node(
+            crate::api::middleware::AdminOnly { user_id: 1 },
+            State(state),
+            Path((10, "node-a".into())),
+        )
+        .await;
+        let result = response.data.expect("node diagnosis result");
+        assert!(result.healthy);
+        assert_eq!(result.node_id, "node-a");
+        assert!(result.checks.iter().all(|check| check.status == "normal"));
+        assert!(result
+            .checks
+            .iter()
+            .all(|check| !check.actual.contains("Rule 100")));
     }
 
     /// Scenario 2: old version (<0.4.14) → Unsupported, even if WS is online.

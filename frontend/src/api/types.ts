@@ -813,10 +813,17 @@ export interface RuleDnsStatus {
 export type TargetProbeOutcome =
   | { reachable: { elapsed_ms: number } }
   | { failed: { error: string } }
+  | { not_tested: { reason: string } }
   | 'timeout';
 
 export interface DiagnoseTargetResult {
   address: string;
+  hostname?: string | null;
+  resolved_ip?: string | null;
+  actual_address?: string | null;
+  port?: number;
+  protocol?: string;
+  error_kind?: 'dns_resolve_failed' | 'connection_refused' | 'timeout' | 'network_unreachable' | 'invalid_target' | 'other' | null;
   outcome: TargetProbeOutcome;
 }
 
@@ -1006,6 +1013,22 @@ export interface NodeDisplayRow {
   /** Shared-group-only metadata (user view). */
   region?: string | null;
   line_type?: string | null;
+}
+
+export interface NodeDiagnosisCheck {
+  key: string;
+  status: 'normal' | 'abnormal' | 'not_observed';
+  expected: string;
+  actual: string;
+  impact?: string | null;
+  technical?: string | null;
+}
+
+export interface NodeDiagnosisResponse {
+  group_id: number;
+  node_id: string;
+  healthy: boolean;
+  checks: NodeDiagnosisCheck[];
 }
 
 export type NodeLifecycleAction = 'logs' | 'restart' | 'upgrade' | 'uninstall';

@@ -31,7 +31,7 @@ use relay_shared::protocol::{
     DiagnoseResult, DiagnoseTargetResult, RealityBackendDiagnosis, RealityCamouflageDiagnosis,
     RealityCertificateDiagnosis, RealityCheck, RealityConfigDiagnosis, RealityConvergenceDiagnosis,
     RealityDiagnosis, RealityFallbackDiagnosis, RealityNginxDiagnosis, RealityRuntimeDiagnosis,
-    TargetProbeOutcome,
+    TargetProbeErrorKind, TargetProbeOutcome,
 };
 use std::fs;
 use std::process::Command;
@@ -64,6 +64,8 @@ pub async fn run_and_report(
     desired_sni: Option<String>,
     desired_config_revision: u64,
     desired_fingerprint: String,
+    targets: Vec<String>,
+    protocol: String,
     challenge: String,
 ) {
     let result = diagnose(
@@ -75,6 +77,8 @@ pub async fn run_and_report(
         desired_sni,
         desired_config_revision,
         desired_fingerprint,
+        targets,
+        protocol,
         challenge,
     )
     .await;
@@ -96,6 +100,8 @@ async fn diagnose(
     desired_sni: Option<String>,
     desired_config_revision: u64,
     desired_fingerprint: String,
+    desired_targets: Vec<String>,
+    desired_protocol: String,
     challenge: String,
 ) -> DiagnoseResult {
     // v0.4.9: select the rule's TCP listener explicitly. For a tcp_udp rule
@@ -143,7 +149,6 @@ async fn diagnose(
             active_revision,
         );
         drop(manager);
-        diagnosis.backends = reality_backend_results(&listener.targets).await;
         if let Some(sni) = diagnosis.config.sni.as_deref() {
             match probe_local_camouflage(sni, diagnosis.camouflage.tls_listener_port).await {
                 Ok(status) => {
@@ -181,8 +186,39 @@ async fn diagnose(
     };
 
     // Cap targets; probe in bounded-concurrency batches. TCP-only (v0.4.9).
-    let targets_to_probe: Vec<String> = targets.into_iter().take(MAX_TARGETS).collect();
-    let results = probe_targets(&targets_to_probe).await;
+    let targets_to_probe: Vec<String> = if desired_targets.is_empty() {
+        targets
+    } else {
+        desired_targets
+    }
+    .into_iter()
+    .take(MAX_TARGETS)
+    .collect();
+    let results = if desired_protocol == "udp" {
+        targets_to_probe
+            .iter()
+            .map(|address| DiagnoseTargetResult {
+                address: address.clone(),
+                hostname: split_target(address).and_then(|(host, _)| {
+                    host.parse::<std::net::IpAddr>().is_err().then_some(host)
+                }),
+                resolved_ip: None,
+                actual_address: None,
+                port: split_target(address).map_or(0, |(_, port)| port),
+                protocol: "udp".into(),
+                error_kind: None,
+                outcome: TargetProbeOutcome::NotTested {
+                    reason: "generic UDP reachability cannot be verified reliably".into(),
+                },
+            })
+            .collect()
+    } else {
+        probe_targets(&targets_to_probe).await
+    };
+    let mut reality = reality;
+    if let Some(diagnosis) = reality.as_mut() {
+        diagnosis.backends = reality_backend_results(&results);
+    }
 
     DiagnoseResult {
         msg_type: "diagnose_result".into(),
@@ -205,7 +241,11 @@ async fn diagnose(
         challenge,
         listener_running,
         listen_port,
-        protocol,
+        protocol: if desired_protocol.is_empty() {
+            protocol
+        } else {
+            desired_protocol
+        },
         transport,
         results,
         reality,
@@ -371,10 +411,10 @@ fn fallback_diagnosis() -> RealityFallbackDiagnosis {
     }
 }
 
-async fn reality_backend_results(targets: &[String]) -> Vec<RealityBackendDiagnosis> {
-    probe_targets(targets)
-        .await
-        .into_iter()
+fn reality_backend_results(results: &[DiagnoseTargetResult]) -> Vec<RealityBackendDiagnosis> {
+    results
+        .iter()
+        .cloned()
         .map(|result| match result.outcome {
             TargetProbeOutcome::Reachable { elapsed_ms } => RealityBackendDiagnosis {
                 address: result.address,
@@ -389,6 +429,11 @@ async fn reality_backend_results(targets: &[String]) -> Vec<RealityBackendDiagno
             TargetProbeOutcome::Timeout => RealityBackendDiagnosis {
                 address: result.address,
                 check: check("fail", "TCP connection timed out"),
+                elapsed_ms: None,
+            },
+            TargetProbeOutcome::NotTested { reason } => RealityBackendDiagnosis {
+                address: result.address,
+                check: check("not_tested", reason),
                 elapsed_ms: None,
             },
         })
@@ -629,11 +674,7 @@ async fn probe_targets(targets: &[String]) -> Vec<DiagnoseTargetResult> {
         let permit = sem.clone();
         handles.push(tokio::spawn(async move {
             let _p = permit.acquire_owned().await.unwrap();
-            let outcome = probe_tcp(&addr).await;
-            DiagnoseTargetResult {
-                address: addr,
-                outcome,
-            }
+            probe_target(&addr).await
         }));
     }
     let mut out = Vec::with_capacity(handles.len());
@@ -646,8 +687,155 @@ async fn probe_targets(targets: &[String]) -> Vec<DiagnoseTargetResult> {
     out
 }
 
-/// TCP reachability: connect with a 3s deadline. Success → close immediately.
-/// Recorded time is the connect latency.
+fn split_target(value: &str) -> Option<(String, u16)> {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        let port = rest[end + 1..].strip_prefix(':')?.parse().ok()?;
+        return (!host.is_empty() && port > 0).then(|| (host.to_string(), port));
+    }
+    let (host, port) = value.rsplit_once(':')?;
+    let port = port.parse().ok()?;
+    (!host.is_empty() && port > 0).then(|| (host.to_string(), port))
+}
+
+fn connect_error_kind(error: &std::io::Error) -> TargetProbeErrorKind {
+    match error.kind() {
+        std::io::ErrorKind::ConnectionRefused => TargetProbeErrorKind::ConnectionRefused,
+        std::io::ErrorKind::TimedOut => TargetProbeErrorKind::Timeout,
+        std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::HostUnreachable => {
+            TargetProbeErrorKind::NetworkUnreachable
+        }
+        _ => TargetProbeErrorKind::Other,
+    }
+}
+
+async fn probe_target(address: &str) -> DiagnoseTargetResult {
+    let Some((host, port)) = split_target(address) else {
+        return DiagnoseTargetResult {
+            address: address.into(),
+            hostname: None,
+            resolved_ip: None,
+            actual_address: None,
+            port: 0,
+            protocol: "tcp".into(),
+            error_kind: Some(TargetProbeErrorKind::InvalidTarget),
+            outcome: TargetProbeOutcome::Failed {
+                error: "invalid target address".into(),
+            },
+        };
+    };
+    let parsed_ip = host.parse::<std::net::IpAddr>().ok();
+    let hostname = parsed_ip.is_none().then(|| host.clone());
+    let resolved = if let Some(ip) = parsed_ip {
+        vec![std::net::SocketAddr::new(ip, port)]
+    } else {
+        match tokio::time::timeout(
+            PROBE_TIMEOUT,
+            tokio::net::lookup_host((host.as_str(), port)),
+        )
+        .await
+        {
+            Ok(Ok(addresses)) => addresses.collect::<Vec<_>>(),
+            Ok(Err(error)) => {
+                return DiagnoseTargetResult {
+                    address: address.into(),
+                    hostname,
+                    resolved_ip: None,
+                    actual_address: None,
+                    port,
+                    protocol: "tcp".into(),
+                    error_kind: Some(TargetProbeErrorKind::DnsResolveFailed),
+                    outcome: TargetProbeOutcome::Failed {
+                        error: format!("resolve: {error}"),
+                    },
+                }
+            }
+            Err(_) => {
+                return DiagnoseTargetResult {
+                    address: address.into(),
+                    hostname,
+                    resolved_ip: None,
+                    actual_address: None,
+                    port,
+                    protocol: "tcp".into(),
+                    error_kind: Some(TargetProbeErrorKind::DnsResolveFailed),
+                    outcome: TargetProbeOutcome::Failed {
+                        error: "DNS resolution timed out".into(),
+                    },
+                }
+            }
+        }
+    };
+    if resolved.is_empty() {
+        return DiagnoseTargetResult {
+            address: address.into(),
+            hostname,
+            resolved_ip: None,
+            actual_address: None,
+            port,
+            protocol: "tcp".into(),
+            error_kind: Some(TargetProbeErrorKind::DnsResolveFailed),
+            outcome: TargetProbeOutcome::Failed {
+                error: "DNS returned no addresses".into(),
+            },
+        };
+    }
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+    let mut last_error = None;
+    let mut last_address = resolved[0];
+    for socket in resolved {
+        last_address = socket;
+        match tokio::time::timeout_at(deadline, TcpStream::connect(socket)).await {
+            Ok(Ok(_)) => {
+                return DiagnoseTargetResult {
+                    address: address.into(),
+                    hostname,
+                    resolved_ip: Some(socket.ip().to_string()),
+                    actual_address: Some(socket.to_string()),
+                    port,
+                    protocol: "tcp".into(),
+                    error_kind: None,
+                    outcome: TargetProbeOutcome::Reachable {
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    },
+                }
+            }
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                return DiagnoseTargetResult {
+                    address: address.into(),
+                    hostname,
+                    resolved_ip: Some(socket.ip().to_string()),
+                    actual_address: Some(socket.to_string()),
+                    port,
+                    protocol: "tcp".into(),
+                    error_kind: Some(TargetProbeErrorKind::Timeout),
+                    outcome: TargetProbeOutcome::Timeout,
+                }
+            }
+        }
+    }
+    let error = last_error.expect("non-empty resolved targets produced an error");
+    DiagnoseTargetResult {
+        address: address.into(),
+        hostname,
+        resolved_ip: Some(last_address.ip().to_string()),
+        actual_address: Some(last_address.to_string()),
+        port,
+        protocol: "tcp".into(),
+        error_kind: Some(connect_error_kind(&error)),
+        outcome: TargetProbeOutcome::Failed {
+            error: format!("connect: {error}"),
+        },
+    }
+}
+
+/// Test-only direct socket helper. Production probes resolve on the Relay and
+/// report the actual connected address through `probe_target`.
+#[cfg(test)]
 async fn probe_tcp(addr: &str) -> TargetProbeOutcome {
     let start = std::time::Instant::now();
     match tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(addr)).await {
@@ -787,6 +975,11 @@ mod tests {
         assert!(r.contains("12"));
         let r = serde_json::to_string(&TargetProbeOutcome::Failed { error: "x".into() }).unwrap();
         assert!(r.contains("failed"));
+        let r = serde_json::to_string(&TargetProbeOutcome::NotTested {
+            reason: "UDP cannot be confirmed".into(),
+        })
+        .unwrap();
+        assert!(r.contains("not_tested"));
     }
 
     #[tokio::test]
@@ -795,7 +988,7 @@ mod tests {
         let o = probe_tcp("127.0.0.1:1").await;
         match o {
             TargetProbeOutcome::Failed { .. } | TargetProbeOutcome::Timeout => {}
-            TargetProbeOutcome::Reachable { .. } => {
+            TargetProbeOutcome::Reachable { .. } | TargetProbeOutcome::NotTested { .. } => {
                 panic!("port 1 should not be reachable")
             }
         }
@@ -811,6 +1004,39 @@ mod tests {
             matches!(o, TargetProbeOutcome::Reachable { .. }),
             "local listener should be reachable: {:?}",
             o
+        );
+    }
+
+    #[tokio::test]
+    async fn hostname_is_resolved_by_the_relay_and_actual_socket_is_reported() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let result = probe_target(&format!("localhost:{port}")).await;
+        assert_eq!(result.hostname.as_deref(), Some("localhost"));
+        assert_eq!(result.port, port);
+        assert_eq!(result.protocol, "tcp");
+        assert!(result.resolved_ip.is_some());
+        assert!(result.actual_address.is_some());
+        assert!(matches!(
+            result.outcome,
+            TargetProbeOutcome::Reachable { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn refused_target_returns_a_machine_readable_reason() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let result = probe_target(&address.to_string()).await;
+        assert_eq!(result.hostname, None);
+        assert_eq!(
+            result.actual_address.as_deref(),
+            Some(address.to_string().as_str())
+        );
+        assert_eq!(
+            result.error_kind,
+            Some(TargetProbeErrorKind::ConnectionRefused)
         );
     }
 

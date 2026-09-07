@@ -530,12 +530,15 @@ async fn connect_and_run(
                             let desired_sni = dm.desired_sni.clone();
                             let desired_revision = dm.config_revision;
                             let desired_fingerprint = dm.config_fingerprint.clone();
+                            let targets = dm.targets.clone();
+                            let protocol = dm.protocol.clone();
                             let challenge = dm.challenge.clone();
                             let reconciler = reconciler.clone();
                             tokio::spawn(async move {
                                 crate::diagnose::run_and_report(
                                     &mgr, &sites, &reconciler, &cfg, &nid, req_id, rid,
-                                    desired_sni, desired_revision, desired_fingerprint, challenge,
+                                    desired_sni, desired_revision, desired_fingerprint, targets,
+                                    protocol, challenge,
                                 )
                                 .await;
                             });

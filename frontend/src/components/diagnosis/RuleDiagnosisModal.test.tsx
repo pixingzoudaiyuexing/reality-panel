@@ -159,7 +159,7 @@ describe('RuleDiagnosisModal table diagnosis', () => {
     renderModal(realityRule, zhT);
     await settle();
     const certificate = screen.getByText('证书').closest('tr') as HTMLElement;
-    const route = screen.getByText('Reality 路由').closest('tr') as HTMLElement;
+    const route = screen.getByText('SNI 路由').closest('tr') as HTMLElement;
     expect(certificate).toHaveTextContent('等待');
     expect(certificate).not.toHaveTextContent('异常');
     expect(route).toHaveTextContent('等待');
@@ -230,7 +230,7 @@ describe('RuleDiagnosisModal table diagnosis', () => {
     ));
     renderModal(realityRule, zhT);
     await settle();
-    const label = layer === 'certificate' ? '证书' : 'Reality 路由';
+    const label = layer === 'certificate' ? '证书' : 'SNI 路由';
     expect(screen.getByText(label).closest('tr')).toHaveTextContent(expected);
   });
 
@@ -239,7 +239,7 @@ describe('RuleDiagnosisModal table diagnosis', () => {
     renderModal(realityRule, zhT);
     await settle();
     expect(screen.getByText('证书').closest('tr')).toHaveTextContent('正常');
-    expect(screen.getByText('Reality 路由').closest('tr')).toHaveTextContent('正常');
+    expect(screen.getByText('SNI 路由').closest('tr')).toHaveTextContent('正常');
   });
 
   it('surfaces a failed TLS handshake in the Certificate row without changing RC9 overall logic', async () => {
@@ -270,7 +270,7 @@ describe('RuleDiagnosisModal table diagnosis', () => {
     renderModal(realityRule, zhT);
     await settle();
     expect(screen.getByTestId('diagnosis-conclusion')).toHaveTextContent('诊断结论: 部分异常');
-    const route = screen.getByText('Reality 路由').closest('tr');
+    const route = screen.getByText('SNI 路由').closest('tr');
     expect(route).not.toHaveTextContent('正常');
     expect(route).toHaveTextContent('伪装站检查异常');
   });
@@ -280,7 +280,7 @@ describe('RuleDiagnosisModal table diagnosis', () => {
     mockPost.mockResolvedValue(response([diagnosedNode('node-a', '192.0.2.10', { reality: nodeReality })]));
     renderModal(realityRule, zhT);
     await settle();
-    const route = screen.getByText('Reality 路由').closest('tr');
+    const route = screen.getByText('SNI 路由').closest('tr');
     expect(route).toHaveTextContent('需注意');
     expect(route).toHaveTextContent('回退链路存在警告');
   });
@@ -400,5 +400,26 @@ describe('RuleDiagnosisModal table diagnosis', () => {
     expect(screen.getByText(/等待节点响应超时/)).toBeInTheDocument();
     expect(screen.getByText(/规则不存在于节点已接受的配置中/)).toBeInTheDocument();
     expect(screen.getByText(/nginx -t failed: invalid mapping/)).toBeInTheDocument();
+  });
+
+  it('explains the Relay-resolved hostname and actual failed socket in Chinese', async () => {
+    mockPost.mockResolvedValue(response([diagnosedNode('node-a', '192.0.2.10', {
+      results: [{
+        address: 'target.example.com:55443', hostname: 'target.example.com', resolved_ip: '192.0.2.44',
+        actual_address: '192.0.2.44:55443', port: 55443, protocol: 'tcp', error_kind: 'connection_refused',
+        outcome: { failed: { error: 'connect: Connection refused (os error 61)' } },
+      }],
+      reality: reality({ backends: [{ address: 'target.example.com:55443', check: { state: 'fail' } }] }),
+    })]));
+    renderModal(realityRule, zhT);
+    await settle();
+    const row = screen.getByText('转发目标连接').closest('tr') as HTMLElement;
+    fireEvent.click(within(row).getByRole('button', { name: '查看详情' }));
+    expect(screen.getByText('target.example.com')).toBeInTheDocument();
+    expect(screen.getByText('192.0.2.44')).toBeInTheDocument();
+    expect(screen.getByText('192.0.2.44:55443')).toBeInTheDocument();
+    expect(screen.getAllByText('目标服务器可以到达，但目标端口没有接受连接。')).toHaveLength(2);
+    expect(screen.getByText(/入口、DNS、证书和监听即使正常/)).toBeInTheDocument();
+    expect(screen.getByText(/Connection refused/)).toBeInTheDocument();
   });
 });
