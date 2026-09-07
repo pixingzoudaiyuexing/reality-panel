@@ -1682,9 +1682,6 @@ pub(crate) async fn schedule_line_upsert(
     expected_value: &str,
 ) -> Result<(), LineDesiredError> {
     let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
-    if line.key == DEFAULT_LINE_KEY {
-        return Err(LineDesiredError::InvalidLine);
-    }
     let desired = line_desired_for_rule(db, rule_id, line, Some(expected_value)).await?;
     persist_line_desired(db, &desired, "UPSERT", Some(expected_value), true).await
 }
@@ -1696,9 +1693,6 @@ pub(crate) async fn schedule_line_delete(
     raw_line_id: &str,
 ) -> Result<(), LineDesiredError> {
     let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
-    if line.key == DEFAULT_LINE_KEY {
-        return Err(LineDesiredError::InvalidLine);
-    }
     let desired = line_desired_for_rule(db, rule_id, line, None).await?;
     persist_line_desired(db, &desired, "DELETE", None, true).await
 }
@@ -1712,7 +1706,7 @@ pub(crate) async fn schedule_transaction_line(
     value: Option<&str>,
 ) -> Result<(), LineDesiredError> {
     let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
-    if line.key == DEFAULT_LINE_KEY || !matches!(action, "UPSERT" | "DELETE") {
+    if !matches!(action, "UPSERT" | "DELETE") {
         return Err(LineDesiredError::InvalidLine);
     }
     let fqdn = normalize_fqdn(fqdn).map_err(|_| LineDesiredError::InvalidRule)?;
@@ -2061,6 +2055,22 @@ async fn project_line_desired(
     let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
     let desired = line_desired_for_rule(db, rule_id, line, value).await?;
     persist_line_desired(db, &desired, action, value, false).await
+}
+
+pub(crate) async fn project_carrier_line_desired(
+    db: &dyn Repository,
+    rule_id: i64,
+    raw_line_id: &str,
+    value: Option<&str>,
+) -> Result<(), LineDesiredError> {
+    project_line_desired(
+        db,
+        rule_id,
+        raw_line_id,
+        if value.is_some() { "UPSERT" } else { "DELETE" },
+        value,
+    )
+    .await
 }
 
 /// Schedule an eligible rule after its DB transaction has committed. Any
@@ -2712,6 +2722,9 @@ async fn reconciliation_tick(state: &AppState) {
             "dns reconciliation: desired-state refresh failed: {}",
             error
         );
+    }
+    if let Err(error) = crate::service::relay_preference::refresh_carrier_desired(state).await {
+        tracing::error!("carrier desired-state refresh failed: {error}");
     }
     let client = match load_client(state.db.as_ref()).await {
         Ok(Some(client)) => client,

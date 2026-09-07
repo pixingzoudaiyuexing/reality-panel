@@ -228,7 +228,6 @@ pub async fn set_carrier_affinity(
                 CarrierPolicyApplyError::InvalidPolicy(_)
                 | CarrierPolicyApplyError::LineUnavailable(_)
                 | CarrierPolicyApplyError::NodeNotInGroup(_)
-                | CarrierPolicyApplyError::TargetNotReady { .. }
                 | CarrierPolicyApplyError::TargetPublicIpv4Invalid(_)
                 | CarrierPolicyApplyError::OwnershipUnverified { .. } => {
                     (StatusCode::UNPROCESSABLE_ENTITY, 422, error.to_string())

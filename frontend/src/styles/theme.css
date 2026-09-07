@@ -874,6 +874,29 @@ html, body, #root {
   font-size: 12px;
 }
 
+.rp-carrier-node-grid {
+  margin-top: 10px;
+  border-top: 1px solid var(--rp-border);
+}
+
+.rp-carrier-node-grid-head,
+.rp-carrier-node-grid-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(130px, 0.8fr) minmax(160px, auto) minmax(240px, 1.6fr);
+  gap: 12px;
+  align-items: center;
+  min-height: 48px;
+  padding: 7px 4px;
+  border-bottom: 1px solid var(--rp-border);
+}
+
+.rp-carrier-node-grid-head {
+  min-height: 36px;
+  color: var(--rp-text-secondary);
+  background: var(--rp-table-header-bg);
+  font-size: 12px;
+}
+
 .rp-provider-decides-note {
   display: block;
   margin-top: 8px;
@@ -953,6 +976,20 @@ html, body, #root {
 @media (max-width: 720px) {
   .rp-routing-grid-head {
     display: none;
+  }
+
+  .rp-carrier-node-grid-head {
+    display: none;
+  }
+
+  .rp-carrier-node-grid-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 10px;
+  }
+
+  .rp-carrier-node-grid-row > :nth-child(2),
+  .rp-carrier-node-grid-row > :nth-child(4) {
+    grid-column: 1 / -1;
   }
 
   .rp-routing-grid-row {

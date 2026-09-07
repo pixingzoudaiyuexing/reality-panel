@@ -390,10 +390,6 @@ pub enum CarrierPolicyApplyError {
     CatalogStale,
     LineUnavailable(String),
     NodeNotInGroup(String),
-    TargetNotReady {
-        node_id: String,
-        reasons: Vec<String>,
-    },
     TargetPublicIpv4Invalid(String),
     DnsMgrUnavailable,
     ProviderPreflight(String),
@@ -420,11 +416,6 @@ impl std::fmt::Display for CarrierPolicyApplyError {
             Self::NodeNotInGroup(node_id) => {
                 write!(f, "target node does not belong to this group: {node_id}")
             }
-            Self::TargetNotReady { node_id, reasons } => write!(
-                f,
-                "target node is not ready: {node_id}:{}",
-                reasons.join(",")
-            ),
             Self::TargetPublicIpv4Invalid(node_id) => {
                 write!(f, "target node public IPv4 is invalid: {node_id}")
             }
@@ -1124,12 +1115,22 @@ pub(crate) async fn carrier_line_desired_for_rule(
     Ok(desired.into_values().collect())
 }
 
+fn carrier_sync_key(line_id: &str) -> String {
+    if crate::service::dnsmgr::ProviderLine::from_provider(line_id, None).key
+        == crate::service::dnsmgr::DEFAULT_LINE_KEY
+    {
+        crate::service::dnsmgr::DEFAULT_LINE_KEY.into()
+    } else {
+        format!("dnsmgr:{line_id}")
+    }
+}
+
 fn carrier_binding_target(
     binding: &CarrierLineBinding,
     default_value: Option<&str>,
     default_node_id: Option<&str>,
     evaluated: &[EvaluatedNode],
-) -> Result<(Option<String>, String), CarrierPolicyApplyError> {
+) -> Result<(Option<String>, Option<String>), CarrierPolicyApplyError> {
     match binding.mode {
         CarrierLineMode::FollowDefault => {
             let default_value = default_value.expect("FollowDefault preflight resolved default");
@@ -1141,15 +1142,12 @@ fn carrier_binding_target(
                     return Err(CarrierPolicyApplyError::NodeNotInGroup(node_id.into()));
                 };
                 if !node.info.ready {
-                    return Err(CarrierPolicyApplyError::TargetNotReady {
-                        node_id: node_id.into(),
-                        reasons: node.info.ready_reasons.clone(),
-                    });
+                    return Ok((Some(node_id.into()), None));
                 }
             }
             Ok((
                 default_node_id.map(str::to_string),
-                default_value.to_string(),
+                Some(default_value.to_string()),
             ))
         }
         CarrierLineMode::Node => {
@@ -1163,18 +1161,15 @@ fn carrier_binding_target(
             else {
                 return Err(CarrierPolicyApplyError::NodeNotInGroup(node_id.into()));
             };
+            if !node.info.ready {
+                return Ok((Some(node_id.into()), None));
+            }
             let Some(value) = valid_public_ipv4(node.public_ipv4.as_deref()) else {
                 return Err(CarrierPolicyApplyError::TargetPublicIpv4Invalid(
                     node_id.into(),
                 ));
             };
-            if !node.info.ready {
-                return Err(CarrierPolicyApplyError::TargetNotReady {
-                    node_id: node_id.into(),
-                    reasons: node.info.ready_reasons.clone(),
-                });
-            }
-            Ok((Some(node_id.into()), value))
+            Ok((Some(node_id.into()), Some(value)))
         }
     }
 }
@@ -1360,17 +1355,17 @@ pub async fn start_carrier_policy_apply(
                 }
             };
             let (target_action, target_value) = match change.new.as_ref() {
-                Some(_) => (
-                    RelayDnsAction::Upsert,
-                    targets.get(&change.line_id).cloned(),
-                ),
+                Some(_) => match targets.get(&change.line_id).cloned().flatten() {
+                    Some(value) => (RelayDnsAction::Upsert, Some(value)),
+                    None => (RelayDnsAction::Delete, None),
+                },
                 None => (RelayDnsAction::Delete, None),
             };
             records.push(RelayDnsTransactionRecord {
                 rule_id: *rule_id,
                 fqdn: fqdn.clone(),
                 line_id: change.line_id.clone(),
-                line_key: format!("dnsmgr:{}", change.line_id),
+                line_key: carrier_sync_key(&change.line_id),
                 target_action,
                 target_value,
                 rollback_action,
@@ -1412,6 +1407,65 @@ pub(crate) async fn carrier_policy_is_configured(
             .pending_carrier_policy
             .as_ref()
             .is_some_and(|policy| !policy.bindings.is_empty()))
+}
+
+/// Re-project persisted Carrier assignments through the existing DNSMgr worker.
+/// Assignment is durable; Relay readiness only decides whether its record should
+/// currently exist. Active Relay transactions remain authoritative until their
+/// existing finalizer reaches a terminal state.
+pub(crate) async fn refresh_carrier_desired(
+    state: &crate::api::AppState,
+) -> Result<(), RelayPreferenceError> {
+    for (key, raw) in state.db.scan_prefix(RELAY_PREFERENCE_KEY_PREFIX).await? {
+        let Some(group_id) = key
+            .strip_prefix(RELAY_PREFERENCE_KEY_PREFIX)
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        let preference: RelayPreferenceState =
+            serde_json::from_str(&raw).map_err(RelayPreferenceError::InvalidPreference)?;
+        if preference.carrier_policy.bindings.is_empty()
+            || matches!(
+                preference.state,
+                RelayPreferencePhase::Switching | RelayPreferencePhase::RollingBack
+            )
+        {
+            continue;
+        }
+        let evaluated =
+            evaluate_group_nodes(state.db.as_ref(), &state.node_connections, group_id).await?;
+        let rule_ids =
+            crate::service::dnsmgr::eligible_rule_ids_for_group(state.db.as_ref(), group_id)
+                .await?;
+        for binding in &preference.carrier_policy.bindings {
+            let node_id = match binding.mode {
+                CarrierLineMode::Node => binding.node_id.as_deref(),
+                CarrierLineMode::FollowDefault => preference.preferred_node_id.as_deref(),
+            };
+            let value = node_id.and_then(|node_id| {
+                evaluated
+                    .iter()
+                    .find(|node| node.info.node_id == node_id && node.info.ready)
+                    .and_then(|node| valid_public_ipv4(node.public_ipv4.as_deref()))
+            });
+            for rule_id in &rule_ids {
+                crate::service::dnsmgr::project_carrier_line_desired(
+                    state.db.as_ref(),
+                    *rule_id,
+                    &binding.line_id,
+                    value.as_deref(),
+                )
+                .await
+                .map_err(|error| {
+                    RelayPreferenceError::Database(DbError::Other(sqlx::Error::Protocol(format!(
+                        "carrier desired projection failed: {error:?}"
+                    ))))
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn build_dns_transaction_records(
@@ -2786,7 +2840,7 @@ pub async fn get_carrier_affinity(
             CarrierLineMode::FollowDefault => preference.preferred_node_id.clone(),
             CarrierLineMode::Node => binding.node_id.clone(),
         };
-        let line_key = format!("dnsmgr:{}", binding.line_id);
+        let line_key = carrier_sync_key(&binding.line_id);
         let mut states = Vec::with_capacity(eligible.len());
         for rule_id in &eligible {
             states.push(
@@ -3756,7 +3810,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_follow_default_requires_ready_preferred_but_unrelated_nodes_do_not_block() {
+    fn carrier_assignment_persists_while_readiness_controls_dns_presence() {
         let ready = EvaluatedNode {
             info: RelayReadyNode {
                 node_id: "node-a".into(),
@@ -3788,9 +3842,9 @@ mod tests {
                 &[ready, unhealthy]
             )
             .unwrap(),
-            (Some("node-a".into()), "203.0.113.5".into())
+            (Some("node-a".into()), Some("203.0.113.5".into()))
         );
-        assert!(matches!(
+        assert_eq!(
             carrier_binding_target(
                 &binding,
                 Some("203.0.113.6"),
@@ -3806,9 +3860,10 @@ mod tests {
                     },
                     public_ipv4: Some("203.0.113.6".into()),
                 }]
-            ),
-            Err(CarrierPolicyApplyError::TargetNotReady { .. })
-        ));
+            )
+            .unwrap(),
+            (Some("node-b".into()), None)
+        );
 
         let explicit = carrier_binding("Liantong", CarrierLineMode::Node, Some("node-c"));
         assert_eq!(
@@ -3829,7 +3884,7 @@ mod tests {
                 }]
             )
             .unwrap(),
-            (Some("node-c".into()), "203.0.113.7".into())
+            (Some("node-c".into()), Some("203.0.113.7".into()))
         );
     }
 

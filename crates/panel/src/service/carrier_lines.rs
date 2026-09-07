@@ -103,7 +103,11 @@ pub async fn group_catalog(
     eligible_snis.dedup();
     if eligible_snis.is_empty() {
         return Ok(CarrierLineCatalog {
-            lines: Vec::new(),
+            lines: vec![CarrierLine {
+                id: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
+                name: "全网默认".into(),
+                parent: None,
+            }],
             stale: false,
         });
     }
@@ -197,7 +201,16 @@ async fn fetch_catalog(
             .map_err(CarrierLineCatalogError::Provider)?;
         catalogs.push(normalize_lines(detail.record_lines)?);
     }
-    Ok(intersect_catalogs(catalogs))
+    let mut lines = intersect_catalogs(catalogs);
+    lines.insert(
+        0,
+        CarrierLine {
+            id: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
+            name: "全网默认".into(),
+            parent: None,
+        },
+    );
+    Ok(lines)
 }
 
 async fn list_domains(client: &DnsMgrClient) -> Result<Vec<DnsMgrDomain>, CarrierLineCatalogError> {
