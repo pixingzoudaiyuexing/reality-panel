@@ -458,6 +458,10 @@ pub fn routes() -> Router<AppState> {
             axum::routing::get(node_ops::download_artifact),
         )
         .route(
+            "/node/uninstall_result",
+            axum::routing::post(node_ops::receive_uninstall_result),
+        )
+        .route(
             "/node/report_traffic",
             axum::routing::post(node::report_traffic),
         )

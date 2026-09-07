@@ -287,7 +287,7 @@ impl NodeOperationRegistry {
             NodeLifecycleEventStatus::Completed
                 if operation.action == NodeLifecycleAction::Uninstall =>
             {
-                entry.uninstall_final = true;
+                operation.message = "legacy uninstall acknowledgement received; waiting for verified cleanup result".into();
                 OperationStatus::Verifying
             }
             NodeLifecycleEventStatus::Completed => OperationStatus::Success,
@@ -324,6 +324,40 @@ impl NodeOperationRegistry {
             }
         }
         transitioned
+    }
+
+    fn uninstall_result(
+        &self,
+        group_id: i64,
+        node_id: &str,
+        operation_id: &str,
+        success: bool,
+        message: String,
+    ) -> Option<NodeOperation> {
+        let mut inner = self.inner.lock().expect("node operation registry lock");
+        let entry = inner.get_mut(operation_id)?;
+        if entry.operation.group_id != group_id
+            || entry.operation.node_id != node_id
+            || entry.operation.action != NodeLifecycleAction::Uninstall
+        {
+            return None;
+        }
+        if entry.operation.status.terminal() {
+            return Some(entry.operation.clone());
+        }
+        entry.operation.updated_at = now();
+        entry.operation.message = message;
+        if !success {
+            entry.operation.status = OperationStatus::Failed;
+        } else {
+            entry.uninstall_final = true;
+            entry.operation.status = if entry.saw_disconnect {
+                OperationStatus::Success
+            } else {
+                OperationStatus::Verifying
+            };
+        }
+        Some(entry.operation.clone())
     }
 
     pub fn connected(
@@ -950,12 +984,103 @@ pub async fn download_artifact(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UninstallResultRequest {
+    pub operation_id: String,
+    pub node_id: String,
+    pub success: bool,
+    pub message: String,
+}
+
+pub async fn receive_uninstall_result(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UninstallResultRequest>,
+) -> Response {
+    let Some(token) = extract_node_token(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let group = match state.db.find_by_token(&token).await {
+        Ok(Some(group)) if group.group_type == "in" => group,
+        Ok(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let authenticated_node_id = headers
+        .get("X-Node-ID")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    if authenticated_node_id != Some(request.node_id.trim()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(operation) = state.node_operations.uninstall_result(
+        group.id,
+        request.node_id.trim(),
+        request.operation_id.trim(),
+        request.success,
+        request.message,
+    ) else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    audit_terminal_operation(&state, &operation).await;
+    success(operation)
+}
+
+async fn cleanup_uninstalled_node(state: &AppState, group_id: i64, node_id: &str) {
+    let status_key = format!("node_status:{group_id}:{node_id}");
+    if let Ok(Some(raw)) = state.db.get(&status_key).await {
+        if let Some(ips) = crate::api::stats::public_ips_from_status_json(&raw) {
+            for ip in ips {
+                let _ = state.db.delete(&format!("geoip:{ip}")).await;
+            }
+        }
+    }
+    let _ = state.db.delete(&status_key).await;
+    let _ = state
+        .db
+        .delete(&format!("node_config_revision:{group_id}:{node_id}"))
+        .await;
+    if let Err(error) = crate::service::relay_preference::remove_node_assignment(
+        state.db.as_ref(),
+        group_id,
+        node_id,
+    )
+    .await
+    {
+        tracing::warn!(
+            group_id,
+            node_id,
+            "uninstall carrier cleanup failed: {error}"
+        );
+    }
+    let _ =
+        crate::service::relay_failover::remove_excluded_node(state.db.as_ref(), group_id, node_id)
+            .await;
+    if let Err(error) = crate::service::relay_schedule::delete_schedules_for_node(
+        state.db.as_ref(),
+        group_id,
+        node_id,
+    )
+    .await
+    {
+        tracing::warn!(
+            group_id,
+            node_id,
+            "uninstall schedule cleanup failed: {error}"
+        );
+    }
+}
+
 pub async fn audit_terminal_operation(state: &AppState, operation: &NodeOperation) {
     if !operation.status.terminal()
         || operation.action == NodeLifecycleAction::Logs
         || !state.node_operations.claim_terminal_audit(&operation.id)
     {
         return;
+    }
+    if operation.action == NodeLifecycleAction::Uninstall
+        && operation.status == OperationStatus::Success
+    {
+        cleanup_uninstalled_node(state, operation.group_id, &operation.node_id).await;
     }
     let action = format!("{:?}", operation.action).to_ascii_lowercase();
     crate::service::audit::record(
@@ -1648,7 +1773,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_requires_final_event_and_disconnect() {
+    fn uninstall_requires_verified_cleanup_result_and_disconnect() {
         let registry = NodeOperationRegistry::new();
         let operation = start(&registry, "a", NodeLifecycleAction::Uninstall);
         registry.event(
@@ -1667,9 +1792,92 @@ mod tests {
             1,
             lifecycle_event(&operation, NodeLifecycleEventStatus::Completed),
         );
-        assert_eq!(
-            registry.disconnected(1, "a")[0].status,
+        assert!(registry.disconnected(1, "a").is_empty());
+        assert_ne!(
+            registry.get(&operation.id).unwrap().status,
             OperationStatus::Success
+        );
+    }
+
+    #[test]
+    fn uninstall_cleanup_result_and_disconnect_are_order_independent() {
+        let confirmation_first = NodeOperationRegistry::new();
+        let operation = confirmation_first
+            .start(
+                1,
+                "node-a".into(),
+                NodeLifecycleAction::Uninstall,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let waiting = confirmation_first
+            .uninstall_result(1, "node-a", &operation.id, true, "cleanup complete".into())
+            .unwrap();
+        assert_eq!(waiting.status, OperationStatus::Verifying);
+        assert_eq!(
+            confirmation_first.disconnected(1, "node-a")[0].status,
+            OperationStatus::Success
+        );
+
+        let disconnect_first = NodeOperationRegistry::new();
+        let operation = disconnect_first
+            .start(
+                1,
+                "node-a".into(),
+                NodeLifecycleAction::Uninstall,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(disconnect_first.disconnected(1, "node-a").is_empty());
+        let completed = disconnect_first
+            .uninstall_result(1, "node-a", &operation.id, true, "cleanup complete".into())
+            .unwrap();
+        assert_eq!(completed.status, OperationStatus::Success);
+    }
+
+    #[test]
+    fn uninstall_failure_is_terminal_and_wrong_correlation_is_rejected() {
+        let registry = NodeOperationRegistry::new();
+        let operation = registry
+            .start(
+                1,
+                "node-a".into(),
+                NodeLifecycleAction::Uninstall,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(registry
+            .uninstall_result(2, "node-a", &operation.id, true, "wrong group".into())
+            .is_none());
+        assert!(registry
+            .uninstall_result(1, "node-b", &operation.id, true, "wrong node".into())
+            .is_none());
+        let failed = registry
+            .uninstall_result(
+                1,
+                "node-a",
+                &operation.id,
+                false,
+                "nginx cleanup failed".into(),
+            )
+            .unwrap();
+        assert_eq!(failed.status, OperationStatus::Failed);
+        assert!(registry.disconnected(1, "node-a").is_empty());
+        assert_eq!(
+            registry.get(&operation.id).unwrap().status,
+            OperationStatus::Failed
         );
     }
 
@@ -1866,5 +2074,52 @@ mod tests {
         for secret_name in ["NODE_TOKEN", "Authorization", "Bearer", "password"] {
             assert!(!detail.contains(secret_name));
         }
+    }
+
+    #[tokio::test]
+    async fn successful_uninstall_cleans_only_node_scoped_panel_state() {
+        let (state, _) = test_state().await;
+        state
+            .db
+            .set("node_status:1:node-a", r#"{"public_ipv4":"192.0.2.10"}"#)
+            .await
+            .unwrap();
+        state.db.set("geoip:192.0.2.10", "{}").await.unwrap();
+        state
+            .db
+            .set(
+                "node_config_revision:1:node-a",
+                r#"{"revision":7,"fingerprint":"x"}"#,
+            )
+            .await
+            .unwrap();
+        state.db.set("relay_preference:1", r#"{"preferred_node_id":"node-a","pending_node_id":null,"state":"idle","started_at":null,"last_error":null,"rollback_error":null,"dns_records":[],"carrier_policy":{"bindings":[{"line_id":"Dianxin","mode":"node","node_id":"node-a"}]},"pending_carrier_policy":null,"transaction_kind":null}"#).await.unwrap();
+        state.db.set(crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY, r#"[{"id":"a","group_id":1,"target_node_id":"node-a","schedule_type":"daily","enabled":true,"created_at":"x","updated_at":"x","execute_at":null,"time":"12:00","utc_offset_minutes":0,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null},{"id":"b","group_id":1,"target_node_id":"node-b","schedule_type":"daily","enabled":true,"created_at":"x","updated_at":"x","execute_at":null,"time":"12:00","utc_offset_minutes":0,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null}]"#).await.unwrap();
+
+        cleanup_uninstalled_node(&state, 1, "node-a").await;
+
+        assert!(state
+            .db
+            .get("node_status:1:node-a")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state.db.get("geoip:192.0.2.10").await.unwrap().is_none());
+        assert!(state
+            .db
+            .get("node_config_revision:1:node-a")
+            .await
+            .unwrap()
+            .is_none());
+        let preference = crate::service::relay_preference::load_preference(state.db.as_ref(), 1)
+            .await
+            .unwrap();
+        assert!(preference.preferred_node_id.is_none());
+        assert!(preference.carrier_policy.bindings.is_empty());
+        let schedules = crate::service::relay_schedule::list_schedules(state.db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].target_node_id, "node-b");
     }
 }

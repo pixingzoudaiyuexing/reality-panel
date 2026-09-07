@@ -441,6 +441,23 @@ pub async fn delete_schedules_for_group(
     Ok(removed_count)
 }
 
+pub async fn delete_schedules_for_node(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: &str,
+) -> Result<usize, RelayScheduleError> {
+    let _guard = RELAY_SCHEDULE_MUTATION_LOCK.lock().await;
+    let mut schedules = load_schedules(db).await?;
+    let original_len = schedules.len();
+    schedules
+        .retain(|schedule| schedule.group_id != group_id || schedule.target_node_id != node_id);
+    let removed = original_len - schedules.len();
+    if removed > 0 {
+        save_schedules(db, &schedules).await?;
+    }
+    Ok(removed)
+}
+
 pub async fn set_schedule_enabled(
     db: &dyn Repository,
     id: &str,

@@ -7,6 +7,7 @@ use relay_shared::protocol::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tokio::sync::mpsc;
@@ -17,9 +18,28 @@ const MANAGED_BINARY: &str = "/opt/relay-node/relay-node";
 const UNINSTALL_REMOVE_FILES: &[&str] = &[
     "/etc/systemd/system/relay-node.service",
     "/etc/nginx/relay-panel-stream.d/relay-panel-sni.conf",
+    "/var/log/nginx/relay-panel-sni.log",
+    "/var/log/nginx/relay-panel-camouflage.log",
 ];
-const UNINSTALL_REMOVE_DIRS: &[&str] = &["/etc/relay-node", "/opt/relay-node"];
+const UNINSTALL_REMOVE_DIRS: &[&str] = &[
+    "/etc/relay-node",
+    "/opt/relay-node",
+    "/etc/relay-panel",
+    "/etc/nginx/relay-panel-stream.d",
+    "/etc/nginx/relay-panel-certs",
+    "/var/www/relay-panel-certbot",
+];
 const UNINSTALL_SYSTEMCTL_ARGS: &[&str] = &["disable", "--now", "relay-node.service"];
+const OPENLIST_IMAGE: &str =
+    "openlistteam/openlist@sha256:3bfba7ab379594c3f140e61ecc9096d66360cd4654ccea9f6cb8164b679a669d";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UninstallJob {
+    operation_id: String,
+    node_id: String,
+    panel_url: String,
+    token: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PendingBootOperation {
@@ -166,6 +186,35 @@ fn schedule_systemd(args: &[&str], unit_suffix: &str, operation_id: &str) -> Res
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+fn write_uninstall_job(
+    config: &NodeConfig,
+    command: &NodeLifecycleCommand,
+) -> Result<PathBuf, String> {
+    let path = PathBuf::from(format!(
+        "/run/relay-node-uninstall-{}.json",
+        command.operation_id
+    ));
+    let job = UninstallJob {
+        operation_id: command.operation_id.clone(),
+        node_id: command.node_id.clone(),
+        panel_url: config.panel_url.clone(),
+        token: config.token.clone(),
+    };
+    let bytes = serde_json::to_vec(&job).map_err(|error| error.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("create uninstall job: {error}"))?;
+    use std::io::Write;
+    file.write_all(&bytes)
+        .map_err(|error| format!("write uninstall job: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("sync uninstall job: {error}"))?;
+    Ok(path)
 }
 
 fn redact_logs(input: &str, token: &str) -> String {
@@ -503,11 +552,17 @@ pub(crate) async fn execute(
             let binary = std::env::current_exe()
                 .map_err(|error| format!("locate relay-node binary: {error}"))?;
             let binary = binary.to_string_lossy().into_owned();
-            schedule_systemd(
-                &[&binary, "--lifecycle-uninstall"],
+            let job = write_uninstall_job(&config, &command)?;
+            let job_arg = job.to_string_lossy().into_owned();
+            let scheduled = schedule_systemd(
+                &[&binary, "--lifecycle-uninstall", &job_arg],
                 "uninstall",
                 &command.operation_id,
-            )
+            );
+            if scheduled.is_err() {
+                let _ = std::fs::remove_file(job);
+            }
+            scheduled
         }),
     };
 
@@ -515,8 +570,8 @@ pub(crate) async fn execute(
         Ok(()) if command.action == NodeLifecycleAction::Uninstall => emit(
             &tx,
             &command,
-            NodeLifecycleEventStatus::Completed,
-            "uninstall scheduled; persistent OpenList data will be retained",
+            NodeLifecycleEventStatus::Restarting,
+            "uninstall helper scheduled; waiting for verified cleanup result",
         ),
         Ok(()) => emit(
             &tx,
@@ -538,8 +593,93 @@ fn remove_if_exists(path: &Path) -> Result<(), String> {
     }
 }
 
+fn remove_marked_file(root: &Path, path: &str, markers: &[&str]) -> Result<(), String> {
+    let path = root.join(path.trim_start_matches('/'));
+    if !path.exists() {
+        return Ok(());
+    }
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    if !markers.iter().any(|marker| contents.contains(marker)) {
+        return Ok(());
+    }
+    remove_if_exists(&path)
+}
+
+fn remove_stream_include(root: &Path) -> Result<(), String> {
+    let path = root.join("etc/nginx/nginx.conf");
+    if !path.exists() {
+        return Ok(());
+    }
+    let original =
+        std::fs::read_to_string(&path).map_err(|error| format!("read nginx.conf: {error}"))?;
+    let filtered = original
+        .lines()
+        .filter(|line| line.trim() != "include /etc/nginx/relay-panel-stream.conf;")
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    if filtered != original {
+        let temp = path.with_extension(format!("rp-uninstall-{}.tmp", std::process::id()));
+        std::fs::write(&temp, filtered).map_err(|error| format!("write nginx.conf: {error}"))?;
+        std::fs::rename(temp, path).map_err(|error| format!("commit nginx.conf: {error}"))?;
+    }
+    Ok(())
+}
+
+fn remove_owned_openlist(root: &Path) -> Result<(), String> {
+    if root != Path::new("/") {
+        return Ok(());
+    }
+    let output = Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            "{{.Config.Image}}|{{range .Mounts}}{{.Source}}:{{.Destination}};{{end}}",
+            "relay-panel-openlist",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Ok(());
+    };
+    if !output.status.success() {
+        return Ok(());
+    }
+    let evidence = String::from_utf8_lossy(&output.stdout);
+    if !evidence.contains(OPENLIST_IMAGE)
+        || !evidence.contains("/var/lib/relay-panel/openlist:/opt/openlist/data;")
+    {
+        return Ok(());
+    }
+    let status = Command::new("docker")
+        .args(["rm", "-f", "relay-panel-openlist"])
+        .status();
+    if !status.is_ok_and(|status| status.success()) {
+        return Err("remove managed OpenList container failed".into());
+    }
+    let data = Path::new("/var/lib/relay-panel/openlist");
+    if data.exists() {
+        std::fs::remove_dir_all(data)
+            .map_err(|error| format!("remove managed OpenList data: {error}"))?;
+    }
+    Ok(())
+}
+
 fn uninstall_managed(root: &Path) -> Result<(), String> {
     let rooted = |path: &str| root.join(path.trim_start_matches('/'));
+    let nginx_paths = [
+        "/etc/nginx/nginx.conf",
+        "/etc/nginx/relay-panel-stream.conf",
+        "/etc/nginx/relay-panel-stream.d/relay-panel-sni.conf",
+        "/etc/nginx/conf.d/relay-panel-fallback.conf",
+        "/etc/nginx/conf.d/relay-panel-acme.conf",
+    ];
+    let nginx_snapshot = nginx_paths
+        .iter()
+        .filter_map(|path| {
+            let path = rooted(path);
+            std::fs::read(&path).ok().map(|bytes| (path, bytes))
+        })
+        .collect::<Vec<_>>();
     if root == Path::new("/") {
         let status = Command::new("systemctl")
             .args(UNINSTALL_SYSTEMCTL_ARGS)
@@ -551,6 +691,25 @@ fn uninstall_managed(root: &Path) -> Result<(), String> {
     for path in UNINSTALL_REMOVE_FILES {
         remove_if_exists(&rooted(path))?;
     }
+    remove_marked_file(
+        root,
+        "/etc/nginx/relay-panel-stream.conf",
+        &["# RelayPanel managed stream root; do not edit"],
+    )?;
+    remove_marked_file(
+        root,
+        "/etc/nginx/conf.d/relay-panel-fallback.conf",
+        &[
+            "# generated by relay-node; TLS camouflage sites",
+            "# RelayPanel managed bootstrap camouflage fallback",
+        ],
+    )?;
+    remove_marked_file(
+        root,
+        "/etc/nginx/conf.d/relay-panel-acme.conf",
+        &["# generated by relay-node;"],
+    )?;
+    remove_stream_include(root)?;
     for path in UNINSTALL_REMOVE_DIRS {
         let path = rooted(path);
         if path.exists() {
@@ -560,12 +719,112 @@ fn uninstall_managed(root: &Path) -> Result<(), String> {
     }
     if root == Path::new("/") {
         let _ = Command::new("systemctl").arg("daemon-reload").status();
+        let nginx = Command::new("nginx").arg("-t").status();
+        if !nginx.is_ok_and(|status| status.success()) {
+            for (path, bytes) in &nginx_snapshot {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(path, bytes);
+            }
+            return Err("nginx configuration is invalid after cleanup".into());
+        }
+        let _ = Command::new("systemctl").args(["reload", "nginx"]).status();
     }
+    remove_owned_openlist(root)?;
     Ok(())
 }
 
+fn report_uninstall(job: &UninstallJob, success: bool, message: &str) -> Result<(), String> {
+    let url = format!(
+        "{}/api/v1/node/uninstall_result",
+        job.panel_url.trim_end_matches('/')
+    );
+    let body = serde_json::json!({ "operation_id": job.operation_id, "node_id": job.node_id, "success": success, "message": message }).to_string();
+    let root = PathBuf::from(format!(
+        "/run/relay-node-uninstall-report-{}",
+        job.operation_id
+    ));
+    let headers = root.with_extension("headers");
+    let body_path = root.with_extension("json");
+    let write_private = |path: &Path, value: &[u8]| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|error| format!("create uninstall callback file: {error}"))?;
+        use std::io::Write;
+        file.write_all(value)
+            .map_err(|error| format!("write uninstall callback file: {error}"))
+    };
+    write_private(
+        &headers,
+        format!(
+            "Authorization: Bearer {}\nX-Node-ID: {}\nContent-Type: application/json\n",
+            job.token, job.node_id
+        )
+        .as_bytes(),
+    )?;
+    if let Err(error) = write_private(&body_path, body.as_bytes()) {
+        let _ = std::fs::remove_file(&headers);
+        return Err(error);
+    }
+    let header_arg = format!("@{}", headers.display());
+    let body_arg = format!("@{}", body_path.display());
+    let mut accepted = false;
+    for _ in 0..3 {
+        let status = Command::new("curl")
+            .args([
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "10",
+                "-X",
+                "POST",
+                "-H",
+                &header_arg,
+                "--data-binary",
+                &body_arg,
+                &url,
+            ])
+            .status();
+        if status.is_ok_and(|status| status.success()) {
+            accepted = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let _ = std::fs::remove_file(headers);
+    let _ = std::fs::remove_file(body_path);
+    accepted
+        .then_some(())
+        .ok_or_else(|| "Panel rejected uninstall result".into())
+}
+
 pub(crate) fn run_helper_from_args(args: &[String]) -> Option<Result<(), String>> {
-    (args == ["--lifecycle-uninstall"]).then(|| uninstall_managed(Path::new("/")))
+    if args.len() != 2 || args[0] != "--lifecycle-uninstall" {
+        return None;
+    }
+    let path = PathBuf::from(&args[1]);
+    let job = match std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<UninstallJob>(&bytes).ok())
+    {
+        Some(job) => job,
+        None => return Some(Err("invalid uninstall job".into())),
+    };
+    let _ = std::fs::remove_file(path);
+    let result = uninstall_managed(Path::new("/"));
+    let message = result
+        .as_ref()
+        .map(|_| "Reality Panel managed node resources removed")
+        .unwrap_or_else(|error| error.as_str());
+    if let Err(error) = report_uninstall(&job, result.is_ok(), message) {
+        return Some(Err(error));
+    }
+    Some(result)
 }
 
 #[cfg(test)]
@@ -818,18 +1077,49 @@ mod tests {
             "etc/relay-node/relay-node.env",
             "etc/systemd/system/relay-node.service",
             "etc/nginx/relay-panel-stream.d/relay-panel-sni.conf",
+            "etc/nginx/relay-panel-stream.conf",
+            "etc/nginx/conf.d/relay-panel-fallback.conf",
+            "etc/nginx/conf.d/relay-panel-acme.conf",
             "etc/nginx/conf.d/unknown.conf",
             "var/lib/relay-panel/openlist/data.db",
             "etc/letsencrypt/account",
         ] {
             std::fs::write(root.join(path), b"keep-or-remove").unwrap();
         }
+        std::fs::write(
+            root.join("etc/nginx/nginx.conf"),
+            "events {}\ninclude /etc/nginx/relay-panel-stream.conf;\nhttp {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("etc/nginx/relay-panel-stream.conf"),
+            "# RelayPanel managed stream root; do not edit\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("etc/nginx/conf.d/relay-panel-fallback.conf"),
+            "# generated by relay-node; TLS camouflage sites\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("etc/nginx/conf.d/relay-panel-acme.conf"),
+            "# generated by relay-node; global HTTP to HTTPS redirect\n",
+        )
+        .unwrap();
         uninstall_managed(&root).unwrap();
         assert!(!root.join("opt/relay-node").exists());
         assert!(!root.join("etc/relay-node").exists());
         assert!(root.join("var/lib/relay-panel/openlist/data.db").exists());
         assert!(root.join("etc/nginx/conf.d/unknown.conf").exists());
         assert!(root.join("etc/letsencrypt/account").exists());
+        assert!(!root.join("etc/nginx/relay-panel-stream.conf").exists());
+        assert!(!root
+            .join("etc/nginx/conf.d/relay-panel-fallback.conf")
+            .exists());
+        assert!(!root.join("etc/nginx/conf.d/relay-panel-acme.conf").exists());
+        assert!(!std::fs::read_to_string(root.join("etc/nginx/nginx.conf"))
+            .unwrap()
+            .contains("relay-panel-stream.conf"));
         assert_eq!(
             UNINSTALL_SYSTEMCTL_ARGS,
             ["disable", "--now", "relay-node.service"]

@@ -393,10 +393,7 @@ pub enum CarrierPolicyApplyError {
     TargetPublicIpv4Invalid(String),
     DnsMgrUnavailable,
     ProviderPreflight(String),
-    OwnershipUnverified {
-        rule_id: i64,
-        line_id: String,
-    },
+    OwnershipUnverified { rule_id: i64, line_id: String },
     DnsSchedulingFailed,
     FailoverEnabled,
     FailoverStateUnavailable(String),
@@ -936,6 +933,39 @@ pub async fn ensure_preference_initialized(
 pub async fn delete_relay_preference(db: &dyn Repository, group_id: i64) -> Result<(), DbError> {
     let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
     db.delete(&preference_key(group_id)).await?;
+    Ok(())
+}
+
+pub async fn remove_node_assignment(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: &str,
+) -> Result<(), RelayPreferenceError> {
+    let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
+    if db.get(&preference_key(group_id)).await?.is_none() {
+        return Ok(());
+    }
+    let mut preference = load_preference(db, group_id).await?;
+    preference
+        .carrier_policy
+        .bindings
+        .retain(|binding| binding.node_id.as_deref() != Some(node_id));
+    if let Some(pending) = preference.pending_carrier_policy.as_mut() {
+        pending
+            .bindings
+            .retain(|binding| binding.node_id.as_deref() != Some(node_id));
+    }
+    if preference.preferred_node_id.as_deref() == Some(node_id)
+        && preference.state == RelayPreferencePhase::Idle
+    {
+        preference.preferred_node_id = None;
+    }
+    if preference.pending_node_id.as_deref() == Some(node_id)
+        && preference.state == RelayPreferencePhase::Idle
+    {
+        preference.pending_node_id = None;
+    }
+    store_preference(db, group_id, &preference).await?;
     Ok(())
 }
 
