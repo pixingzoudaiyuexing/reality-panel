@@ -334,7 +334,7 @@ where
 fn nginx_sni_active_tcp(managed_ports: &[u16]) -> Option<u32> {
     #[cfg(target_os = "linux")]
     {
-        nginx_sni_active_tcp_with_reader(managed_ports, std::fs::read_to_string)
+        nginx_sni_active_tcp_with_reader(managed_ports, |path| std::fs::read_to_string(path))
     }
     #[cfg(not(target_os = "linux"))]
     {
