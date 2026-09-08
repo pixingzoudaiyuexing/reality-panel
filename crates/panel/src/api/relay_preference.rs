@@ -91,7 +91,8 @@ pub async fn set_relay_preference(
                         "carrier DNS preflight is unavailable".into(),
                     )
                 }
-                StartRelaySwitchError::SwitchInProgress { .. } => {
+                StartRelaySwitchError::SwitchInProgress { .. }
+                | StartRelaySwitchError::NodeUninstalling(_) => {
                     (StatusCode::CONFLICT, 409, error.to_string())
                 }
                 StartRelaySwitchError::Database(_)
@@ -219,7 +220,8 @@ pub async fn set_carrier_affinity(
                 CarrierPolicyApplyError::InboundGroupNotFound => {
                     (StatusCode::NOT_FOUND, 404, error.to_string())
                 }
-                CarrierPolicyApplyError::TransactionInProgress => {
+                CarrierPolicyApplyError::TransactionInProgress
+                | CarrierPolicyApplyError::NodeUninstalling(_) => {
                     (StatusCode::CONFLICT, 409, error.to_string())
                 }
                 CarrierPolicyApplyError::FailoverEnabled => {

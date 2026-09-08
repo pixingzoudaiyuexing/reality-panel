@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::Ipv4Addr;
 
 pub const RELAY_PREFERENCE_KEY_PREFIX: &str = "relay_preference:";
+const NODE_UNINSTALL_GATE_PREFIX: &str = "node_uninstall_gate:";
 
 /// The Panel is a single process. Serializing short preference mutations keeps
 /// initialization, manual switching, DNS finalization, and deletion coherent
@@ -36,6 +37,42 @@ pub enum RelayPreferencePhase {
     Failed,
     FailedRolledBack,
     FailedManualIntervention,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct NodeUninstallGate {
+    operation_id: String,
+    destructive_started: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginUninstallGateOutcome {
+    Acquired,
+    ActiveTransaction,
+    AlreadyUninstalling,
+}
+
+fn uninstall_gate_key(group_id: i64, node_id: &str) -> String {
+    format!("{NODE_UNINSTALL_GATE_PREFIX}{group_id}:{node_id}")
+}
+
+async fn load_uninstall_gate(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: &str,
+) -> Result<Option<NodeUninstallGate>, RelayPreferenceError> {
+    db.get(&uninstall_gate_key(group_id, node_id))
+        .await?
+        .map(|raw| serde_json::from_str(&raw).map_err(RelayPreferenceError::InvalidPreference))
+        .transpose()
+}
+
+async fn node_is_uninstalling(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: &str,
+) -> Result<bool, RelayPreferenceError> {
+    Ok(load_uninstall_gate(db, group_id, node_id).await?.is_some())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -377,6 +414,7 @@ pub enum StartRelaySwitchError {
     NoEligibleDnsRules,
     SwitchInProgress { pending_node_id: Option<String> },
     DnsSchedulingFailed(DbError),
+    NodeUninstalling(String),
 }
 
 #[derive(Debug)]
@@ -397,6 +435,7 @@ pub enum CarrierPolicyApplyError {
     DnsSchedulingFailed,
     FailoverEnabled,
     FailoverStateUnavailable(String),
+    NodeUninstalling(String),
 }
 
 impl std::fmt::Display for CarrierPolicyApplyError {
@@ -428,6 +467,9 @@ impl std::fmt::Display for CarrierPolicyApplyError {
             }
             Self::FailoverStateUnavailable(error) => {
                 write!(f, "failover policy state is unavailable: {error}")
+            }
+            Self::NodeUninstalling(node_id) => {
+                write!(f, "节点 {node_id} 正在卸载，当前不能参与线路切换。")
             }
         }
     }
@@ -461,6 +503,9 @@ impl std::fmt::Display for StartRelaySwitchError {
             ),
             Self::DnsSchedulingFailed(error) => {
                 write!(f, "failed to schedule group DNS reconciliation: {error}")
+            }
+            Self::NodeUninstalling(node_id) => {
+                write!(f, "节点 {node_id} 正在卸载，当前不能参与线路切换。")
             }
         }
     }
@@ -918,11 +963,12 @@ pub async fn ensure_preference_initialized(
 
     let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
 
-    let ready_node_ids: Vec<String> = evaluated
-        .iter()
-        .filter(|node| node.info.ready)
-        .map(|node| node.info.node_id.clone())
-        .collect();
+    let mut ready_node_ids = Vec::new();
+    for node in evaluated.iter().filter(|node| node.info.ready) {
+        if !node_is_uninstalling(db, group_id, &node.info.node_id).await? {
+            ready_node_ids.push(node.info.node_id.clone());
+        }
+    }
     if initialize_preference_if_unique_ready(&mut preference, &ready_node_ids) {
         store_preference(db, group_id, &preference).await?;
     }
@@ -976,17 +1022,75 @@ fn remove_node_references(preference: &mut RelayPreferenceState, node_id: &str) 
     }
 }
 
-pub async fn uninstall_blocked_by_active_transaction(
+pub async fn begin_uninstall_gate(
     db: &dyn Repository,
     group_id: i64,
     node_id: &str,
+    operation_id: &str,
+) -> Result<BeginUninstallGateOutcome, RelayPreferenceError> {
+    let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
+    if let Some(gate) = load_uninstall_gate(db, group_id, node_id).await? {
+        return Ok(if gate.operation_id == operation_id {
+            BeginUninstallGateOutcome::Acquired
+        } else {
+            BeginUninstallGateOutcome::AlreadyUninstalling
+        });
+    }
+    if db.get(&preference_key(group_id)).await?.is_some() {
+        let preference = load_preference(db, group_id).await?;
+        if active_transaction_references_node(&preference, node_id) {
+            return Ok(BeginUninstallGateOutcome::ActiveTransaction);
+        }
+    }
+    let gate = serde_json::to_string(&NodeUninstallGate {
+        operation_id: operation_id.into(),
+        destructive_started: false,
+    })
+    .map_err(RelayPreferenceError::InvalidPreference)?;
+    db.set(&uninstall_gate_key(group_id, node_id), &gate)
+        .await?;
+    Ok(BeginUninstallGateOutcome::Acquired)
+}
+
+pub async fn mark_uninstall_gate_destructive(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: &str,
+    operation_id: &str,
 ) -> Result<bool, RelayPreferenceError> {
     let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
-    if db.get(&preference_key(group_id)).await?.is_none() {
+    let Some(mut gate) = load_uninstall_gate(db, group_id, node_id).await? else {
+        return Ok(false);
+    };
+    if gate.operation_id != operation_id {
         return Ok(false);
     }
-    let preference = load_preference(db, group_id).await?;
-    Ok(active_transaction_references_node(&preference, node_id))
+    if !gate.destructive_started {
+        gate.destructive_started = true;
+        db.set(
+            &uninstall_gate_key(group_id, node_id),
+            &serde_json::to_string(&gate).map_err(RelayPreferenceError::InvalidPreference)?,
+        )
+        .await?;
+    }
+    Ok(true)
+}
+
+pub async fn release_uninstall_gate(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: &str,
+    operation_id: &str,
+) -> Result<bool, RelayPreferenceError> {
+    let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
+    let Some(gate) = load_uninstall_gate(db, group_id, node_id).await? else {
+        return Ok(true);
+    };
+    if gate.operation_id != operation_id {
+        return Ok(false);
+    }
+    db.delete(&uninstall_gate_key(group_id, node_id)).await?;
+    Ok(true)
 }
 
 pub async fn remove_node_assignment(
@@ -1314,6 +1418,27 @@ pub async fn start_carrier_policy_apply(
             | RelayPreferencePhase::FailedManualIntervention
     ) {
         return Err(CarrierPolicyApplyError::TransactionInProgress);
+    }
+    for binding in &requested.bindings {
+        let node_id = match binding.mode {
+            CarrierLineMode::Node => binding.node_id.as_deref(),
+            CarrierLineMode::FollowDefault => preference.preferred_node_id.as_deref(),
+        };
+        if let Some(node_id) = node_id {
+            if node_is_uninstalling(db, group_id, node_id)
+                .await
+                .map_err(|error| match error {
+                    RelayPreferenceError::Database(error) => {
+                        CarrierPolicyApplyError::Database(error)
+                    }
+                    RelayPreferenceError::InvalidPreference(error) => {
+                        CarrierPolicyApplyError::InvalidPreference(error)
+                    }
+                })?
+            {
+                return Err(CarrierPolicyApplyError::NodeUninstalling(node_id.into()));
+            }
+        }
     }
     let changes = carrier_policy_diff(&preference.carrier_policy, &requested);
     if changes.is_empty() {
@@ -1740,6 +1865,25 @@ async fn start_relay_switch_locked(
             return Err(StartRelaySwitchError::InvalidPreference(error))
         }
     };
+    for node_id in [
+        Some(target_node_id),
+        preference.preferred_node_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if node_is_uninstalling(db, group_id, node_id)
+            .await
+            .map_err(|error| match error {
+                RelayPreferenceError::Database(error) => StartRelaySwitchError::Database(error),
+                RelayPreferenceError::InvalidPreference(error) => {
+                    StartRelaySwitchError::InvalidPreference(error)
+                }
+            })?
+        {
+            return Err(StartRelaySwitchError::NodeUninstalling(node_id.into()));
+        }
+    }
     if matches!(
         preference.state,
         RelayPreferencePhase::Switching | RelayPreferencePhase::RollingBack
@@ -3564,6 +3708,105 @@ mod tests {
             .iter()
             .any(|node| node.node_id == "node-b" && node.ready && !node.preferred));
         connections.unregister(7, b_connection).await;
+    }
+
+    #[tokio::test]
+    async fn durable_uninstall_gate_survives_reload_and_blocks_new_target_selection() {
+        use crate::db::schema::SCHEMA_SQL;
+        use crate::db::sqlite_repo::SqliteRepository;
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (7, 'reality', 'in', 'group-token', 1, '')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = SqliteRepository::new(pool);
+        assert_eq!(
+            begin_uninstall_gate(&repo, 7, "node-a", "operation-a")
+                .await
+                .unwrap(),
+            BeginUninstallGateOutcome::Acquired
+        );
+        assert!(node_is_uninstalling(&repo, 7, "node-a").await.unwrap());
+        assert!(matches!(
+            start_relay_switch(&repo, &NodeConnections::new(), 7, "node-a").await,
+            Err(StartRelaySwitchError::NodeUninstalling(node_id)) if node_id == "node-a"
+        ));
+        assert_eq!(
+            begin_uninstall_gate(&repo, 7, "node-a", "operation-b")
+                .await
+                .unwrap(),
+            BeginUninstallGateOutcome::AlreadyUninstalling
+        );
+        assert!(
+            mark_uninstall_gate_destructive(&repo, 7, "node-a", "operation-a")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !release_uninstall_gate(&repo, 7, "node-a", "wrong-operation")
+                .await
+                .unwrap()
+        );
+        assert!(node_is_uninstalling(&repo, 7, "node-a").await.unwrap());
+        assert!(release_uninstall_gate(&repo, 7, "node-a", "operation-a")
+            .await
+            .unwrap());
+        assert!(!node_is_uninstalling(&repo, 7, "node-a").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn carrier_transaction_cannot_enter_after_uninstall_preflight_acquires_gate() {
+        use crate::db::schema::SCHEMA_SQL;
+        use crate::db::sqlite_repo::SqliteRepository;
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (7, 'reality', 'in', 'group-token', 1, '')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = SqliteRepository::new(pool);
+        assert_eq!(
+            begin_uninstall_gate(&repo, 7, "node-a", "operation-a")
+                .await
+                .unwrap(),
+            BeginUninstallGateOutcome::Acquired
+        );
+        let carrier = start_carrier_policy_apply(
+            &repo,
+            &NodeConnections::new(),
+            7,
+            CarrierPolicy {
+                bindings: vec![CarrierLineBinding {
+                    line_id: "default".into(),
+                    mode: CarrierLineMode::Node,
+                    node_id: Some("node-a".into()),
+                }],
+            },
+        )
+        .await;
+        assert!(matches!(
+            carrier,
+            Err(CarrierPolicyApplyError::NodeUninstalling(node_id)) if node_id == "node-a"
+        ));
     }
 
     async fn switch_fixture() -> (

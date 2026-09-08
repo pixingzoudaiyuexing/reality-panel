@@ -78,6 +78,8 @@ struct DurableUninstallOperation {
     actor_id: Option<i64>,
     saw_disconnect: bool,
     cleanup_confirmed: bool,
+    #[serde(default)]
+    destructive_started: bool,
     panel_cleanup_complete: bool,
     result_audited: bool,
 }
@@ -89,6 +91,7 @@ impl DurableUninstallOperation {
             actor_id: operation.actor_id,
             saw_disconnect: false,
             cleanup_confirmed: false,
+            destructive_started: false,
             panel_cleanup_complete: false,
             result_audited: false,
         }
@@ -898,36 +901,6 @@ async fn create_operation(
             "NODE_CONFIG_PROTOCOL_MISMATCH",
         ));
     }
-    if action == NodeLifecycleAction::Uninstall {
-        match crate::service::relay_preference::uninstall_blocked_by_active_transaction(
-            state.db.as_ref(),
-            group_id,
-            &node_id,
-        )
-        .await
-        {
-            Ok(true) => {
-                return Err(response::<()>(
-                    StatusCode::CONFLICT,
-                    409,
-                    "该节点当前正在进行线路切换，请等待切换完成后再卸载。",
-                ))
-            }
-            Ok(false) => {}
-            Err(error) => {
-                tracing::error!(
-                    group_id,
-                    node_id,
-                    "uninstall transaction preflight: {error}"
-                );
-                return Err(response::<()>(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    503,
-                    "UNINSTALL_PREFLIGHT_UNAVAILABLE",
-                ));
-            }
-        }
-    }
     let mut target_version = None;
     let mut architecture = status
         .as_ref()
@@ -978,16 +951,58 @@ async fn create_operation(
         )
         .map_err(|_| response::<()>(StatusCode::CONFLICT, 409, "NODE_OPERATION_IN_PROGRESS"))?;
     if action == NodeLifecycleAction::Uninstall {
-        let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
-        let durable = DurableUninstallOperation::new(&operation);
-        if let Err(error) = store_durable_uninstall(state, &durable).await {
-            state.node_operations.remove(&operation.id);
-            tracing::error!(group_id, node_id, "persist uninstall operation: {error}");
-            return Err(response::<()>(
-                StatusCode::SERVICE_UNAVAILABLE,
-                503,
-                "UNINSTALL_STATE_PERSIST_FAILED",
-            ));
+        {
+            let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
+            let durable = DurableUninstallOperation::new(&operation);
+            if let Err(error) = store_durable_uninstall(state, &durable).await {
+                state.node_operations.remove(&operation.id);
+                tracing::error!(group_id, node_id, "persist uninstall operation: {error}");
+                return Err(response::<()>(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    503,
+                    "UNINSTALL_STATE_PERSIST_FAILED",
+                ));
+            }
+        }
+        match crate::service::relay_preference::begin_uninstall_gate(
+            state.db.as_ref(),
+            group_id,
+            &node_id,
+            &operation.id,
+        )
+        .await
+        {
+            Ok(crate::service::relay_preference::BeginUninstallGateOutcome::Acquired) => {}
+            Ok(crate::service::relay_preference::BeginUninstallGateOutcome::ActiveTransaction) => {
+                state.node_operations.remove(&operation.id);
+                let _ = state.db.delete(&durable_uninstall_key(&operation.id)).await;
+                return Err(response::<()>(
+                    StatusCode::CONFLICT,
+                    409,
+                    "该节点当前正在进行线路切换，请等待切换完成后再卸载。",
+                ));
+            }
+            Ok(
+                crate::service::relay_preference::BeginUninstallGateOutcome::AlreadyUninstalling,
+            ) => {
+                state.node_operations.remove(&operation.id);
+                let _ = state.db.delete(&durable_uninstall_key(&operation.id)).await;
+                return Err(response::<()>(
+                    StatusCode::CONFLICT,
+                    409,
+                    "该节点正在卸载，请等待当前卸载完成。",
+                ));
+            }
+            Err(error) => {
+                state.node_operations.remove(&operation.id);
+                let _ = state.db.delete(&durable_uninstall_key(&operation.id)).await;
+                tracing::error!(group_id, node_id, "persist uninstall gate: {error}");
+                return Err(response::<()>(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    503,
+                    "UNINSTALL_GATE_UNAVAILABLE",
+                ));
+            }
         }
     }
     let action_name = format!("{:?}", action).to_ascii_lowercase();
@@ -1047,6 +1062,13 @@ async fn create_operation(
                     durable.operation = failed.clone();
                     let _ = store_durable_uninstall(state, &durable).await;
                 }
+                let _ = crate::service::relay_preference::release_uninstall_gate(
+                    state.db.as_ref(),
+                    group_id,
+                    &node_id,
+                    &operation.id,
+                )
+                .await;
             }
             audit_terminal_operation(state, &failed).await;
         }
@@ -1224,6 +1246,8 @@ pub struct UninstallResultRequest {
     pub operation_id: String,
     pub node_id: String,
     pub success: bool,
+    #[serde(default)]
+    pub destructive_started: bool,
     pub message: String,
 }
 
@@ -1249,14 +1273,12 @@ pub async fn receive_uninstall_result(
     }
     let operation_id = request.operation_id.trim();
     let node_id = request.node_id.trim();
-    let currently_connected = state
-        .node_connections
-        .config_online_node_ids(group.id)
-        .await
-        .contains(node_id);
+    if request.success && !request.destructive_started {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     {
         let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
-        let Ok(Some(mut durable)) = load_durable_uninstall(&state, operation_id).await else {
+        let Ok(Some(durable)) = load_durable_uninstall(&state, operation_id).await else {
             return StatusCode::FORBIDDEN.into_response();
         };
         if durable.operation.group_id != group.id
@@ -1272,17 +1294,73 @@ pub async fn receive_uninstall_result(
         if durable.operation.status.terminal() {
             return StatusCode::FORBIDDEN.into_response();
         }
+    }
+    if request.destructive_started {
+        match crate::service::relay_preference::mark_uninstall_gate_destructive(
+            state.db.as_ref(),
+            group.id,
+            node_id,
+            operation_id,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return StatusCode::FORBIDDEN.into_response(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
+    let currently_connected = state
+        .node_connections
+        .config_online_node_ids(group.id)
+        .await
+        .contains(node_id);
+    {
+        let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
+        let Ok(Some(mut durable)) = load_durable_uninstall(&state, operation_id).await else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        if durable.operation.group_id != group.id
+            || durable.operation.node_id != node_id
+            || durable.operation.action != NodeLifecycleAction::Uninstall
+            || durable.operation.status.terminal()
+        {
+            return StatusCode::FORBIDDEN.into_response();
+        }
         durable.operation.updated_at = now();
         durable.operation.message = request.message.clone();
         durable.cleanup_confirmed = request.success;
+        durable.destructive_started |= request.destructive_started;
         if !currently_connected {
             durable.saw_disconnect = true;
         }
-        durable.operation.status = OperationStatus::Verifying;
+        durable.operation.status = if !request.success && !request.destructive_started {
+            OperationStatus::Failed
+        } else {
+            OperationStatus::Verifying
+        };
         if store_durable_uninstall(&state, &durable).await.is_err() {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
         state.node_operations.restore_uninstall(&durable);
+    }
+    if !request.success && !request.destructive_started {
+        let Some(operation) = state.node_operations.get(operation_id) else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        match crate::service::relay_preference::release_uninstall_gate(
+            state.db.as_ref(),
+            group.id,
+            node_id,
+            operation_id,
+        )
+        .await
+        {
+            Ok(true) => {
+                audit_terminal_operation(&state, &operation).await;
+                return success(operation);
+            }
+            _ => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
     }
     let _ = state.node_operations.uninstall_result(
         group.id,
@@ -1393,6 +1471,18 @@ async fn finalize_durable_uninstall(
             state.node_operations.restore_uninstall(&durable);
             return Err(error);
         }
+        match crate::service::relay_preference::release_uninstall_gate(
+            state.db.as_ref(),
+            durable.operation.group_id,
+            &durable.operation.node_id,
+            operation_id,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err("uninstall gate belongs to another operation".into()),
+            Err(error) => return Err(error.to_string()),
+        }
         durable.panel_cleanup_complete = true;
         durable.operation.status = OperationStatus::Success;
         durable.operation.message = format!("{}; Panel state cleaned", durable.operation.message);
@@ -1463,8 +1553,43 @@ async fn claim_durable_uninstall_audit(state: &AppState, operation_id: &str) -> 
     store_durable_uninstall(state, &durable).await.is_ok()
 }
 
+async fn persist_pre_destructive_uninstall_failure(
+    state: &AppState,
+    operation: &NodeOperation,
+) -> bool {
+    let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
+    let Ok(Some(mut durable)) = load_durable_uninstall(state, &operation.id).await else {
+        return false;
+    };
+    if durable.destructive_started {
+        return false;
+    }
+    durable.operation = operation.clone();
+    durable.operation.status = OperationStatus::Failed;
+    if store_durable_uninstall(state, &durable).await.is_err() {
+        return false;
+    }
+    drop(_guard);
+    matches!(
+        crate::service::relay_preference::release_uninstall_gate(
+            state.db.as_ref(),
+            operation.group_id,
+            &operation.node_id,
+            &operation.id,
+        )
+        .await,
+        Ok(true)
+    )
+}
+
 pub async fn audit_terminal_operation(state: &AppState, operation: &NodeOperation) {
     if !operation.status.terminal() || operation.action == NodeLifecycleAction::Logs {
+        return;
+    }
+    if operation.action == NodeLifecycleAction::Uninstall
+        && operation.status == OperationStatus::Failed
+        && !persist_pre_destructive_uninstall_failure(state, operation).await
+    {
         return;
     }
     let claimed = if operation.action == NodeLifecycleAction::Uninstall {
@@ -1583,9 +1708,21 @@ mod tests {
         saw_disconnect: bool,
         cleanup_confirmed: bool,
     ) {
+        assert_eq!(
+            crate::service::relay_preference::begin_uninstall_gate(
+                state.db.as_ref(),
+                operation.group_id,
+                &operation.node_id,
+                &operation.id,
+            )
+            .await
+            .unwrap(),
+            crate::service::relay_preference::BeginUninstallGateOutcome::Acquired
+        );
         let mut durable = DurableUninstallOperation::new(operation);
         durable.saw_disconnect = saw_disconnect;
         durable.cleanup_confirmed = cleanup_confirmed;
+        durable.destructive_started = cleanup_confirmed;
         durable.operation.status = OperationStatus::Verifying;
         store_durable_uninstall(state, &durable).await.unwrap();
     }
@@ -2340,6 +2477,7 @@ mod tests {
             operation_id: operation.id.clone(),
             node_id: "node-a".into(),
             success: true,
+            destructive_started: true,
             message: "cleanup complete".into(),
         };
         let response =
@@ -2354,6 +2492,16 @@ mod tests {
                 .operation
                 .status,
             OperationStatus::Success
+        );
+        assert!(
+            !crate::service::relay_preference::mark_uninstall_gate_destructive(
+                restarted.db.as_ref(),
+                1,
+                "node-a",
+                &operation.id,
+            )
+            .await
+            .unwrap()
         );
 
         let duplicate = receive_uninstall_result(State(restarted), headers, Json(request())).await;
@@ -2387,6 +2535,7 @@ mod tests {
             operation_id: operation.id.clone(),
             node_id: "node-a".into(),
             success: true,
+            destructive_started: true,
             message: "cleanup complete; OpenList ownership unknown, preserved".into(),
         };
         let waiting =
@@ -2436,6 +2585,7 @@ mod tests {
             operation_id,
             node_id: node_id.into(),
             success: true,
+            destructive_started: true,
             message: "cleanup complete".into(),
         };
         let unauthenticated = receive_uninstall_result(
@@ -2525,6 +2675,82 @@ mod tests {
                 .unwrap()
                 .status,
             OperationStatus::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn uninstall_gate_releases_only_for_explicit_pre_destructive_failure() {
+        let (state, pool) = test_state().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (1, 'relay', 'in', 'node-token', 1, '192.0.2.1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer node-token".parse().unwrap());
+        headers.insert("X-Node-ID", "node-a".parse().unwrap());
+
+        let before = start(
+            &state.node_operations,
+            "node-a",
+            NodeLifecycleAction::Uninstall,
+        );
+        seed_durable_uninstall(&state, &before, false, false).await;
+        let failed_before = receive_uninstall_result(
+            State(state.clone()),
+            headers.clone(),
+            Json(UninstallResultRequest {
+                operation_id: before.id.clone(),
+                node_id: "node-a".into(),
+                success: false,
+                destructive_started: false,
+                message: "finalizer installation failed".into(),
+            }),
+        )
+        .await;
+        assert_eq!(failed_before.status(), StatusCode::OK);
+        assert!(
+            !crate::service::relay_preference::mark_uninstall_gate_destructive(
+                state.db.as_ref(),
+                1,
+                "node-a",
+                &before.id,
+            )
+            .await
+            .unwrap()
+        );
+
+        let after = start(
+            &state.node_operations,
+            "node-b",
+            NodeLifecycleAction::Uninstall,
+        );
+        seed_durable_uninstall(&state, &after, false, false).await;
+        headers.insert("X-Node-ID", "node-b".parse().unwrap());
+        let failed_after = receive_uninstall_result(
+            State(state.clone()),
+            headers,
+            Json(UninstallResultRequest {
+                operation_id: after.id.clone(),
+                node_id: "node-b".into(),
+                success: false,
+                destructive_started: true,
+                message: "cleanup will retry".into(),
+            }),
+        )
+        .await;
+        assert_eq!(failed_after.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            crate::service::relay_preference::mark_uninstall_gate_destructive(
+                state.db.as_ref(),
+                1,
+                "node-b",
+                &after.id,
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -2644,6 +2870,12 @@ mod tests {
             .unwrap_err();
             assert_eq!(response.status(), StatusCode::CONFLICT, "{phase}");
             assert!(state.node_operations.inner.lock().unwrap().is_empty());
+            assert!(state
+                .db
+                .scan_prefix(DURABLE_UNINSTALL_PREFIX)
+                .await
+                .unwrap()
+                .is_empty());
         }
 
         let (state, _) = test_state().await;
