@@ -282,6 +282,17 @@ impl ForwarderManager {
         self.listen_ipv6 = ipv6.to_string();
     }
 
+    #[cfg(test)]
+    pub(crate) fn abort_listener_for_test(&self, rule_id: i64) {
+        if let Some(listener) = self
+            .listeners
+            .values()
+            .find(|listener| listener.fingerprint.rule_id == rule_id)
+        {
+            listener.handle.abort();
+        }
+    }
+
     /// Apply a configuration snapshot. `true` means every synchronous
     /// data-plane prerequisite succeeded and it is safe for the caller to make
     /// this snapshot the last-known-good config.

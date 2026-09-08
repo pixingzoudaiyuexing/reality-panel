@@ -350,6 +350,31 @@ impl Reconciler {
         self.status.clone()
     }
 
+    /// A transient HTTP poll has no authority to replace a healthy state that
+    /// this process already established from a validated Panel snapshot.
+    pub async fn preserve_converged_after_transient(
+        &self,
+        manager: &Arc<Mutex<ForwarderManager>>,
+        camouflage: &Arc<Mutex<CamouflageSiteManager>>,
+    ) -> bool {
+        if self.status.state != ReconciliationStatusState::Converged || self.pending.is_some() {
+            return false;
+        }
+        let Some(snapshot) = self.latest_panel_snapshot.as_ref() else {
+            return false;
+        };
+        let effective_fingerprint = config_fingerprint(snapshot.config());
+        if self.last_panel_desired.as_ref() != Some(snapshot.fingerprint())
+            || self.last_applied.as_ref() != Some(&effective_fingerprint)
+            || self.last_applied_revision != Some(snapshot.config_revision())
+        {
+            return false;
+        }
+        poller::inspect_runtime(manager, camouflage, snapshot.config())
+            .await
+            .healthy
+    }
+
     /// Pure foundation decision. Runtime callers currently pass Unknown
     /// observed evidence, so Slice 1 never skips an apply based on assumptions.
     #[allow(dead_code)]
@@ -2579,6 +2604,189 @@ mod tests {
                 camouflage_sites: vec![],
             })
             .await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_preserves_healthy_panel_authority_but_real_drift_uses_lkg_repair() {
+        let dir = unique_runtime_dir("transient-authority");
+        let paths = runtime_paths(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut manager = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        manager.set_listen_addresses_for_test("127.0.0.1", "");
+        let manager = Arc::new(Mutex::new(manager));
+        let camouflage = Arc::new(Mutex::new(test_camouflage_manager(&dir)));
+        let config = raw_config(port);
+        let snapshot = NodeConfigSnapshot {
+            config_revision: 28,
+            config_fingerprint: config_fingerprint(&config).to_string(),
+            config: config.clone(),
+        };
+        let mut reconciler = Reconciler::new();
+        let applied = reconciler
+            .reconcile_with_test_paths(
+                &manager,
+                &camouflage,
+                ReconciliationInput::validated_panel_snapshot(snapshot.clone()).unwrap(),
+                paths.clone(),
+            )
+            .await;
+        assert_eq!(applied.state, ReconciliationState::Converged);
+        assert!(
+            reconciler
+                .preserve_converged_after_transient(&manager, &camouflage)
+                .await
+        );
+        assert!(
+            reconciler
+                .preserve_converged_after_transient(&manager, &camouflage)
+                .await
+        );
+        assert_eq!(
+            reconciler.status_snapshot().state,
+            ReconciliationStatusState::Converged
+        );
+
+        manager.lock().await.abort_listener_for_test(7);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !reconciler
+                .preserve_converged_after_transient(&manager, &camouflage)
+                .await
+        );
+
+        let cached = poller::load_cache_state_at(&paths).unwrap();
+        let recovery_snapshot = NodeConfigSnapshot {
+            config_revision: cached.config_revision,
+            config_fingerprint: cached.config_fingerprint.to_string(),
+            config: cached.config,
+        };
+        let repaired = reconciler
+            .reconcile_with_test_paths(
+                &manager,
+                &camouflage,
+                ReconciliationInput::local_recovery_snapshot(
+                    recovery_snapshot,
+                    LocalRecoverySource::PrimaryLkg,
+                )
+                .unwrap(),
+                paths.clone(),
+            )
+            .await;
+        assert_eq!(repaired.state, ReconciliationState::DegradedLocalRecovery);
+        assert!(manager.lock().await.listener_info_for_rule_tcp(7).is_some());
+
+        let next = NodeConfigSnapshot {
+            config_revision: 29,
+            config_fingerprint: config_fingerprint(&config).to_string(),
+            config: config.clone(),
+        };
+        let converged = reconciler
+            .reconcile_with_test_paths(
+                &manager,
+                &camouflage,
+                ReconciliationInput::validated_panel_snapshot(next).unwrap(),
+                paths.clone(),
+            )
+            .await;
+        assert_eq!(converged.state, ReconciliationState::Converged);
+
+        let stale = reconciler
+            .reconcile_with_test_paths(
+                &manager,
+                &camouflage,
+                ReconciliationInput::validated_panel_snapshot(snapshot).unwrap(),
+                paths.clone(),
+            )
+            .await;
+        assert_eq!(stale.state, ReconciliationState::StaleIgnored);
+        assert_eq!(
+            reconciler.status_snapshot().state,
+            ReconciliationStatusState::Converged
+        );
+
+        manager.lock().await.apply_config(&empty()).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_runtime_repair_failure_never_claims_converged() {
+        let dir = unique_runtime_dir("transient-repair-failure");
+        let paths = runtime_paths(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manager = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        manager.set_nginx_sni_config_for_test(test_nginx_config(&dir));
+        let manager = Arc::new(Mutex::new(manager));
+        let camouflage = Arc::new(Mutex::new(test_camouflage_manager(&dir)));
+        let config = NodeConfigResponse {
+            listeners: vec![nginx_listener(22, "drift.example.com")],
+            camouflage_sites: vec![],
+        };
+        let snapshot = NodeConfigSnapshot {
+            config_revision: 28,
+            config_fingerprint: config_fingerprint(&config).to_string(),
+            config,
+        };
+        let mut reconciler = Reconciler::new();
+        assert_eq!(
+            reconciler
+                .reconcile_with_test_paths(
+                    &manager,
+                    &camouflage,
+                    ReconciliationInput::validated_panel_snapshot(snapshot).unwrap(),
+                    paths.clone(),
+                )
+                .await
+                .state,
+            ReconciliationState::Converged
+        );
+        std::fs::remove_file(dir.join("relay.conf")).unwrap();
+        manager
+            .lock()
+            .await
+            .set_nginx_sni_config_for_test(NginxSniConfig {
+                enabled: true,
+                conf_path: dir.join("relay.conf"),
+                test_cmd: "false".into(),
+                reload_cmd: "true".into(),
+                default_backend: "127.0.0.1:9".into(),
+                access_log_path: dir.join("sni.log").display().to_string(),
+            });
+        assert!(
+            !reconciler
+                .preserve_converged_after_transient(&manager, &camouflage)
+                .await
+        );
+
+        let cached = poller::load_cache_state_at(&paths).unwrap();
+        let recovery = ReconciliationInput::local_recovery_snapshot(
+            NodeConfigSnapshot {
+                config_revision: cached.config_revision,
+                config_fingerprint: cached.config_fingerprint.to_string(),
+                config: cached.config,
+            },
+            LocalRecoverySource::PrimaryLkg,
+        )
+        .unwrap();
+        let failed = reconciler
+            .reconcile_with_test_paths(&manager, &camouflage, recovery, paths)
+            .await;
+        assert_eq!(failed.state, ReconciliationState::ApplyFailed);
+        assert_eq!(
+            reconciler.status_snapshot().state,
+            ReconciliationStatusState::ApplyFailed
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

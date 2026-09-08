@@ -27,7 +27,17 @@ async fn run_local_recovery_tick(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage_sites: &Arc<Mutex<forwarder::camouflage_site::CamouflageSiteManager>>,
     reconciler: &Arc<Mutex<reconciler::Reconciler>>,
+    preserve_converged: bool,
 ) {
+    if preserve_converged
+        && reconciler
+            .lock()
+            .await
+            .preserve_converged_after_transient(manager, camouflage_sites)
+            .await
+    {
+        return;
+    }
     let Some(cached) = poller::load_cache_state_at(&poller::current_cache_paths()) else {
         return;
     };
@@ -470,7 +480,7 @@ async fn run() {
                     interval = tokio::time::interval(Duration::from_secs(MISMATCH_BACKOFF_SECS));
                     in_mismatch_backoff = true;
                 }
-                run_local_recovery_tick(&manager, &camouflage_sites, &reconciler).await;
+                run_local_recovery_tick(&manager, &camouflage_sites, &reconciler, false).await;
             }
             poller::FetchResult::Transient => {
                 if in_mismatch_backoff {
@@ -479,7 +489,7 @@ async fn run() {
                     interval = tokio::time::interval(Duration::from_secs(config.poll_interval));
                     in_mismatch_backoff = false;
                 }
-                run_local_recovery_tick(&manager, &camouflage_sites, &reconciler).await;
+                run_local_recovery_tick(&manager, &camouflage_sites, &reconciler, true).await;
             }
         }
 
