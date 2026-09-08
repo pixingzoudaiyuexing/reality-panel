@@ -1956,6 +1956,9 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
         assert!(INSTALL_SCRIPT.contains("listen 8443 ssl default_server"));
         assert!(INSTALL_SCRIPT.contains("listen [::]:8443 ssl default_server"));
         assert!(INSTALL_SCRIPT.contains("/var/lib/relay-panel/openlist"));
+        assert!(INSTALL_SCRIPT.contains("/var/lib/relay-panel/openlist-ownership.json"));
+        assert!(INSTALL_SCRIPT.contains("OPENLIST_CONTAINER_CREATED=false"));
+        assert!(INSTALL_SCRIPT.contains("OPENLIST_DATA_CREATED=false"));
         assert!(INSTALL_SCRIPT.contains("/var/www/relay-panel-certbot/.well-known/acme-challenge"));
         assert!(INSTALL_SCRIPT.contains("existing_env_value CAMOUFLAGE_SITES_STATE_DIR"));
         assert!(INSTALL_SCRIPT.contains("existing_env_value CERTIFICATE_STATE_DIR"));

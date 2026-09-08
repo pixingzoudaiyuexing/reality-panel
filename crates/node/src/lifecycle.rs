@@ -32,13 +32,46 @@ const UNINSTALL_REMOVE_DIRS: &[&str] = &[
 const UNINSTALL_SYSTEMCTL_ARGS: &[&str] = &["disable", "--now", "relay-node.service"];
 const OPENLIST_IMAGE: &str =
     "openlistteam/openlist@sha256:3bfba7ab379594c3f140e61ecc9096d66360cd4654ccea9f6cb8164b679a669d";
+const OPENLIST_CONTAINER: &str = "relay-panel-openlist";
+const OPENLIST_DATA_PATH: &str = "/var/lib/relay-panel/openlist";
+const OPENLIST_OWNERSHIP_PATH: &str = "/var/lib/relay-panel/openlist-ownership.json";
+const UNINSTALL_RECEIPT_DIR: &str = "/var/lib/relay-panel/uninstall-completions";
+const UNINSTALL_RETRY_SECS: u64 = 10;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct UninstallJob {
     operation_id: String,
     node_id: String,
     panel_url: String,
     token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct OpenListOwnership {
+    version: u8,
+    container_name: String,
+    image: String,
+    data_path: String,
+    container_created: bool,
+    data_dir_created: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UninstallCompletionReceipt {
+    job: UninstallJob,
+    cleanup_success: bool,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenListCleanupPlan {
+    Remove { container: bool, data: bool },
+    Preserve(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UninstallCleanupReport {
+    message: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -657,45 +690,135 @@ fn remove_stream_include(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn remove_owned_openlist(root: &Path) -> Result<(), String> {
+fn openlist_cleanup_plan(root: &Path, inspection: Option<&str>) -> OpenListCleanupPlan {
+    let ownership_path = root.join(OPENLIST_OWNERSHIP_PATH.trim_start_matches('/'));
+    let ownership = std::fs::read(&ownership_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<OpenListOwnership>(&bytes).ok());
+    let Some(ownership) = ownership else {
+        return OpenListCleanupPlan::Preserve(
+            "OpenList ownership cannot be verified; existing container and data were preserved"
+                .into(),
+        );
+    };
+    if ownership.version != 1
+        || ownership.container_name != OPENLIST_CONTAINER
+        || ownership.image != OPENLIST_IMAGE
+        || ownership.data_path != OPENLIST_DATA_PATH
+    {
+        return OpenListCleanupPlan::Preserve(
+            "OpenList ownership marker is invalid; existing container and data were preserved"
+                .into(),
+        );
+    }
+    if ownership.container_created {
+        let Some(inspection) = inspection else {
+            return OpenListCleanupPlan::Preserve(
+                "OpenList container ownership could not be revalidated; resources were preserved"
+                    .into(),
+            );
+        };
+        if !inspection.contains(OPENLIST_IMAGE)
+            || !inspection.contains(&format!("{OPENLIST_DATA_PATH}:/opt/openlist/data;"))
+        {
+            return OpenListCleanupPlan::Preserve(
+                "OpenList container no longer matches its ownership marker; resources were preserved"
+                    .into(),
+            );
+        }
+    }
+    if !ownership.container_created && !ownership.data_dir_created {
+        return OpenListCleanupPlan::Preserve(
+            "OpenList was pre-existing and reused; container and data were preserved".into(),
+        );
+    }
+    OpenListCleanupPlan::Remove {
+        container: ownership.container_created,
+        data: ownership.data_dir_created,
+    }
+}
+
+fn remove_owned_openlist(root: &Path) -> Result<Option<String>, String> {
     if root != Path::new("/") {
-        return Ok(());
+        return Ok(None);
     }
     let output = Command::new("docker")
         .args([
             "inspect",
             "-f",
             "{{.Config.Image}}|{{range .Mounts}}{{.Source}}:{{.Destination}};{{end}}",
-            "relay-panel-openlist",
+            OPENLIST_CONTAINER,
         ])
         .output();
-    let Ok(output) = output else {
-        return Ok(());
-    };
-    if !output.status.success() {
-        return Ok(());
+    let inspection = output.as_ref().ok().and_then(|output| {
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    });
+    match openlist_cleanup_plan(root, inspection.as_deref()) {
+        OpenListCleanupPlan::Preserve(message) => Ok(Some(message)),
+        OpenListCleanupPlan::Remove { container, data } => {
+            if container && inspection.is_some() {
+                let status = Command::new("docker")
+                    .args(["rm", "-f", OPENLIST_CONTAINER])
+                    .status();
+                if !status.is_ok_and(|status| status.success()) {
+                    return Err("remove owned OpenList container failed".into());
+                }
+            }
+            if data {
+                let data_path = Path::new(OPENLIST_DATA_PATH);
+                if data_path.is_symlink() {
+                    return Err("refusing to remove symlinked OpenList data directory".into());
+                }
+                if data_path.exists() {
+                    std::fs::remove_dir_all(data_path)
+                        .map_err(|error| format!("remove owned OpenList data: {error}"))?;
+                }
+            }
+            remove_if_exists(Path::new(OPENLIST_OWNERSHIP_PATH))?;
+            Ok(None)
+        }
     }
-    let evidence = String::from_utf8_lossy(&output.stdout);
-    if !evidence.contains(OPENLIST_IMAGE)
-        || !evidence.contains("/var/lib/relay-panel/openlist:/opt/openlist/data;")
-    {
-        return Ok(());
-    }
-    let status = Command::new("docker")
-        .args(["rm", "-f", "relay-panel-openlist"])
-        .status();
-    if !status.is_ok_and(|status| status.success()) {
-        return Err("remove managed OpenList container failed".into());
-    }
-    let data = Path::new("/var/lib/relay-panel/openlist");
-    if data.exists() {
-        std::fs::remove_dir_all(data)
-            .map_err(|error| format!("remove managed OpenList data: {error}"))?;
+}
+
+fn restore_nginx_snapshot(snapshot: &[(PathBuf, Vec<u8>)]) -> Result<(), String> {
+    for (path, bytes) in snapshot {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("restore Nginx directory: {error}"))?;
+        }
+        std::fs::write(path, bytes)
+            .map_err(|error| format!("restore Nginx snapshot {}: {error}", path.display()))?;
     }
     Ok(())
 }
 
-fn uninstall_managed(root: &Path) -> Result<(), String> {
+fn validate_and_reload_nginx<F>(snapshot: &[(PathBuf, Vec<u8>)], mut run: F) -> Result<(), String>
+where
+    F: FnMut(&str, &[&str]) -> Result<(), String>,
+{
+    if let Err(error) = run("nginx", &["-t"]) {
+        restore_nginx_snapshot(snapshot)?;
+        return Err(format!(
+            "nginx configuration is invalid after cleanup: {error}"
+        ));
+    }
+    if let Err(error) = run("systemctl", &["reload", "nginx"]) {
+        restore_nginx_snapshot(snapshot)?;
+        run("nginx", &["-t"]).map_err(|restore| {
+            format!("Nginx reload failed ({error}); restored config is invalid: {restore}")
+        })?;
+        run("systemctl", &["reload", "nginx"]).map_err(|restore| {
+            format!("Nginx reload failed ({error}); restoring previous runtime failed: {restore}")
+        })?;
+        return Err(format!("Nginx reload failed after cleanup: {error}"));
+    }
+    Ok(())
+}
+
+fn uninstall_managed(root: &Path) -> Result<UninstallCleanupReport, String> {
     let rooted = |path: &str| root.join(path.trim_start_matches('/'));
     let nginx_paths = [
         "/etc/nginx/nginx.conf",
@@ -767,24 +890,68 @@ fn uninstall_managed(root: &Path) -> Result<(), String> {
         }
     }
     if root == Path::new("/") {
-        let _ = Command::new("systemctl").arg("daemon-reload").status();
-        let nginx = Command::new("nginx").arg("-t").status();
-        if !nginx.is_ok_and(|status| status.success()) {
-            for (path, bytes) in &nginx_snapshot {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::write(path, bytes);
-            }
-            return Err("nginx configuration is invalid after cleanup".into());
+        let daemon_reload = Command::new("systemctl").arg("daemon-reload").status();
+        if !daemon_reload.is_ok_and(|status| status.success()) {
+            return Err("systemd daemon-reload failed after relay-node service removal".into());
         }
-        let _ = Command::new("systemctl").args(["reload", "nginx"]).status();
+        validate_and_reload_nginx(&nginx_snapshot, |program, args| {
+            let status = Command::new(program)
+                .args(args)
+                .status()
+                .map_err(|error| format!("execute {program}: {error}"))?;
+            status
+                .success()
+                .then_some(())
+                .ok_or_else(|| format!("{program} {} exited unsuccessfully", args.join(" ")))
+        })?;
     }
-    remove_owned_openlist(root)?;
-    Ok(())
+    let openlist_note = remove_owned_openlist(root)?;
+    Ok(UninstallCleanupReport {
+        message: openlist_note.map_or_else(
+            || "Reality Panel managed node resources removed".into(),
+            |note| format!("Reality Panel managed node resources removed; {note}"),
+        ),
+    })
 }
 
-fn report_uninstall(job: &UninstallJob, success: bool, message: &str) -> Result<(), String> {
+fn uninstall_receipt_path(root: &Path, operation_id: &str) -> PathBuf {
+    root.join(UNINSTALL_RECEIPT_DIR.trim_start_matches('/'))
+        .join(format!("{operation_id}.json"))
+}
+
+fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let parent = path.parent().ok_or("private state path has no parent")?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create private state directory: {error}"))?;
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    let result: Result<(), String> = (|| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+            .map_err(|error| format!("create private state: {error}"))?;
+        file.write_all(&bytes)
+            .map_err(|error| format!("write private state: {error}"))?;
+        file.flush()
+            .map_err(|error| format!("flush private state: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("fsync private state: {error}"))?;
+        std::fs::rename(&temp, path).map_err(|error| format!("commit private state: {error}"))?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("fsync private state directory: {error}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
+}
+
+fn report_uninstall_once(job: &UninstallJob, success: bool, message: &str) -> Result<(), String> {
     let url = format!(
         "{}/api/v1/node/uninstall_result",
         job.panel_url.trim_end_matches('/')
@@ -796,6 +963,8 @@ fn report_uninstall(job: &UninstallJob, success: bool, message: &str) -> Result<
     ));
     let headers = root.with_extension("headers");
     let body_path = root.with_extension("json");
+    let _ = std::fs::remove_file(&headers);
+    let _ = std::fs::remove_file(&body_path);
     let write_private = |path: &Path, value: &[u8]| -> Result<(), String> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -821,35 +990,67 @@ fn report_uninstall(job: &UninstallJob, success: bool, message: &str) -> Result<
     }
     let header_arg = format!("@{}", headers.display());
     let body_arg = format!("@{}", body_path.display());
-    let mut accepted = false;
-    for _ in 0..3 {
-        let status = Command::new("curl")
-            .args([
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--max-time",
-                "10",
-                "-X",
-                "POST",
-                "-H",
-                &header_arg,
-                "--data-binary",
-                &body_arg,
-                &url,
-            ])
-            .status();
-        if status.is_ok_and(|status| status.success()) {
-            accepted = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
+    let status = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "10",
+            "-X",
+            "POST",
+            "-H",
+            &header_arg,
+            "--data-binary",
+            &body_arg,
+            &url,
+        ])
+        .status();
     let _ = std::fs::remove_file(headers);
     let _ = std::fs::remove_file(body_path);
-    accepted
+    status
+        .is_ok_and(|status| status.success())
         .then_some(())
         .ok_or_else(|| "Panel rejected uninstall result".into())
+}
+
+fn completion_attempt<C, R>(
+    receipt_path: &Path,
+    mut cleanup: C,
+    mut report: R,
+) -> Result<bool, String>
+where
+    C: FnMut() -> Result<UninstallCleanupReport, String>,
+    R: FnMut(&UninstallJob, bool, &str) -> Result<(), String>,
+{
+    let mut receipt: UninstallCompletionReceipt = serde_json::from_slice(
+        &std::fs::read(receipt_path).map_err(|error| format!("read uninstall receipt: {error}"))?,
+    )
+    .map_err(|error| format!("parse uninstall receipt: {error}"))?;
+    if !receipt.cleanup_success {
+        match cleanup() {
+            Ok(cleanup) => {
+                receipt.cleanup_success = true;
+                receipt.message = cleanup.message;
+            }
+            Err(error) => {
+                receipt.cleanup_success = false;
+                receipt.message = error;
+            }
+        }
+        write_private_json(receipt_path, &receipt)?;
+    }
+    if report(&receipt.job, receipt.cleanup_success, &receipt.message).is_err() {
+        return Ok(false);
+    }
+    remove_if_exists(receipt_path)?;
+    if let Some(parent) = receipt_path.parent() {
+        let _ = std::fs::remove_dir(parent);
+        if let Some(state_root) = parent.parent() {
+            let _ = std::fs::remove_dir(state_root);
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn run_helper_from_args(args: &[String]) -> Option<Result<(), String>> {
@@ -864,16 +1065,29 @@ pub(crate) fn run_helper_from_args(args: &[String]) -> Option<Result<(), String>
         Some(job) => job,
         None => return Some(Err("invalid uninstall job".into())),
     };
-    let _ = std::fs::remove_file(path);
-    let result = uninstall_managed(Path::new("/"));
-    let message = result
-        .as_ref()
-        .map(|_| "Reality Panel managed node resources removed")
-        .unwrap_or_else(|error| error.as_str());
-    if let Err(error) = report_uninstall(&job, result.is_ok(), message) {
-        return Some(Err(error));
+    let receipt_path = uninstall_receipt_path(Path::new("/"), &job.operation_id);
+    if !receipt_path.exists() {
+        let receipt = UninstallCompletionReceipt {
+            job,
+            cleanup_success: false,
+            message: "uninstall cleanup pending".into(),
+        };
+        if let Err(error) = write_private_json(&receipt_path, &receipt) {
+            return Some(Err(error));
+        }
     }
-    Some(result)
+    let _ = std::fs::remove_file(path);
+    loop {
+        match completion_attempt(
+            &receipt_path,
+            || uninstall_managed(Path::new("/")),
+            report_uninstall_once,
+        ) {
+            Ok(true) => return Some(Ok(())),
+            Ok(false) => std::thread::sleep(std::time::Duration::from_secs(UNINSTALL_RETRY_SECS)),
+            Err(error) => return Some(Err(error)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1105,6 +1319,163 @@ mod tests {
             assert!(!output.contains(secret));
         }
         assert!(output.contains("rule failed"));
+    }
+
+    fn write_openlist_ownership(root: &Path, container_created: bool, data_dir_created: bool) {
+        let path = root.join(OPENLIST_OWNERSHIP_PATH.trim_start_matches('/'));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_private_json(
+            &path,
+            &OpenListOwnership {
+                version: 1,
+                container_name: OPENLIST_CONTAINER.into(),
+                image: OPENLIST_IMAGE.into(),
+                data_path: OPENLIST_DATA_PATH.into(),
+                container_created,
+                data_dir_created,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn openlist_cleanup_requires_durable_creation_ownership() {
+        let root = test_dir("relay-openlist-ownership");
+        std::fs::create_dir_all(&root).unwrap();
+        let inspection = format!("{OPENLIST_IMAGE}|{OPENLIST_DATA_PATH}:/opt/openlist/data;");
+
+        assert!(matches!(
+            openlist_cleanup_plan(&root, Some(&inspection)),
+            OpenListCleanupPlan::Preserve(message) if message.contains("cannot be verified")
+        ));
+
+        write_openlist_ownership(&root, false, false);
+        assert!(matches!(
+            openlist_cleanup_plan(&root, Some(&inspection)),
+            OpenListCleanupPlan::Preserve(message) if message.contains("pre-existing and reused")
+        ));
+
+        write_openlist_ownership(&root, true, true);
+        assert_eq!(
+            openlist_cleanup_plan(&root, Some(&inspection)),
+            OpenListCleanupPlan::Remove {
+                container: true,
+                data: true,
+            }
+        );
+        assert!(matches!(
+            openlist_cleanup_plan(&root, Some("other-image|other:/opt/openlist/data;")),
+            OpenListCleanupPlan::Preserve(message) if message.contains("no longer matches")
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn container_ownership_does_not_imply_data_ownership() {
+        let root = test_dir("relay-openlist-split-ownership");
+        std::fs::create_dir_all(&root).unwrap();
+        write_openlist_ownership(&root, true, false);
+        let inspection = format!("{OPENLIST_IMAGE}|{OPENLIST_DATA_PATH}:/opt/openlist/data;");
+        assert_eq!(
+            openlist_cleanup_plan(&root, Some(&inspection)),
+            OpenListCleanupPlan::Remove {
+                container: true,
+                data: false,
+            }
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completion_receipt_survives_callback_failure_until_ack() {
+        let root = test_dir("relay-uninstall-receipt");
+        let receipt_path = uninstall_receipt_path(&root, "operation-a");
+        let receipt = UninstallCompletionReceipt {
+            job: UninstallJob {
+                operation_id: "operation-a".into(),
+                node_id: "node-a".into(),
+                panel_url: "https://panel.example".into(),
+                token: "secret".into(),
+            },
+            cleanup_success: false,
+            message: "pending".into(),
+        };
+        write_private_json(&receipt_path, &receipt).unwrap();
+        let mut cleanup_calls = 0;
+        let retry = completion_attempt(
+            &receipt_path,
+            || {
+                cleanup_calls += 1;
+                Ok(UninstallCleanupReport {
+                    message: "cleanup complete".into(),
+                })
+            },
+            |_, _, _| Err("Panel unavailable".into()),
+        )
+        .unwrap();
+        assert!(!retry);
+        assert!(receipt_path.exists());
+        assert_eq!(cleanup_calls, 1);
+
+        let acknowledged = completion_attempt(
+            &receipt_path,
+            || panic!("successful cleanup must not repeat"),
+            |job, success, message| {
+                assert_eq!(job.operation_id, "operation-a");
+                assert!(success);
+                assert_eq!(message, "cleanup complete");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(acknowledged);
+        assert!(!receipt_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nginx_validation_or_reload_failure_restores_snapshot() {
+        for failure in ["test", "reload"] {
+            let root = test_dir("relay-uninstall-nginx");
+            let config = root.join("nginx.conf");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(&config, "modified\n").unwrap();
+            let snapshot = vec![(config.clone(), b"original\n".to_vec())];
+            let mut reload_calls = 0;
+            let result = validate_and_reload_nginx(&snapshot, |program, args| {
+                if failure == "test" && program == "nginx" && args == ["-t"] {
+                    return Err("invalid".into());
+                }
+                if program == "systemctl" && args == ["reload", "nginx"] {
+                    reload_calls += 1;
+                    if failure == "reload" && reload_calls == 1 {
+                        return Err("reload failed".into());
+                    }
+                }
+                Ok(())
+            });
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), "original\n");
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn successful_nginx_reload_keeps_the_cleaned_configuration() {
+        let root = test_dir("relay-uninstall-nginx-success");
+        let config = root.join("nginx.conf");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&config, "cleaned\n").unwrap();
+        let snapshot = vec![(config.clone(), b"original\n".to_vec())];
+        let mut commands = Vec::new();
+        validate_and_reload_nginx(&snapshot, |program, args| {
+            commands.push(format!("{program} {}", args.join(" ")));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(commands, ["nginx -t", "systemctl reload nginx"]);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), "cleaned\n");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

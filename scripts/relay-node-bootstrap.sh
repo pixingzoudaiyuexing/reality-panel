@@ -243,6 +243,7 @@ capture_transaction() {
   snapshot_file fallback_cert /etc/nginx/relay-panel-certs/fallback.crt
   snapshot_file fallback_key /etc/nginx/relay-panel-certs/fallback.key
   snapshot_file capabilities /opt/relay-node/provisioning-capabilities.json
+  snapshot_file openlist_ownership /var/lib/relay-panel/openlist-ownership.json
   snapshot_directory_state env_dir /etc/relay-node
   snapshot_directory_state stream_dir /etc/nginx/relay-panel-stream.d
   snapshot_directory_state fallback_cert_dir /etc/nginx/relay-panel-certs
@@ -333,6 +334,7 @@ rollback_transaction() {
   restore_file_if_changed fallback_cert /etc/nginx/relay-panel-certs/fallback.crt || failed=1
   restore_file_if_changed fallback_key /etc/nginx/relay-panel-certs/fallback.key || failed=1
   restore_file_if_changed capabilities /opt/relay-node/provisioning-capabilities.json || failed=1
+  restore_file_if_changed openlist_ownership /var/lib/relay-panel/openlist-ownership.json || failed=1
 
   if [ "$unit_changed" = 1 ]; then
     retry_command "systemd daemon-reload" "$SYSTEMCTL_BIN" daemon-reload || failed=1
@@ -406,12 +408,14 @@ rollback_transaction() {
   file_matches_snapshot fallback_cert /etc/nginx/relay-panel-certs/fallback.crt || failed=1
   file_matches_snapshot fallback_key /etc/nginx/relay-panel-certs/fallback.key || failed=1
   file_matches_snapshot capabilities /opt/relay-node/provisioning-capabilities.json || failed=1
+  file_matches_snapshot openlist_ownership /var/lib/relay-panel/openlist-ownership.json || failed=1
   restore_directory_state fallback_cert_dir /etc/nginx/relay-panel-certs || failed=1
   restore_directory_state stream_dir /etc/nginx/relay-panel-stream.d || failed=1
   restore_directory_state env_dir /etc/relay-node || failed=1
 
   remove_file_staging /opt/relay-node/relay-node
   remove_file_staging /opt/relay-node/provisioning-capabilities.json
+  remove_file_staging /var/lib/relay-panel/openlist-ownership.json
   remove_file_staging /etc/relay-node/relay-node.env
   remove_file_staging /etc/systemd/system/relay-node.service
   remove_file_staging /etc/nginx/nginx.conf
@@ -1023,10 +1027,19 @@ step_ok
 # 1001, so the bind mount must be writable by that account.
 step openlist
 OPENLIST_IMAGE="openlistteam/openlist@sha256:3bfba7ab379594c3f140e61ecc9096d66360cd4654ccea9f6cb8164b679a669d"
+OPENLIST_OWNERSHIP=/var/lib/relay-panel/openlist-ownership.json
+OPENLIST_CONTAINER_CREATED=false
+OPENLIST_DATA_CREATED=false
+if [ ! -e /var/lib/relay-panel/openlist ]; then
+  OPENLIST_DATA_CREATED=true
+fi
+if ! docker inspect relay-panel-openlist >/dev/null 2>&1; then
+  OPENLIST_CONTAINER_CREATED=true
+fi
 install -d -m 0750 -o 1001 -g 1001 /var/lib/relay-panel/openlist
 find /var/lib/relay-panel/openlist -xdev \
   \( ! -uid 1001 -o ! -gid 1001 \) -exec chown 1001:1001 -- {} +
-if ! docker inspect relay-panel-openlist >/dev/null 2>&1; then
+if [ "$OPENLIST_CONTAINER_CREATED" = true ]; then
   docker pull "$OPENLIST_IMAGE"
   docker run -d --name relay-panel-openlist --restart unless-stopped \
     -p 127.0.0.1:5244:5244 \
@@ -1036,6 +1049,13 @@ else
   docker start relay-panel-openlist >/dev/null 2>&1 || true
 fi
 docker inspect -f '{{.State.Running}}' relay-panel-openlist | grep -Fx true >/dev/null
+if [ ! -e "$OPENLIST_OWNERSHIP" ]; then
+  cat > "${OPENLIST_OWNERSHIP}.tmp" <<EOF
+{"version":1,"container_name":"relay-panel-openlist","image":"${OPENLIST_IMAGE}","data_path":"/var/lib/relay-panel/openlist","container_created":${OPENLIST_CONTAINER_CREATED},"data_dir_created":${OPENLIST_DATA_CREATED}}
+EOF
+  chmod 0600 "${OPENLIST_OWNERSHIP}.tmp"
+  mv -f "${OPENLIST_OWNERSHIP}.tmp" "$OPENLIST_OWNERSHIP"
+fi
 step_ok
 
 step fallback
