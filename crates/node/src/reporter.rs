@@ -1023,7 +1023,7 @@ impl PublicIpRefreshBackoff {
         let delay = PUBLIC_IP_RETRY_DELAYS
             .get(self.consecutive_failures)
             .copied()
-            .unwrap_or(PUBLIC_IP_REFRESH);
+            .unwrap_or(PUBLIC_IP_RETRY_DELAYS[PUBLIC_IP_RETRY_DELAYS.len() - 1]);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         delay
     }
@@ -1558,8 +1558,8 @@ mod tests {
         assert_eq!(backoff.next_delay(false), Duration::from_secs(10));
         assert_eq!(backoff.next_delay(false), Duration::from_secs(30));
         assert_eq!(backoff.next_delay(false), Duration::from_secs(60));
-        assert_eq!(backoff.next_delay(false), PUBLIC_IP_REFRESH);
-        assert_eq!(backoff.next_delay(false), PUBLIC_IP_REFRESH);
+        assert_eq!(backoff.next_delay(false), Duration::from_secs(60));
+        assert_eq!(backoff.next_delay(false), Duration::from_secs(60));
         assert_eq!(backoff.next_delay(true), PUBLIC_IP_REFRESH);
         assert_eq!(backoff.next_delay(false), Duration::from_secs(5));
     }
