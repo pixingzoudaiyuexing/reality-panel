@@ -141,6 +141,7 @@ async fn main() {
             std::collections::HashSet::new(),
         )),
     };
+    api::node_batch_upgrade::interrupt_incomplete_batches(&state).await;
     let addr: SocketAddr = config.listen.parse().expect("Invalid listen address");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 

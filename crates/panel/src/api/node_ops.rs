@@ -165,7 +165,7 @@ async fn store_durable_uninstall(
         .map_err(|error| error.to_string())
 }
 
-async fn has_active_durable_uninstall(
+pub(crate) async fn has_active_durable_uninstall(
     state: &AppState,
     group_id: i64,
     node_id: &str,
@@ -614,6 +614,11 @@ impl NodeOperationRegistry {
             })
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_status_for_test(&self, id: &str, status: OperationStatus) {
+        self.update(id, status, "test terminal status");
+    }
+
     fn artifact_target(
         &self,
         group_id: i64,
@@ -767,6 +772,10 @@ fn load_artifact(architecture: &str) -> Result<LoadedArtifact, String> {
     load_artifact_from(&artifact_root(), architecture)
 }
 
+pub(crate) fn validated_artifact_version(architecture: &str) -> Result<String, String> {
+    load_artifact(architecture).map(|artifact| artifact.metadata.version)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct OperationRequest {
     #[serde(default)]
@@ -879,7 +888,7 @@ async fn operation_channel_online(
     }
 }
 
-async fn create_operation(
+pub(crate) async fn create_operation(
     state: &AppState,
     actor_id: i64,
     group_id: i64,

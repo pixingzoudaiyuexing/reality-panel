@@ -14,6 +14,7 @@ pub mod geoip;
 pub mod groups;
 pub mod middleware;
 pub mod node;
+pub mod node_batch_upgrade;
 pub mod node_deploy;
 pub mod node_enrollment;
 pub mod node_ops;
@@ -423,6 +424,22 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/admin/node-operations",
             axum::routing::get(node_ops::list_operations),
+        )
+        .route(
+            "/admin/nodes/batch-upgrade/preview",
+            axum::routing::get(node_batch_upgrade::preview),
+        )
+        .route(
+            "/admin/nodes/batch-upgrade",
+            axum::routing::post(node_batch_upgrade::start),
+        )
+        .route(
+            "/admin/nodes/batch-upgrade/{id}",
+            axum::routing::get(node_batch_upgrade::get),
+        )
+        .route(
+            "/admin/nodes/batch-upgrades",
+            axum::routing::get(node_batch_upgrade::list),
         )
         .route(
             "/admin/nodes/{group_id}/{node_id}/logs",
