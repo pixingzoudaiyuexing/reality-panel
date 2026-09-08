@@ -157,6 +157,17 @@ impl NginxSniPlan {
             .cloned()
     }
 
+    pub fn listen_ports(&self) -> Vec<u16> {
+        let mut ports = self
+            .rules
+            .iter()
+            .map(|rule| rule.listen_port)
+            .collect::<Vec<_>>();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
     pub fn render(&self) -> String {
         let mut by_port: BTreeMap<u16, Vec<&NginxSniRule>> = BTreeMap::new();
         for rule in &self.rules {
@@ -722,6 +733,39 @@ mod tests {
         assert!(mixed
             .unwrap_err()
             .contains("mixed upstream Proxy Protocol modes"));
+    }
+
+    #[test]
+    fn managed_listen_ports_are_sorted_and_deduplicated_across_sni_rules() {
+        let plan = NginxSniPlan::from_listeners(
+            &[
+                listener(
+                    1,
+                    443,
+                    "a.example.com",
+                    &["10.0.0.1:1"],
+                    LoadBalanceStrategy::First,
+                ),
+                listener(
+                    2,
+                    443,
+                    "b.example.com",
+                    &["10.0.0.2:2"],
+                    LoadBalanceStrategy::First,
+                ),
+                listener(
+                    3,
+                    8443,
+                    "c.example.com",
+                    &["10.0.0.3:3"],
+                    LoadBalanceStrategy::First,
+                ),
+            ],
+            "127.0.0.1:8443",
+            "/tmp/sni.log",
+        )
+        .unwrap();
+        assert_eq!(plan.listen_ports(), vec![443, 8443]);
     }
 
     #[test]

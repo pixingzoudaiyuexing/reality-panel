@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import type { Tfn } from './types';
 import type { NodeDisplayRow, RelayReadyNode } from '../../api/types';
-import { statusTag } from './shared';
+import { connectionTelemetry, statusTag } from './shared';
 import { NodeGroupSection } from './NodeGroupSection';
 import { NodeDesktopTable } from './NodeDesktopTable';
 import { NodeMobileList } from './NodeMobileList';
@@ -60,6 +60,26 @@ describe('NodeGroupSection mobile vs desktop', () => {
       <NodeGroupSection rows={placeholder} panelProtocol={0} latestNodeVersion="1.1.0" nodeVersionCheckFailed={false} isMobile={false} t={t} openDetail={vi.fn()} />,
     );
     expect(screen.getByText('noNodeReportingInGroup')).toBeInTheDocument();
+  });
+});
+
+describe('Node connection telemetry', () => {
+  it('distinguishes observed zero from unavailable split telemetry', () => {
+    expect(connectionTelemetry(row({ tcp_connections: 0, udp_sessions: 0 }))).toBe('0 / 0');
+    expect(connectionTelemetry(row({ tcp_connections: null, udp_sessions: undefined }))).toBe('- / -');
+  });
+
+  it('shows separate TCP and UDP values on desktop and mobile', () => {
+    const telemetryRow = row({ online: true, tcp_connections: 27, udp_sessions: 3 });
+    const desktop = render(
+      <NodeDesktopTable rows={[telemetryRow]} panelProtocol={0} latestNodeVersion="" nodeVersionCheckFailed={false} t={t} openDetail={vi.fn()} />,
+    );
+    expect(screen.getByRole('columnheader', { name: 'TCP / UDP' })).toBeInTheDocument();
+    expect(screen.getByText('27 / 3')).toBeInTheDocument();
+    desktop.unmount();
+
+    render(<NodeMobileList rows={[telemetryRow]} panelProtocol={0} t={t} openDetail={vi.fn()} />);
+    expect(screen.getByText(/TCP \/ UDP: 27 \/ 3/)).toBeInTheDocument();
   });
 });
 

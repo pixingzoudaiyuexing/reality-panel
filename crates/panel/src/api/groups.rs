@@ -251,6 +251,8 @@ fn aggregate_shared_node_summaries(
                 // connections defaults to 0 (not None) — a placeholder/old node
                 // simply has no active connections.
                 connections: i("connections").unwrap_or(0),
+                tcp_connections: i("tcp_connections"),
+                udp_sessions: i("udp_sessions"),
                 uptime: i("uptime"),
                 process_uptime: i("process_uptime"),
                 network_interface: s("network_interface"),

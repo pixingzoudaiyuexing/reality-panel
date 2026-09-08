@@ -4,7 +4,7 @@ import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined, FileTe
 import type { NodeLifecycleHandler, Tfn } from './types';
 import type { NodeDisplayRow, RelayReadyNode } from '../../api/types';
 import { NodeResourceBar } from './NodeResourceBar';
-import { NetworkCell, RelayReadyStatus, statusTag } from './shared';
+import { connectionTelemetry, NetworkCell, RelayReadyStatus, statusTag } from './shared';
 import { formatBps, formatUptime } from '../../utils/format';
 import { versionRelation, versionTagColor } from '../../utils/version';
 import { resolveNodeUpgrade, type NodeUpgradeState } from './upgrade';
@@ -114,6 +114,7 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
                 Both now come from the theme. */}
             <div className="rp-node-meta" style={{ fontSize: 12, marginTop: 4 }}>
               ↑ {formatBps(r.upload_bps)} ↓ {formatBps(r.download_bps)}
+              {' · '}TCP / UDP: {connectionTelemetry(r)}
               {' · '}{t('systemUptime')}: {formatUptime(r.uptime, labels)}
             </div>
             <div style={{ display: 'flex', gap: 12, marginTop: 6 }}>

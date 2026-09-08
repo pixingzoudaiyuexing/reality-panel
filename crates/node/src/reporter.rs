@@ -6,7 +6,11 @@ use relay_shared::protocol::{
     TrafficEntry, TrafficReport,
 };
 use std::collections::HashMap;
+#[cfg(any(target_os = "linux", test))]
+use std::collections::HashSet;
 use std::net::SocketAddr;
+#[cfg(any(target_os = "linux", test))]
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -258,15 +262,83 @@ impl ConnectionTracker {
         prune_expired(&self.udp)
     }
 
+    pub fn current_tcp(&self) -> u32 {
+        u32::try_from(self.tcp.load(Ordering::Relaxed)).unwrap_or(u32::MAX)
+    }
+
+    pub async fn current_udp(&self) -> u32 {
+        prune_expired(&self.udp);
+        u32::try_from(self.udp.len()).unwrap_or(u32::MAX)
+    }
+
     /// Total active connections reported to the panel:
     /// active TCP connections + active UDP sessions.
+    #[allow(dead_code)] // Compatibility reader retained for callers/tests using the legacy total.
     pub async fn current(&self) -> u32 {
-        // TCP count is exact; UDP count is pruned-of-expired first so a quiet
-        // node reports 0 shortly after traffic stops.
-        let tcp = self.tcp.load(Ordering::Relaxed) as u32;
-        prune_expired(&self.udp);
-        let udp = self.udp.len() as u32;
-        tcp.saturating_add(udp)
+        self.current_tcp().saturating_add(self.current_udp().await)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+const PROC_NET_TCP: &str = "/proc/net/tcp";
+#[cfg(any(target_os = "linux", test))]
+const PROC_NET_TCP6: &str = "/proc/net/tcp6";
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_established_on_ports(
+    contents: &str,
+    managed_ports: &HashSet<u16>,
+) -> Result<u64, ()> {
+    let mut count = 0_u64;
+    for (index, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || (index == 0 && line.contains("local_address")) {
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 4 {
+            return Err(());
+        }
+        let (_, local_port) = fields[1].rsplit_once(':').ok_or(())?;
+        let local_port = u16::from_str_radix(local_port, 16).map_err(|_| ())?;
+        if fields[3].len() != 2 || !fields[3].bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(());
+        }
+        if fields[3] != "01" {
+            continue;
+        }
+        if managed_ports.contains(&local_port) {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn nginx_sni_active_tcp_with_reader<F>(managed_ports: &[u16], mut read: F) -> Option<u32>
+where
+    F: FnMut(&Path) -> std::io::Result<String>,
+{
+    let managed_ports = managed_ports.iter().copied().collect::<HashSet<_>>();
+    if managed_ports.is_empty() {
+        return Some(0);
+    }
+    let ipv4 = read(Path::new(PROC_NET_TCP)).ok()?;
+    let ipv6 = read(Path::new(PROC_NET_TCP6)).ok()?;
+    let count = parse_proc_established_on_ports(&ipv4, &managed_ports)
+        .ok()?
+        .saturating_add(parse_proc_established_on_ports(&ipv6, &managed_ports).ok()?);
+    Some(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+fn nginx_sni_active_tcp(managed_ports: &[u16]) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        nginx_sni_active_tcp_with_reader(managed_ports, std::fs::read_to_string)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        managed_ports.is_empty().then_some(0)
     }
 }
 
@@ -801,6 +873,7 @@ pub async fn report_status(
     config: &NodeConfig,
     metrics: &Arc<NodeMetrics>,
     connections: &ConnectionTracker,
+    managed_nginx_sni_ports: &[u16],
     start_time: Instant,
     node_id: &str,
     listener_errors: Vec<ListenerError>,
@@ -809,12 +882,20 @@ pub async fn report_status(
     reconciliation: ReconciliationStatus,
 ) {
     let snap = metrics.snapshot().await;
-    let active_connections = connections.current().await;
+    let relay_tcp = connections.current_tcp();
+    let active_udp_sessions = connections.current_udp().await;
+    let active_tcp_connections = nginx_sni_active_tcp(managed_nginx_sni_ports)
+        .map(|nginx_tcp| relay_tcp.saturating_add(nginx_tcp));
+    let active_connections = active_tcp_connections
+        .unwrap_or(relay_tcp)
+        .saturating_add(active_udp_sessions);
 
     let report = StatusReport {
         cpu_usage: snap.cpu,
         mem_usage: snap.mem_pct,
         active_connections,
+        active_tcp_connections,
+        active_udp_sessions: Some(active_udp_sessions),
         // v0.3.2: uptime_secs is now SYSTEM uptime (since OS boot), matching
         // what "运行时长" means to users. The process uptime moved to its own
         // field below.
@@ -1137,10 +1218,13 @@ mod tests {
         let tracker = ConnectionTracker::new();
         // Baseline: zero active connections.
         assert_eq!(tracker.current().await, 0);
+        assert_eq!(tracker.current_tcp(), 0);
+        assert_eq!(tracker.current_udp().await, 0);
 
         // Open one TCP connection -> count becomes 1.
         let guard = tracker.tcp_handle();
         assert_eq!(tracker.current().await, 1);
+        assert_eq!(tracker.current_tcp(), 1);
 
         // Open a second -> count becomes 2.
         let guard2 = tracker.tcp_handle();
@@ -1235,7 +1319,62 @@ mod tests {
         let _t2 = tracker.tcp_handle();
         tracker.udp_touch(addr(8000), 1).await;
         tracker.udp_touch(addr(8001), 1).await;
+        assert_eq!(tracker.current_tcp(), 2);
+        assert_eq!(tracker.current_udp().await, 2);
         assert_eq!(tracker.current().await, 4);
+    }
+
+    fn proc_line(local_port: u16, remote_port: u16, state: &str) -> String {
+        format!(
+            "  0: 0100007F:{local_port:04X} 0200007F:{remote_port:04X} {state} 00000000:00000000 00:00000000 00000000 0 0 1 1"
+        )
+    }
+
+    #[test]
+    fn proc_tcp_parser_counts_only_established_managed_local_ports() {
+        let managed = HashSet::from([443, 8443]);
+        let sample = [
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode".into(),
+            proc_line(443, 50000, "01"),
+            proc_line(8443, 50001, "01"),
+            proc_line(443, 50002, "0A"),
+            proc_line(443, 50003, "06"),
+            proc_line(50004, 443, "01"),
+        ]
+        .join("\n");
+        assert_eq!(parse_proc_established_on_ports(&sample, &managed), Ok(2));
+    }
+
+    #[test]
+    fn proc_tcp_parser_handles_ipv6_and_rejects_malformed_rows() {
+        let managed = HashSet::from([443]);
+        let ipv6 = format!(
+            "  sl  local_address rem_address st\n  1: 00000000000000000000000000000000:{:04X} 00000000000000000000000000000000:C350 01 00000000:00000000 00:00000000 00000000",
+            443
+        );
+        assert_eq!(parse_proc_established_on_ports(&ipv6, &managed), Ok(1));
+        assert_eq!(
+            parse_proc_established_on_ports("not a proc row", &managed),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn nginx_socket_telemetry_deduplicates_ports_and_preserves_unknown() {
+        let sample = format!(
+            "  sl  local_address rem_address st\n{}",
+            proc_line(443, 50000, "01")
+        );
+        let available = nginx_sni_active_tcp_with_reader(&[443, 443], |_| Ok(sample.clone()));
+        assert_eq!(available, Some(2), "one IPv4 plus one IPv6 socket");
+        let unavailable = nginx_sni_active_tcp_with_reader(&[443], |_| {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+        });
+        assert_eq!(unavailable, None);
+        assert_eq!(
+            nginx_sni_active_tcp_with_reader(&[], |_| unreachable!()),
+            Some(0)
+        );
     }
 
     /// Performance: applying a config with many rules must keep the listener

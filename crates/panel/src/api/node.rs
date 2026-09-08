@@ -417,6 +417,8 @@ pub async fn report_status(
             "cpu": req.cpu_usage,
             "mem": req.mem_usage,
             "connections": req.active_connections,
+            "tcp_connections": req.active_tcp_connections,
+            "udp_sessions": req.active_udp_sessions,
             // v0.3.2: "uptime" is SYSTEM uptime (since OS boot). process uptime
             // is separate below; older nodes don't send it and it renders as "-".
             "uptime": req.uptime_secs,
@@ -661,6 +663,8 @@ mod tests {
             cpu_usage: 0.0,
             mem_usage: 0.0,
             active_connections: 0,
+            active_tcp_connections: Some(0),
+            active_udp_sessions: Some(0),
             uptime_secs: 60,
             public_ip: Some("203.0.113.10".into()),
             public_ipv4: Some("203.0.113.10".into()),
@@ -973,6 +977,8 @@ mod tests {
             cpu_usage: 0.0,
             mem_usage: 0.0,
             active_connections: 0,
+            active_tcp_connections: None,
+            active_udp_sessions: None,
             uptime_secs: 0,
             public_ip: None,
             public_ipv4: None,
@@ -1342,6 +1348,8 @@ mod tests {
             cpu_usage: 0.0,
             mem_usage: 0.0,
             active_connections: 0,
+            active_tcp_connections: Some(0),
+            active_udp_sessions: Some(0),
             uptime_secs: 0,
             public_ip: None,
             public_ipv4: None,
@@ -1413,6 +1421,8 @@ mod tests {
             Some(true)
         );
         assert_eq!(v["reconciliation"]["state"].as_str(), Some("CONVERGED"));
+        assert_eq!(v["tcp_connections"].as_u64(), Some(0));
+        assert_eq!(v["udp_sessions"].as_u64(), Some(0));
         for forbidden in ["PRIVATE KEY", "privkey.pem", "NODE_TOKEN", "Bearer"] {
             assert!(!raw.contains(forbidden));
         }
@@ -1421,6 +1431,28 @@ mod tests {
             Some("systemd"),
             "install_method must be persisted so the upgrade UI can offer a self-upgrade"
         );
+    }
+
+    #[tokio::test]
+    async fn report_status_preserves_unknown_split_connection_telemetry() {
+        let (state, _) = seeded_state().await;
+        let mut req = ready_status("node-unknown");
+        req.active_connections = 7;
+        req.active_tcp_connections = None;
+        req.active_udp_sessions = None;
+        let Json(response) =
+            report_status(State(state.clone()), auth_headers("tok-A"), Json(req)).await;
+        assert_eq!(response.code, 0);
+        let raw = state
+            .db
+            .get("node_status:10:node-unknown")
+            .await
+            .unwrap()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["connections"].as_u64(), Some(7));
+        assert!(value["tcp_connections"].is_null());
+        assert!(value["udp_sessions"].is_null());
     }
 
     #[tokio::test]

@@ -658,6 +658,8 @@ export interface NodeStatus {
   cpu: number;
   mem: number;
   connections: number;
+  tcp_connections?: number | null;
+  udp_sessions?: number | null;
   /** v0.3.2: SYSTEM uptime (since OS boot). Was process uptime before v0.3.2. */
   uptime: number;
   /** v0.3.2: relay-node process uptime (since this binary started). Optional —
@@ -955,6 +957,8 @@ export interface SharedNodeSummary {
   node_version?: string | null;
   config_protocol_version?: number | null;
   connections: number;
+  tcp_connections?: number | null;
+  udp_sessions?: number | null;
   uptime?: number | null;
   process_uptime?: number | null;
   network_interface?: string | null;
@@ -992,6 +996,8 @@ export interface NodeDisplayRow {
   architecture?: string | null;
   config_protocol_version?: number | null;
   connections?: number | null;
+  tcp_connections?: number | null;
+  udp_sessions?: number | null;
   cpu?: number | null;
   mem?: number | null;
   uptime?: number | null;

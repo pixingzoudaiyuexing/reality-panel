@@ -587,6 +587,8 @@ export const zhCN = {
   cpu: 'CPU',
   mem: '内存',
   connections: '连接数',
+  tcpActiveConnections: 'TCP 活跃连接',
+  udpActiveSessions: 'UDP 活跃会话',
   uptime: '运行时长',
   systemUptime: '系统运行时长',
   processUptime: '进程运行时长',

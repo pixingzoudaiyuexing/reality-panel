@@ -27,6 +27,10 @@ export function NetworkCell({ row }: { row: NodeDisplayRow; t: Tfn }) {
   );
 }
 
+export function connectionTelemetry(row: NodeDisplayRow): string {
+  return `${row.tcp_connections ?? '-'} / ${row.udp_sessions ?? '-'}`;
+}
+
 /** Status tag with protocol-mismatch detection. */
 export function statusTag(r: NodeDisplayRow, t: Tfn, panelProtocol: number) {
   const v = r.config_protocol_version;

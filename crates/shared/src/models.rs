@@ -269,6 +269,10 @@ pub struct SharedNodeSummary {
     pub config_protocol_version: Option<i64>,
     /// v0.4.14: active connection count.
     pub connections: i64,
+    /// Additive split telemetry. None means the node did not report a reliable
+    /// value; zero is a real observed zero.
+    pub tcp_connections: Option<i64>,
+    pub udp_sessions: Option<i64>,
     /// v0.4.14: SYSTEM uptime (since OS boot), seconds.
     pub uptime: Option<i64>,
     /// v0.4.14: relay-node process uptime (since binary start), seconds.

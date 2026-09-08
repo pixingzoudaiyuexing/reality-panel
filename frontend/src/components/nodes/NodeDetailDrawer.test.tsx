@@ -37,6 +37,19 @@ describe('NodeDetailDrawer desensitization', () => {
     expect(screen.getByText('nodeStatusDelete')).toBeInTheDocument();
   });
 
+  it('shows TCP and UDP separately while preserving zero and unknown', () => {
+    const first = render(
+      <NodeDetailDrawer row={{ ...baseRow, tcp_connections: 0, udp_sessions: 3 }} open onClose={vi.fn()} isAdmin panelProtocol={2} />,
+    );
+    expect(screen.getByText('tcpActiveConnections').closest('tr')).toHaveTextContent('0');
+    expect(screen.getByText('udpActiveSessions').closest('tr')).toHaveTextContent('3');
+    first.unmount();
+
+    render(<NodeDetailDrawer row={{ ...baseRow, tcp_connections: null, udp_sessions: undefined }} open onClose={vi.fn()} isAdmin panelProtocol={2} />);
+    expect(screen.getByText('tcpActiveConnections').closest('tr')).toHaveTextContent('-');
+    expect(screen.getByText('udpActiveSessions').closest('tr')).toHaveTextContent('-');
+  });
+
   it('hides node_id and all admin-only fields when isAdmin is false', () => {
     const row = {
       ...baseRow,

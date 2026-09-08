@@ -96,7 +96,8 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
           )}
 
           <Descriptions.Item label={t('nodeVersion')}>{row.node_version || '-'}</Descriptions.Item>
-          <Descriptions.Item label={t('connections')}>{row.connections || 0}</Descriptions.Item>
+          <Descriptions.Item label={t('tcpActiveConnections')}>{row.tcp_connections ?? '-'}</Descriptions.Item>
+          <Descriptions.Item label={t('udpActiveSessions')}>{row.udp_sessions ?? '-'}</Descriptions.Item>
           <Descriptions.Item label="CPU">{formatPercent(row.cpu)}</Descriptions.Item>
           <Descriptions.Item label={t('mem')}>{formatPercent(row.mem)}</Descriptions.Item>
           <Descriptions.Item label={t('disk')}>

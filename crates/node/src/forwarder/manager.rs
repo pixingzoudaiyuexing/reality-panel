@@ -248,6 +248,16 @@ impl ForwarderManager {
         None
     }
 
+    /// Unique listen ports from the currently effective managed nginx_sni
+    /// plan. These are the only local ports eligible for Reality socket
+    /// telemetry; system listeners and backend remote ports are excluded.
+    pub fn managed_nginx_sni_ports(&self) -> Vec<u16> {
+        self.nginx_sni_plan
+            .as_ref()
+            .map(NginxSniPlan::listen_ports)
+            .unwrap_or_default()
+    }
+
     /// v0.4.1: set the shared TLS acceptor for tls_simple listeners. Called at
     /// startup after loading the cert+key (or starting the CertReloader).
     /// None = no cert (tls_simple rules skipped).

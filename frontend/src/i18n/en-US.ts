@@ -590,6 +590,8 @@ export const enUS: Dict = {
   cpu: 'CPU',
   mem: 'MEM',
   connections: 'Connections',
+  tcpActiveConnections: 'Active TCP connections',
+  udpActiveSessions: 'Active UDP sessions',
   uptime: 'Uptime',
   systemUptime: 'System Uptime',
   processUptime: 'Process Uptime',

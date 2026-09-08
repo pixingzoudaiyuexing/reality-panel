@@ -696,6 +696,14 @@ pub struct StatusReport {
     pub cpu_usage: f32,
     pub mem_usage: f32,
     pub active_connections: u32,
+    /// Active TCP sockets across relay-node listeners plus managed nginx_sni
+    /// ingress. None means the Nginx socket source could not be read reliably.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tcp_connections: Option<u32>,
+    /// Active relay-node UDP sessions. UDP uses inactivity-based sessions, not
+    /// TCP connection semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_udp_sessions: Option<u32>,
     pub uptime_secs: u64,
     // --- Extended metrics (all optional; older nodes that don't report them
     //     still deserialize fine, and the panel renders "-" for missing). ---
@@ -2254,7 +2262,19 @@ mod tests {
         }"#;
         let report: StatusReport = serde_json::from_str(legacy).unwrap();
         assert!(report.reconciliation.is_none());
+        assert_eq!(report.active_tcp_connections, None);
+        assert_eq!(report.active_udp_sessions, None);
         assert_eq!(CONFIG_PROTOCOL_VERSION, 10);
+
+        let split: StatusReport = serde_json::from_str(
+            r#"{"cpu_usage":1.0,"mem_usage":2.0,"active_connections":8,"active_tcp_connections":5,"active_udp_sessions":3,"uptime_secs":4}"#,
+        )
+        .unwrap();
+        assert_eq!(split.active_tcp_connections, Some(5));
+        assert_eq!(split.active_udp_sessions, Some(3));
+        let encoded_split = serde_json::to_value(split).unwrap();
+        assert_eq!(encoded_split["active_tcp_connections"], 5);
+        assert_eq!(encoded_split["active_udp_sessions"], 3);
 
         let status = ReconciliationStatus {
             state: ReconciliationStatusState::Converged,

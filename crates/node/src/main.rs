@@ -508,9 +508,13 @@ async fn run() {
         // Drain any listener bind/runtime errors captured since the last cycle
         // and forward them to the panel so an operator can see WHY a rule isn't
         // forwarding (port in use, permission denied, etc.).
-        let (listener_errors, active_listener_rule_ids) = {
+        let (listener_errors, active_listener_rule_ids, managed_nginx_sni_ports) = {
             let mgr = manager.lock().await;
-            (mgr.take_listener_errors().await, mgr.active_rule_ids())
+            (
+                mgr.take_listener_errors().await,
+                mgr.active_rule_ids(),
+                mgr.managed_nginx_sni_ports(),
+            )
         };
         let camouflage_status =
             forwarder::camouflage_site::status_snapshot_shared(&camouflage_sites).await;
@@ -519,6 +523,7 @@ async fn run() {
             &config,
             &metrics,
             &connections,
+            &managed_nginx_sni_ports,
             start_time,
             &node_id,
             listener_errors,

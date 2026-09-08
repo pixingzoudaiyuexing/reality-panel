@@ -6,7 +6,7 @@ import type { NodeDisplayRow, RelayReadyNode } from '../../api/types';
 import { NodeResourceBar, NodeDiskBar } from './NodeResourceBar';
 import { formatBps, formatBytes, formatUptime, formatPercent } from '../../utils/format';
 import { versionRelation, versionTagColor } from '../../utils/version';
-import { NetworkCell, RelayReadyStatus } from './shared';
+import { connectionTelemetry, NetworkCell, RelayReadyStatus } from './shared';
 import { resolveNodeUpgrade } from './upgrade';
 import { nodeDesktopColumnWidths } from './tableLayout';
 
@@ -147,8 +147,9 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
       render: (_: unknown, r: NodeDisplayRow) => <NetworkCell row={r} t={t} />,
     },
     {
-      title: t('connections'), dataIndex: 'connections', key: 'connections', width: 70,
-      render: (v: number) => <span className="rp-mono">{v || 0}</span>,
+      title: <Tooltip title={`${t('tcpActiveConnections')} / ${t('udpActiveSessions')}`}>TCP / UDP</Tooltip>,
+      key: 'connections', width: 92,
+      render: (_: unknown, r: NodeDisplayRow) => <span className="rp-mono">{connectionTelemetry(r)}</span>,
     },
     {
       title: 'CPU', key: 'cpu', width: nodeDesktopColumnWidths.cpu,
