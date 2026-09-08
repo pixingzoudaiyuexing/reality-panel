@@ -408,6 +408,7 @@ describe('NodeStatus background lifecycle operations', () => {
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       if (url === '/groups') return Promise.resolve(ok([]));
       if (url === '/admin/node-operations') return Promise.resolve(ok([runningOperation]));
+      if (url === '/admin/nodes/1/n1/operations/operation-running') return Promise.resolve(ok({ ...runningOperation, message: 'latest' }));
       return Promise.reject(new Error(`unexpected ${url}`));
     });
     renderPage();
@@ -415,7 +416,10 @@ describe('NodeStatus background lifecycle operations', () => {
     fireEvent.click(screen.getByRole('button', { name: /backgroundTasks/ }));
     expect(screen.getByText(/n1 · nodeOperation_upgrade/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'details' }));
+    await flush();
+    expect(mockGet).toHaveBeenCalledWith('/admin/nodes/1/n1/operations/operation-running');
     expect(screen.getByText('nodeOperation_upgrade')).toBeInTheDocument();
+    expect(screen.getByText('latest')).toBeInTheDocument();
   });
 });
 

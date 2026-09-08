@@ -229,6 +229,18 @@ export default function NodeStatus() {
     }
   };
 
+  const openOperationDetail = async (operation: NodeOperation) => {
+    setActiveOperation(operation);
+    setBackgroundTasksOpen(false);
+    setOperationDrawerOpen(true);
+    try {
+      const res = await api.get<unknown, ApiEnvelope<NodeOperation>>(
+        `/admin/nodes/${operation.group_id}/${operation.node_id}/operations/${operation.id}`,
+      );
+      if (res.code === 0 && res.data) setActiveOperation(res.data);
+    } catch { /* keep the discovered snapshot */ }
+  };
+
   const handleLifecycle = (row: AnyNodeRow, action: NodeLifecycleAction) => {
     if (action === 'logs') { void startOperation(row, action); return; }
     if (action === 'uninstall') {
@@ -259,8 +271,7 @@ export default function NodeStatus() {
   const openBatchUpgrade = async () => {
     const running = batchOperations.find((batch) => !terminalBatchStatuses.has(batch.status));
     if (running) {
-      setActiveBatch(running);
-      setBatchDrawerOpen(true);
+      await openBatchDetail(running);
       return;
     }
     try {
@@ -271,6 +282,16 @@ export default function NodeStatus() {
     } catch (error) {
       message.error(errorMessage(error));
     }
+  };
+
+  const openBatchDetail = async (batch: BatchUpgradeOperation) => {
+    setActiveBatch(batch);
+    setBackgroundTasksOpen(false);
+    setBatchDrawerOpen(true);
+    try {
+      const res = await api.get<unknown, ApiEnvelope<BatchUpgradeOperation>>(`/admin/nodes/batch-upgrade/${batch.id}`);
+      if (res.code === 0 && res.data) setActiveBatch(res.data);
+    } catch { /* keep the discovered snapshot */ }
   };
 
   const startBatchUpgrade = async () => {
@@ -432,11 +453,7 @@ export default function NodeStatus() {
           locale={{ emptyText: t('backgroundTasksEmpty') }}
           renderItem={(batch) => (
             <List.Item actions={[
-              <Button key="view" type="link" onClick={() => {
-                setActiveBatch(batch);
-                setBackgroundTasksOpen(false);
-                setBatchDrawerOpen(true);
-              }}>{t('details')}</Button>,
+              <Button key="view" type="link" onClick={() => void openBatchDetail(batch)}>{t('details')}</Button>,
             ]}>
               <List.Item.Meta
                 title={`${t('batchUpgradeAll')} · ${t(`batchUpgradeStatus_${batch.status}`)}`}
@@ -451,15 +468,11 @@ export default function NodeStatus() {
           locale={{ emptyText: t('backgroundTasksEmpty') }}
           renderItem={(operation) => (
             <List.Item actions={[
-              <Button key="view" type="link" onClick={() => {
-                setActiveOperation(operation);
-                setBackgroundTasksOpen(false);
-                setOperationDrawerOpen(true);
-              }}>{t('details')}</Button>,
+              <Button key="view" type="link" onClick={() => void openOperationDetail(operation)}>{t('details')}</Button>,
             ]}>
               <List.Item.Meta
                 title={`${operation.node_id} · ${t(`nodeOperation_${operation.action}`)}`}
-                description={`${operationStatusLabel(operation, t)} · ${operation.updated_at}`}
+                description={`G${operation.group_id} · ${operationStatusLabel(operation, t)} · ${operation.current_version ? `v${operation.current_version}` : '-'}${operation.target_version ? ` → v${operation.target_version}` : ''} · ${operation.updated_at}`}
               />
             </List.Item>
           )}
