@@ -1,27 +1,21 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typography, Badge, List, Space } from 'antd';
-import { CloudUploadOutlined, CopyOutlined, LineChartOutlined, ReloadOutlined, UnorderedListOutlined } from '@ant-design/icons';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typography, Badge, List, Space, Descriptions, Progress } from 'antd';
+import { CloudUploadOutlined, CopyOutlined, LineChartOutlined, ReloadOutlined, UnorderedListOutlined, SyncOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog, RelayReadyNode } from '../api/types';
+import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog, RelayReadyNode, BatchUpgradeOperation, BatchUpgradePreview, BatchUpgradeItemStatus } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
 import { NodeGroupSection } from '../components/nodes/NodeGroupSection';
 import { NodeDetailDrawer } from '../components/nodes/NodeDetailDrawer';
 import { stableGroupedRows } from '../components/nodes/sort';
 import { NodeDiagnosisDrawer } from '../components/diagnosis/NodeDiagnosisDrawer';
+import { operationStatusLabel } from '../components/nodes/lifecycleStatus';
 
 type AnyNodeRow = NodeDisplayRow;
 
 const terminalOperationStatuses = new Set(['SUCCESS', 'FAILED', 'TIMEOUT']);
-
-export function operationStatusLabel(operation: NodeOperation, t: (key: string) => string): string {
-  if (operation.status !== 'VERIFYING') return t(`nodeOperationStatus_${operation.status}`);
-  if (operation.action === 'restart') return t('nodeOperationVerifyingRestart');
-  if (operation.action === 'upgrade') return t('nodeOperationVerifyingUpgrade');
-  if (operation.action === 'uninstall') return t('nodeOperationVerifyingUninstall');
-  return t('nodeOperationStatus_VERIFYING');
-}
+const terminalBatchStatuses = new Set(['SUCCESS', 'PARTIAL_SUCCESS', 'FAILED', 'INTERRUPTED']);
 
 /** Hook: is the viewport mobile-width? Re-evaluates on resize. */
 function useIsMobile(breakpoint = 768): boolean {
@@ -57,6 +51,12 @@ export default function NodeStatus() {
   const [operationDrawerOpen, setOperationDrawerOpen] = useState(false);
   const [backgroundTasks, setBackgroundTasks] = useState<NodeOperation[]>([]);
   const [backgroundTasksOpen, setBackgroundTasksOpen] = useState(false);
+  const [batchOperations, setBatchOperations] = useState<BatchUpgradeOperation[]>([]);
+  const [batchPreview, setBatchPreview] = useState<BatchUpgradePreview | null>(null);
+  const [batchPreviewOpen, setBatchPreviewOpen] = useState(false);
+  const [batchStarting, setBatchStarting] = useState(false);
+  const [activeBatch, setActiveBatch] = useState<BatchUpgradeOperation | null>(null);
+  const [batchDrawerOpen, setBatchDrawerOpen] = useState(false);
   const [uninstallRow, setUninstallRow] = useState<AnyNodeRow | null>(null);
   const [uninstallConfirmation, setUninstallConfirmation] = useState('');
   const [nodeDiagnosisTarget, setNodeDiagnosisTarget] = useState<{ groupId: number; nodeId: string; label: string } | null>(null);
@@ -117,6 +117,10 @@ export default function NodeStatus() {
       const res = await api.get<unknown, ApiEnvelope<NodeOperation[]>>('/admin/node-operations');
       if (res.code === 0) setBackgroundTasks(res.data ?? []);
     } catch { /* discovery is best-effort */ }
+    try {
+      const res = await api.get<unknown, ApiEnvelope<BatchUpgradeOperation[]>>('/admin/nodes/batch-upgrades');
+      if (res.code === 0) setBatchOperations(res.data ?? []);
+    } catch { /* discovery is best-effort */ }
   };
 
   const refresh = async () => {
@@ -144,10 +148,10 @@ export default function NodeStatus() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAdmin]);
 
-  const errorMessage = (error: unknown) => {
+  const errorMessage = useCallback((error: unknown) => {
     const payload = (error as { response?: { data?: { message?: string } } })?.response?.data;
     return payload?.message || t('nodeOperationFailed');
-  };
+  }, [t]);
 
   const copyLogs = async () => {
     if (!activeOperation?.logs) return;
@@ -182,7 +186,30 @@ export default function NodeStatus() {
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [activeOperation?.group_id, activeOperation?.id, activeOperation?.node_id, activeOperation?.status, operationDrawerOpen]);
+  }, [activeOperation, errorMessage, operationDrawerOpen]);
+
+  useEffect(() => {
+    if (!batchDrawerOpen || !activeBatch || terminalBatchStatuses.has(activeBatch.status)) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const res = await api.get<unknown, ApiEnvelope<BatchUpgradeOperation>>(`/admin/nodes/batch-upgrade/${activeBatch.id}`);
+        if (cancelled) return;
+        if (res.code !== 0 || !res.data) throw new Error(res.message);
+        setActiveBatch(res.data);
+        setBatchOperations((current) => [res.data as BatchUpgradeOperation, ...current.filter((item) => item.id !== res.data?.id)]);
+        if (!terminalBatchStatuses.has(res.data.status)) timer = window.setTimeout(poll, 1000);
+      } catch (error) {
+        if (!cancelled) message.error(errorMessage(error));
+      }
+    };
+    timer = window.setTimeout(poll, 1000);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [activeBatch, batchDrawerOpen, errorMessage]);
 
   const startOperation = async (row: AnyNodeRow, action: NodeLifecycleAction, confirmation?: string) => {
     if (!row.node_id) return;
@@ -229,11 +256,45 @@ export default function NodeStatus() {
     setNodeDiagnosisTarget({ groupId, nodeId, label: node.public_ipv4 ?? nodeId });
   };
 
+  const openBatchUpgrade = async () => {
+    const running = batchOperations.find((batch) => !terminalBatchStatuses.has(batch.status));
+    if (running) {
+      setActiveBatch(running);
+      setBatchDrawerOpen(true);
+      return;
+    }
+    try {
+      const res = await api.get<unknown, ApiEnvelope<BatchUpgradePreview>>('/admin/nodes/batch-upgrade/preview');
+      if (res.code !== 0 || !res.data) throw new Error(res.message);
+      setBatchPreview(res.data);
+      setBatchPreviewOpen(true);
+    } catch (error) {
+      message.error(errorMessage(error));
+    }
+  };
+
+  const startBatchUpgrade = async () => {
+    setBatchStarting(true);
+    try {
+      const res = await api.post<unknown, ApiEnvelope<BatchUpgradeOperation>>('/admin/nodes/batch-upgrade', {});
+      if (res.code !== 0 || !res.data) throw new Error(res.message);
+      setBatchPreviewOpen(false);
+      setActiveBatch(res.data);
+      setBatchOperations((current) => [res.data as BatchUpgradeOperation, ...current.filter((item) => item.id !== res.data?.id)]);
+      setBatchDrawerOpen(true);
+    } catch (error) {
+      message.error(errorMessage(error));
+    } finally {
+      setBatchStarting(false);
+    }
+  };
+
   const rows: AnyNodeRow[] | null = isAdmin ? adminRows : userRows;
   const groups = useMemo(() => (rows ? stableGroupedRows(rows) : null), [rows]);
 
   const title = t('nodeStatus');
-  const activeTaskCount = backgroundTasks.filter((operation) => !terminalOperationStatuses.has(operation.status)).length;
+  const activeTaskCount = backgroundTasks.filter((operation) => !terminalOperationStatuses.has(operation.status)).length
+    + batchOperations.filter((batch) => !terminalBatchStatuses.has(batch.status)).length;
   const pageTitle = (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
       <h2 className="rp-page-title"><LineChartOutlined /> {title}</h2>
@@ -242,6 +303,7 @@ export default function NodeStatus() {
           <Badge count={activeTaskCount} size="small">
             <Button icon={<UnorderedListOutlined />} onClick={() => setBackgroundTasksOpen(true)}>{t('backgroundTasks')}</Button>
           </Badge>
+          <Button icon={<SyncOutlined />} onClick={() => void openBatchUpgrade()}>{t('batchUpgradeAll')}</Button>
           <Button type="primary" icon={<CloudUploadOutlined />} onClick={() => navigate('/node-bootstrap')}>{t('nodeBootstrapTitle')}</Button>
         </Space>
       )}
@@ -364,6 +426,26 @@ export default function NodeStatus() {
         ) : null}
       </Drawer>
       <Drawer title={t('backgroundTasks')} open={backgroundTasksOpen} onClose={() => setBackgroundTasksOpen(false)} size={isMobile ? '100%' : 640}>
+        <Typography.Title level={5}>{t('batchUpgrades')}</Typography.Title>
+        <List
+          dataSource={batchOperations}
+          locale={{ emptyText: t('backgroundTasksEmpty') }}
+          renderItem={(batch) => (
+            <List.Item actions={[
+              <Button key="view" type="link" onClick={() => {
+                setActiveBatch(batch);
+                setBackgroundTasksOpen(false);
+                setBatchDrawerOpen(true);
+              }}>{t('details')}</Button>,
+            ]}>
+              <List.Item.Meta
+                title={`${t('batchUpgradeAll')} · ${t(`batchUpgradeStatus_${batch.status}`)}`}
+                description={`${batch.success + batch.failed + batch.skipped} / ${batch.total} · ${batch.updated_at}`}
+              />
+            </List.Item>
+          )}
+        />
+        <Typography.Title level={5} style={{ marginTop: 24 }}>{t('singleNodeOperations')}</Typography.Title>
         <List
           dataSource={backgroundTasks}
           locale={{ emptyText: t('backgroundTasksEmpty') }}
@@ -382,6 +464,63 @@ export default function NodeStatus() {
             </List.Item>
           )}
         />
+      </Drawer>
+      <Modal
+        title={t('batchUpgradeConfirmTitle')}
+        open={batchPreviewOpen}
+        okText={t('batchUpgradeStart')}
+        cancelText={t('cancel')}
+        confirmLoading={batchStarting}
+        okButtonProps={{ disabled: !batchPreview || batchPreview.pending === 0 }}
+        onCancel={() => setBatchPreviewOpen(false)}
+        onOk={() => void startBatchUpgrade()}
+      >
+        {batchPreview ? (
+          <>
+            <Descriptions column={1} size="small">
+              <Descriptions.Item label={t('batchUpgradeTarget')}>v{batchPreview.target_version ?? '-'}</Descriptions.Item>
+              <Descriptions.Item label={t('batchUpgradeEligible')}>{batchPreview.pending}</Descriptions.Item>
+              <Descriptions.Item label={t('batchUpgradeAlreadyCurrent')}>{batchPreview.already_current}</Descriptions.Item>
+              <Descriptions.Item label={t('batchUpgradeOffline')}>{batchPreview.offline}</Descriptions.Item>
+              <Descriptions.Item label={t('batchUpgradeOtherSkipped')}>{Math.max(0, batchPreview.skipped - batchPreview.already_current - batchPreview.offline)}</Descriptions.Item>
+            </Descriptions>
+            <Typography.Paragraph type="secondary" style={{ marginTop: 16 }}>{t('batchUpgradeRollingHint')}</Typography.Paragraph>
+            <Typography.Paragraph type="secondary">{t('batchUpgradeBackgroundHint')}</Typography.Paragraph>
+          </>
+        ) : null}
+      </Modal>
+      <Drawer
+        title={t('batchUpgradeProgressTitle')}
+        open={batchDrawerOpen}
+        onClose={() => setBatchDrawerOpen(false)}
+        size={isMobile ? '100%' : 680}
+        extra={activeBatch ? <Tag color={activeBatch.status === 'SUCCESS' ? 'green' : activeBatch.status === 'PARTIAL_SUCCESS' ? 'orange' : activeBatch.status === 'FAILED' || activeBatch.status === 'INTERRUPTED' ? 'red' : 'blue'}>{t(`batchUpgradeStatus_${activeBatch.status}`)}</Tag> : null}
+      >
+        {activeBatch ? (
+          <>
+            <Progress
+              percent={activeBatch.total === 0 ? 100 : Math.round(((activeBatch.success + activeBatch.failed + activeBatch.skipped) / activeBatch.total) * 100)}
+              status={activeBatch.status === 'FAILED' || activeBatch.status === 'INTERRUPTED' ? 'exception' : activeBatch.status === 'SUCCESS' ? 'success' : 'active'}
+            />
+            <Space wrap style={{ marginBottom: 16 }}>
+              <Tag color="green">{t('batchUpgradeSuccess')}: {activeBatch.success}</Tag>
+              <Tag color="red">{t('batchUpgradeFailed')}: {activeBatch.failed}</Tag>
+              <Tag>{t('batchUpgradeSkipped')}: {activeBatch.skipped}</Tag>
+            </Space>
+            <Typography.Paragraph type="secondary">{t('batchUpgradeBackgroundHint')}</Typography.Paragraph>
+            <List
+              dataSource={activeBatch.items}
+              renderItem={(item) => (
+                <List.Item>
+                  <List.Item.Meta
+                    title={`${item.node_id} · ${item.current_version ? `v${item.current_version}` : '-'} → ${item.target_version ? `v${item.target_version}` : '-'}`}
+                    description={`${t(`batchUpgradeItemStatus_${item.status as BatchUpgradeItemStatus}`)}${item.reason ? ` · ${item.reason}` : ''}`}
+                  />
+                </List.Item>
+              )}
+            />
+          </>
+        ) : null}
       </Drawer>
       <Modal
         title={t('nodeUninstallConfirmTitle')}

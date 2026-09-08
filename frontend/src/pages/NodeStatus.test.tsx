@@ -12,9 +12,10 @@ vi.mock('../api/client', () => ({
 }));
 vi.mock('../auth/useAuth', () => ({ useAuth: mockUseAuth }));
 
-import NodeStatus, { operationStatusLabel } from './NodeStatus';
+import NodeStatus from './NodeStatus';
 import { stableGroupedRows, compareNodeRows } from '../components/nodes/sort';
-import type { NodeDisplayRow, NodeOperation } from '../api/types';
+import { operationStatusLabel } from '../components/nodes/lifecycleStatus';
+import type { BatchUpgradeOperation, NodeDisplayRow, NodeOperation } from '../api/types';
 
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
 
@@ -89,6 +90,7 @@ describe('NodeStatus page data source', () => {
     expect(mockGet).toHaveBeenCalledWith('/nodes/shared');
     expect(mockGet).not.toHaveBeenCalledWith('/nodes');
     expect(mockGet).not.toHaveBeenCalledWith('/admin/node-artifacts');
+    expect(screen.queryByRole('button', { name: 'batchUpgradeAll' })).toBeNull();
   });
 
   it('mounts Relay preference management only for admin inbound groups', async () => {
@@ -414,6 +416,100 @@ describe('NodeStatus background lifecycle operations', () => {
     expect(screen.getByText(/n1 · nodeOperation_upgrade/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'details' }));
     expect(screen.getByText('nodeOperation_upgrade')).toBeInTheDocument();
+  });
+});
+
+describe('NodeStatus batch rolling upgrade', () => {
+  const preview = {
+    target_version: '1.1.12', total: 5, pending: 2, already_current: 1, offline: 1, skipped: 3,
+    items: [],
+  };
+  const runningBatch: BatchUpgradeOperation = {
+    id: 'batch-running', status: 'RUNNING' as const, target_version: '1.1.12',
+    created_at: '2026-09-08T00:00:00Z', updated_at: '2026-09-08T00:00:01Z', created_by: 1,
+    total: 2, pending: 1, running: 1, success: 0, failed: 0, skipped: 0,
+    current_item: 'node-a',
+    items: [
+      { group_id: 1, node_id: 'node-a', current_version: '1.1.11', target_version: '1.1.12', architecture: 'amd64', status: 'RUNNING' as const },
+      { group_id: 1, node_id: 'node-b', current_version: '1.1.11', target_version: '1.1.12', architecture: 'amd64', status: 'PENDING' as const },
+    ],
+  };
+
+  function mockBatchPage(batches: typeof runningBatch[] = []) {
+    mockUseAuth.mockReturnValue({ isAdmin: true });
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/nodes') return Promise.resolve(ok([adminNode]));
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      if (url === '/groups') return Promise.resolve(ok([]));
+      if (url === '/admin/node-operations') return Promise.resolve(ok([]));
+      if (url === '/admin/nodes/batch-upgrades') return Promise.resolve(ok(batches));
+      if (url === '/admin/nodes/batch-upgrade/preview') return Promise.resolve(ok(preview));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+  }
+
+  it('renders preview counts and starts one backend batch request', async () => {
+    mockBatchPage();
+    mockPost.mockResolvedValue(ok(runningBatch));
+    renderPage();
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: /batchUpgradeAll/ }));
+    await flush();
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByText('v1.1.12')).toBeInTheDocument();
+    expect(within(dialog).getByText('2')).toBeInTheDocument();
+    expect(within(dialog).getAllByText('1')).toHaveLength(3);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'batchUpgradeStart' }));
+    await flush();
+    expect(mockPost).toHaveBeenCalledTimes(1);
+    expect(mockPost).toHaveBeenCalledWith('/admin/nodes/batch-upgrade', {});
+    expect(screen.getByText('batchUpgradeProgressTitle')).toBeInTheDocument();
+    expect(screen.getByText('node-a · v1.1.11 → v1.1.12')).toBeInTheDocument();
+  });
+
+  it('closing a running batch Drawer stops UI polling without cancelling or reopening', async () => {
+    mockBatchPage([runningBatch]);
+    let resolvePoll!: (value: ReturnType<typeof ok<typeof runningBatch>>) => void;
+    const latePoll = new Promise<ReturnType<typeof ok<typeof runningBatch>>>((resolve) => { resolvePoll = resolve; });
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/nodes') return Promise.resolve(ok([adminNode]));
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      if (url === '/groups') return Promise.resolve(ok([]));
+      if (url === '/admin/node-operations') return Promise.resolve(ok([]));
+      if (url === '/admin/nodes/batch-upgrades') return Promise.resolve(ok([runningBatch]));
+      if (url === '/admin/nodes/batch-upgrade/batch-running') return latePoll;
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+    renderPage();
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: /batchUpgradeAll/ }));
+    await flush(1000);
+    expect(mockGet).toHaveBeenCalledWith('/admin/nodes/batch-upgrade/batch-running');
+    fireEvent.click(document.querySelector('.ant-drawer-open .ant-drawer-close') as HTMLElement);
+    await flush();
+    resolvePoll(ok({ ...runningBatch, success: 1, running: 0, pending: 1 }));
+    await flush();
+    expect(document.querySelector('.ant-drawer-open')).toBeNull();
+    expect(mockPost).not.toHaveBeenCalled();
+    const calls = mockGet.mock.calls.filter((call) => call[0] === '/admin/nodes/batch-upgrade/batch-running').length;
+    await flush(5000);
+    expect(mockGet.mock.calls.filter((call) => call[0] === '/admin/nodes/batch-upgrade/batch-running')).toHaveLength(calls);
+  });
+
+  it.each([
+    ['SUCCESS', 2, 0, 'batchUpgradeStatus_SUCCESS'],
+    ['PARTIAL_SUCCESS', 1, 1, 'batchUpgradeStatus_PARTIAL_SUCCESS'],
+  ] as const)('rediscovers and renders %s summary', async (status, success, failed, label) => {
+    const terminal = { ...runningBatch, status, success, failed, running: 0, pending: 0, current_item: null };
+    mockBatchPage([terminal]);
+    renderPage();
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: /backgroundTasks/ }));
+    expect(screen.getByText(new RegExp(label))).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
+    expect(screen.getByText('batchUpgradeProgressTitle')).toBeInTheDocument();
+    expect(screen.getByText(`batchUpgradeSuccess: ${success}`)).toBeInTheDocument();
+    expect(screen.getByText(`batchUpgradeFailed: ${failed}`)).toBeInTheDocument();
   });
 });
 

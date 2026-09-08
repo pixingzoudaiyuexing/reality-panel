@@ -1076,3 +1076,50 @@ export interface NodeArtifactCatalog {
   config_protocol_version: number;
   artifacts: NodeArtifactInfo[];
 }
+
+export type BatchUpgradeStatus = 'PENDING' | 'RUNNING' | 'SUCCESS' | 'PARTIAL_SUCCESS' | 'FAILED' | 'INTERRUPTED';
+export type BatchUpgradeItemStatus =
+  | 'PENDING' | 'RUNNING' | 'SUCCESS' | 'FAILED' | 'INTERRUPTED'
+  | 'SKIPPED_ALREADY_CURRENT' | 'SKIPPED_OFFLINE' | 'SKIPPED_UNSUPPORTED_ARCH'
+  | 'SKIPPED_ARTIFACT_UNAVAILABLE' | 'SKIPPED_OPERATION_IN_PROGRESS'
+  | 'SKIPPED_UNINSTALL_IN_PROGRESS' | 'SKIPPED_VERSION_UNAVAILABLE';
+
+export interface BatchUpgradeItem {
+  group_id: number;
+  node_id: string;
+  current_version?: string | null;
+  target_version?: string | null;
+  architecture?: string | null;
+  status: BatchUpgradeItemStatus;
+  reason?: string | null;
+  child_operation_id?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
+export interface BatchUpgradeOperation {
+  id: string;
+  status: BatchUpgradeStatus;
+  target_version?: string | null;
+  created_at: string;
+  updated_at: string;
+  created_by: number;
+  total: number;
+  pending: number;
+  running: number;
+  success: number;
+  failed: number;
+  skipped: number;
+  current_item?: string | null;
+  items: BatchUpgradeItem[];
+}
+
+export interface BatchUpgradePreview {
+  target_version?: string | null;
+  total: number;
+  pending: number;
+  already_current: number;
+  offline: number;
+  skipped: number;
+  items: BatchUpgradeItem[];
+}
