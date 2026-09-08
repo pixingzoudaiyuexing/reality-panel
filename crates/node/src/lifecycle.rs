@@ -36,7 +36,15 @@ const OPENLIST_CONTAINER: &str = "relay-panel-openlist";
 const OPENLIST_DATA_PATH: &str = "/var/lib/relay-panel/openlist";
 const OPENLIST_OWNERSHIP_PATH: &str = "/var/lib/relay-panel/openlist-ownership.json";
 const UNINSTALL_RECEIPT_DIR: &str = "/var/lib/relay-panel/uninstall-completions";
-const UNINSTALL_RETRY_SECS: u64 = 10;
+const UNINSTALL_FINALIZER_DIR: &str = "/var/lib/relay-panel/uninstall-finalizer";
+const UNINSTALL_FINALIZER_BINARY: &str =
+    "/var/lib/relay-panel/uninstall-finalizer/relay-node-finalizer";
+const UNINSTALL_FINALIZER_SERVICE: &str = "relay-node-uninstall-finalizer.service";
+const UNINSTALL_FINALIZER_SERVICE_PATH: &str =
+    "/etc/systemd/system/relay-node-uninstall-finalizer.service";
+const UNINSTALL_FINALIZER_TIMER: &str = "relay-node-uninstall-finalizer.timer";
+const UNINSTALL_FINALIZER_TIMER_PATH: &str =
+    "/etc/systemd/system/relay-node-uninstall-finalizer.timer";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UninstallJob {
@@ -60,6 +68,8 @@ struct OpenListOwnership {
 struct UninstallCompletionReceipt {
     job: UninstallJob,
     cleanup_success: bool,
+    #[serde(default)]
+    destructive_started: bool,
     message: String,
 }
 
@@ -956,6 +966,102 @@ fn uninstall_receipt_path(root: &Path, operation_id: &str) -> PathBuf {
         .join(format!("{operation_id}.json"))
 }
 
+fn rooted(root: &Path, path: &str) -> PathBuf {
+    root.join(path.trim_start_matches('/'))
+}
+
+fn finalizer_service(receipt_path: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=Reality Panel uninstall completion finalizer\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nExecStart={UNINSTALL_FINALIZER_BINARY} --lifecycle-uninstall-finalize {}\nRestart=on-failure\nRestartSec=10s\n",
+        receipt_path.display()
+    )
+}
+
+fn finalizer_timer() -> &'static str {
+    "[Unit]\nDescription=Retry Reality Panel uninstall completion\n\n[Timer]\nOnBootSec=10s\nOnUnitActiveSec=10s\nPersistent=true\nUnit=relay-node-uninstall-finalizer.service\n\n[Install]\nWantedBy=timers.target\n"
+}
+
+fn write_atomic_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    let parent = path.parent().ok_or("managed file has no parent")?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create managed directory: {error}"))?;
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let result: Result<(), String> = (|| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&temp)
+            .map_err(|error| format!("create managed temporary file: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("write managed file: {error}"))?;
+        file.flush()
+            .map_err(|error| format!("flush managed file: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("fsync managed file: {error}"))?;
+        std::fs::rename(&temp, path).map_err(|error| format!("commit managed file: {error}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
+}
+
+fn install_uninstall_finalizer<F>(
+    root: &Path,
+    source_binary: &Path,
+    receipt_path: &Path,
+    mut run: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str, &[&str]) -> Result<(), String>,
+{
+    let binary = rooted(root, UNINSTALL_FINALIZER_BINARY);
+    let service = rooted(root, UNINSTALL_FINALIZER_SERVICE_PATH);
+    let timer = rooted(root, UNINSTALL_FINALIZER_TIMER_PATH);
+    let bytes = std::fs::read(source_binary)
+        .map_err(|error| format!("read uninstall finalizer binary: {error}"))?;
+    write_atomic_file(&binary, &bytes, 0o700)?;
+    write_atomic_file(&service, finalizer_service(receipt_path).as_bytes(), 0o644)?;
+    write_atomic_file(&timer, finalizer_timer().as_bytes(), 0o644)?;
+    run("systemctl", &["daemon-reload"])?;
+    run("systemctl", &["enable", "--now", UNINSTALL_FINALIZER_TIMER])?;
+    Ok(())
+}
+
+fn cleanup_uninstall_finalizer<F>(
+    root: &Path,
+    receipt_path: &Path,
+    mut run: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str, &[&str]) -> Result<(), String>,
+{
+    run(
+        "systemctl",
+        &["disable", "--now", UNINSTALL_FINALIZER_TIMER],
+    )?;
+    for path in [
+        UNINSTALL_FINALIZER_SERVICE_PATH,
+        UNINSTALL_FINALIZER_TIMER_PATH,
+        UNINSTALL_FINALIZER_BINARY,
+    ] {
+        remove_if_exists(&rooted(root, path))?;
+    }
+    remove_if_exists(receipt_path)?;
+    run("systemctl", &["daemon-reload"])?;
+    for path in [
+        UNINSTALL_RECEIPT_DIR,
+        UNINSTALL_FINALIZER_DIR,
+        "/var/lib/relay-panel",
+    ] {
+        let _ = std::fs::remove_dir(rooted(root, path));
+    }
+    Ok(())
+}
+
 fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let parent = path.parent().ok_or("private state path has no parent")?;
     std::fs::create_dir_all(parent)
@@ -988,12 +1094,17 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String
     result
 }
 
-fn report_uninstall_once(job: &UninstallJob, success: bool, message: &str) -> Result<(), String> {
+fn report_uninstall_once(
+    job: &UninstallJob,
+    success: bool,
+    destructive_started: bool,
+    message: &str,
+) -> Result<(), String> {
     let url = format!(
         "{}/api/v1/node/uninstall_result",
         job.panel_url.trim_end_matches('/')
     );
-    let body = serde_json::json!({ "operation_id": job.operation_id, "node_id": job.node_id, "success": success, "message": message }).to_string();
+    let body = serde_json::json!({ "operation_id": job.operation_id, "node_id": job.node_id, "success": success, "destructive_started": destructive_started, "message": message }).to_string();
     let root = PathBuf::from(format!(
         "/run/relay-node-uninstall-report-{}",
         job.operation_id
@@ -1058,13 +1169,15 @@ fn completion_attempt<C, R>(
 ) -> Result<bool, String>
 where
     C: FnMut() -> Result<UninstallCleanupReport, String>,
-    R: FnMut(&UninstallJob, bool, &str) -> Result<(), String>,
+    R: FnMut(&UninstallJob, bool, bool, &str) -> Result<(), String>,
 {
     let mut receipt: UninstallCompletionReceipt = serde_json::from_slice(
         &std::fs::read(receipt_path).map_err(|error| format!("read uninstall receipt: {error}"))?,
     )
     .map_err(|error| format!("parse uninstall receipt: {error}"))?;
     if !receipt.cleanup_success {
+        receipt.destructive_started = true;
+        write_private_json(receipt_path, &receipt)?;
         match cleanup() {
             Ok(cleanup) => {
                 receipt.cleanup_success = true;
@@ -1077,24 +1190,74 @@ where
         }
         write_private_json(receipt_path, &receipt)?;
     }
-    if report(&receipt.job, receipt.cleanup_success, &receipt.message).is_err() {
+    if report(
+        &receipt.job,
+        receipt.cleanup_success,
+        receipt.destructive_started,
+        &receipt.message,
+    )
+    .is_err()
+    {
         return Ok(false);
-    }
-    remove_if_exists(receipt_path)?;
-    if let Some(parent) = receipt_path.parent() {
-        let _ = std::fs::remove_dir(parent);
-        if let Some(state_root) = parent.parent() {
-            let _ = std::fs::remove_dir(state_root);
-        }
     }
     Ok(true)
 }
 
+fn finalizer_tick<C, R, S>(
+    root: &Path,
+    receipt_path: &Path,
+    cleanup: C,
+    report: R,
+    systemctl: S,
+) -> Result<bool, String>
+where
+    C: FnMut() -> Result<UninstallCleanupReport, String>,
+    R: FnMut(&UninstallJob, bool, bool, &str) -> Result<(), String>,
+    S: FnMut(&str, &[&str]) -> Result<(), String>,
+{
+    if !completion_attempt(receipt_path, cleanup, report)? {
+        return Ok(false);
+    }
+    cleanup_uninstall_finalizer(root, receipt_path, systemctl)?;
+    Ok(true)
+}
+
+fn run_checked(program: &str, args: &[&str]) -> Result<(), String> {
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|error| format!("execute {program}: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("{program} {} exited unsuccessfully", args.join(" ")))
+}
+
 pub(crate) fn run_helper_from_args(args: &[String]) -> Option<Result<(), String>> {
-    if args.len() != 2 || args[0] != "--lifecycle-uninstall" {
+    if args.len() != 2
+        || !matches!(
+            args[0].as_str(),
+            "--lifecycle-uninstall" | "--lifecycle-uninstall-finalize"
+        )
+    {
         return None;
     }
     let path = PathBuf::from(&args[1]);
+    if args[0] == "--lifecycle-uninstall-finalize" {
+        return Some(
+            match finalizer_tick(
+                Path::new("/"),
+                &path,
+                || uninstall_managed(Path::new("/")),
+                report_uninstall_once,
+                run_checked,
+            ) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err("Panel has not acknowledged uninstall completion".into()),
+                Err(error) => Err(error),
+            },
+        );
+    }
     let job = match std::fs::read(&path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<UninstallJob>(&bytes).ok())
@@ -1103,28 +1266,33 @@ pub(crate) fn run_helper_from_args(args: &[String]) -> Option<Result<(), String>
         None => return Some(Err("invalid uninstall job".into())),
     };
     let receipt_path = uninstall_receipt_path(Path::new("/"), &job.operation_id);
+    let binary = match std::env::current_exe() {
+        Ok(binary) => binary,
+        Err(error) => return Some(Err(format!("locate uninstall finalizer binary: {error}"))),
+    };
+    if let Err(error) =
+        install_uninstall_finalizer(Path::new("/"), &binary, &receipt_path, run_checked)
+    {
+        let message = format!("install persistent uninstall finalizer failed: {error}");
+        let _ = report_uninstall_once(&job, false, false, &message);
+        return Some(Err(message));
+    }
     if !receipt_path.exists() {
         let receipt = UninstallCompletionReceipt {
             job,
             cleanup_success: false,
+            destructive_started: false,
             message: "uninstall cleanup pending".into(),
         };
         if let Err(error) = write_private_json(&receipt_path, &receipt) {
             return Some(Err(error));
         }
     }
+    // The timer is already durable before the receipt exists. Start one eager
+    // attempt now; failures are retried by the enabled timer and after reboot.
+    let _ = run_checked("systemctl", &["start", UNINSTALL_FINALIZER_SERVICE]);
     let _ = std::fs::remove_file(path);
-    loop {
-        match completion_attempt(
-            &receipt_path,
-            || uninstall_managed(Path::new("/")),
-            report_uninstall_once,
-        ) {
-            Ok(true) => return Some(Ok(())),
-            Ok(false) => std::thread::sleep(std::time::Duration::from_secs(UNINSTALL_RETRY_SECS)),
-            Err(error) => return Some(Err(error)),
-        }
-    }
+    Some(Ok(()))
 }
 
 #[cfg(test)]
@@ -1435,6 +1603,7 @@ mod tests {
                 token: "secret".into(),
             },
             cleanup_success: false,
+            destructive_started: false,
             message: "pending".into(),
         };
         write_private_json(&receipt_path, &receipt).unwrap();
@@ -1447,26 +1616,128 @@ mod tests {
                     message: "cleanup complete".into(),
                 })
             },
-            |_, _, _| Err("Panel unavailable".into()),
+            |_, _, _, _| Err("Panel unavailable".into()),
         )
         .unwrap();
         assert!(!retry);
         assert!(receipt_path.exists());
         assert_eq!(cleanup_calls, 1);
 
-        let acknowledged = completion_attempt(
+        let acknowledged = finalizer_tick(
+            &root,
             &receipt_path,
             || panic!("successful cleanup must not repeat"),
-            |job, success, message| {
+            |job, success, destructive_started, message| {
                 assert_eq!(job.operation_id, "operation-a");
                 assert!(success);
+                assert!(destructive_started);
                 assert_eq!(message, "cleanup complete");
+                Ok(())
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert!(acknowledged);
+        assert!(!receipt_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persistent_finalizer_resumes_existing_receipt_and_self_cleans_after_ack() {
+        let root = test_dir("relay-uninstall-finalizer");
+        let source_binary = root.join("source-relay-node");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&source_binary, b"finalizer-binary").unwrap();
+        let receipt_path = uninstall_receipt_path(&root, "operation-b");
+        write_private_json(
+            &receipt_path,
+            &UninstallCompletionReceipt {
+                job: UninstallJob {
+                    operation_id: "operation-b".into(),
+                    node_id: "node-b".into(),
+                    panel_url: "https://panel.example".into(),
+                    token: "secret".into(),
+                },
+                cleanup_success: true,
+                destructive_started: true,
+                message: "cleanup complete".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&receipt_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let mut install_commands = Vec::new();
+        install_uninstall_finalizer(&root, &source_binary, &receipt_path, |program, args| {
+            install_commands.push(format!("{program} {}", args.join(" ")));
+            Ok(())
+        })
+        .unwrap();
+        for managed in [
+            UNINSTALL_FINALIZER_BINARY,
+            UNINSTALL_FINALIZER_SERVICE_PATH,
+            UNINSTALL_FINALIZER_TIMER_PATH,
+        ] {
+            assert!(rooted(&root, managed).exists(), "missing {managed}");
+        }
+        assert!(install_commands
+            .iter()
+            .any(|command| command.contains("enable --now relay-node-uninstall-finalizer.timer")));
+        assert!(!install_commands
+            .iter()
+            .any(|command| command.contains("start relay-node-uninstall-finalizer.service")));
+        assert!(finalizer_timer().contains("OnBootSec=10s"));
+        assert!(finalizer_timer().contains("Persistent=true"));
+        assert!(finalizer_service(&receipt_path).contains("Restart=on-failure"));
+        assert!(finalizer_service(&receipt_path).contains(&receipt_path.display().to_string()));
+        assert!(!finalizer_service(&receipt_path).contains("secret"));
+
+        let no_ack = finalizer_tick(
+            &root,
+            &receipt_path,
+            || panic!("completed cleanup must not repeat"),
+            |_, _, _, _| Err("Panel unavailable".into()),
+            |_, _| panic!("no ACK must not clean finalizer"),
+        )
+        .unwrap();
+        assert!(!no_ack);
+        assert!(receipt_path.exists());
+        assert!(rooted(&root, UNINSTALL_FINALIZER_TIMER_PATH).exists());
+
+        let mut cleanup_commands = Vec::new();
+        let acknowledged = finalizer_tick(
+            &root,
+            &receipt_path,
+            || panic!("restarted finalizer must reuse completed receipt"),
+            |job, success, destructive_started, _| {
+                assert_eq!(job.operation_id, "operation-b");
+                assert!(success);
+                assert!(destructive_started);
+                Ok(())
+            },
+            |program, args| {
+                cleanup_commands.push(format!("{program} {}", args.join(" ")));
                 Ok(())
             },
         )
         .unwrap();
         assert!(acknowledged);
         assert!(!receipt_path.exists());
+        for managed in [
+            UNINSTALL_FINALIZER_BINARY,
+            UNINSTALL_FINALIZER_SERVICE_PATH,
+            UNINSTALL_FINALIZER_TIMER_PATH,
+        ] {
+            assert!(!rooted(&root, managed).exists(), "left {managed}");
+        }
+        assert!(cleanup_commands
+            .iter()
+            .any(|command| command.contains("disable --now relay-node-uninstall-finalizer.timer")));
         let _ = std::fs::remove_dir_all(root);
     }
 
