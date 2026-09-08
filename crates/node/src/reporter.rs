@@ -1002,6 +1002,32 @@ pub async fn report_status(
 /// How often the public-IP refresher re-checks (long interval so we are not
 /// hammering the external service every poll cycle).
 const PUBLIC_IP_REFRESH: Duration = Duration::from_secs(30 * 60);
+const PUBLIC_IP_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+
+#[derive(Default)]
+struct PublicIpRefreshBackoff {
+    consecutive_failures: usize,
+}
+
+impl PublicIpRefreshBackoff {
+    fn next_delay(&mut self, detected: bool) -> Duration {
+        if detected {
+            self.consecutive_failures = 0;
+            return PUBLIC_IP_REFRESH;
+        }
+        let delay = PUBLIC_IP_RETRY_DELAYS
+            .get(self.consecutive_failures)
+            .copied()
+            .unwrap_or(PUBLIC_IP_REFRESH);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        delay
+    }
+}
 
 /// Detect a public egress IP by calling the configured check URL. The returned
 /// text is validated as a parseable `IpAddr` (rejects garbage / HTML error
@@ -1073,6 +1099,22 @@ async fn detect_public_ip(check_url: &str, family: &IpFamily, quiet: bool) -> Op
     }
 }
 
+async fn store_public_ip_detection(
+    metrics: &NodeMetrics,
+    family: &IpFamily,
+    detected: Option<String>,
+) -> bool {
+    let Some(value) = detected else {
+        return false;
+    };
+    tracing::info!("public_{:?} detected: {}", family, value);
+    match family {
+        IpFamily::V4 => metrics.set_public_ipv4(Some(value)).await,
+        IpFamily::V6 => metrics.set_public_ipv6(Some(value)).await,
+    }
+    true
+}
+
 /// v0.4.15: detect one address family in a loop, storing into its own field.
 /// INDEPENDENT of the other family — a v6 failure never clears v4 and vice
 /// versa. `quiet` suppresses failure logs for IPv6 (absence is normal).
@@ -1082,20 +1124,16 @@ async fn run_family_refresher(
     family: IpFamily,
     quiet: bool,
 ) {
+    let mut backoff = PublicIpRefreshBackoff::default();
     loop {
         // v0.4.15: only OVERWRITE the stored address on a successful, correct-
         // family detection. A transient failure (endpoint down, timeout, wrong
         // family) keeps the LAST good value instead of clearing it to None —
         // otherwise one flaky poll would blank the IP/region on the panel until
         // the next success 30 min later.
-        if let Some(v) = detect_public_ip(&check_url, &family, quiet).await {
-            tracing::info!("public_{:?} detected: {}", family, v);
-            match family {
-                IpFamily::V4 => metrics.set_public_ipv4(Some(v)).await,
-                IpFamily::V6 => metrics.set_public_ipv6(Some(v)).await,
-            }
-        }
-        tokio::time::sleep(PUBLIC_IP_REFRESH).await;
+        let detected = detect_public_ip(&check_url, &family, quiet).await;
+        let detected = store_public_ip_detection(&metrics, &family, detected).await;
+        tokio::time::sleep(backoff.next_delay(detected)).await;
     }
 }
 
@@ -1511,5 +1549,39 @@ mod tests {
         // this node's identity, and plain HTTP lets any on-path party set it.
         assert!(DEFAULT_IPV4_CHECK_URL.starts_with("https://"));
         assert!(DEFAULT_IPV6_CHECK_URL.starts_with("https://"));
+    }
+
+    #[test]
+    fn public_ip_failures_use_bounded_fast_retries_and_success_resets() {
+        let mut backoff = PublicIpRefreshBackoff::default();
+        assert_eq!(backoff.next_delay(false), Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(false), Duration::from_secs(10));
+        assert_eq!(backoff.next_delay(false), Duration::from_secs(30));
+        assert_eq!(backoff.next_delay(false), Duration::from_secs(60));
+        assert_eq!(backoff.next_delay(false), PUBLIC_IP_REFRESH);
+        assert_eq!(backoff.next_delay(false), PUBLIC_IP_REFRESH);
+        assert_eq!(backoff.next_delay(true), PUBLIC_IP_REFRESH);
+        assert_eq!(backoff.next_delay(false), Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn failed_family_detection_cannot_clear_an_existing_other_family() {
+        let metrics = NodeMetrics::new("auto");
+        metrics.set_public_ipv4(Some("192.0.2.10".into())).await;
+        metrics.set_public_ipv6(Some("2001:db8::10".into())).await;
+
+        assert!(!store_public_ip_detection(&metrics, &IpFamily::V4, None).await);
+        assert_eq!(metrics.public_ipv4().await.as_deref(), Some("192.0.2.10"));
+        assert_eq!(metrics.public_ipv6().await.as_deref(), Some("2001:db8::10"));
+
+        assert!(!store_public_ip_detection(&metrics, &IpFamily::V6, None).await);
+        assert_eq!(metrics.public_ipv4().await.as_deref(), Some("192.0.2.10"));
+        assert_eq!(metrics.public_ipv6().await.as_deref(), Some("2001:db8::10"));
+
+        assert!(
+            store_public_ip_detection(&metrics, &IpFamily::V4, Some("192.0.2.11".into())).await
+        );
+        assert_eq!(metrics.public_ipv4().await.as_deref(), Some("192.0.2.11"));
+        assert_eq!(metrics.public_ipv6().await.as_deref(), Some("2001:db8::10"));
     }
 }
