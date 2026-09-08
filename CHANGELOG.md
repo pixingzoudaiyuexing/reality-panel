@@ -7,6 +7,26 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.8] - 2026-09-08
+
+### 新增
+
+- Carrier 线路按 Relay 节点配置，并随节点 Ready、Down 和 Recovery 自动收敛 DNS。
+- SSH 批量测试与部署，支持独立状态和受控并发。
+- 拆分 Node 与 Rule diagnostics，并由实际 Relay Node 测试规则转发目标。
+- 支持完整卸载受管 Relay Node，并清理节点作用域状态。
+
+### 修复
+
+- 强化 Node 卸载的所有权检查、幂等回调、重启恢复和操作收敛。
+- Node Status 分别上报 TCP 活跃连接和 UDP 活跃会话，并纳入 Reality managed Nginx SNI 入站连接。
+
+### 兼容性
+
+- 无数据库 migration。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- 保留 v1.1.4 Node ID、v1.1.5 LKG/reconciliation 和 v1.1.6 global certificate 语义。
+
 ## [1.1.6] - 2026-09-07
 
 证书资源模型修复：managed certificate 改为 Panel 全局资源。

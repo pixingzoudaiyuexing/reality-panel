@@ -7,6 +7,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.8] - 2026-09-08
+
+### 新增
+
+- Rule diagnostics 由实际承载规则的 Relay Node 完成 DNS 解析和目标连接测试。
+- 支持完整卸载受管 Relay Node，并安全清理 systemd、配置、缓存和受管 Nginx 资源。
+
+### 修复
+
+- 强化卸载操作的所有权检查、幂等结果回调、重启恢复和最终状态收敛。
+- 分别上报 TCP 活跃连接与 UDP 活跃会话，并统计 Reality managed Nginx SNI 入站连接。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.6 relay-node 可直接升级到 v1.1.8。
+
 ## [1.1.6] - 2026-09-07
 
 统一版本发布。证书全局资源修复位于 Panel，Relay Node runtime 和协议不变。
