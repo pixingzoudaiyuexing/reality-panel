@@ -21,6 +21,10 @@ const OPERATION_IDLE_TIMEOUT_SECS: i64 = 300;
 const OPERATION_HARD_TIMEOUT_SECS: i64 = 900;
 const UNINSTALL_CONFIRMATION: &str = "UNINSTALL";
 const MIN_ARTIFACT_BYTES: usize = 64 * 1024;
+const DURABLE_UNINSTALL_PREFIX: &str = "node_uninstall_operation:";
+
+static DURABLE_UNINSTALL_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -68,12 +72,42 @@ pub struct NodeOperation {
     actor_id: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableUninstallOperation {
+    operation: NodeOperation,
+    actor_id: Option<i64>,
+    saw_disconnect: bool,
+    cleanup_confirmed: bool,
+    panel_cleanup_complete: bool,
+    result_audited: bool,
+}
+
+impl DurableUninstallOperation {
+    fn new(operation: &NodeOperation) -> Self {
+        Self {
+            operation: operation.clone(),
+            actor_id: operation.actor_id,
+            saw_disconnect: false,
+            cleanup_confirmed: false,
+            panel_cleanup_complete: false,
+            result_audited: false,
+        }
+    }
+
+    fn operation(&self) -> NodeOperation {
+        let mut operation = self.operation.clone();
+        operation.actor_id = self.actor_id;
+        operation
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RegistryEntry {
     operation: NodeOperation,
     saw_disconnect: bool,
     matching_boot_confirmation: Option<BootConfirmation>,
     uninstall_final: bool,
+    uninstall_panel_cleanup_complete: bool,
     result_audited: bool,
 }
 
@@ -96,6 +130,54 @@ pub struct NodeOperationRegistry {
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+fn durable_uninstall_key(operation_id: &str) -> String {
+    format!("{DURABLE_UNINSTALL_PREFIX}{operation_id}")
+}
+
+async fn load_durable_uninstall(
+    state: &AppState,
+    operation_id: &str,
+) -> Result<Option<DurableUninstallOperation>, String> {
+    state
+        .db
+        .get(&durable_uninstall_key(operation_id))
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
+        .transpose()
+}
+
+async fn store_durable_uninstall(
+    state: &AppState,
+    durable: &DurableUninstallOperation,
+) -> Result<(), String> {
+    let raw = serde_json::to_string(durable).map_err(|error| error.to_string())?;
+    state
+        .db
+        .set(&durable_uninstall_key(&durable.operation.id), &raw)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn has_active_durable_uninstall(
+    state: &AppState,
+    group_id: i64,
+    node_id: &str,
+) -> Result<bool, String> {
+    let rows = state
+        .db
+        .scan_prefix(DURABLE_UNINSTALL_PREFIX)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(rows.into_iter().any(|(_, raw)| {
+        serde_json::from_str::<DurableUninstallOperation>(&raw).is_ok_and(|durable| {
+            durable.operation.group_id == group_id
+                && durable.operation.node_id == node_id
+                && !durable.operation.status.terminal()
+        })
+    }))
 }
 
 impl NodeOperationRegistry {
@@ -150,6 +232,7 @@ impl NodeOperationRegistry {
                 saw_disconnect: false,
                 matching_boot_confirmation: None,
                 uninstall_final: false,
+                uninstall_panel_cleanup_complete: false,
                 result_audited: false,
             },
         );
@@ -167,6 +250,49 @@ impl NodeOperationRegistry {
             entry.operation.message = message.into();
             entry.operation.updated_at = now();
         }
+    }
+
+    fn remove(&self, id: &str) {
+        self.inner
+            .lock()
+            .expect("node operation registry lock")
+            .remove(id);
+    }
+
+    fn restore_uninstall(&self, durable: &DurableUninstallOperation) {
+        let operation = durable.operation();
+        self.inner
+            .lock()
+            .expect("node operation registry lock")
+            .insert(
+                operation.id.clone(),
+                RegistryEntry {
+                    operation,
+                    saw_disconnect: durable.saw_disconnect,
+                    matching_boot_confirmation: None,
+                    uninstall_final: durable.cleanup_confirmed,
+                    uninstall_panel_cleanup_complete: durable.panel_cleanup_complete,
+                    result_audited: durable.result_audited,
+                },
+            );
+    }
+
+    fn mark_uninstall_panel_cleanup_complete(&self, id: &str) -> Option<NodeOperation> {
+        let mut inner = self.inner.lock().expect("node operation registry lock");
+        let entry = inner.get_mut(id)?;
+        if entry.operation.action != NodeLifecycleAction::Uninstall {
+            return None;
+        }
+        entry.uninstall_panel_cleanup_complete = true;
+        if entry.saw_disconnect && entry.uninstall_final {
+            entry.operation.status = OperationStatus::Success;
+            if !entry.operation.message.contains("Panel state cleaned") {
+                entry.operation.message =
+                    format!("{}; Panel state cleaned", entry.operation.message);
+            }
+            entry.operation.updated_at = now();
+        }
+        Some(entry.operation.clone())
     }
 
     #[cfg(test)]
@@ -311,9 +437,26 @@ impl NodeOperationRegistry {
             }
             entry.saw_disconnect = true;
             entry.operation.updated_at = now();
-            if entry.operation.action == NodeLifecycleAction::Uninstall && entry.uninstall_final {
-                entry.operation.status = OperationStatus::Success;
-                entry.operation.message = "uninstall confirmed and node disconnected".into();
+            if entry.operation.action == NodeLifecycleAction::Uninstall {
+                entry.operation.status =
+                    if entry.uninstall_final && entry.uninstall_panel_cleanup_complete {
+                        OperationStatus::Success
+                    } else {
+                        OperationStatus::Verifying
+                    };
+                entry.operation.message = if entry.operation.status == OperationStatus::Success {
+                    format!(
+                        "{}; node disconnected and Panel state cleaned",
+                        entry.operation.message
+                    )
+                } else if entry.uninstall_final {
+                    format!(
+                        "{}; node disconnected; waiting for Panel state cleanup",
+                        entry.operation.message
+                    )
+                } else {
+                    "node disconnected; waiting for verified cleanup and Panel state cleanup".into()
+                };
                 transitioned.push(entry.operation.clone());
             } else if complete_if_ready(entry) {
                 transitioned.push(entry.operation.clone());
@@ -342,20 +485,21 @@ impl NodeOperationRegistry {
         {
             return None;
         }
-        if entry.operation.status.terminal() {
+        if entry.operation.status == OperationStatus::Success {
             return Some(entry.operation.clone());
         }
         entry.operation.updated_at = now();
         entry.operation.message = message;
         if !success {
-            entry.operation.status = OperationStatus::Failed;
+            entry.operation.status = OperationStatus::Verifying;
         } else {
             entry.uninstall_final = true;
-            entry.operation.status = if entry.saw_disconnect {
-                OperationStatus::Success
-            } else {
-                OperationStatus::Verifying
-            };
+            entry.operation.status =
+                if entry.saw_disconnect && entry.uninstall_panel_cleanup_complete {
+                    OperationStatus::Success
+                } else {
+                    OperationStatus::Verifying
+                };
         }
         Some(entry.operation.clone())
     }
@@ -401,7 +545,9 @@ impl NodeOperationRegistry {
     pub fn get(&self, id: &str) -> Option<NodeOperation> {
         let mut inner = self.inner.lock().expect("node operation registry lock");
         let entry = inner.get_mut(id)?;
-        if !entry.operation.status.terminal() {
+        if !entry.operation.status.terminal()
+            && entry.operation.action != NodeLifecycleAction::Uninstall
+        {
             let created = chrono::DateTime::parse_from_rfc3339(&entry.operation.created_at).ok()?;
             let updated = chrono::DateTime::parse_from_rfc3339(&entry.operation.updated_at).ok()?;
             let elapsed =
@@ -699,6 +845,26 @@ async fn create_operation(
     action: NodeLifecycleAction,
     log_lines: Option<u16>,
 ) -> Result<NodeOperation, Response> {
+    if action != NodeLifecycleAction::Logs {
+        match has_active_durable_uninstall(state, group_id, &node_id).await {
+            Ok(true) => {
+                return Err(response::<()>(
+                    StatusCode::CONFLICT,
+                    409,
+                    "NODE_OPERATION_IN_PROGRESS",
+                ))
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(group_id, node_id, "durable uninstall preflight: {error}");
+                return Err(response::<()>(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    503,
+                    "UNINSTALL_STATE_UNAVAILABLE",
+                ));
+            }
+        }
+    }
     if !operation_channel_online(&state.node_connections, group_id, &node_id, action).await {
         return Err(response::<()>(StatusCode::CONFLICT, 409, "NODE_OFFLINE"));
     }
@@ -731,6 +897,36 @@ async fn create_operation(
             409,
             "NODE_CONFIG_PROTOCOL_MISMATCH",
         ));
+    }
+    if action == NodeLifecycleAction::Uninstall {
+        match crate::service::relay_preference::uninstall_blocked_by_active_transaction(
+            state.db.as_ref(),
+            group_id,
+            &node_id,
+        )
+        .await
+        {
+            Ok(true) => {
+                return Err(response::<()>(
+                    StatusCode::CONFLICT,
+                    409,
+                    "该节点当前正在进行线路切换，请等待切换完成后再卸载。",
+                ))
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    group_id,
+                    node_id,
+                    "uninstall transaction preflight: {error}"
+                );
+                return Err(response::<()>(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    503,
+                    "UNINSTALL_PREFLIGHT_UNAVAILABLE",
+                ));
+            }
+        }
     }
     let mut target_version = None;
     let mut architecture = status
@@ -781,6 +977,19 @@ async fn create_operation(
             Some(actor_id),
         )
         .map_err(|_| response::<()>(StatusCode::CONFLICT, 409, "NODE_OPERATION_IN_PROGRESS"))?;
+    if action == NodeLifecycleAction::Uninstall {
+        let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
+        let durable = DurableUninstallOperation::new(&operation);
+        if let Err(error) = store_durable_uninstall(state, &durable).await {
+            state.node_operations.remove(&operation.id);
+            tracing::error!(group_id, node_id, "persist uninstall operation: {error}");
+            return Err(response::<()>(
+                StatusCode::SERVICE_UNAVAILABLE,
+                503,
+                "UNINSTALL_STATE_PERSIST_FAILED",
+            ));
+        }
+    }
     let action_name = format!("{:?}", action).to_ascii_lowercase();
     let audit_action = if action == NodeLifecycleAction::Logs {
         "node_logs".to_string()
@@ -832,6 +1041,13 @@ async fn create_operation(
             "node disconnected before command delivery",
         );
         if let Some(failed) = state.node_operations.get(&operation.id) {
+            if action == NodeLifecycleAction::Uninstall {
+                let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
+                if let Ok(Some(mut durable)) = load_durable_uninstall(state, &operation.id).await {
+                    durable.operation = failed.clone();
+                    let _ = store_durable_uninstall(state, &durable).await;
+                }
+            }
             audit_terminal_operation(state, &failed).await;
         }
         return Err(response::<()>(StatusCode::CONFLICT, 409, "NODE_OFFLINE"));
@@ -839,7 +1055,15 @@ async fn create_operation(
     state
         .node_operations
         .update(&operation.id, OperationStatus::Sent, "command sent to node");
-    Ok(state.node_operations.get(&operation.id).unwrap())
+    let operation = state.node_operations.get(&operation.id).unwrap();
+    if action == NodeLifecycleAction::Uninstall {
+        let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
+        if let Ok(Some(mut durable)) = load_durable_uninstall(state, &operation.id).await {
+            durable.operation = operation.clone();
+            let _ = store_durable_uninstall(state, &durable).await;
+        }
+    }
+    Ok(operation)
 }
 
 pub async fn start_operation(
@@ -899,11 +1123,22 @@ pub async fn get_operation(
     State(state): State<AppState>,
     Path((group_id, node_id, operation_id)): Path<(i64, String, String)>,
 ) -> Response {
-    match state
+    let operation = state
         .node_operations
         .get(&operation_id)
-        .filter(|operation| operation.group_id == group_id && operation.node_id == node_id)
-    {
+        .filter(|operation| operation.group_id == group_id && operation.node_id == node_id);
+    let operation = match operation {
+        Some(operation) => Some(operation),
+        None => match load_durable_uninstall(&state, &operation_id).await {
+            Ok(Some(durable)) => {
+                let operation = durable.operation();
+                (operation.group_id == group_id && operation.node_id == node_id)
+                    .then_some(operation)
+            }
+            _ => None,
+        },
+    };
+    match operation {
         Some(operation) => {
             audit_terminal_operation(&state, &operation).await;
             success(operation)
@@ -1012,75 +1247,233 @@ pub async fn receive_uninstall_result(
     if authenticated_node_id != Some(request.node_id.trim()) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(operation) = state.node_operations.uninstall_result(
+    let operation_id = request.operation_id.trim();
+    let node_id = request.node_id.trim();
+    let currently_connected = state
+        .node_connections
+        .config_online_node_ids(group.id)
+        .await
+        .contains(node_id);
+    {
+        let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
+        let Ok(Some(mut durable)) = load_durable_uninstall(&state, operation_id).await else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        if durable.operation.group_id != group.id
+            || durable.operation.node_id != node_id
+            || durable.operation.action != NodeLifecycleAction::Uninstall
+        {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        if durable.operation.status == OperationStatus::Success {
+            state.node_operations.restore_uninstall(&durable);
+            return success(durable.operation());
+        }
+        if durable.operation.status.terminal() {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        durable.operation.updated_at = now();
+        durable.operation.message = request.message.clone();
+        durable.cleanup_confirmed = request.success;
+        if !currently_connected {
+            durable.saw_disconnect = true;
+        }
+        durable.operation.status = OperationStatus::Verifying;
+        if store_durable_uninstall(&state, &durable).await.is_err() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        state.node_operations.restore_uninstall(&durable);
+    }
+    let _ = state.node_operations.uninstall_result(
         group.id,
-        request.node_id.trim(),
-        request.operation_id.trim(),
+        node_id,
+        operation_id,
         request.success,
         request.message,
-    ) else {
-        return StatusCode::FORBIDDEN.into_response();
-    };
-    audit_terminal_operation(&state, &operation).await;
-    success(operation)
+    );
+    if !request.success {
+        return response::<()>(
+            StatusCode::SERVICE_UNAVAILABLE,
+            503,
+            "NODE_CLEANUP_RETRY_REQUIRED",
+        );
+    }
+    match finalize_durable_uninstall(&state, operation_id).await {
+        Ok(operation) if operation.status == OperationStatus::Success => success(operation),
+        Ok(_) => response::<()>(
+            StatusCode::SERVICE_UNAVAILABLE,
+            503,
+            "WAITING_FOR_DISCONNECT",
+        ),
+        Err(error) => {
+            tracing::warn!(
+                operation_id,
+                "Panel uninstall cleanup retry required: {error}"
+            );
+            response::<()>(
+                StatusCode::SERVICE_UNAVAILABLE,
+                503,
+                "PANEL_CLEANUP_RETRY_REQUIRED",
+            )
+        }
+    }
 }
 
-async fn cleanup_uninstalled_node(state: &AppState, group_id: i64, node_id: &str) {
+async fn cleanup_uninstalled_node(
+    state: &AppState,
+    group_id: i64,
+    node_id: &str,
+) -> Result<(), String> {
     let status_key = format!("node_status:{group_id}:{node_id}");
-    if let Ok(Some(raw)) = state.db.get(&status_key).await {
+    if let Some(raw) = state
+        .db
+        .get(&status_key)
+        .await
+        .map_err(|error| error.to_string())?
+    {
         if let Some(ips) = crate::api::stats::public_ips_from_status_json(&raw) {
             for ip in ips {
-                let _ = state.db.delete(&format!("geoip:{ip}")).await;
+                state
+                    .db
+                    .delete(&format!("geoip:{ip}"))
+                    .await
+                    .map_err(|error| error.to_string())?;
             }
         }
     }
-    let _ = state.db.delete(&status_key).await;
-    let _ = state
+    state
+        .db
+        .delete(&status_key)
+        .await
+        .map_err(|error| error.to_string())?;
+    state
         .db
         .delete(&format!("node_config_revision:{group_id}:{node_id}"))
-        .await;
-    if let Err(error) = crate::service::relay_preference::remove_node_assignment(
-        state.db.as_ref(),
-        group_id,
-        node_id,
-    )
-    .await
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::service::relay_preference::remove_node_assignment(state.db.as_ref(), group_id, node_id)
+        .await?;
+    crate::service::relay_failover::remove_excluded_node(state.db.as_ref(), group_id, node_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::service::relay_schedule::delete_schedules_for_node(state.db.as_ref(), group_id, node_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn finalize_durable_uninstall(
+    state: &AppState,
+    operation_id: &str,
+) -> Result<NodeOperation, String> {
+    let operation = {
+        let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
+        let mut durable = load_durable_uninstall(state, operation_id)
+            .await?
+            .ok_or_else(|| "durable uninstall operation not found".to_string())?;
+        if durable.operation.status == OperationStatus::Success {
+            state.node_operations.restore_uninstall(&durable);
+            return Ok(durable.operation());
+        }
+        if !durable.cleanup_confirmed || !durable.saw_disconnect {
+            state.node_operations.restore_uninstall(&durable);
+            return Ok(durable.operation());
+        }
+        if let Err(error) = cleanup_uninstalled_node(
+            state,
+            durable.operation.group_id,
+            &durable.operation.node_id,
+        )
+        .await
+        {
+            durable.operation.status = OperationStatus::Verifying;
+            durable.operation.message = format!("Panel state cleanup failed; retrying: {error}");
+            durable.operation.updated_at = now();
+            store_durable_uninstall(state, &durable).await?;
+            state.node_operations.restore_uninstall(&durable);
+            return Err(error);
+        }
+        durable.panel_cleanup_complete = true;
+        durable.operation.status = OperationStatus::Success;
+        durable.operation.message = format!("{}; Panel state cleaned", durable.operation.message);
+        durable.operation.updated_at = now();
+        store_durable_uninstall(state, &durable).await?;
+        state.node_operations.restore_uninstall(&durable);
+        let _ = state
+            .node_operations
+            .mark_uninstall_panel_cleanup_complete(operation_id);
+        durable.operation()
+    };
+    audit_terminal_operation(state, &operation).await;
+    Ok(operation)
+}
+
+pub async fn record_uninstall_disconnect(state: &AppState, group_id: i64, node_id: &str) {
+    let mut operation_ids = Vec::new();
     {
-        tracing::warn!(
-            group_id,
-            node_id,
-            "uninstall carrier cleanup failed: {error}"
-        );
+        let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
+        let rows = match state.db.scan_prefix(DURABLE_UNINSTALL_PREFIX).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(group_id, node_id, "persist uninstall disconnect: {error}");
+                return;
+            }
+        };
+        for (_, raw) in rows {
+            let Ok(mut durable) = serde_json::from_str::<DurableUninstallOperation>(&raw) else {
+                continue;
+            };
+            if durable.operation.group_id != group_id
+                || durable.operation.node_id != node_id
+                || durable.operation.status == OperationStatus::Success
+            {
+                continue;
+            }
+            durable.saw_disconnect = true;
+            durable.operation.status = OperationStatus::Verifying;
+            durable.operation.message = if durable.cleanup_confirmed {
+                format!(
+                    "{}; node disconnected; waiting for Panel state cleanup",
+                    durable.operation.message
+                )
+            } else {
+                "node disconnected; waiting for verified cleanup and Panel state cleanup".into()
+            };
+            durable.operation.updated_at = now();
+            if store_durable_uninstall(state, &durable).await.is_ok() {
+                state.node_operations.restore_uninstall(&durable);
+                operation_ids.push(durable.operation.id.clone());
+            }
+        }
     }
-    let _ =
-        crate::service::relay_failover::remove_excluded_node(state.db.as_ref(), group_id, node_id)
-            .await;
-    if let Err(error) = crate::service::relay_schedule::delete_schedules_for_node(
-        state.db.as_ref(),
-        group_id,
-        node_id,
-    )
-    .await
-    {
-        tracing::warn!(
-            group_id,
-            node_id,
-            "uninstall schedule cleanup failed: {error}"
-        );
+    for operation_id in operation_ids {
+        let _ = finalize_durable_uninstall(state, &operation_id).await;
     }
 }
 
+async fn claim_durable_uninstall_audit(state: &AppState, operation_id: &str) -> bool {
+    let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
+    let Ok(Some(mut durable)) = load_durable_uninstall(state, operation_id).await else {
+        return false;
+    };
+    if !durable.operation.status.terminal() || durable.result_audited {
+        return false;
+    }
+    durable.result_audited = true;
+    store_durable_uninstall(state, &durable).await.is_ok()
+}
+
 pub async fn audit_terminal_operation(state: &AppState, operation: &NodeOperation) {
-    if !operation.status.terminal()
-        || operation.action == NodeLifecycleAction::Logs
-        || !state.node_operations.claim_terminal_audit(&operation.id)
-    {
+    if !operation.status.terminal() || operation.action == NodeLifecycleAction::Logs {
         return;
     }
-    if operation.action == NodeLifecycleAction::Uninstall
-        && operation.status == OperationStatus::Success
-    {
-        cleanup_uninstalled_node(state, operation.group_id, &operation.node_id).await;
+    let claimed = if operation.action == NodeLifecycleAction::Uninstall {
+        claim_durable_uninstall_audit(state, &operation.id).await
+    } else {
+        state.node_operations.claim_terminal_audit(&operation.id)
+    };
+    if !claimed {
+        return;
     }
     let action = format!("{:?}", operation.action).to_ascii_lowercase();
     crate::service::audit::record(
@@ -1182,6 +1575,19 @@ mod tests {
             architecture: Some("x86_64".into()),
             logs: None,
         }
+    }
+
+    async fn seed_durable_uninstall(
+        state: &AppState,
+        operation: &NodeOperation,
+        saw_disconnect: bool,
+        cleanup_confirmed: bool,
+    ) {
+        let mut durable = DurableUninstallOperation::new(operation);
+        durable.saw_disconnect = saw_disconnect;
+        durable.cleanup_confirmed = cleanup_confirmed;
+        durable.operation.status = OperationStatus::Verifying;
+        store_durable_uninstall(state, &durable).await.unwrap();
     }
 
     #[test]
@@ -1780,7 +2186,10 @@ mod tests {
             1,
             lifecycle_event(&operation, NodeLifecycleEventStatus::Accepted),
         );
-        assert!(registry.disconnected(1, "a").is_empty());
+        assert_eq!(
+            registry.disconnected(1, "a")[0].status,
+            OperationStatus::Verifying
+        );
         assert_ne!(
             registry.get(&operation.id).unwrap().status,
             OperationStatus::Success
@@ -1792,7 +2201,10 @@ mod tests {
             1,
             lifecycle_event(&operation, NodeLifecycleEventStatus::Completed),
         );
-        assert!(registry.disconnected(1, "a").is_empty());
+        assert_eq!(
+            registry.disconnected(1, "a")[0].status,
+            OperationStatus::Verifying
+        );
         assert_ne!(
             registry.get(&operation.id).unwrap().status,
             OperationStatus::Success
@@ -1820,6 +2232,13 @@ mod tests {
         assert_eq!(waiting.status, OperationStatus::Verifying);
         assert_eq!(
             confirmation_first.disconnected(1, "node-a")[0].status,
+            OperationStatus::Verifying
+        );
+        assert_eq!(
+            confirmation_first
+                .mark_uninstall_panel_cleanup_complete(&operation.id)
+                .unwrap()
+                .status,
             OperationStatus::Success
         );
 
@@ -1836,11 +2255,21 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(disconnect_first.disconnected(1, "node-a").is_empty());
+        assert_eq!(
+            disconnect_first.disconnected(1, "node-a")[0].status,
+            OperationStatus::Verifying
+        );
         let completed = disconnect_first
             .uninstall_result(1, "node-a", &operation.id, true, "cleanup complete".into())
             .unwrap();
-        assert_eq!(completed.status, OperationStatus::Success);
+        assert_eq!(completed.status, OperationStatus::Verifying);
+        assert_eq!(
+            disconnect_first
+                .mark_uninstall_panel_cleanup_complete(&operation.id)
+                .unwrap()
+                .status,
+            OperationStatus::Success
+        );
     }
 
     #[test]
@@ -1873,11 +2302,229 @@ mod tests {
                 "nginx cleanup failed".into(),
             )
             .unwrap();
-        assert_eq!(failed.status, OperationStatus::Failed);
-        assert!(registry.disconnected(1, "node-a").is_empty());
+        assert_eq!(failed.status, OperationStatus::Verifying);
+        assert_eq!(
+            registry.disconnected(1, "node-a")[0].status,
+            OperationStatus::Verifying
+        );
         assert_eq!(
             registry.get(&operation.id).unwrap().status,
-            OperationStatus::Failed
+            OperationStatus::Verifying
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_uninstall_survives_registry_restart_and_duplicate_completion() {
+        let (state, pool) = test_state().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (1, 'relay', 'in', 'node-token', 1, '192.0.2.1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let operation = start(
+            &state.node_operations,
+            "node-a",
+            NodeLifecycleAction::Uninstall,
+        );
+        seed_durable_uninstall(&state, &operation, true, false).await;
+        let restarted = AppState {
+            node_operations: NodeOperationRegistry::new(),
+            ..state.clone()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer node-token".parse().unwrap());
+        headers.insert("X-Node-ID", "node-a".parse().unwrap());
+        let request = || UninstallResultRequest {
+            operation_id: operation.id.clone(),
+            node_id: "node-a".into(),
+            success: true,
+            message: "cleanup complete".into(),
+        };
+        let response =
+            receive_uninstall_result(State(restarted.clone()), headers.clone(), Json(request()))
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            load_durable_uninstall(&restarted, &operation.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .operation
+                .status,
+            OperationStatus::Success
+        );
+
+        let duplicate = receive_uninstall_result(State(restarted), headers, Json(request())).await;
+        assert_eq!(duplicate.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn callback_first_waits_for_disconnect_then_duplicate_receives_ack() {
+        let (state, pool) = test_state().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (1, 'relay', 'in', 'node-token', 1, '192.0.2.1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let operation = start(
+            &state.node_operations,
+            "node-a",
+            NodeLifecycleAction::Uninstall,
+        );
+        seed_durable_uninstall(&state, &operation, false, false).await;
+        let (_connection, receiver) = state
+            .node_connections
+            .register_with_capabilities(1, Some("node-a".into()), true, true)
+            .await;
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer node-token".parse().unwrap());
+        headers.insert("X-Node-ID", "node-a".parse().unwrap());
+        let request = || UninstallResultRequest {
+            operation_id: operation.id.clone(),
+            node_id: "node-a".into(),
+            success: true,
+            message: "cleanup complete; OpenList ownership unknown, preserved".into(),
+        };
+        let waiting =
+            receive_uninstall_result(State(state.clone()), headers.clone(), Json(request())).await;
+        assert_eq!(waiting.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            load_durable_uninstall(&state, &operation.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .operation
+                .status,
+            OperationStatus::Verifying
+        );
+
+        drop(receiver);
+        state.node_connections.close_group(1).await;
+        record_uninstall_disconnect(&state, 1, "node-a").await;
+        let completed = load_durable_uninstall(&state, &operation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.operation.status, OperationStatus::Success);
+        assert!(completed.operation.message.contains("ownership unknown"));
+
+        let acknowledged = receive_uninstall_result(State(state), headers, Json(request())).await;
+        assert_eq!(acknowledged.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn uninstall_callback_rejects_unauthenticated_and_wrong_correlation() {
+        let (state, pool) = test_state().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) \
+             VALUES (1, 'relay', 'in', 'node-token', 1, '192.0.2.1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let operation = start(
+            &state.node_operations,
+            "node-a",
+            NodeLifecycleAction::Uninstall,
+        );
+        seed_durable_uninstall(&state, &operation, true, false).await;
+        let body = |operation_id: String, node_id: &str| UninstallResultRequest {
+            operation_id,
+            node_id: node_id.into(),
+            success: true,
+            message: "cleanup complete".into(),
+        };
+        let unauthenticated = receive_uninstall_result(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(body(operation.id.clone(), "node-a")),
+        )
+        .await;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "Bearer node-token".parse().unwrap());
+        headers.insert("X-Node-ID", "node-a".parse().unwrap());
+        let wrong_operation = receive_uninstall_result(
+            State(state.clone()),
+            headers.clone(),
+            Json(body("wrong-operation".into(), "node-a")),
+        )
+        .await;
+        assert_eq!(wrong_operation.status(), StatusCode::FORBIDDEN);
+        let mut wrong_action = load_durable_uninstall(&state, &operation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        wrong_action.operation.action = NodeLifecycleAction::Restart;
+        store_durable_uninstall(&state, &wrong_action)
+            .await
+            .unwrap();
+        let wrong_action_response = receive_uninstall_result(
+            State(state.clone()),
+            headers.clone(),
+            Json(body(operation.id.clone(), "node-a")),
+        )
+        .await;
+        assert_eq!(wrong_action_response.status(), StatusCode::FORBIDDEN);
+        wrong_action.operation.action = NodeLifecycleAction::Uninstall;
+        store_durable_uninstall(&state, &wrong_action)
+            .await
+            .unwrap();
+        headers.insert("X-Node-ID", "node-b".parse().unwrap());
+        let wrong_node =
+            receive_uninstall_result(State(state), headers, Json(body(operation.id, "node-b")))
+                .await;
+        assert_eq!(wrong_node.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn panel_cleanup_failure_stays_nonterminal_and_retry_converges() {
+        let (state, _) = test_state().await;
+        let operation = start(
+            &state.node_operations,
+            "node-a",
+            NodeLifecycleAction::Uninstall,
+        );
+        seed_durable_uninstall(&state, &operation, true, true).await;
+        state
+            .db
+            .set("relay_preference:1", "not-json")
+            .await
+            .unwrap();
+        assert!(finalize_durable_uninstall(&state, &operation.id)
+            .await
+            .is_err());
+        assert_eq!(
+            load_durable_uninstall(&state, &operation.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .operation
+                .status,
+            OperationStatus::Verifying
+        );
+        state
+            .db
+            .set(
+                "relay_preference:1",
+                &serde_json::to_string(
+                    &crate::service::relay_preference::RelayPreferenceState::default(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            finalize_durable_uninstall(&state, &operation.id)
+                .await
+                .unwrap()
+                .status,
+            OperationStatus::Success
         );
     }
 
@@ -1960,6 +2607,100 @@ mod tests {
             assert_eq!(response.status(), StatusCode::CONFLICT);
         }
         assert!(state.node_operations.inner.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn uninstall_preflight_rejects_active_switching_and_rolling_back_references() {
+        for phase in ["switching", "rolling_back"] {
+            let (state, _) = test_state().await;
+            state
+                .db
+                .set(
+                    "node_status:1:node-a",
+                    &serde_json::json!({
+                        "node_id": "node-a",
+                        "node_version": "1.1.6",
+                        "config_protocol_version": CONFIG_PROTOCOL_VERSION,
+                        "architecture": "x86_64"
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            state.db.set("relay_preference:1", &format!(r#"{{"preferred_node_id":"node-a","pending_node_id":"node-b","state":"{phase}","started_at":"x","last_error":null,"rollback_error":null,"dns_records":[],"carrier_policy":{{"bindings":[]}},"pending_carrier_policy":null,"transaction_kind":"preferred_switch"}}"#)).await.unwrap();
+            let (_connection, _receiver) = state
+                .node_connections
+                .register_with_capabilities(1, Some("node-a".into()), true, true)
+                .await;
+            let response = create_operation(
+                &state,
+                1,
+                1,
+                "node-a".into(),
+                NodeLifecycleAction::Uninstall,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{phase}");
+            assert!(state.node_operations.inner.lock().unwrap().is_empty());
+        }
+
+        let (state, _) = test_state().await;
+        state
+            .db
+            .set(
+                "node_status:1:node-a",
+                &serde_json::json!({
+                    "node_id": "node-a",
+                    "node_version": "1.1.6",
+                    "config_protocol_version": CONFIG_PROTOCOL_VERSION,
+                    "architecture": "x86_64"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        state.db.set("relay_preference:1", r#"{"preferred_node_id":"node-a","pending_node_id":null,"state":"idle","started_at":null,"last_error":null,"rollback_error":null,"dns_records":[],"carrier_policy":{"bindings":[]},"pending_carrier_policy":null,"transaction_kind":null}"#).await.unwrap();
+        let (_connection, _receiver) = state
+            .node_connections
+            .register_with_capabilities(1, Some("node-a".into()), true, true)
+            .await;
+        assert!(create_operation(
+            &state,
+            1,
+            1,
+            "node-a".into(),
+            NodeLifecycleAction::Uninstall,
+            None,
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn durable_uninstall_blocks_duplicate_destructive_operation_after_registry_restart() {
+        let (state, _) = test_state().await;
+        let operation = start(
+            &state.node_operations,
+            "node-a",
+            NodeLifecycleAction::Uninstall,
+        );
+        seed_durable_uninstall(&state, &operation, false, false).await;
+        let restarted = AppState {
+            node_operations: NodeOperationRegistry::new(),
+            ..state
+        };
+        for action in [
+            NodeLifecycleAction::Restart,
+            NodeLifecycleAction::Upgrade,
+            NodeLifecycleAction::Uninstall,
+        ] {
+            let response = create_operation(&restarted, 1, 1, "node-a".into(), action, None)
+                .await
+                .unwrap_err();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{action:?}");
+        }
     }
 
     #[tokio::test]
@@ -2094,9 +2835,17 @@ mod tests {
             .await
             .unwrap();
         state.db.set("relay_preference:1", r#"{"preferred_node_id":"node-a","pending_node_id":null,"state":"idle","started_at":null,"last_error":null,"rollback_error":null,"dns_records":[],"carrier_policy":{"bindings":[{"line_id":"Dianxin","mode":"node","node_id":"node-a"}]},"pending_carrier_policy":null,"transaction_kind":null}"#).await.unwrap();
+        state.db.set("relay_failover:1", r#"{"model_version":1,"enabled":false,"health_check_port":443,"failure_after_seconds":5,"excluded_failed_node_ids":["node-a"],"last_switch_at":"x","last_from_node_id":"node-a","last_to_node_id":"node-a","last_result":"failed","last_error":"x"}"#).await.unwrap();
         state.db.set(crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY, r#"[{"id":"a","group_id":1,"target_node_id":"node-a","schedule_type":"daily","enabled":true,"created_at":"x","updated_at":"x","execute_at":null,"time":"12:00","utc_offset_minutes":0,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null},{"id":"b","group_id":1,"target_node_id":"node-b","schedule_type":"daily","enabled":true,"created_at":"x","updated_at":"x","execute_at":null,"time":"12:00","utc_offset_minutes":0,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null}]"#).await.unwrap();
+        state
+            .db
+            .set("global_certificate:sentinel", "keep")
+            .await
+            .unwrap();
+        state.db.set("rule:sentinel", "keep").await.unwrap();
+        state.db.set("group:sentinel", "keep").await.unwrap();
 
-        cleanup_uninstalled_node(&state, 1, "node-a").await;
+        cleanup_uninstalled_node(&state, 1, "node-a").await.unwrap();
 
         assert!(state
             .db
@@ -2115,11 +2864,25 @@ mod tests {
             .await
             .unwrap();
         assert!(preference.preferred_node_id.is_none());
+        assert!(preference.pending_node_id.is_none());
         assert!(preference.carrier_policy.bindings.is_empty());
+        let failover: crate::service::relay_failover::RelayFailoverPolicy =
+            serde_json::from_str(&state.db.get("relay_failover:1").await.unwrap().unwrap())
+                .unwrap();
+        assert!(!failover.excluded_failed_node_ids.contains("node-a"));
+        assert_eq!(failover.last_from_node_id, None);
+        assert_eq!(failover.last_to_node_id, None);
         let schedules = crate::service::relay_schedule::list_schedules(state.db.as_ref())
             .await
             .unwrap();
         assert_eq!(schedules.len(), 1);
         assert_eq!(schedules[0].target_node_id, "node-b");
+        for key in [
+            "global_certificate:sentinel",
+            "rule:sentinel",
+            "group:sentinel",
+        ] {
+            assert_eq!(state.db.get(key).await.unwrap().as_deref(), Some("keep"));
+        }
     }
 }

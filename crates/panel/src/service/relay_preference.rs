@@ -936,16 +936,29 @@ pub async fn delete_relay_preference(db: &dyn Repository, group_id: i64) -> Resu
     Ok(())
 }
 
-pub async fn remove_node_assignment(
-    db: &dyn Repository,
-    group_id: i64,
-    node_id: &str,
-) -> Result<(), RelayPreferenceError> {
-    let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
-    if db.get(&preference_key(group_id)).await?.is_none() {
-        return Ok(());
-    }
-    let mut preference = load_preference(db, group_id).await?;
+fn active_transaction_references_node(preference: &RelayPreferenceState, node_id: &str) -> bool {
+    matches!(
+        preference.state,
+        RelayPreferencePhase::Switching | RelayPreferencePhase::RollingBack
+    ) && (preference.preferred_node_id.as_deref() == Some(node_id)
+        || preference.pending_node_id.as_deref() == Some(node_id)
+        || preference
+            .carrier_policy
+            .bindings
+            .iter()
+            .any(|binding| binding.node_id.as_deref() == Some(node_id))
+        || preference
+            .pending_carrier_policy
+            .as_ref()
+            .is_some_and(|policy| {
+                policy
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.node_id.as_deref() == Some(node_id))
+            }))
+}
+
+fn remove_node_references(preference: &mut RelayPreferenceState, node_id: &str) {
     preference
         .carrier_policy
         .bindings
@@ -955,17 +968,51 @@ pub async fn remove_node_assignment(
             .bindings
             .retain(|binding| binding.node_id.as_deref() != Some(node_id));
     }
-    if preference.preferred_node_id.as_deref() == Some(node_id)
-        && preference.state == RelayPreferencePhase::Idle
-    {
+    if preference.preferred_node_id.as_deref() == Some(node_id) {
         preference.preferred_node_id = None;
     }
-    if preference.pending_node_id.as_deref() == Some(node_id)
-        && preference.state == RelayPreferencePhase::Idle
-    {
+    if preference.pending_node_id.as_deref() == Some(node_id) {
         preference.pending_node_id = None;
     }
-    store_preference(db, group_id, &preference).await?;
+}
+
+pub async fn uninstall_blocked_by_active_transaction(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: &str,
+) -> Result<bool, RelayPreferenceError> {
+    let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
+    if db.get(&preference_key(group_id)).await?.is_none() {
+        return Ok(false);
+    }
+    let preference = load_preference(db, group_id).await?;
+    Ok(active_transaction_references_node(&preference, node_id))
+}
+
+pub async fn remove_node_assignment(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: &str,
+) -> Result<(), String> {
+    let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
+    if db
+        .get(&preference_key(group_id))
+        .await
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let mut preference = load_preference(db, group_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    if active_transaction_references_node(&preference, node_id) {
+        return Err("node is referenced by an active Relay/Carrier transaction".into());
+    }
+    remove_node_references(&mut preference, node_id);
+    store_preference(db, group_id, &preference)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -3164,6 +3211,65 @@ mod tests {
             .normalize(),
             Err(CarrierPolicyValidationError::MissingNodeId)
         );
+    }
+
+    #[test]
+    fn uninstall_preflight_blocks_active_relay_transactions_that_reference_node() {
+        for phase in [
+            RelayPreferencePhase::Switching,
+            RelayPreferencePhase::RollingBack,
+        ] {
+            let preference = RelayPreferenceState {
+                preferred_node_id: Some("node-a".into()),
+                pending_node_id: Some("node-b".into()),
+                state: phase,
+                transaction_kind: Some(RelayTransactionKind::PreferredSwitch),
+                ..RelayPreferenceState::default()
+            };
+            assert!(active_transaction_references_node(&preference, "node-a"));
+            assert!(active_transaction_references_node(&preference, "node-b"));
+            assert!(!active_transaction_references_node(&preference, "node-c"));
+        }
+        let idle = RelayPreferenceState {
+            preferred_node_id: Some("node-a".into()),
+            state: RelayPreferencePhase::Idle,
+            ..RelayPreferenceState::default()
+        };
+        assert!(!active_transaction_references_node(&idle, "node-a"));
+    }
+
+    #[test]
+    fn terminal_uninstall_cleanup_removes_every_node_reference() {
+        let mut preference = RelayPreferenceState {
+            preferred_node_id: Some("node-a".into()),
+            pending_node_id: Some("node-a".into()),
+            state: RelayPreferencePhase::FailedRolledBack,
+            carrier_policy: CarrierPolicy {
+                bindings: vec![carrier_binding(
+                    "Dianxin",
+                    CarrierLineMode::Node,
+                    Some("node-a"),
+                )],
+            },
+            pending_carrier_policy: Some(CarrierPolicy {
+                bindings: vec![carrier_binding(
+                    "Liantong",
+                    CarrierLineMode::Node,
+                    Some("node-a"),
+                )],
+            }),
+            ..RelayPreferenceState::default()
+        };
+        remove_node_references(&mut preference, "node-a");
+        assert_eq!(preference.preferred_node_id, None);
+        assert_eq!(preference.pending_node_id, None);
+        assert!(preference.carrier_policy.bindings.is_empty());
+        assert!(preference
+            .pending_carrier_policy
+            .as_ref()
+            .unwrap()
+            .bindings
+            .is_empty());
     }
 
     #[test]

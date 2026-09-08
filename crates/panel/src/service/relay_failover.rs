@@ -363,7 +363,16 @@ pub async fn remove_excluded_node(
     };
     let mut policy: RelayFailoverPolicy = serde_json::from_str(&raw)
         .map_err(|error| RelayFailoverError::InvalidStoredData(error.to_string()))?;
-    if !policy.excluded_failed_node_ids.remove(node_id) {
+    let mut changed = policy.excluded_failed_node_ids.remove(node_id);
+    if policy.last_from_node_id.as_deref() == Some(node_id) {
+        policy.last_from_node_id = None;
+        changed = true;
+    }
+    if policy.last_to_node_id.as_deref() == Some(node_id) {
+        policy.last_to_node_id = None;
+        changed = true;
+    }
+    if !changed {
         return Ok(false);
     }
     store_policy(db, group_id, &policy).await?;
@@ -1840,15 +1849,17 @@ mod tests {
         let (repo, _) = test_repo().await;
         let mut policy = update_policy(&repo, 1, false, 443, 5).await.unwrap();
         policy.excluded_failed_node_ids = BTreeSet::from(["node-a".into(), "node-b".into()]);
+        policy.last_from_node_id = Some("node-a".into());
+        policy.last_to_node_id = Some("node-b".into());
         store_policy(&repo, 1, &policy).await.unwrap();
         assert!(remove_excluded_node(&repo, 1, "node-a").await.unwrap());
+        let cleaned = load_policy(&repo, 1).await.unwrap();
         assert_eq!(
-            load_policy(&repo, 1)
-                .await
-                .unwrap()
-                .excluded_failed_node_ids,
+            cleaned.excluded_failed_node_ids,
             BTreeSet::from(["node-b".to_string()])
         );
+        assert_eq!(cleaned.last_from_node_id, None);
+        assert_eq!(cleaned.last_to_node_id.as_deref(), Some("node-b"));
         delete_failover(&repo, 1).await.unwrap();
         assert!(repo.get("relay_failover:1").await.unwrap().is_none());
     }

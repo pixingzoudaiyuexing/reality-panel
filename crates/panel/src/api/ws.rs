@@ -582,6 +582,7 @@ async fn handle_node_ws(
         for operation in node_operations.disconnected(group_id, node_id) {
             crate::api::node_ops::audit_terminal_operation(&state, &operation).await;
         }
+        crate::api::node_ops::record_uninstall_disconnect(&state, group_id, node_id).await;
     }
 }
 
