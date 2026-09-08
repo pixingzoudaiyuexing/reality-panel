@@ -13,9 +13,37 @@ use std::collections::{HashMap, HashSet};
 
 const BATCH_PREFIX: &str = "node_batch_upgrade:";
 const RECENT_BATCH_LIMIT: usize = 10;
+const PERSIST_RETRY_DELAYS: [std::time::Duration; 5] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(5),
+    std::time::Duration::from_secs(10),
+    std::time::Duration::from_secs(30),
+];
 
 static BATCH_CREATE_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
     once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
+#[cfg(test)]
+static PERSIST_FAILURES: once_cell::sync::Lazy<
+    std::sync::Mutex<HashMap<(String, &'static str), usize>>,
+> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[derive(Default)]
+struct PersistRetryBackoff {
+    failures: usize,
+}
+
+impl PersistRetryBackoff {
+    fn next_delay(&mut self) -> std::time::Duration {
+        let delay = PERSIST_RETRY_DELAYS
+            .get(self.failures)
+            .copied()
+            .unwrap_or(PERSIST_RETRY_DELAYS[PERSIST_RETRY_DELAYS.len() - 1]);
+        self.failures = self.failures.saturating_add(1);
+        delay
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -285,6 +313,72 @@ async fn persist(state: &AppState, batch: &BatchUpgradeOperation) -> Result<(), 
         .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
+fn inject_persist_failures(batch_id: &str, transition: &'static str, failures: usize) {
+    PERSIST_FAILURES
+        .lock()
+        .expect("batch persist failure lock")
+        .insert((batch_id.to_string(), transition), failures);
+}
+
+async fn persist_transition_once(
+    state: &AppState,
+    batch: &BatchUpgradeOperation,
+    _transition: &'static str,
+) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let mut failures = PERSIST_FAILURES.lock().expect("batch persist failure lock");
+        if let Some(remaining) = failures.get_mut(&(batch.id.clone(), _transition)) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err("injected batch persistence failure".into());
+            }
+        }
+    }
+    persist(state, batch).await
+}
+
+async fn persist_batch_transition_with_retry(
+    state: &AppState,
+    batch: &BatchUpgradeOperation,
+    transition: &'static str,
+    item_index: Option<usize>,
+) {
+    let mut backoff = PersistRetryBackoff::default();
+    let mut attempt = 0_u64;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match persist_transition_once(state, batch, transition).await {
+            Ok(()) => return,
+            Err(error) => {
+                let item = item_index.and_then(|index| batch.items.get(index));
+                if attempt == 1 {
+                    tracing::warn!(
+                        batch_id = batch.id,
+                        group_id = item.map(|item| item.group_id),
+                        node_id = item.map(|item| item.node_id.as_str()),
+                        transition,
+                        error,
+                        "batch transition persistence failed; retrying before advancing"
+                    );
+                } else {
+                    tracing::debug!(
+                        batch_id = batch.id,
+                        group_id = item.map(|item| item.group_id),
+                        node_id = item.map(|item| item.node_id.as_str()),
+                        transition,
+                        attempt,
+                        error,
+                        "batch transition persistence still unavailable"
+                    );
+                }
+                tokio::time::sleep(backoff.next_delay()).await;
+            }
+        }
+    }
+}
+
 async fn load(state: &AppState, id: &str) -> Result<Option<BatchUpgradeOperation>, String> {
     state
         .db
@@ -396,9 +490,7 @@ async fn run_batch(state: AppState, mut batch: BatchUpgradeOperation) {
     batch.status = BatchUpgradeStatus::Running;
     batch.updated_at = now();
     refresh_counts(&mut batch);
-    if persist(&state, &batch).await.is_err() {
-        return;
-    }
+    persist_batch_transition_with_retry(&state, &batch, "batch_running", None).await;
     for index in 0..batch.items.len() {
         if batch.items[index].status != BatchUpgradeItemStatus::Pending {
             continue;
@@ -408,9 +500,7 @@ async fn run_batch(state: AppState, mut batch: BatchUpgradeOperation) {
         batch.current_item = Some(batch.items[index].node_id.clone());
         batch.updated_at = now();
         refresh_counts(&mut batch);
-        if persist(&state, &batch).await.is_err() {
-            return;
-        }
+        persist_batch_transition_with_retry(&state, &batch, "item_running", Some(index)).await;
 
         let group_id = batch.items[index].group_id;
         let node_id = batch.items[index].node_id.clone();
@@ -427,9 +517,13 @@ async fn run_batch(state: AppState, mut batch: BatchUpgradeOperation) {
             Ok(operation) => {
                 batch.items[index].child_operation_id = Some(operation.id.clone());
                 batch.updated_at = now();
-                if persist(&state, &batch).await.is_err() {
-                    return;
-                }
+                persist_batch_transition_with_retry(
+                    &state,
+                    &batch,
+                    "child_operation_assigned",
+                    Some(index),
+                )
+                .await;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     let Some(child) = state.node_operations.get(&operation.id) else {
@@ -467,15 +561,13 @@ async fn run_batch(state: AppState, mut batch: BatchUpgradeOperation) {
         batch.current_item = None;
         batch.updated_at = now();
         refresh_counts(&mut batch);
-        if persist(&state, &batch).await.is_err() {
-            return;
-        }
+        persist_batch_transition_with_retry(&state, &batch, "item_terminal", Some(index)).await;
     }
     refresh_counts(&mut batch);
     batch.status = final_status(&batch);
     batch.current_item = None;
     batch.updated_at = now();
-    let _ = persist(&state, &batch).await;
+    persist_batch_transition_with_retry(&state, &batch, "batch_terminal", None).await;
 }
 
 pub async fn preview(_admin: AdminOnly, State(state): State<AppState>) -> Response {
@@ -733,6 +825,82 @@ mod tests {
             .unwrap()
             .unwrap();
         serde_json::from_str(&payload).unwrap()
+    }
+
+    async fn worker_fixture(
+        batch_id: &str,
+        node_ids: &[&str],
+    ) -> (
+        AppState,
+        BatchUpgradeOperation,
+        Vec<tokio::sync::mpsc::UnboundedReceiver<String>>,
+        std::path::PathBuf,
+    ) {
+        let root = std::env::temp_dir().join(format!("batch-artifacts-{}", uuid::Uuid::new_v4()));
+        write_artifact(&root);
+        std::env::set_var(crate::api::provisioning::NODE_ARTIFACT_ROOT_ENV, &root);
+        let state = test_state().await;
+        let mut receivers = Vec::new();
+        for node_id in node_ids {
+            state
+                .db
+                .set(
+                    &format!("node_status:1:{node_id}"),
+                    &serde_json::json!({
+                        "node_version": "1.1.11",
+                        "architecture": "x86_64",
+                        "config_protocol_version": relay_shared::protocol::CONFIG_PROTOCOL_VERSION
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            let (_, receiver) = state
+                .node_connections
+                .register(1, Some((*node_id).into()))
+                .await;
+            receivers.push(receiver);
+        }
+        let items = preview_items(&state).await.unwrap();
+        let timestamp = now();
+        let mut batch = BatchUpgradeOperation {
+            id: batch_id.into(),
+            status: BatchUpgradeStatus::Pending,
+            target_version: Some("1.1.12".into()),
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+            created_by: 1,
+            total: 0,
+            pending: 0,
+            running: 0,
+            success: 0,
+            failed: 0,
+            skipped: 0,
+            current_item: None,
+            items,
+        };
+        refresh_counts(&mut batch);
+        persist(&state, &batch).await.unwrap();
+        (state, batch, receivers, root)
+    }
+
+    async fn wait_batch_terminal(state: &AppState, batch_id: &str) -> BatchUpgradeOperation {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let batch = load(state, batch_id).await.unwrap().unwrap();
+                if batch.status.terminal() {
+                    break batch;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    fn cleanup_worker_fixture(root: std::path::PathBuf) {
+        std::env::remove_var(crate::api::provisioning::NODE_ARTIFACT_ROOT_ENV);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn event(
@@ -1055,5 +1223,129 @@ mod tests {
         assert_eq!(completed.status, BatchUpgradeStatus::Success);
         assert_eq!(completed.total, 0);
         assert_eq!(completed.pending, 0);
+    }
+
+    #[test]
+    fn persistence_retry_backoff_is_bounded_without_a_retry_limit() {
+        let mut backoff = PersistRetryBackoff::default();
+        assert_eq!(backoff.next_delay(), std::time::Duration::from_secs(1));
+        assert_eq!(backoff.next_delay(), std::time::Duration::from_secs(2));
+        assert_eq!(backoff.next_delay(), std::time::Duration::from_secs(5));
+        assert_eq!(backoff.next_delay(), std::time::Duration::from_secs(10));
+        assert_eq!(backoff.next_delay(), std::time::Duration::from_secs(30));
+        for _ in 0..100 {
+            assert_eq!(backoff.next_delay(), std::time::Duration::from_secs(30));
+        }
+    }
+
+    #[tokio::test]
+    async fn item_running_must_persist_before_child_starts() {
+        let _guard = BATCH_CREATE_LOCK.lock().await;
+        let (state, batch, mut receivers, root) =
+            worker_fixture("persist-before-child", &["node-a"]).await;
+        inject_persist_failures(&batch.id, "item_running", 2);
+        let worker = tokio::spawn(run_batch(state.clone(), batch));
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), receivers[0].recv())
+                .await
+                .is_err(),
+            "child must not start while its RUNNING transition is not durable"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(
+            !worker.is_finished(),
+            "worker must keep retrying after repeated failures"
+        );
+        assert!(receivers[0].try_recv().is_err());
+        let command = wait_command(&mut receivers[0]).await;
+        state
+            .node_operations
+            .event(1, event(&command, NodeLifecycleEventStatus::Completed));
+        wait_batch_terminal(&state, "persist-before-child").await;
+        worker.await.unwrap();
+        cleanup_worker_fixture(root);
+    }
+
+    #[tokio::test]
+    async fn child_id_persistence_retry_monitors_the_same_child_without_duplicate_creation() {
+        let _guard = BATCH_CREATE_LOCK.lock().await;
+        let (state, batch, mut receivers, root) =
+            worker_fixture("persist-child-id", &["node-a"]).await;
+        inject_persist_failures(&batch.id, "child_operation_assigned", 1);
+        let worker = tokio::spawn(run_batch(state.clone(), batch));
+
+        let command = wait_command(&mut receivers[0]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(receivers[0].try_recv().is_err());
+        let active = state.node_operations.active_and_recent();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, command.operation_id);
+        state
+            .node_operations
+            .event(1, event(&command, NodeLifecycleEventStatus::Completed));
+        let completed = wait_batch_terminal(&state, "persist-child-id").await;
+        assert_eq!(
+            completed.items[0].child_operation_id.as_deref(),
+            Some(command.operation_id.as_str())
+        );
+        assert_eq!(state.node_operations.active_and_recent().len(), 1);
+        worker.await.unwrap();
+        cleanup_worker_fixture(root);
+    }
+
+    #[tokio::test]
+    async fn item_terminal_must_persist_before_next_child_starts() {
+        let _guard = BATCH_CREATE_LOCK.lock().await;
+        let (state, batch, mut receivers, root) =
+            worker_fixture("persist-item-terminal", &["node-a", "node-b"]).await;
+        inject_persist_failures(&batch.id, "item_terminal", 1);
+        let worker = tokio::spawn(run_batch(state.clone(), batch));
+
+        let first = wait_command(&mut receivers[0]).await;
+        state
+            .node_operations
+            .event(1, event(&first, NodeLifecycleEventStatus::Completed));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), receivers[1].recv())
+                .await
+                .is_err(),
+            "next child must wait for previous terminal transition durability"
+        );
+        let second = wait_command(&mut receivers[1]).await;
+        state
+            .node_operations
+            .event(1, event(&second, NodeLifecycleEventStatus::Completed));
+        let completed = wait_batch_terminal(&state, "persist-item-terminal").await;
+        assert_eq!(completed.success, 2);
+        worker.await.unwrap();
+        cleanup_worker_fixture(root);
+    }
+
+    #[tokio::test]
+    async fn final_terminal_persistence_retries_and_keeps_active_gate_closed_until_durable() {
+        let _guard = BATCH_CREATE_LOCK.lock().await;
+        let (state, batch, mut receivers, root) =
+            worker_fixture("persist-final-terminal", &["node-a"]).await;
+        inject_persist_failures(&batch.id, "batch_terminal", 1);
+        let worker = tokio::spawn(run_batch(state.clone(), batch));
+
+        let command = wait_command(&mut receivers[0]).await;
+        state
+            .node_operations
+            .event(1, event(&command, NodeLifecycleEventStatus::Completed));
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let durable = load(&state, "persist-final-terminal")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, BatchUpgradeStatus::Running);
+        assert!(active_batch(&state).await.unwrap().is_some());
+
+        let completed = wait_batch_terminal(&state, "persist-final-terminal").await;
+        assert_eq!(completed.status, BatchUpgradeStatus::Success);
+        assert!(active_batch(&state).await.unwrap().is_none());
+        worker.await.unwrap();
+        cleanup_worker_fixture(root);
     }
 }
