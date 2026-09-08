@@ -1,4 +1,5 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { message } from 'antd';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CarrierAffinityView, CarrierLineCatalog, RelayReadyNode } from '../../api/types';
 import type { Tfn } from './types';
@@ -7,9 +8,21 @@ const { mockGet, mockPut } = vi.hoisted(() => ({ mockGet: vi.fn(), mockPut: vi.f
 vi.mock('../../api/client', () => ({ default: { get: mockGet, put: mockPut } }));
 
 import { CarrierAffinityPanel } from './CarrierAffinityPanel';
+import { carrierApplyErrorMessage } from './carrierErrors';
 import { assignCarrierLines, buildCarrierLineOptions, carrierLineMatchesSearch } from './carrierCatalog';
 
-const t = ((key: string) => key === 'carrierAllNetworkDefault' ? '全网默认' : key) as Tfn;
+const translations: Record<string, string> = {
+  carrierAllNetworkDefault: '全网默认',
+  carrierErrorDefaultAuthority: '全网默认线路请使用“设为默认线路”功能管理',
+  carrierErrorFailoverEnabled: '已启用故障切换，无法应用运营商线路策略',
+  carrierErrorCatalogStale: '运营商线路目录已过期，请稍后重试',
+  carrierErrorDnsMgrUnavailable: 'DNS 服务暂不可用',
+  carrierErrorTransactionInProgress: '当前有线路事务正在执行',
+  carrierErrorOwnershipUnverified: 'DNS 记录所有权无法确认',
+  carrierErrorProviderPreflight: 'DNS 服务预检查失败',
+  carrierSaveFailed: '运营商线路策略应用失败',
+};
+const t = ((key: string) => translations[key] ?? key) as Tfn;
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
 const nodes: RelayReadyNode[] = [
   { node_id: 'node-a', public_ipv4: '203.0.113.5', online: true, ready: true, ready_reasons: [], preferred: true },
@@ -40,11 +53,11 @@ const view: CarrierAffinityView = {
   catalog_stale: false,
 };
 
-function arrange(over: Partial<CarrierAffinityView> = {}) {
+function arrange(over: Partial<CarrierAffinityView> = {}, displayedNodes = nodes) {
   const response = { ...view, ...over };
   mockGet.mockImplementation((url: string) => Promise.resolve(ok(url.endsWith('/carrier-lines') ? catalog : response)));
   mockPut.mockResolvedValue(ok(response));
-  render(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} />);
+  render(<CarrierAffinityPanel groupId={7} nodes={displayedNodes} t={t} />);
 }
 
 describe('CarrierAffinityPanel node-oriented editor', () => {
@@ -60,7 +73,6 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
   it('moves one unique line between Relays', () => {
     expect(assignCarrierLines(view.active_policy.bindings, 'node-a', ['default', 'Dianxin'], view.default_node_id)).toEqual([
       { line_id: 'Dianxin', mode: 'node', node_id: 'node-a' },
-      { line_id: 'default', mode: 'node', node_id: 'node-a' },
     ]);
   });
 
@@ -73,12 +85,18 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     ]);
   });
 
-  it('exposes default as an ordinary assignable line', async () => {
+  it('shows default only as a derived fixed indicator on the preferred Relay', async () => {
     arrange();
-    expect(await screen.findByTestId('carrier-node-node-a')).toHaveTextContent('全网默认');
+    const preferred = await screen.findByTestId('carrier-node-node-a');
+    expect(within(preferred).getByTestId('carrier-default-node-indicator')).toHaveTextContent('全网默认');
+    expect(within(screen.getByTestId('carrier-node-node-b')).queryByTestId('carrier-default-node-indicator')).not.toBeInTheDocument();
+    expect(screen.getByText('carrierLegacyDefaultBinding')).toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByLabelText('node-a carrierLine'));
+    expect(screen.queryByRole('option', { name: '全网默认' })).not.toBeInTheDocument();
   });
 
-  it('keeps the all-network default first and supports keyword AND search', async () => {
+  it('excludes the all-network default and keeps keyword AND search', async () => {
     const names = new Map([
       ['Yidong', '移动'],
       ['default', '全网默认'],
@@ -90,7 +108,7 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
       ['Yidong_Sichuan', '移动_四川'],
     ]);
     const options = buildCarrierLineOptions(names.keys(), names);
-    expect(options[0]).toEqual({ value: 'default', label: '全网默认' });
+    expect(options.some((option) => option.value === 'default')).toBe(false);
 
     const labels = (query: string) => options
       .filter((option) => carrierLineMatchesSearch(query, option))
@@ -99,8 +117,8 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     expect(labels('上海')).toHaveLength(3);
     expect(labels('上海')).toEqual(expect.arrayContaining(['电信_上海', '联通_上海', '移动_上海']));
     expect(labels('移动   四川')).toEqual(['移动_四川']);
-    expect(labels('默认')).toEqual(['全网默认']);
-    expect(labels('全网')).toEqual(['全网默认']);
+    expect(labels('默认')).toEqual([]);
+    expect(labels('全网')).toEqual([]);
     expect(labels('上海')).not.toContain('全网默认');
     expect(labels('DIANXIN')).toEqual(['电信', '电信_上海']);
 
@@ -110,6 +128,51 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     fireEvent.change(input, { target: { value: '移动 四川' } });
     expect(await screen.findByText('移动_四川')).toBeInTheDocument();
     expect(screen.queryByRole('option', { name: '全网默认' })).not.toBeInTheDocument();
+  });
+
+  it('moves the derived default indicator when preferred Relay telemetry changes', async () => {
+    arrange({}, [
+      { ...nodes[0], preferred: false },
+      { ...nodes[1], preferred: true },
+    ]);
+    await screen.findByTestId('carrier-node-node-a');
+    expect(within(screen.getByTestId('carrier-node-node-a')).queryByTestId('carrier-default-node-indicator')).not.toBeInTheDocument();
+    expect(within(screen.getByTestId('carrier-node-node-b')).getByTestId('carrier-default-node-indicator')).toHaveTextContent('全网默认');
+  });
+
+  it('never includes a legacy default binding in the Carrier PUT payload', async () => {
+    arrange();
+    fireEvent.click(await screen.findByRole('button', { name: /carrierSave/ }));
+    await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(1));
+    expect(mockPut).toHaveBeenCalledWith('/groups/7/carrier-affinity', {
+      bindings: [{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }],
+    });
+  });
+
+  it.each([
+    ['DEFAULT_LINE_OWNED_BY_RELAY_PREFERENCE', '全网默认线路请使用“设为默认线路”功能管理'],
+    ['FAILOVER_ENABLED', '已启用故障切换，无法应用运营商线路策略'],
+    ['CATALOG_STALE', '运营商线路目录已过期，请稍后重试'],
+    ['DNSMGR_UNAVAILABLE', 'DNS 服务暂不可用'],
+    ['TRANSACTION_IN_PROGRESS', '当前有线路事务正在执行'],
+    ['OWNERSHIP_UNVERIFIED', 'DNS 记录所有权无法确认'],
+  ])('maps known backend error %s', (backendMessage, expected) => {
+    expect(carrierApplyErrorMessage({ response: { data: { message: backendMessage } } }, t)).toBe(expected);
+  });
+
+  it('shows only bounded provider preflight detail and hides unknown internals', () => {
+    expect(carrierApplyErrorMessage({ response: { data: { message: 'PROVIDER_PREFLIGHT: DNSMgr request timed out' } } }, t))
+      .toBe('DNS 服务预检查失败: DNSMgr request timed out');
+    expect(carrierApplyErrorMessage({ response: { data: { message: 'database password=secret' } } }, t))
+      .toBe('运营商线路策略应用失败');
+  });
+
+  it('shows a useful known save error instead of the generic fallback', async () => {
+    const errorSpy = vi.spyOn(message, 'error');
+    arrange();
+    mockPut.mockRejectedValueOnce({ response: { data: { message: 'DEFAULT_LINE_OWNED_BY_RELAY_PREFERENCE' } } });
+    fireEvent.click(await screen.findByRole('button', { name: /carrierSave/ }));
+    await waitFor(() => expect(errorSpy).toHaveBeenCalledWith('全网默认线路请使用“设为默认线路”功能管理'));
   });
 
   it('locks edits while the existing DNS transaction is active', async () => {

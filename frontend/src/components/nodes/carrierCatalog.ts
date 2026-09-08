@@ -1,17 +1,28 @@
 import type { CarrierLineBinding, CarrierLineCatalogItem } from '../../api/types';
 
+const DEFAULT_LINE_ALIASES = new Set(['', '0', 'default', 'default_view']);
+
+export function isCarrierMutableLineId(lineId: string): boolean {
+  return !DEFAULT_LINE_ALIASES.has(lineId.trim().toLocaleLowerCase());
+}
+
+export function mutableCarrierBindings(bindings: CarrierLineBinding[]): CarrierLineBinding[] {
+  return bindings.filter((binding) => isCarrierMutableLineId(binding.line_id));
+}
+
 export function assignCarrierLines(
   bindings: CarrierLineBinding[],
   nodeId: string,
   selected: string[],
   defaultNodeId?: string | null,
 ): CarrierLineBinding[] {
-  const selectedSet = new Set(selected);
-  const next = bindings.filter((binding) => {
+  const mutableSelected = selected.filter(isCarrierMutableLineId);
+  const selectedSet = new Set(mutableSelected);
+  const next = mutableCarrierBindings(bindings).filter((binding) => {
     const effectiveNodeId = binding.mode === 'node' ? binding.node_id : defaultNodeId;
     return effectiveNodeId !== nodeId && !selectedSet.has(binding.line_id);
   });
-  next.push(...selected.map((lineId) => ({ line_id: lineId, mode: 'node' as const, node_id: nodeId })));
+  next.push(...mutableSelected.map((lineId) => ({ line_id: lineId, mode: 'node' as const, node_id: nodeId })));
   return next.sort((left, right) => left.line_id < right.line_id ? -1 : left.line_id > right.line_id ? 1 : 0);
 }
 
@@ -30,15 +41,13 @@ export function buildCarrierLineOptions(
   lineIds: Iterable<string>,
   names: ReadonlyMap<string, string>,
 ): CarrierLineOption[] {
-  const ids = [...new Set(lineIds)];
-  const defaultId = ids.includes('default') ? ['default'] : [];
-  const others = ids
-    .filter((lineId) => lineId !== 'default')
-    .sort((left, right) => (names.get(left) ?? left).localeCompare(names.get(right) ?? right));
-  return [...defaultId, ...others].map((lineId) => ({
-    value: lineId,
-    label: names.get(lineId) ?? lineId,
-  }));
+  const ids = [...new Set(lineIds)].filter(isCarrierMutableLineId);
+  return ids
+    .sort((left, right) => (names.get(left) ?? left).localeCompare(names.get(right) ?? right))
+    .map((lineId) => ({
+      value: lineId,
+      label: names.get(lineId) ?? lineId,
+    }));
 }
 
 export function carrierLineMatchesSearch(query: string, option: CarrierLineOption): boolean {

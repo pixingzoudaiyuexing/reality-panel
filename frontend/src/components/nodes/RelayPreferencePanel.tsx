@@ -6,6 +6,7 @@ import type { ApiEnvelope, CarrierAffinityView, CarrierLineCatalog, RelayPrefere
 import type { Tfn } from './types';
 import { RelaySchedulePanel } from './RelaySchedulePanel';
 import { CarrierAffinityPanel } from './CarrierAffinityPanel';
+import { isCarrierMutableLineId } from './carrierCatalog';
 import { RelayFailoverPanel } from './RelayFailoverPanel';
 import { relayReadyReasonLabel } from './shared';
 import { dnsSyncStateDisplay } from '../../utils/realityRuleStatus';
@@ -188,7 +189,8 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
     return nodeById.get(nodeId)?.public_ipv4 ?? nodeId;
   };
   const catalogNames = new Map((carrierCatalog?.lines ?? []).map((line) => [line.id, line.name || line.id]));
-  const activeCarrierBindings = carrierView?.active_policy.bindings ?? [];
+  const activeCarrierBindings = (carrierView?.active_policy.bindings ?? [])
+    .filter((binding) => isCarrierMutableLineId(binding.line_id));
   const followDefault = activeCarrierBindings.filter((binding) => binding.mode === 'follow_default');
   const explicit = activeCarrierBindings.filter((binding) => binding.mode === 'node');
   const topologyLocked = view?.state === 'switching'
