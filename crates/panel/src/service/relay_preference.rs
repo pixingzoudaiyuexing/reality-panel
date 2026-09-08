@@ -360,6 +360,8 @@ struct StoredNodeStatus {
     #[serde(default)]
     public_ip: Option<String>,
     #[serde(default)]
+    public_ipv4_reported: Option<bool>,
+    #[serde(default)]
     config_protocol_version: Option<u32>,
     #[serde(default)]
     active_listener_rule_ids: Option<Vec<i64>>,
@@ -375,6 +377,16 @@ struct StoredNodeStatus {
 struct EvaluatedNode {
     info: RelayReadyNode,
     public_ipv4: Option<String>,
+}
+
+fn reported_public_ipv4(status: &StoredNodeStatus) -> Option<&str> {
+    if status.public_ipv4_reported == Some(false) {
+        return None;
+    }
+    status
+        .public_ipv4
+        .as_deref()
+        .or(status.public_ip.as_deref())
 }
 
 #[derive(Debug)]
@@ -610,10 +622,7 @@ fn evaluate_node(
         reasons.push("CONFIG_PROTOCOL_MISMATCH".into());
     }
 
-    let public_ipv4 = status
-        .public_ipv4
-        .clone()
-        .or_else(|| status.public_ip.clone());
+    let public_ipv4 = reported_public_ipv4(&status).map(ToOwned::to_owned);
     match public_ipv4
         .as_deref()
         .and_then(|value| value.parse::<Ipv4Addr>().ok())
@@ -792,10 +801,7 @@ async fn stored_node_public_ipv4(
     let Ok(status) = serde_json::from_str::<StoredNodeStatus>(&raw) else {
         return Ok(RelayDnsTarget::Invalid("RELAY_NODE_STATUS_INVALID"));
     };
-    let public_ipv4 = status
-        .public_ipv4
-        .as_deref()
-        .or(status.public_ip.as_deref());
+    let public_ipv4 = reported_public_ipv4(&status);
     Ok(match valid_public_ipv4(public_ipv4) {
         Some(ip) => RelayDnsTarget::Resolved(ip),
         None => RelayDnsTarget::Invalid("INVALID_RELAY_IPV4"),
@@ -3222,6 +3228,24 @@ mod tests {
             HashSet::new()
         };
         evaluate_node("node-a".into(), Some(raw), Utc::now(), &ids, rules).info
+    }
+
+    #[test]
+    fn preserved_only_ipv4_is_not_ready_or_trusted_for_dns() {
+        let preserved = status(serde_json::json!({
+            "public_ipv4": "203.0.113.5",
+            "public_ipv4_reported": false
+        }));
+        let node = evaluate(&preserved, &[rule(1, false)], true);
+        assert_eq!(node.public_ipv4, None);
+        assert!(node.ready_reasons.contains(&"PUBLIC_IPV4_MISSING".into()));
+
+        let status: StoredNodeStatus = serde_json::from_str(&preserved).unwrap();
+        assert_eq!(reported_public_ipv4(&status), None);
+
+        let legacy: StoredNodeStatus =
+            serde_json::from_str(&status_with_ip("203.0.113.5", 0)).unwrap();
+        assert_eq!(reported_public_ipv4(&legacy), Some("203.0.113.5"));
     }
 
     #[test]

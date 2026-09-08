@@ -371,6 +371,29 @@ pub async fn report_traffic(
     }
 }
 
+fn merge_reported_public_ipv4(
+    incoming: Option<String>,
+    previous_status: Option<&str>,
+) -> (Option<String>, bool) {
+    if incoming.is_some() {
+        return (incoming, true);
+    }
+    let previous = previous_status
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|status| {
+            status
+                .get("public_ipv4")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| status.get("public_ip").and_then(serde_json::Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .and_then(|value| value.parse::<std::net::Ipv4Addr>().ok())
+                .filter(|address| !address.is_loopback() && !address.is_unspecified())
+                .map(|address| address.to_string())
+        });
+    (previous, false)
+}
+
 pub async fn report_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -408,6 +431,14 @@ pub async fn report_status(
             Some(nid) if !nid.trim().is_empty() => format!("node_status:{}:{}", g.id, nid.trim()),
             _ => format!("node_status:{}", g.id), // legacy fallback
         };
+        let incoming_public_ipv4 = req.public_ipv4.clone().or_else(|| req.public_ip.clone());
+        let previous_status = if incoming_public_ipv4.is_none() {
+            state.db.get(&status_key).await.ok().flatten()
+        } else {
+            None
+        };
+        let (public_ipv4, public_ipv4_reported) =
+            merge_reported_public_ipv4(incoming_public_ipv4, previous_status.as_deref());
         let node_id_for_json = req.node_id.clone();
         // Store every reported metric in the status JSON. New optional fields
         // are only included when the node actually reported them (older nodes
@@ -434,7 +465,11 @@ pub async fn report_status(
             "public_ip": req.public_ip,
             // v0.4.15: dual-stack public IPs. Falls back to public_ip (legacy
             // IPv4) when the node hasn't upgraded yet.
-            "public_ipv4": req.public_ipv4.clone().or(req.public_ip.clone()),
+            "public_ipv4": public_ipv4,
+            // False means the displayed value is last-known-good telemetry,
+            // not a value supplied by this report. Safety-sensitive consumers
+            // must reject preserved-only values.
+            "public_ipv4_reported": public_ipv4_reported,
             "public_ipv6": req.public_ipv6,
             "disk_total": req.disk_total,
             "disk_used": req.disk_used,
@@ -1453,6 +1488,51 @@ mod tests {
         assert_eq!(value["connections"].as_u64(), Some(7));
         assert!(value["tcp_connections"].is_null());
         assert!(value["udp_sessions"].is_null());
+    }
+
+    #[tokio::test]
+    async fn report_status_preserves_but_distrusts_last_known_public_ipv4() {
+        let (state, _) = seeded_state().await;
+        state
+            .db
+            .set(
+                "node_status:10:node-ip",
+                r#"{"public_ipv4":"203.0.113.10","public_ipv4_reported":true}"#,
+            )
+            .await
+            .unwrap();
+
+        let mut missing = ready_status("node-ip");
+        missing.public_ip = None;
+        missing.public_ipv4 = None;
+        let Json(response) =
+            report_status(State(state.clone()), auth_headers("tok-A"), Json(missing)).await;
+        assert_eq!(response.code, 0);
+        let raw = state
+            .db
+            .get("node_status:10:node-ip")
+            .await
+            .unwrap()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["public_ipv4"], "203.0.113.10");
+        assert_eq!(value["public_ipv4_reported"], false);
+
+        let mut updated = ready_status("node-ip");
+        updated.public_ip = Some("203.0.113.11".into());
+        updated.public_ipv4 = Some("203.0.113.11".into());
+        let Json(response) =
+            report_status(State(state.clone()), auth_headers("tok-A"), Json(updated)).await;
+        assert_eq!(response.code, 0);
+        let raw = state
+            .db
+            .get("node_status:10:node-ip")
+            .await
+            .unwrap()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["public_ipv4"], "203.0.113.11");
+        assert_eq!(value["public_ipv4_reported"], true);
     }
 
     #[tokio::test]

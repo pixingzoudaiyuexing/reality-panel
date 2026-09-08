@@ -167,25 +167,27 @@ pub async fn build_node_config_for_node(
                     certificate_domain_resolution_for_rule(db, effective_rule.id, &sni)
                         .await?
                         .domain;
-                let expected_public_ip =
-                    expected_camouflage_public_ipv4(db, &group, node_id).await?;
-                camouflage_by_sni
-                    .entry(sni.clone())
-                    .or_insert_with(|| CamouflageSiteDesired {
-                        site_id: relay_shared::reconciliation::stable_camouflage_site_id(&sni),
-                        sni: sni.clone(),
-                        tls_listener_port: 8443,
-                        local_backend: CamouflageLocalBackend::OpenList,
-                        certificate: CamouflageCertificatePolicy {
-                            domain: certificate_domain,
-                            expected_public_ip,
-                            renew_before_days: 30,
-                            // Reality Panel 的证书权威路径固定使用 Panel DNS-01。
-                            // DNSMgr 未就绪时由依赖状态阻塞签发，不降级到 :80 HTTP-01。
-                            challenge_method: AcmeChallengeMethod::Dns01,
-                        },
-                        enabled: true,
-                    });
+                if let Some(expected_public_ip) =
+                    expected_camouflage_public_ipv4(db, &group, node_id).await?
+                {
+                    camouflage_by_sni
+                        .entry(sni.clone())
+                        .or_insert_with(|| CamouflageSiteDesired {
+                            site_id: relay_shared::reconciliation::stable_camouflage_site_id(&sni),
+                            sni: sni.clone(),
+                            tls_listener_port: 8443,
+                            local_backend: CamouflageLocalBackend::OpenList,
+                            certificate: CamouflageCertificatePolicy {
+                                domain: certificate_domain,
+                                expected_public_ip,
+                                renew_before_days: 30,
+                                // Reality Panel 的证书权威路径固定使用 Panel DNS-01。
+                                // DNSMgr 未就绪时由依赖状态阻塞签发，不降级到 :80 HTTP-01。
+                                challenge_method: AcmeChallengeMethod::Dns01,
+                            },
+                            enabled: true,
+                        });
+                }
             }
         }
     }
@@ -429,25 +431,30 @@ async fn expected_camouflage_public_ipv4(
     db: &dyn Repository,
     group: &DeviceGroup,
     node_id: Option<&str>,
-) -> Result<String, NodeConfigBuildError> {
+) -> Result<Option<String>, NodeConfigBuildError> {
     if let Some(node_id) = node_id.map(str::trim).filter(|id| !id.is_empty()) {
         let key = format!("node_status:{}:{}", group.id, node_id);
-        let raw = db.get(&key).await?.ok_or_else(|| {
-            NodeConfigBuildError::InvalidConfig(format!("node status unavailable for {node_id}"))
-        })?;
+        let Some(raw) = db.get(&key).await? else {
+            return Ok(None);
+        };
         let status: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
             NodeConfigBuildError::InvalidConfig(format!("invalid node status: {error}"))
         })?;
-        let value = status
+        if status
+            .get("public_ipv4_reported")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        {
+            return Ok(None);
+        }
+        let Some(value) = status
             .get("public_ipv4")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                NodeConfigBuildError::InvalidConfig(format!(
-                    "node {node_id} has no public IPv4 telemetry"
-                ))
-            })?;
+        else {
+            return Ok(None);
+        };
         let address = value.parse::<std::net::Ipv4Addr>().map_err(|_| {
             NodeConfigBuildError::InvalidConfig(format!("node {node_id} has invalid public IPv4"))
         })?;
@@ -456,7 +463,7 @@ async fn expected_camouflage_public_ipv4(
                 "node {node_id} has unusable public IPv4"
             )));
         }
-        return Ok(address.to_string());
+        return Ok(Some(address.to_string()));
     }
 
     let legacy = group.connect_host.trim();
@@ -465,7 +472,7 @@ async fn expected_camouflage_public_ipv4(
             "node identity is required for inbound camouflage config".into(),
         ));
     }
-    Ok(legacy.to_string())
+    Ok(Some(legacy.to_string()))
 }
 
 /// 根据已经验证过的 Panel DNS ownership 计算证书作用域。
@@ -1133,6 +1140,53 @@ mod tests {
             config.camouflage_sites[0].certificate.expected_public_ip,
             other.camouflage_sites[0].certificate.expected_public_ip
         );
+    }
+
+    #[tokio::test]
+    async fn missing_current_node_ip_withholds_only_camouflage_desired_state() {
+        let pool = pool().await;
+        add_user(&pool, 2).await;
+        add_group(&pool, 10, "in", 2).await;
+        add_rule(&pool, 100, 2, 10, 443).await;
+        sqlx::query("UPDATE device_groups SET connect_host='192.0.2.200' WHERE id=10")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE forward_rules SET protocol='tcp', public_transport='nginx_sni', \
+             node_transport='nginx_sni', entry_transport='nginx_sni', \
+             sni='pending.example.com', camouflage_enabled=1, \
+             target_addr='198.51.100.20', target_port=55443 WHERE id=100",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repository = repo(&pool);
+        repository
+            .set(
+                "node_status:10:node-a",
+                r#"{"public_ipv4":"203.0.113.20","public_ipv4_reported":false}"#,
+            )
+            .await
+            .unwrap();
+        repository
+            .set(
+                "node_status:10:node-b",
+                r#"{"public_ipv4":"203.0.113.21","public_ipv4_reported":true}"#,
+            )
+            .await
+            .unwrap();
+
+        let snapshot = build_node_config_snapshot_for_node(&repository, 10, Some("node-a"))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.listeners.len(), 1);
+        assert!(snapshot.listeners[0].camouflage_required);
+        assert!(snapshot.camouflage_sites.is_empty());
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert!(!wire.contains("203.0.113.20"));
+        assert!(!wire.contains("203.0.113.21"));
+        assert!(!wire.contains("0.0.0.0"));
     }
 
     #[tokio::test]

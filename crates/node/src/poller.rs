@@ -515,12 +515,18 @@ fn build_effective_config(
     let mut listeners = Vec::new();
     let mut preserved_rules = std::collections::HashSet::new();
     let mut dependency_withheld = false;
+    let desired_snis = desired
+        .camouflage_sites
+        .iter()
+        .filter(|site| site.enabled)
+        .map(|site| site.sni.as_str())
+        .collect::<std::collections::HashSet<_>>();
     for listener in &desired.listeners {
         let ready = !listener.camouflage_required
             || listener
                 .sni
                 .as_deref()
-                .map(|sni| active_snis.contains(sni))
+                .map(|sni| desired_snis.contains(sni) && active_snis.contains(sni))
                 .unwrap_or(false);
         if ready {
             listeners.push(listener.clone());
@@ -805,20 +811,9 @@ pub(crate) fn validate_config(config: &NodeConfigResponse) -> Result<(), String>
             return Err("duplicate camouflage desired state".into());
         }
     }
-    for listener in &config.listeners {
-        if listener.camouflage_required
-            && !listener
-                .sni
-                .as_ref()
-                .map(|sni| site_snis.contains(sni))
-                .unwrap_or(false)
-        {
-            return Err(format!(
-                "rule {} requires missing camouflage desired state",
-                listener.rule_id
-            ));
-        }
-    }
+    // A required site's desired state may be omitted while Panel lacks safe
+    // public-IP telemetry. `build_effective_config` treats that as dependency
+    // withholding and preserves only an already-active LKG route/site.
     Ok(())
 }
 
@@ -1637,6 +1632,51 @@ mod tests {
         assert_eq!(ready.listeners.len(), 1);
         assert!(refs.contains("op1.example.com"));
         assert!(!withheld);
+    }
+
+    #[test]
+    fn missing_camouflage_desired_state_preserves_only_active_lkg_route() {
+        let previous = NodeConfigResponse {
+            camouflage_sites: vec![camouflage_site("op1.example.com")],
+            listeners: vec![dependent_listener(
+                1,
+                "op1.example.com",
+                "198.51.100.1:55443",
+            )],
+        };
+        let mut ordinary = dependent_listener(2, "ordinary.example.com", "198.51.100.2:55443");
+        ordinary.camouflage_required = false;
+        let desired = NodeConfigResponse {
+            camouflage_sites: vec![],
+            listeners: vec![
+                dependent_listener(1, "op1.example.com", "198.51.100.3:55443"),
+                ordinary,
+            ],
+        };
+        assert!(validate_config(&desired).is_ok());
+
+        let active = std::collections::HashSet::from(["op1.example.com".to_string()]);
+        let (effective, refs, withheld) =
+            build_effective_config(&desired, Some(&previous), &active);
+        assert!(withheld);
+        assert_eq!(effective.listeners.len(), 2);
+        assert!(effective.listeners.iter().any(|listener| {
+            listener.rule_id == 1 && listener.targets == vec!["198.51.100.1:55443"]
+        }));
+        assert!(effective
+            .listeners
+            .iter()
+            .any(|listener| listener.rule_id == 2));
+        assert_eq!(effective.camouflage_sites, previous.camouflage_sites);
+        assert!(refs.contains("op1.example.com"));
+
+        let (first_boot, refs, withheld) =
+            build_effective_config(&desired, None, &Default::default());
+        assert!(withheld);
+        assert_eq!(first_boot.listeners.len(), 1);
+        assert_eq!(first_boot.listeners[0].rule_id, 2);
+        assert!(first_boot.camouflage_sites.is_empty());
+        assert!(refs.is_empty());
     }
 
     #[test]
