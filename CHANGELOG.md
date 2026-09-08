@@ -7,6 +7,20 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.13] - 2026-09-08
+
+### 修复
+
+- 全网默认线路继续唯一由 Relay Preference 管理，不再作为可编辑的运营商线路提交。
+- Carrier 事务只管理运营商专用线路，阻止其创建、投影或调度默认 DNS 记录。
+- 优化运营商线路策略的错误提示，并安全兼容旧版默认线路配置。
+
+### 兼容性
+
+- 无数据库 migration。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.12 Panel 可直接升级到 v1.1.13；Relay Node 无功能代码变化。
+
 ## [1.1.12] - 2026-09-08
 
 ### 新增

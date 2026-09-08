@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.13] - 2026-09-08
+
+统一版本发布。本次 Hotfix 仅修改 Panel backend/frontend；relay-node 没有功能代码变化。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.12 relay-node 与 v1.1.13 Panel 功能兼容；v1.1.13 Node artifact 仅同步发布版本号。
+
 ## [1.1.12] - 2026-09-08
 
 统一版本发布。批量滚动升级 orchestration 位于 Panel，Relay Node 继续使用现有单节点 Upgrade protocol 和精确完成确认。
