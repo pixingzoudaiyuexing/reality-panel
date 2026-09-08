@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CarrierAffinityView, CarrierLineCatalog, RelayReadyNode } from '../../api/types';
 import type { Tfn } from './types';
@@ -7,9 +7,9 @@ const { mockGet, mockPut } = vi.hoisted(() => ({ mockGet: vi.fn(), mockPut: vi.f
 vi.mock('../../api/client', () => ({ default: { get: mockGet, put: mockPut } }));
 
 import { CarrierAffinityPanel } from './CarrierAffinityPanel';
-import { assignCarrierLines } from './carrierCatalog';
+import { assignCarrierLines, buildCarrierLineOptions, carrierLineMatchesSearch } from './carrierCatalog';
 
-const t = ((key: string) => key) as Tfn;
+const t = ((key: string) => key === 'carrierAllNetworkDefault' ? '全网默认' : key) as Tfn;
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
 const nodes: RelayReadyNode[] = [
   { node_id: 'node-a', public_ipv4: '203.0.113.5', online: true, ready: true, ready_reasons: [], preferred: true },
@@ -21,6 +21,10 @@ const catalog: CarrierLineCatalog = {
     { id: 'default', name: '全网默认', parent: null },
     { id: 'Dianxin', name: '电信', parent: null },
     { id: 'Liantong', name: '联通', parent: null },
+    { id: 'Dianxin_Shanghai', name: '电信_上海', parent: 'Dianxin' },
+    { id: 'Liantong_Shanghai', name: '联通_上海', parent: 'Liantong' },
+    { id: 'Yidong_Shanghai', name: '移动_上海', parent: null },
+    { id: 'Yidong_Sichuan', name: '移动_四川', parent: null },
   ],
 };
 const view: CarrierAffinityView = {
@@ -71,7 +75,41 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
 
   it('exposes default as an ordinary assignable line', async () => {
     arrange();
-    expect(await screen.findByTestId('carrier-node-node-a')).toHaveTextContent('relayPreferenceDefaultLine');
+    expect(await screen.findByTestId('carrier-node-node-a')).toHaveTextContent('全网默认');
+  });
+
+  it('keeps the all-network default first and supports keyword AND search', async () => {
+    const names = new Map([
+      ['Yidong', '移动'],
+      ['default', '全网默认'],
+      ['Dianxin', '电信'],
+      ['Liantong', '联通'],
+      ['Dianxin_Shanghai', '电信_上海'],
+      ['Liantong_Shanghai', '联通_上海'],
+      ['Yidong_Shanghai', '移动_上海'],
+      ['Yidong_Sichuan', '移动_四川'],
+    ]);
+    const options = buildCarrierLineOptions(names.keys(), names);
+    expect(options[0]).toEqual({ value: 'default', label: '全网默认' });
+
+    const labels = (query: string) => options
+      .filter((option) => carrierLineMatchesSearch(query, option))
+      .map((option) => option.label);
+    expect(labels('电信')).toEqual(['电信', '电信_上海']);
+    expect(labels('上海')).toHaveLength(3);
+    expect(labels('上海')).toEqual(expect.arrayContaining(['电信_上海', '联通_上海', '移动_上海']));
+    expect(labels('移动   四川')).toEqual(['移动_四川']);
+    expect(labels('默认')).toEqual(['全网默认']);
+    expect(labels('全网')).toEqual(['全网默认']);
+    expect(labels('上海')).not.toContain('全网默认');
+    expect(labels('DIANXIN')).toEqual(['电信', '电信_上海']);
+
+    arrange();
+    const input = await screen.findByLabelText('node-a carrierLine');
+    fireEvent.mouseDown(input);
+    fireEvent.change(input, { target: { value: '移动 四川' } });
+    expect(await screen.findByText('移动_四川')).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: '全网默认' })).not.toBeInTheDocument();
   });
 
   it('locks edits while the existing DNS transaction is active', async () => {

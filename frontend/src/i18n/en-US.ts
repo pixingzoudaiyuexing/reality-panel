@@ -436,6 +436,7 @@ export const enUS: Dict = {
   relaySwitchHttpUnprocessable: 'The target cannot be switched or DNSMgr is unavailable',
   relaySwitchHttpFailed: 'Could not start the Relay switch',
   carrierAffinityTitle: 'Carrier line policy',
+  carrierAllNetworkDefault: 'Global Default',
   carrierDefaultRelay: 'Default line',
   carrierAddLine: 'Add line',
   carrierSave: 'Apply line policy',

@@ -21,6 +21,33 @@ export interface CatalogTreeNode {
   children?: CatalogTreeNode[];
 }
 
+export interface CarrierLineOption {
+  value: string;
+  label: string;
+}
+
+export function buildCarrierLineOptions(
+  lineIds: Iterable<string>,
+  names: ReadonlyMap<string, string>,
+): CarrierLineOption[] {
+  const ids = [...new Set(lineIds)];
+  const defaultId = ids.includes('default') ? ['default'] : [];
+  const others = ids
+    .filter((lineId) => lineId !== 'default')
+    .sort((left, right) => (names.get(left) ?? left).localeCompare(names.get(right) ?? right));
+  return [...defaultId, ...others].map((lineId) => ({
+    value: lineId,
+    label: names.get(lineId) ?? lineId,
+  }));
+}
+
+export function carrierLineMatchesSearch(query: string, option: CarrierLineOption): boolean {
+  const keywords = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  if (keywords.length === 0) return true;
+  const haystack = `${option.label} ${option.value}`.toLocaleLowerCase();
+  return keywords.every((keyword) => haystack.includes(keyword));
+}
+
 export function buildCarrierCatalogTree(lines: CarrierLineCatalogItem[]): CatalogTreeNode[] {
   const byId = new Map(lines.map((line) => [line.id, line]));
   const children = new Map<string, CarrierLineCatalogItem[]>();

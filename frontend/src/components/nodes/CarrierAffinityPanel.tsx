@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import api from '../../api/client';
 import type { ApiEnvelope, CarrierAffinityView, CarrierLineBinding, CarrierLineCatalog, RelayDnsRecordView, RelayReadyNode } from '../../api/types';
 import type { Tfn } from './types';
-import { assignCarrierLines } from './carrierCatalog';
+import { assignCarrierLines, buildCarrierLineOptions, carrierLineMatchesSearch } from './carrierCatalog';
 
 const { Text } = Typography;
 
@@ -88,12 +88,12 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const status = view ? transactionLabel(view, t) : null;
   const names = useMemo(() => new Map((catalog?.lines ?? []).map((line) => [
     line.id,
-    line.id === 'default' ? t('relayPreferenceDefaultLine') : line.name || line.id,
+    line.id === 'default' ? t('carrierAllNetworkDefault') : line.name || line.id,
   ])), [catalog, t]);
-  const allLineIds = useMemo(() => {
+  const lineOptions = useMemo(() => {
     const ids = new Set((catalog?.lines ?? []).map((line) => line.id));
     draft.forEach((binding) => ids.add(binding.line_id));
-    return [...ids].sort((left, right) => (names.get(left) ?? left).localeCompare(names.get(right) ?? right));
+    return buildCarrierLineOptions(ids, names);
   }, [catalog, draft, names]);
 
   const assignLines = (nodeId: string, selected: string[]) => {
@@ -137,7 +137,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
               <Text code>{node.node_id}</Text>
               <Text code>{node.public_ipv4 ?? '-'}</Text>
               <Space size={4}><Tag color={node.online ? 'green' : undefined}>{node.online ? t('online') : t('offline')}</Tag><Tag color={node.ready ? 'green' : 'orange'}>{node.ready ? t('relayReady') : t('relayNotReady')}</Tag></Space>
-              <Select mode="multiple" aria-label={`${node.node_id} ${t('carrierLine')}`} value={nodeLines(draft, node.node_id, view?.default_node_id)} disabled={mutationLocked || catalogUnavailable} placeholder={t('carrierNotConfigured')} options={allLineIds.map((lineId) => ({ value: lineId, label: names.get(lineId) ?? lineId }))} onChange={(values) => assignLines(node.node_id, values)} style={{ width: '100%' }} />
+              <Select mode="multiple" showSearch aria-label={`${node.node_id} ${t('carrierLine')}`} value={nodeLines(draft, node.node_id, view?.default_node_id)} disabled={mutationLocked || catalogUnavailable} placeholder={t('carrierNotConfigured')} options={lineOptions} filterOption={(query, option) => carrierLineMatchesSearch(query, { value: String(option?.value ?? ''), label: String(option?.label ?? '') })} onChange={(values) => assignLines(node.node_id, values)} style={{ width: '100%' }} />
             </div>
           ))}
         </div>

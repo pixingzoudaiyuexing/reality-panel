@@ -433,6 +433,7 @@ export const zhCN = {
   relaySwitchHttpUnprocessable: '目标不可切换或 DNSMgr 当前不可用',
   relaySwitchHttpFailed: '启动默认线路切换失败',
   carrierAffinityTitle: '运营商线路策略',
+  carrierAllNetworkDefault: '全网默认',
   carrierDefaultRelay: '默认线路',
   carrierAddLine: '添加线路',
   carrierSave: '应用线路策略',
