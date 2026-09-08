@@ -7,6 +7,19 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.10] - 2026-09-08
+
+### 修复
+
+- 修复 hostname target 在 Nginx SNI plan 中解析为 IP 后导致的 Rule Diagnostics 路由误报，同时保留真实配置漂移检测。
+- Carrier 线路选择将“全网默认”固定置顶，并支持中文、英文和多关键词搜索。
+
+### 兼容性
+
+- 无数据库 migration。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.9 可直接升级到 v1.1.10。
+
 ## [1.1.9] - 2026-09-08
 
 ### 修复

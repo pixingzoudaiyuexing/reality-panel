@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.10] - 2026-09-08
+
+### 修复
+
+- Nginx SNI plan 分别保留 configured target identity 与 resolved runtime target，避免 hostname 规则被诊断为映射不一致。
+- Nginx render 和 DNS refresh 继续使用解析后的 runtime target。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.9 relay-node 可直接升级到 v1.1.10。
+
 ## [1.1.9] - 2026-09-08
 
 ### 修复

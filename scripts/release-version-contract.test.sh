@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONTRACT="$ROOT/scripts/release-version-contract.sh"
-TAG="${1:-v1.1.9}"
+TAG="${1:-v1.1.10}"
 
 bash "$CONTRACT" "$TAG"
 
