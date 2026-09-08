@@ -2063,6 +2063,9 @@ pub(crate) async fn project_carrier_line_desired(
     raw_line_id: &str,
     value: Option<&str>,
 ) -> Result<(), LineDesiredError> {
+    if canonical_provider_line(raw_line_id).is_none_or(|line| line.key == DEFAULT_LINE_KEY) {
+        return Err(LineDesiredError::InvalidLine);
+    }
     project_line_desired(
         db,
         rule_id,
@@ -3366,6 +3369,146 @@ mod tests {
             Err(LineRecordSnapshotError::OwnershipUnverified)
         ));
         assert_eq!(duplicate.state.total_mutations(), 0);
+    }
+
+    #[tokio::test]
+    async fn carrier_projection_rejects_default_authority_without_writing_desired_state() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        for line_id in ["default", "default_view", "0"] {
+            assert_eq!(
+                project_carrier_line_desired(&db, 100, line_id, Some("192.0.2.20")).await,
+                Err(LineDesiredError::InvalidLine)
+            );
+        }
+        assert!(db
+            .find_dns_record_sync(100, DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn carrier_apply_starts_for_operator_lines_without_default_transaction_records() {
+        use crate::service::relay_preference::{
+            CarrierLineBinding, CarrierLineMode, CarrierPolicy, CarrierPolicyApplyOutcome,
+            RelayPreferenceState, RelayTransactionKind,
+        };
+
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        let mock =
+            spawn_ensure_mock(Vec::new(), MutationBehavior::Apply, MutationBehavior::Apply).await;
+        mock.state.record_lines.lock().unwrap().extend([
+            DnsMgrRecordLine {
+                id: "Liantong".into(),
+                name: "联通".into(),
+                parent: None,
+            },
+            DnsMgrRecordLine {
+                id: "Yidong".into(),
+                name: "移动".into(),
+                parent: None,
+            },
+        ]);
+        db.set(
+            DNSMGR_CONFIG_KEY,
+            &serde_json::json!({
+                "enabled": true,
+                "base_url": mock.base_url.clone(),
+                "uid": 7,
+                "api_key": "key"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let node_status = |node_id: &str, public_ipv4: &str| {
+            serde_json::json!({
+                "last_seen": chrono::Utc::now().to_rfc3339(),
+                "node_id": node_id,
+                "public_ipv4": public_ipv4,
+                "public_ipv4_reported": true,
+                "config_protocol_version": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+                "active_listener_rule_ids": [100],
+                "camouflage_sites": [{
+                    "site_id": "site-100",
+                    "sni": "op1.example.com",
+                    "site_status": "active",
+                    "certificate_status": "active"
+                }],
+                "reconciliation": {"state": "CONVERGED", "recovery_source": "PANEL"}
+            })
+            .to_string()
+        };
+        db.set(
+            "node_status:10:node-a",
+            &node_status("node-a", "192.0.2.20"),
+        )
+        .await
+        .unwrap();
+        db.set(
+            "node_status:10:node-b",
+            &node_status("node-b", "192.0.2.30"),
+        )
+        .await
+        .unwrap();
+        db.set(
+            "relay_preference:10",
+            &serde_json::to_string(&RelayPreferenceState {
+                preferred_node_id: Some("node-a".into()),
+                ..RelayPreferenceState::default()
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let connections = crate::api::ws::NodeConnections::new();
+        let (_, _node_a_rx) = connections.register(10, Some("node-a".into())).await;
+        let (_, _node_b_rx) = connections.register(10, Some("node-b".into())).await;
+        let policy = CarrierPolicy {
+            bindings: vec![
+                CarrierLineBinding {
+                    line_id: "Dianxin".into(),
+                    mode: CarrierLineMode::Node,
+                    node_id: Some("node-a".into()),
+                },
+                CarrierLineBinding {
+                    line_id: "Liantong".into(),
+                    mode: CarrierLineMode::Node,
+                    node_id: Some("node-a".into()),
+                },
+                CarrierLineBinding {
+                    line_id: "Yidong".into(),
+                    mode: CarrierLineMode::Node,
+                    node_id: Some("node-b".into()),
+                },
+            ],
+        };
+
+        assert_eq!(
+            crate::service::relay_preference::start_carrier_policy_apply(
+                &db,
+                &connections,
+                10,
+                policy.clone(),
+            )
+            .await
+            .unwrap(),
+            CarrierPolicyApplyOutcome::Started
+        );
+        let stored: RelayPreferenceState =
+            serde_json::from_str(&db.get("relay_preference:10").await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            stored.transaction_kind,
+            Some(RelayTransactionKind::CarrierPolicyApply)
+        );
+        assert_eq!(stored.pending_carrier_policy, Some(policy));
+        assert_eq!(stored.dns_records.len(), 3);
+        assert!(stored.dns_records.iter().all(|record| {
+            record.line_key != DEFAULT_LINE_KEY && record.line_id != DEFAULT_LINE_KEY
+        }));
+        assert_eq!(mock.state.total_mutations(), 0);
     }
 
     #[tokio::test]

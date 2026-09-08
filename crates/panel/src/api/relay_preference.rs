@@ -21,6 +21,79 @@ pub struct SetCarrierAffinityRequest {
     pub bindings: Vec<crate::service::relay_preference::CarrierLineBinding>,
 }
 
+fn safe_carrier_preflight_detail(detail: &str) -> String {
+    detail
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(200)
+        .collect()
+}
+
+fn carrier_apply_error_response(
+    error: &crate::service::relay_preference::CarrierPolicyApplyError,
+) -> (StatusCode, i32, String) {
+    use crate::service::relay_preference::CarrierPolicyApplyError;
+    match error {
+        CarrierPolicyApplyError::InboundGroupNotFound => {
+            (StatusCode::NOT_FOUND, 404, error.to_string())
+        }
+        CarrierPolicyApplyError::DefaultLineOwnedByRelayPreference => (
+            StatusCode::CONFLICT,
+            409,
+            "DEFAULT_LINE_OWNED_BY_RELAY_PREFERENCE".into(),
+        ),
+        CarrierPolicyApplyError::TransactionInProgress => {
+            (StatusCode::CONFLICT, 409, "TRANSACTION_IN_PROGRESS".into())
+        }
+        CarrierPolicyApplyError::NodeUninstalling(_) => {
+            (StatusCode::CONFLICT, 409, error.to_string())
+        }
+        CarrierPolicyApplyError::FailoverEnabled => {
+            (StatusCode::CONFLICT, 409, "FAILOVER_ENABLED".into())
+        }
+        CarrierPolicyApplyError::InvalidPolicy(_)
+        | CarrierPolicyApplyError::LineUnavailable(_)
+        | CarrierPolicyApplyError::NodeNotInGroup(_)
+        | CarrierPolicyApplyError::TargetPublicIpv4Invalid(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, 422, error.to_string())
+        }
+        CarrierPolicyApplyError::OwnershipUnverified { .. } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            422,
+            "OWNERSHIP_UNVERIFIED".into(),
+        ),
+        CarrierPolicyApplyError::CatalogStale => {
+            (StatusCode::SERVICE_UNAVAILABLE, 503, "CATALOG_STALE".into())
+        }
+        CarrierPolicyApplyError::DnsMgrUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            503,
+            "DNSMGR_UNAVAILABLE".into(),
+        ),
+        CarrierPolicyApplyError::CatalogUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            503,
+            "CATALOG_UNAVAILABLE".into(),
+        ),
+        CarrierPolicyApplyError::ProviderPreflight(detail) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            503,
+            format!(
+                "PROVIDER_PREFLIGHT: {}",
+                safe_carrier_preflight_detail(detail)
+            ),
+        ),
+        CarrierPolicyApplyError::Database(_)
+        | CarrierPolicyApplyError::InvalidPreference(_)
+        | CarrierPolicyApplyError::DnsSchedulingFailed
+        | CarrierPolicyApplyError::FailoverStateUnavailable(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            500,
+            "carrier policy could not be applied".into(),
+        ),
+    }
+}
+
 pub async fn get_relay_preference(
     _admin: AdminOnly,
     State(state): State<AppState>,
@@ -216,47 +289,24 @@ pub async fn set_carrier_affinity(
     {
         Ok(outcome) => outcome,
         Err(error) => {
-            let (status, code, message) = match &error {
-                CarrierPolicyApplyError::InboundGroupNotFound => {
-                    (StatusCode::NOT_FOUND, 404, error.to_string())
-                }
-                CarrierPolicyApplyError::TransactionInProgress
-                | CarrierPolicyApplyError::NodeUninstalling(_) => {
-                    (StatusCode::CONFLICT, 409, error.to_string())
-                }
-                CarrierPolicyApplyError::FailoverEnabled => {
-                    (StatusCode::CONFLICT, 409, error.to_string())
-                }
-                CarrierPolicyApplyError::InvalidPolicy(_)
-                | CarrierPolicyApplyError::LineUnavailable(_)
-                | CarrierPolicyApplyError::NodeNotInGroup(_)
-                | CarrierPolicyApplyError::TargetPublicIpv4Invalid(_)
-                | CarrierPolicyApplyError::OwnershipUnverified { .. } => {
-                    (StatusCode::UNPROCESSABLE_ENTITY, 422, error.to_string())
-                }
+            if matches!(
+                error,
                 CarrierPolicyApplyError::CatalogUnavailable
-                | CarrierPolicyApplyError::CatalogStale
-                | CarrierPolicyApplyError::DnsMgrUnavailable
-                | CarrierPolicyApplyError::ProviderPreflight(_) => {
-                    tracing::warn!(group_id, "carrier policy preflight unavailable: {error}");
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        503,
-                        "carrier policy preflight is unavailable".into(),
-                    )
-                }
+                    | CarrierPolicyApplyError::CatalogStale
+                    | CarrierPolicyApplyError::DnsMgrUnavailable
+                    | CarrierPolicyApplyError::ProviderPreflight(_)
+            ) {
+                tracing::warn!(group_id, "carrier policy preflight unavailable: {error}");
+            } else if matches!(
+                error,
                 CarrierPolicyApplyError::Database(_)
-                | CarrierPolicyApplyError::InvalidPreference(_)
-                | CarrierPolicyApplyError::DnsSchedulingFailed
-                | CarrierPolicyApplyError::FailoverStateUnavailable(_) => {
-                    tracing::error!(group_id, "set carrier affinity failed: {error}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        500,
-                        "carrier policy could not be applied".into(),
-                    )
-                }
-            };
+                    | CarrierPolicyApplyError::InvalidPreference(_)
+                    | CarrierPolicyApplyError::DnsSchedulingFailed
+                    | CarrierPolicyApplyError::FailoverStateUnavailable(_)
+            ) {
+                tracing::error!(group_id, "set carrier affinity failed: {error}");
+            }
+            let (status, code, message) = carrier_apply_error_response(&error);
             return (status, Json(ApiResponse::<()>::error(code, &message))).into_response();
         }
     };
@@ -281,5 +331,31 @@ pub async fn set_carrier_affinity(
             tracing::error!(group_id, "carrier affinity response failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::relay_preference::CarrierPolicyApplyError;
+
+    #[test]
+    fn default_carrier_authority_conflict_is_a_semantic_409() {
+        let (status, code, message) = carrier_apply_error_response(
+            &CarrierPolicyApplyError::DefaultLineOwnedByRelayPreference,
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(code, 409);
+        assert_eq!(message, "DEFAULT_LINE_OWNED_BY_RELAY_PREFERENCE");
+    }
+
+    #[test]
+    fn provider_preflight_detail_is_bounded_and_control_free() {
+        let detail = format!("line unavailable\n{}", "x".repeat(250));
+        let (_, _, message) =
+            carrier_apply_error_response(&CarrierPolicyApplyError::ProviderPreflight(detail));
+        assert!(message.starts_with("PROVIDER_PREFLIGHT: line unavailable"));
+        assert!(!message.contains('\n'));
+        assert!(message.len() <= "PROVIDER_PREFLIGHT: ".len() + 200);
     }
 }
