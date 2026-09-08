@@ -7,6 +7,20 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.11] - 2026-09-08
+
+### 修复
+
+- 公网 IP 探测失败后使用有上限的快速退避重试，成功后恢复正常刷新周期。
+- 缺少当前公网 IPv4 telemetry 时不再阻断整份 Node 配置；历史值仅用于展示，不参与 Carrier、Failover、DNS 或证书安全决策。
+- 已由 Panel 权威配置收敛且 runtime 健康时，HTTP 瞬时失败不再把节点错误降级为 Local Recovery。
+
+### 兼容性
+
+- 无数据库 migration。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.10 可直接升级到 v1.1.11。
+
 ## [1.1.10] - 2026-09-08
 
 ### 修复

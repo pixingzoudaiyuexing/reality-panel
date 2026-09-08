@@ -7,6 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.11] - 2026-09-08
+
+### 修复
+
+- 公网 IP 探测失败后按 5、10、30、60 秒退避重试，持续失败以 60 秒为上限，成功后恢复 30 分钟刷新周期。
+- 缺少安全公网 IP 时保持普通 forwarding config 可用，并沿用现有 camouflage dependency withholding/LKG 保护。
+- HTTP 配置拉取瞬时失败时保留健康的 Panel-authoritative Converged 状态；真实 runtime drift 仍执行原有 LKG repair。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.10 relay-node 可直接升级到 v1.1.11。
+
 ## [1.1.10] - 2026-09-08
 
 ### 修复
