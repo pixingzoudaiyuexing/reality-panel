@@ -7,6 +7,19 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.9] - 2026-09-08
+
+### 修复
+
+- 修复 Linux Release 构建中 Reality TCP telemetry reader 的函数生命周期编译错误。
+- Connection Telemetry 的统计定义、unknown/zero 语义和协议保持不变。
+
+### 兼容性
+
+- 无数据库 migration。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.6 可直接升级到 v1.1.9。
+
 ## [1.1.8] - 2026-09-08
 
 ### 新增

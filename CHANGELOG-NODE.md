@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.9] - 2026-09-08
+
+### 修复
+
+- 修复 Linux 构建中 Reality TCP telemetry reader 的函数生命周期编译错误。
+- TCP/UDP telemetry 行为和协议保持不变。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.6 relay-node 可直接升级到 v1.1.9。
+
 ## [1.1.8] - 2026-09-08
 
 ### 新增
