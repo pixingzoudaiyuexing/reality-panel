@@ -12,9 +12,9 @@ vi.mock('../api/client', () => ({
 }));
 vi.mock('../auth/useAuth', () => ({ useAuth: mockUseAuth }));
 
-import NodeStatus from './NodeStatus';
+import NodeStatus, { operationStatusLabel } from './NodeStatus';
 import { stableGroupedRows, compareNodeRows } from '../components/nodes/sort';
-import type { NodeDisplayRow } from '../api/types';
+import type { NodeDisplayRow, NodeOperation } from '../api/types';
 
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
 
@@ -349,6 +349,71 @@ describe('NodeStatus log drawer', () => {
     fireEvent.click(screen.getByRole('button', { name: 'nodeLogs' }));
     await flush();
     expect(screen.queryByRole('button', { name: /nodeCopyLogs/ })).toBeNull();
+  });
+});
+
+describe('NodeStatus background lifecycle operations', () => {
+  const runningOperation: NodeOperation = {
+    id: 'operation-running', group_id: 1, node_id: 'n1', action: 'upgrade', status: 'SENT',
+    message: 'sent', created_at: '2026-09-08T00:00:00Z', updated_at: '2026-09-08T00:00:01Z',
+    current_version: '1.1.11', target_version: '1.1.12', architecture: 'amd64',
+  };
+
+  it('uses action-aware VERIFYING labels', () => {
+    const t = (key: string) => key;
+    expect(operationStatusLabel({ ...runningOperation, action: 'restart', status: 'VERIFYING' }, t)).toBe('nodeOperationVerifyingRestart');
+    expect(operationStatusLabel({ ...runningOperation, action: 'upgrade', status: 'VERIFYING' }, t)).toBe('nodeOperationVerifyingUpgrade');
+    expect(operationStatusLabel({ ...runningOperation, action: 'uninstall', status: 'VERIFYING' }, t)).toBe('nodeOperationVerifyingUninstall');
+  });
+
+  it('closes a running Drawer, cancels UI polling, and never reopens on a late response', async () => {
+    mockUseAuth.mockReturnValue({ isAdmin: true });
+    let resolvePoll!: (value: ReturnType<typeof ok<NodeOperation>>) => void;
+    const latePoll = new Promise<ReturnType<typeof ok<NodeOperation>>>((resolve) => { resolvePoll = resolve; });
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/nodes') return Promise.resolve(ok([{ ...adminNode, ...runningOperation, lifecycle_online: true, install_method: 'systemd' }]));
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      if (url === '/groups') return Promise.resolve(ok([]));
+      if (url === '/admin/node-operations') return Promise.resolve(ok([runningOperation]));
+      if (url === '/admin/nodes/1/n1/logs?lines=200') return Promise.resolve(ok(runningOperation));
+      if (url === '/admin/nodes/1/n1/operations/operation-running') return latePoll;
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+
+    const page = renderPage();
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: 'nodeLogs' }));
+    await flush();
+    expect(screen.getByText('nodeOperation_upgrade')).toBeInTheDocument();
+    await flush(1000);
+    expect(mockGet).toHaveBeenCalledWith('/admin/nodes/1/n1/operations/operation-running');
+    fireEvent.click(document.querySelector('.ant-drawer-close') as HTMLElement);
+    await flush();
+    resolvePoll(ok({ ...runningOperation, status: 'VERIFYING' }));
+    await flush();
+    expect(document.querySelector('.ant-drawer-open')).toBeNull();
+    expect(mockPost).not.toHaveBeenCalled();
+    const calls = mockGet.mock.calls.filter((call) => call[0] === '/admin/nodes/1/n1/operations/operation-running').length;
+    await flush(5000);
+    expect(mockGet.mock.calls.filter((call) => call[0] === '/admin/nodes/1/n1/operations/operation-running')).toHaveLength(calls);
+    page.unmount();
+  });
+
+  it('rediscovers an active operation and opens its latest detail explicitly', async () => {
+    mockUseAuth.mockReturnValue({ isAdmin: true });
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/nodes') return Promise.resolve(ok([adminNode]));
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      if (url === '/groups') return Promise.resolve(ok([]));
+      if (url === '/admin/node-operations') return Promise.resolve(ok([runningOperation]));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+    renderPage();
+    await flush();
+    fireEvent.click(screen.getByRole('button', { name: /backgroundTasks/ }));
+    expect(screen.getByText(/n1 · nodeOperation_upgrade/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'details' }));
+    expect(screen.getByText('nodeOperation_upgrade')).toBeInTheDocument();
   });
 });
 

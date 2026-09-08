@@ -22,6 +22,7 @@ const OPERATION_HARD_TIMEOUT_SECS: i64 = 900;
 const UNINSTALL_CONFIRMATION: &str = "UNINSTALL";
 const MIN_ARTIFACT_BYTES: usize = 64 * 1024;
 const DURABLE_UNINSTALL_PREFIX: &str = "node_uninstall_operation:";
+const RECENT_TERMINAL_OPERATION_LIMIT: usize = 20;
 
 static DURABLE_UNINSTALL_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
     once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
@@ -573,6 +574,44 @@ impl NodeOperationRegistry {
             }
         }
         Some(entry.operation.clone())
+    }
+
+    pub fn active_and_recent(&self) -> Vec<NodeOperation> {
+        let ids = self
+            .inner
+            .lock()
+            .expect("node operation registry lock")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut operations = ids.iter().filter_map(|id| self.get(id)).collect::<Vec<_>>();
+        operations.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        let mut terminal = 0usize;
+        operations.retain(|operation| {
+            if operation.status.terminal() {
+                terminal += 1;
+                terminal <= RECENT_TERMINAL_OPERATION_LIMIT
+            } else {
+                true
+            }
+        });
+        for operation in &mut operations {
+            operation.logs = None;
+        }
+        operations
+    }
+
+    pub(crate) fn has_active_for_node(&self, group_id: i64, node_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("node operation registry lock")
+            .values()
+            .any(|entry| {
+                entry.operation.group_id == group_id
+                    && entry.operation.node_id == node_id
+                    && entry.operation.action != NodeLifecycleAction::Logs
+                    && !entry.operation.status.terminal()
+            })
     }
 
     fn artifact_target(
@@ -1167,6 +1206,10 @@ pub async fn get_operation(
         }
         None => response::<()>(StatusCode::NOT_FOUND, 404, "NODE_OPERATION_NOT_FOUND"),
     }
+}
+
+pub async fn list_operations(_admin: AdminOnly, State(state): State<AppState>) -> Response {
+    success(state.node_operations.active_and_recent())
 }
 
 pub async fn list_artifacts(_admin: AdminOnly) -> Response {
@@ -1965,6 +2008,38 @@ mod tests {
                 Some(1),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn operation_discovery_keeps_active_and_bounds_recent_terminal_without_logs() {
+        let registry = NodeOperationRegistry::new();
+        let active = start(&registry, "active", NodeLifecycleAction::Restart);
+        for index in 0..25 {
+            let operation = start(
+                &registry,
+                &format!("terminal-{index}"),
+                NodeLifecycleAction::Logs,
+            );
+            {
+                let mut inner = registry.inner.lock().unwrap();
+                let entry = inner.get_mut(&operation.id).unwrap();
+                entry.operation.status = OperationStatus::Success;
+                entry.operation.updated_at = format!("2026-09-08T00:00:{index:02}Z");
+                entry.operation.logs = Some("sensitive bounded logs".into());
+            }
+        }
+
+        let discovered = registry.active_and_recent();
+        assert_eq!(discovered.len(), 1 + RECENT_TERMINAL_OPERATION_LIMIT);
+        assert!(discovered.iter().any(|operation| operation.id == active.id));
+        assert!(discovered.iter().all(|operation| operation.logs.is_none()));
+        assert_eq!(
+            discovered
+                .iter()
+                .filter(|operation| operation.status.terminal())
+                .count(),
+            RECENT_TERMINAL_OPERATION_LIMIT
+        );
     }
 
     fn matching_upgrade_boot(operation: &NodeOperation) -> NodeLifecycleEvent {

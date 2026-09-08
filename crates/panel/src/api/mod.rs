@@ -421,6 +421,10 @@ pub fn routes() -> Router<AppState> {
             axum::routing::post(node_ops::start_operation).get(node_ops::get_operation),
         )
         .route(
+            "/admin/node-operations",
+            axum::routing::get(node_ops::list_operations),
+        )
+        .route(
             "/admin/nodes/{group_id}/{node_id}/logs",
             axum::routing::get(node_ops::request_logs),
         )

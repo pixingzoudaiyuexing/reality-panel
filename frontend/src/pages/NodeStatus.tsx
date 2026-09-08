@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typography } from 'antd';
-import { CloudUploadOutlined, CopyOutlined, LineChartOutlined, ReloadOutlined } from '@ant-design/icons';
+import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typography, Badge, List, Space } from 'antd';
+import { CloudUploadOutlined, CopyOutlined, LineChartOutlined, ReloadOutlined, UnorderedListOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
 import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog, RelayReadyNode } from '../api/types';
@@ -12,6 +12,16 @@ import { stableGroupedRows } from '../components/nodes/sort';
 import { NodeDiagnosisDrawer } from '../components/diagnosis/NodeDiagnosisDrawer';
 
 type AnyNodeRow = NodeDisplayRow;
+
+const terminalOperationStatuses = new Set(['SUCCESS', 'FAILED', 'TIMEOUT']);
+
+export function operationStatusLabel(operation: NodeOperation, t: (key: string) => string): string {
+  if (operation.status !== 'VERIFYING') return t(`nodeOperationStatus_${operation.status}`);
+  if (operation.action === 'restart') return t('nodeOperationVerifyingRestart');
+  if (operation.action === 'upgrade') return t('nodeOperationVerifyingUpgrade');
+  if (operation.action === 'uninstall') return t('nodeOperationVerifyingUninstall');
+  return t('nodeOperationStatus_VERIFYING');
+}
 
 /** Hook: is the viewport mobile-width? Re-evaluates on resize. */
 function useIsMobile(breakpoint = 768): boolean {
@@ -44,6 +54,9 @@ export default function NodeStatus() {
   const [inboundGroupIds, setInboundGroupIds] = useState<Set<number>>(() => new Set());
   const [detailRow, setDetailRow] = useState<AnyNodeRow | null>(null);
   const [activeOperation, setActiveOperation] = useState<NodeOperation | null>(null);
+  const [operationDrawerOpen, setOperationDrawerOpen] = useState(false);
+  const [backgroundTasks, setBackgroundTasks] = useState<NodeOperation[]>([]);
+  const [backgroundTasksOpen, setBackgroundTasksOpen] = useState(false);
   const [uninstallRow, setUninstallRow] = useState<AnyNodeRow | null>(null);
   const [uninstallConfirmation, setUninstallConfirmation] = useState('');
   const [nodeDiagnosisTarget, setNodeDiagnosisTarget] = useState<{ groupId: number; nodeId: string; label: string } | null>(null);
@@ -100,6 +113,10 @@ export default function NodeStatus() {
     } catch {
       setInboundGroupIds(new Set());
     }
+    try {
+      const res = await api.get<unknown, ApiEnvelope<NodeOperation[]>>('/admin/node-operations');
+      if (res.code === 0) setBackgroundTasks(res.data ?? []);
+    } catch { /* discovery is best-effort */ }
   };
 
   const refresh = async () => {
@@ -142,21 +159,30 @@ export default function NodeStatus() {
     }
   };
 
-  const pollOperation = async (row: AnyNodeRow, operationId: string) => {
-    if (!row.node_id) return;
-    try {
-      const res = await api.get<unknown, ApiEnvelope<NodeOperation>>(
-        `/admin/nodes/${row.group_id}/${row.node_id}/operations/${operationId}`,
-      );
-      if (res.code !== 0 || !res.data) throw new Error(res.message);
-      setActiveOperation(res.data);
-      if (!['SUCCESS', 'FAILED', 'TIMEOUT'].includes(res.data.status)) {
-        window.setTimeout(() => pollOperation(row, operationId), 1000);
+  useEffect(() => {
+    if (!operationDrawerOpen || !activeOperation || terminalOperationStatuses.has(activeOperation.status)) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const res = await api.get<unknown, ApiEnvelope<NodeOperation>>(
+          `/admin/nodes/${activeOperation.group_id}/${activeOperation.node_id}/operations/${activeOperation.id}`,
+        );
+        if (cancelled) return;
+        if (res.code !== 0 || !res.data) throw new Error(res.message);
+        setActiveOperation(res.data);
+        setBackgroundTasks((current) => [res.data as NodeOperation, ...current.filter((item) => item.id !== res.data?.id)]);
+        if (!terminalOperationStatuses.has(res.data.status)) timer = window.setTimeout(poll, 1000);
+      } catch (error) {
+        if (!cancelled) message.error(errorMessage(error));
       }
-    } catch (error) {
-      message.error(errorMessage(error));
-    }
-  };
+    };
+    timer = window.setTimeout(poll, 1000);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [activeOperation?.group_id, activeOperation?.id, activeOperation?.node_id, activeOperation?.status, operationDrawerOpen]);
 
   const startOperation = async (row: AnyNodeRow, action: NodeLifecycleAction, confirmation?: string) => {
     if (!row.node_id) return;
@@ -169,7 +195,8 @@ export default function NodeStatus() {
           );
       if (res.code !== 0 || !res.data) { message.error(res.message); return; }
       setActiveOperation(res.data);
-      void pollOperation(row, res.data.id);
+      setOperationDrawerOpen(true);
+      setBackgroundTasks((current) => [res.data as NodeOperation, ...current.filter((item) => item.id !== res.data?.id)]);
     } catch (error) {
       message.error(errorMessage(error));
     }
@@ -206,10 +233,18 @@ export default function NodeStatus() {
   const groups = useMemo(() => (rows ? stableGroupedRows(rows) : null), [rows]);
 
   const title = t('nodeStatus');
+  const activeTaskCount = backgroundTasks.filter((operation) => !terminalOperationStatuses.has(operation.status)).length;
   const pageTitle = (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
       <h2 className="rp-page-title"><LineChartOutlined /> {title}</h2>
-      {isAdmin && <Button type="primary" icon={<CloudUploadOutlined />} onClick={() => navigate('/node-bootstrap')}>{t('nodeBootstrapTitle')}</Button>}
+      {isAdmin && (
+        <Space wrap>
+          <Badge count={activeTaskCount} size="small">
+            <Button icon={<UnorderedListOutlined />} onClick={() => setBackgroundTasksOpen(true)}>{t('backgroundTasks')}</Button>
+          </Badge>
+          <Button type="primary" icon={<CloudUploadOutlined />} onClick={() => navigate('/node-bootstrap')}>{t('nodeBootstrapTitle')}</Button>
+        </Space>
+      )}
     </div>
   );
 
@@ -287,8 +322,8 @@ export default function NodeStatus() {
       <NodeDiagnosisDrawer target={nodeDiagnosisTarget} onClose={() => setNodeDiagnosisTarget(null)} t={t} />
       <Drawer
         title={activeOperation ? t(`nodeOperation_${activeOperation.action}`) : t('nodeOperations')}
-        open={activeOperation !== null}
-        onClose={() => setActiveOperation(null)}
+        open={operationDrawerOpen}
+        onClose={() => setOperationDrawerOpen(false)}
         size={isMobile ? '100%' : 640}
         extra={activeOperation ? (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
@@ -311,7 +346,7 @@ export default function NodeStatus() {
                 </Button>
               </>
             ) : null}
-            <Tag color={activeOperation.status === 'SUCCESS' ? 'green' : activeOperation.status === 'FAILED' || activeOperation.status === 'TIMEOUT' ? 'red' : 'blue'}>{t(`nodeOperationStatus_${activeOperation.status}`)}</Tag>
+            <Tag color={activeOperation.status === 'SUCCESS' ? 'green' : activeOperation.status === 'FAILED' || activeOperation.status === 'TIMEOUT' ? 'red' : 'blue'}>{operationStatusLabel(activeOperation, t)}</Tag>
           </span>
         ) : null}
       >
@@ -327,6 +362,26 @@ export default function NodeStatus() {
             ) : null}
           </>
         ) : null}
+      </Drawer>
+      <Drawer title={t('backgroundTasks')} open={backgroundTasksOpen} onClose={() => setBackgroundTasksOpen(false)} size={isMobile ? '100%' : 640}>
+        <List
+          dataSource={backgroundTasks}
+          locale={{ emptyText: t('backgroundTasksEmpty') }}
+          renderItem={(operation) => (
+            <List.Item actions={[
+              <Button key="view" type="link" onClick={() => {
+                setActiveOperation(operation);
+                setBackgroundTasksOpen(false);
+                setOperationDrawerOpen(true);
+              }}>{t('details')}</Button>,
+            ]}>
+              <List.Item.Meta
+                title={`${operation.node_id} · ${t(`nodeOperation_${operation.action}`)}`}
+                description={`${operationStatusLabel(operation, t)} · ${operation.updated_at}`}
+              />
+            </List.Item>
+          )}
+        />
       </Drawer>
       <Modal
         title={t('nodeUninstallConfirmTitle')}
