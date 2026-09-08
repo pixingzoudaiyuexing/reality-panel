@@ -1302,7 +1302,8 @@ fn nginx_sni_plan_with_resolutions(
         }
         listener.targets = targets;
     }
-    NginxSniPlan::from_listeners(&resolved_listeners, default_backend, access_log_path)
+    NginxSniPlan::from_listeners(&resolved_listeners, default_backend, access_log_path)?
+        .with_configured_targets(listeners)
 }
 
 fn protocol_tag(protocol: Protocol) -> &'static str {
@@ -2860,8 +2861,20 @@ mod tests {
             "same answers must not reload"
         );
         assert_ne!(first, changed, "a changed DDNS answer must reconcile");
+        let first_rule = first.rule_for_id(91).unwrap();
+        assert_eq!(
+            first_rule.configured_targets,
+            vec!["ddns.example.com:50036"]
+        );
+        assert_eq!(first_rule.targets, vec!["1.1.1.1:50036", "2.2.2.2:50036"]);
+        assert_eq!(
+            changed.rule_for_id(91).unwrap().configured_targets,
+            vec!["ddns.example.com:50036"],
+            "DNS refresh must preserve configured target identity"
+        );
         assert!(first.render().contains("server 1.1.1.1:50036"));
         assert!(changed.render().contains("server 2.2.2.2:50036"));
+        assert!(!changed.render().contains("server ddns.example.com:50036"));
     }
 
     #[test]

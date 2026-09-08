@@ -264,6 +264,27 @@ fn check(state: &str, detail: impl Into<String>) -> RealityCheck {
     }
 }
 
+fn nginx_sni_mapping_matches(
+    rule: &crate::forwarder::nginx_sni::NginxSniRule,
+    listener: &relay_shared::protocol::ListenerConfig,
+    sni: Option<&str>,
+) -> bool {
+    let configured_targets = listener
+        .targets
+        .iter()
+        .map(|target| target.trim())
+        .filter(|target| !target.is_empty())
+        .collect::<Vec<_>>();
+    rule.listen_port == listener.port
+        && sni.is_some_and(|value| rule.sni == value.trim().to_ascii_lowercase())
+        && rule
+            .configured_targets
+            .iter()
+            .map(String::as_str)
+            .eq(configured_targets)
+        && rule.send_proxy_protocol == listener.send_proxy_protocol
+}
+
 #[allow(clippy::too_many_arguments)] // desired/effective identity 必须独立传入以防旧状态误判。
 fn build_reality_diagnosis(
     manager: &ForwarderManager,
@@ -285,14 +306,9 @@ fn build_reality_diagnosis(
 
     let plan_rule = manager.nginx_sni_rule_for_id(listener.rule_id);
     let plan_contains_rule = plan_rule.is_some();
-    let mapping_matches = plan_rule.as_ref().is_some_and(|rule| {
-        rule.listen_port == listener.port
-            && sni
-                .as_deref()
-                .is_some_and(|value| rule.sni == value.trim().to_ascii_lowercase())
-            && rule.targets == listener.targets
-            && rule.send_proxy_protocol == listener.send_proxy_protocol
-    });
+    let mapping_matches = plan_rule
+        .as_ref()
+        .is_some_and(|rule| nginx_sni_mapping_matches(rule, listener, sni.as_deref()));
     let observation = manager.nginx_sni_runtime_observation();
     let expected_fingerprint = manager.nginx_sni_expected_fingerprint();
     let deployed_fingerprint = observation
@@ -883,7 +899,7 @@ mod tests {
     use crate::forwarder::nginx_sni::NginxSniConfig;
     use relay_shared::protocol::{
         AcmeChallengeMethod, CamouflageCertificatePolicy, CamouflageLocalBackend,
-        CamouflageSiteDesired,
+        CamouflageSiteDesired, ListenerConfig, LoadBalanceStrategy, NodeTransport, Protocol,
     };
     use std::os::unix::fs::PermissionsExt;
 
@@ -1202,5 +1218,77 @@ mod tests {
         let detail = fallback.check.detail.as_deref().unwrap();
         assert!(detail.contains(":443 -> remote Reality -> :8443"));
         assert!(!detail.contains("credential"));
+    }
+
+    #[test]
+    fn nginx_sni_mapping_compares_configured_identity_not_resolved_runtime_targets() {
+        let listener = ListenerConfig {
+            rule_id: 1,
+            port: 443,
+            protocol: Protocol::Tcp,
+            node_transport: NodeTransport::NginxSni,
+            ws_path: None,
+            sni: Some("Host.Example".into()),
+            camouflage_required: false,
+            send_proxy_protocol: true,
+            targets: vec!["host.example:20209".into()],
+            load_balance_strategy: LoadBalanceStrategy::First,
+            upload_limit_bps: None,
+            download_limit_bps: None,
+            max_connections: None,
+        };
+        let plan_rule = crate::forwarder::nginx_sni::NginxSniRule {
+            rule_id: 1,
+            listen_port: 443,
+            sni: "host.example".into(),
+            configured_targets: vec!["host.example:20209".into()],
+            targets: vec!["1.2.3.4:20209".into()],
+            load_balance_strategy: LoadBalanceStrategy::First,
+            send_proxy_protocol: true,
+        };
+
+        assert!(nginx_sni_mapping_matches(
+            &plan_rule,
+            &listener,
+            listener.sni.as_deref()
+        ));
+
+        let mut changed = plan_rule.clone();
+        changed.targets = vec!["5.6.7.8:20209".into()];
+        assert!(
+            nginx_sni_mapping_matches(&changed, &listener, listener.sni.as_deref()),
+            "runtime DNS refresh must not change configured identity"
+        );
+
+        changed.configured_targets = vec!["host-b.example:20209".into()];
+        assert!(!nginx_sni_mapping_matches(
+            &changed,
+            &listener,
+            listener.sni.as_deref()
+        ));
+
+        let mut changed = plan_rule.clone();
+        changed.listen_port = 8443;
+        assert!(!nginx_sni_mapping_matches(
+            &changed,
+            &listener,
+            listener.sni.as_deref()
+        ));
+
+        let mut changed = plan_rule.clone();
+        changed.sni = "other.example".into();
+        assert!(!nginx_sni_mapping_matches(
+            &changed,
+            &listener,
+            listener.sni.as_deref()
+        ));
+
+        let mut changed = plan_rule;
+        changed.send_proxy_protocol = false;
+        assert!(!nginx_sni_mapping_matches(
+            &changed,
+            &listener,
+            listener.sni.as_deref()
+        ));
     }
 }

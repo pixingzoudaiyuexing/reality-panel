@@ -46,6 +46,9 @@ pub struct NginxSniRule {
     pub rule_id: i64,
     pub listen_port: u16,
     pub sni: String,
+    /// Canonical targets from the accepted Panel config. Diagnosis compares
+    /// this identity while `targets` remains the DNS-resolved runtime route.
+    pub configured_targets: Vec<String>,
     pub targets: Vec<String>,
     pub load_balance_strategy: LoadBalanceStrategy,
     pub send_proxy_protocol: bool,
@@ -102,6 +105,7 @@ impl NginxSniPlan {
                 rule_id: l.rule_id,
                 listen_port: l.port,
                 sni: sni.to_ascii_lowercase(),
+                configured_targets: targets.clone(),
                 targets,
                 load_balance_strategy: l.load_balance_strategy,
                 send_proxy_protocol: l.send_proxy_protocol,
@@ -140,6 +144,32 @@ impl NginxSniPlan {
             default_backend: default_backend.to_string(),
             access_log_path: access_log_path.to_string(),
         })
+    }
+
+    pub(super) fn with_configured_targets(
+        mut self,
+        listeners: &[ListenerConfig],
+    ) -> Result<Self, String> {
+        let configured = listeners
+            .iter()
+            .map(|listener| {
+                let targets = listener
+                    .targets
+                    .iter()
+                    .map(|target| target.trim())
+                    .filter(|target| !target.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                (listener.rule_id, targets)
+            })
+            .collect::<BTreeMap<_, _>>();
+        for rule in &mut self.rules {
+            rule.configured_targets = configured
+                .get(&rule.rule_id)
+                .cloned()
+                .ok_or_else(|| format!("configured targets missing for rule {}", rule.rule_id))?;
+        }
+        Ok(self)
     }
 
     pub fn rule_id_for(&self, port: u16, sni: &str) -> Option<i64> {
