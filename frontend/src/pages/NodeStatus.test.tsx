@@ -209,13 +209,14 @@ describe('NodeStatus page data source', () => {
     renderPage();
     await flush();
 
-    expect(screen.getByText('defaultLineTitle')).toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: 'carrierAffinityTitle' })).toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: 'relayScheduleTitle' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'routingFunctionNormal' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'routingFunctionCarrier' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'routingFunctionSchedule' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'routingFunctionFailover' })).toBeInTheDocument();
     expect(mockGet).toHaveBeenCalledWith('/groups/1/relay-preference');
     expect(mockGet).not.toHaveBeenCalledWith('/admin/relay-schedules');
     expect(mockGet).not.toHaveBeenCalledWith('/groups/2/relay-preference');
-    fireEvent.click(screen.getByRole('tab', { name: 'relayScheduleTitle' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'routingFunctionSchedule' }));
     await flush();
     expect(mockGet).toHaveBeenCalledWith('/admin/relay-schedules');
   });

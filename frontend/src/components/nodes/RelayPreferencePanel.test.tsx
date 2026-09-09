@@ -165,7 +165,7 @@ describe('RelayPreferencePanel routing function UX', () => {
   it('confirms once before activating inactive NORMAL', async () => {
     await renderPanel(preference({ active_routing_mode: 'carrier' }));
     fireEvent.click(screen.getByRole('tab', { name: 'routingFunctionNormal' }));
-    fireEvent.click(within(screen.getByTestId('default-line-candidate-node-b')).getByRole('button', { name: 'routingSetNormalDefault' }));
+    fireEvent.click(within(await screen.findByTestId('default-line-candidate-node-b')).getByRole('button', { name: 'routingSetNormalDefault' }));
     fireEvent.click(screen.getByTestId('normal-routing-apply'));
     expect(mockPut).not.toHaveBeenCalled();
     await confirmModeChange();
