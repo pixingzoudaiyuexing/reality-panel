@@ -7,7 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 use super::gate::RuleGate;
 use super::limiter::RateLimit;
 use super::selector::TargetSelector;
-use crate::reporter::{ConnectionTracker, TrafficCounter};
+use crate::reporter::{ConnectionTracker, RuleCounterHandle, TrafficCounter};
 
 /// v1.2.0: how often the "rule is at its connection cap" warning may be logged
 /// per listener. A rule sitting at its cap rejects on EVERY accept, so an
@@ -75,6 +75,11 @@ pub async fn serve_tcp_listener(
                     }
                     continue;
                 };
+                // Register this accepted connection's immutable traffic-counter
+                // generation before spawn. A later prune can detach that
+                // generation, but this connection will never look it up again by
+                // rule_id and therefore cannot resurrect a deleted rule.
+                let traffic = counter.handle(rule_id).await;
                 // v1.0.8: disable Nagle on the accepted (client-facing) socket.
                 // See the note in outbound::tcp_connect — a relay MUST set
                 // TCP_NODELAY on both ends or small packets get buffered ~40ms
@@ -94,7 +99,6 @@ pub async fn serve_tcp_listener(
                 let targets = targets.clone();
                 let selector = selector.clone();
                 let rate_limit = rate_limit.clone();
-                let counter = counter.clone();
                 let connections = connections.clone();
                 let mut gate = gate.clone();
 
@@ -127,7 +131,7 @@ pub async fn serve_tcp_listener(
                             targets,
                             selector,
                             rate_limit,
-                            counter,
+                            traffic,
                             rule_id,
                             source_ipv4,
                         ) => {
@@ -185,7 +189,7 @@ async fn handle_tcp_connection(
     targets: Vec<String>,
     selector: Arc<TargetSelector>,
     rate_limit: RateLimit,
-    counter: Arc<TrafficCounter>,
+    traffic: RuleCounterHandle,
     rule_id: i64,
     source_ipv4: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -258,10 +262,10 @@ async fn handle_tcp_connection(
     // the userspace copy below.
     #[cfg(target_os = "linux")]
     if matches!(rate_limit, RateLimit::Unlimited) {
-        match super::splice::zero_copy_bidirectional(inbound, outbound).await {
-            // (up = client→target, down = target→client) — same attribution as
-            // the userspace path's counter.add(rule_id, up, down).
-            Ok((up, down)) => counter.add(rule_id, up, down).await,
+        match super::splice::zero_copy_bidirectional(inbound, outbound, &traffic).await {
+            // splice accounts each successful pipe→destination transfer. The
+            // returned totals are diagnostic only and must not be added again.
+            Ok((_up, _down)) => {}
             Err(e) => tracing::debug!("TCP splice forward (rule {}): {}", rule_id, e),
         }
         return Ok(());
@@ -278,50 +282,58 @@ async fn handle_tcp_connection(
     let (mut ri, mut wi) = inbound.into_split();
     let (mut ro, mut wo) = outbound.into_split();
 
-    let counter_up = counter.clone();
-    let counter_down = counter.clone();
+    let traffic_up = &traffic;
+    let traffic_down = &traffic;
     let rl_up = rate_limit.clone();
     let rl_down = rate_limit;
 
     let upload = Box::pin(async move {
-        let mut total = 0u64;
         // v1.0.8: 32 KiB copy buffer (this userspace path is only used by
         // rate-limited rules, which are capped anyway; the unlimited fast path
         // uses splice above). Heap-allocated as part of this Box::pin'd future,
         // so it does not grow the task stack.
         let mut buf = [0u8; 32 * 1024];
-        loop {
+        'copy: loop {
             let n = match ri.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(_) => break,
             };
             rl_up.acquire_upload(n as u64).await;
-            if wo.write_all(&buf[..n]).await.is_err() {
-                break;
+            let mut written = 0;
+            while written < n {
+                match wo.write(&buf[written..n]).await {
+                    Ok(0) | Err(_) => break 'copy,
+                    Ok(bytes) => {
+                        traffic_up.add_upload(bytes as u64);
+                        written += bytes;
+                    }
+                }
             }
-            total += n as u64;
         }
-        counter_up.add(rule_id, total, 0).await;
         let _ = wo.shutdown().await;
     });
     let download = Box::pin(async move {
-        let mut total = 0u64;
         // v1.0.8: 32 KiB copy buffer (see the upload side above).
         let mut buf = [0u8; 32 * 1024];
-        loop {
+        'copy: loop {
             let n = match ro.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(_) => break,
             };
             rl_down.acquire_download(n as u64).await;
-            if wi.write_all(&buf[..n]).await.is_err() {
-                break;
+            let mut written = 0;
+            while written < n {
+                match wi.write(&buf[written..n]).await {
+                    Ok(0) | Err(_) => break 'copy,
+                    Ok(bytes) => {
+                        traffic_down.add_download(bytes as u64);
+                        written += bytes;
+                    }
+                }
             }
-            total += n as u64;
         }
-        counter_down.add(rule_id, 0, total).await;
         let _ = wi.shutdown().await;
     });
 
@@ -344,15 +356,20 @@ mod tests {
     /// 64 KiB buffer changes, and the client-facing socket has Nagle disabled.
     /// Topology: client → [serve_tcp_listener] → echo target.
     #[tokio::test]
-    async fn raw_tcp_forward_roundtrips_and_client_has_nodelay() {
-        // Echo target: read a chunk, write it straight back.
+    async fn raw_tcp_forward_reports_live_incremental_deltas() {
+        // Echo target: keep the connection open and echo every chunk so traffic
+        // can be snapshotted and committed between two writes on one session.
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target.local_addr().unwrap();
         tokio::spawn(async move {
             if let Ok((mut s, _)) = target.accept().await {
                 let mut b = vec![0u8; 1024];
-                if let Ok(n) = s.read(&mut b).await {
-                    let _ = s.write_all(&b[..n]).await;
+                loop {
+                    match s.read(&mut b).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) if s.write_all(&b[..n]).await.is_err() => break,
+                        Ok(_) => {}
+                    }
                 }
             }
         });
@@ -384,14 +401,45 @@ mod tests {
         // The client's own socket having NODELAY isn't what we set (we set it on
         // the RELAY's accepted socket), but we can at least prove the relay path
         // forwards bytes correctly under the new buffer/nodelay code.
-        client.write_all(b"ping-through-relay").await.unwrap();
+        let first_payload = b"ping-through-relay";
+        client.write_all(first_payload).await.unwrap();
         let mut got = vec![0u8; 64];
-        let n = client.read(&mut got).await.unwrap();
+        client
+            .read_exact(&mut got[..first_payload.len()])
+            .await
+            .unwrap();
         assert_eq!(
-            &got[..n],
-            b"ping-through-relay",
+            &got[..first_payload.len()],
+            first_payload,
             "relay must echo the target"
         );
+
+        let first = counter.snapshot().await;
+        let first_entry = first
+            .entries
+            .iter()
+            .find(|entry| entry.rule_id == 1)
+            .unwrap();
+        assert_eq!(first_entry.upload, first_payload.len() as u64);
+        assert_eq!(first_entry.download, first_payload.len() as u64);
+        first.commit().await;
+
+        let second_payload = b"second-live-delta";
+        client.write_all(second_payload).await.unwrap();
+        client
+            .read_exact(&mut got[..second_payload.len()])
+            .await
+            .unwrap();
+        assert_eq!(&got[..second_payload.len()], second_payload);
+        let second = counter.snapshot().await;
+        let second_entry = second
+            .entries
+            .iter()
+            .find(|entry| entry.rule_id == 1)
+            .unwrap();
+        assert_eq!(second_entry.upload, second_payload.len() as u64);
+        assert_eq!(second_entry.download, second_payload.len() as u64);
+        second.commit().await;
     }
 
     /// v1.2.0: the cap is enforced at accept. Connections up to the cap forward

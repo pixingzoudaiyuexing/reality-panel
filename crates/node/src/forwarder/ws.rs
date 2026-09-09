@@ -31,7 +31,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::limiter::RateLimit;
 use super::selector::TargetSelector;
-use crate::reporter::{ConnectionTracker, TrafficCounter};
+use crate::reporter::{ConnectionTracker, RuleCounterHandle, TrafficCounter};
 
 /// Max payload we accept in a single WS frame, to stop a malicious peer from
 /// forcing us to buffer an arbitrarily large frame (§8.5 of the design doc:
@@ -85,10 +85,13 @@ pub async fn start_ws_listener(
             }
             Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
         };
+        // Acquire the immutable generation before spawn/handshake. The handler
+        // never performs a later rule_id lookup, so a pruned old connection
+        // cannot recreate a deleted counter entry.
+        let traffic = counter.handle(rule_id).await;
         let targets = targets.clone();
         let selector = selector.clone();
         let rate_limit = rate_limit.clone();
-        let counter = counter.clone();
         let connections = connections.clone();
         let expected_path = expected_path.clone();
 
@@ -102,7 +105,7 @@ pub async fn start_ws_listener(
                 targets,
                 selector,
                 rate_limit,
-                counter,
+                traffic,
                 rule_id,
                 &expected_path,
             )
@@ -179,7 +182,7 @@ async fn handle_ws_connection(
     targets: Vec<String>,
     selector: Arc<TargetSelector>,
     rate_limit: RateLimit,
-    counter: Arc<TrafficCounter>,
+    traffic: RuleCounterHandle,
     rule_id: i64,
     expected_path: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -233,13 +236,12 @@ async fn handle_ws_connection(
     // Either side returning (peer closed / error) ends the session; we then
     // shut down the target write side and close the WS so both ends see a
     // clean teardown.
-    let counter_up = counter.clone();
-    let counter_down = counter.clone();
+    let traffic_up = &traffic;
+    let traffic_down = &traffic;
     let rl_up = rate_limit.clone();
     let rl_down = rate_limit;
 
     let upload = Box::pin(async move {
-        let mut total: u64 = 0;
         let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
             while let Some(msg_result) = ws_stream.next().await {
                 let payload: Vec<u8> = match msg_result? {
@@ -268,15 +270,21 @@ async fn handle_ws_connection(
                 }
                 // v0.4.6: throttle ws→target (upload) bytes before forwarding.
                 rl_up.acquire_upload(payload.len() as u64).await;
-                target_write.write_all(&payload).await?;
-                total += payload.len() as u64;
+                let mut written = 0;
+                while written < payload.len() {
+                    let bytes = target_write.write(&payload[written..]).await?;
+                    if bytes == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+                    }
+                    traffic_up.add_upload(bytes as u64);
+                    written += bytes;
+                }
             }
             Ok(())
         }
         .await;
         // Shut down the target's write side so the download arm sees EOF.
         let _ = target_write.shutdown().await;
-        counter_up.add(rule_id, total, 0).await;
         result
     });
 
@@ -284,7 +292,6 @@ async fn handle_ws_connection(
         // Read target bytes and send them as Binary WS frames. 8 KiB is a
         // reasonable trade-off between syscall overhead and frame granularity.
         let mut buf = vec![0u8; 8 * 1024];
-        let mut total: u64 = 0;
         loop {
             match target_read.read(&mut buf).await {
                 Ok(0) => break, // target closed its side
@@ -298,7 +305,7 @@ async fn handle_ws_connection(
                         tracing::debug!("WS rule {}: send frame failed: {}", rule_id, e);
                         break;
                     }
-                    total += n as u64;
+                    traffic_down.add_download(n as u64);
                 }
                 Err(e) => {
                     tracing::debug!("WS rule {}: target read failed: {}", rule_id, e);
@@ -308,7 +315,6 @@ async fn handle_ws_connection(
         }
         // Close the WebSocket cleanly so the client disconnects promptly.
         let _ = ws_sink.close().await;
-        counter_down.add(rule_id, 0, total).await;
     });
 
     let (up_res, ()) = tokio::join!(upload, download);
@@ -364,7 +370,7 @@ mod tests {
     /// succeeds. The echo target is plain TCP, so any data the WS listener
     /// forwards reaches it as bytes and comes back as a Binary frame.
     #[tokio::test]
-    async fn ws_listener_forwards_binary_both_directions() {
+    async fn ws_listener_reports_live_incremental_deltas() {
         let (target_port, _echo) = spawn_echo_target().await;
 
         // Bind the WS listener on an ephemeral port, pointing at the echo target.
@@ -378,6 +384,7 @@ mod tests {
             // connection, so the test can observe the result and doesn't hang
             // forever in start_ws_listener's infinite accept loop.
             let (inbound, client_addr) = ws_listener.accept().await.unwrap();
+            let traffic = counter_for_listener.handle(42).await;
             handle_ws_connection(
                 inbound,
                 client_addr,
@@ -387,7 +394,7 @@ mod tests {
                     1,
                 )),
                 crate::forwarder::limiter::RateLimit::new(None, None),
-                counter_for_listener,
+                traffic,
                 42,
                 "/relay",
             )
@@ -424,30 +431,43 @@ mod tests {
             other => panic!("expected Binary echo, got {:?}", other),
         }
 
-        // Close the client so the handler's pump arms see EOF and run their
-        // final traffic accounting. Without this the handler would stay in its
-        // read loop and never reach counter.add, so drain() would find nothing.
-        let _ = ws_client.close(None).await;
-        // Give the handler a beat to finish its join! arms after the close.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Traffic for rule 42 must be non-zero in BOTH directions (the echo
-        // target sent the same bytes back, so upload == download for one frame).
-        let drained = counter.drain().await;
-        let entry = drained
+        // The connection is still open: traffic must already be visible and
+        // committable instead of waiting for the WS session to close.
+        let first = counter.snapshot().await;
+        let entry = first
+            .entries
             .iter()
-            .find(|e| e.rule_id == 42)
-            .unwrap_or_else(|| panic!("traffic counted for rule 42, got: {:?}", drained));
-        assert!(
-            entry.upload >= payload.len() as u64,
-            "upload counted: {:?}",
-            entry
-        );
-        assert!(
-            entry.download >= payload.len() as u64,
-            "download counted: {:?}",
-            entry
-        );
+            .find(|entry| entry.rule_id == 42)
+            .unwrap();
+        assert_eq!(entry.upload, payload.len() as u64);
+        assert_eq!(entry.download, payload.len() as u64);
+        first.commit().await;
+
+        let next_payload = b"ws-next-delta";
+        ws_client
+            .send(Message::Binary(next_payload.to_vec().into()))
+            .await
+            .unwrap();
+        let echoed = tokio::time::timeout(std::time::Duration::from_secs(3), ws_client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match echoed {
+            Message::Binary(bytes) => assert_eq!(bytes.as_ref(), next_payload),
+            other => panic!("expected Binary echo, got {:?}", other),
+        }
+        let second = counter.snapshot().await;
+        let entry = second
+            .entries
+            .iter()
+            .find(|entry| entry.rule_id == 42)
+            .unwrap();
+        assert_eq!(entry.upload, next_payload.len() as u64);
+        assert_eq!(entry.download, next_payload.len() as u64);
+        second.commit().await;
+
+        let _ = ws_client.close(None).await;
     }
 
     /// A Text frame from the client must also be forwarded (its UTF-8 bytes
@@ -462,6 +482,7 @@ mod tests {
         let target_addr = format!("127.0.0.1:{}", target_port);
         let _listener_task = tokio::spawn(async move {
             let (inbound, client_addr) = ws_listener.accept().await.unwrap();
+            let traffic = counter.handle(7).await;
             handle_ws_connection(
                 inbound,
                 client_addr,
@@ -471,7 +492,7 @@ mod tests {
                     1,
                 )),
                 crate::forwarder::limiter::RateLimit::new(None, None),
-                counter,
+                traffic,
                 7,
                 "/relay",
             )
@@ -511,6 +532,7 @@ mod tests {
         let _listener_task = tokio::spawn(async move {
             let (inbound, client_addr) = ws_listener.accept().await.unwrap();
             // Listener expects "/relay"; the client below will hit "/wrong".
+            let traffic = counter.handle(9).await;
             handle_ws_connection(
                 inbound,
                 client_addr,
@@ -520,7 +542,7 @@ mod tests {
                     1,
                 )),
                 crate::forwarder::limiter::RateLimit::new(None, None),
-                counter,
+                traffic,
                 9,
                 "/relay",
             )

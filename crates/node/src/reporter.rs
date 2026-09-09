@@ -11,15 +11,56 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 #[cfg(any(target_os = "linux", test))]
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, System};
 use tokio::sync::{Mutex, RwLock};
 
-/// Per-rule (upload, download) byte counters. Shared behind an Arc so the
-/// per-packet add() path can clone-free `fetch_add` after a shared read lock.
-type RuleCounters = Arc<(AtomicU64, AtomicU64)>;
+struct RuleCounterState {
+    upload: AtomicU64,
+    download: AtomicU64,
+    live_handles: AtomicUsize,
+}
+
+impl RuleCounterState {
+    fn new() -> Self {
+        Self {
+            upload: AtomicU64::new(0),
+            download: AtomicU64::new(0),
+            live_handles: AtomicUsize::new(0),
+        }
+    }
+}
+
+type RuleCounters = Arc<RuleCounterState>;
+
+/// Connection-lifetime reference to one immutable counter generation. It is
+/// deliberately not Clone: every accepted TCP/TLS/WS connection acquires one
+/// handle before spawn and both directional pumps borrow that same handle.
+pub struct RuleCounterHandle {
+    state: RuleCounters,
+}
+
+impl RuleCounterHandle {
+    pub fn add_upload(&self, bytes: u64) {
+        self.state.upload.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn add_download(&self, bytes: u64) {
+        self.state.download.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+impl Drop for RuleCounterHandle {
+    fn drop(&mut self) {
+        // AcqRel chains concurrent handle drops together. A cleanup load that
+        // observes zero with Acquire therefore also observes all traffic writes
+        // sequenced before every preceding handle drop.
+        let previous = self.state.live_handles.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "rule counter handle underflow");
+    }
+}
 
 pub struct TrafficCounter {
     // rule_id -> (upload, download) as lock-free atomic counters. Keyed by rule
@@ -31,13 +72,31 @@ pub struct TrafficCounter {
     // lock and do a lock-free atomic fetch_add, so they never serialize on each
     // other — this is the per-packet path for both TCP and UDP forwarding.
     data: Arc<RwLock<HashMap<i64, RuleCounters>>>,
+    // At most one report snapshot may be in flight. The guard lives inside
+    // TrafficSnapshot, so failed uploads release it simply by dropping the
+    // snapshot while successful uploads release it after commit.
+    snapshot_gate: Mutex<()>,
 }
 
 impl TrafficCounter {
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
+            snapshot_gate: Mutex::new(()),
         }
+    }
+
+    /// Acquire the immutable counter generation for one accepted stream
+    /// connection. Creation and live-writer registration are serialized with
+    /// commit/prune by the map write lock; chunk writes after this are lock-free.
+    pub async fn handle(&self, rule_id: i64) -> RuleCounterHandle {
+        let mut map = self.data.write().await;
+        let state = map
+            .entry(rule_id)
+            .or_insert_with(|| Arc::new(RuleCounterState::new()))
+            .clone();
+        state.live_handles.fetch_add(1, Ordering::Relaxed);
+        RuleCounterHandle { state }
     }
 
     pub async fn add(&self, rule_id: i64, upload: u64, download: u64) {
@@ -45,8 +104,8 @@ impl TrafficCounter {
         {
             let map = self.data.read().await;
             if let Some(c) = map.get(&rule_id) {
-                c.0.fetch_add(upload, Ordering::Relaxed);
-                c.1.fetch_add(download, Ordering::Relaxed);
+                c.upload.fetch_add(upload, Ordering::Relaxed);
+                c.download.fetch_add(download, Ordering::Relaxed);
                 return;
             }
         }
@@ -54,9 +113,9 @@ impl TrafficCounter {
         let mut map = self.data.write().await;
         let c = map
             .entry(rule_id)
-            .or_insert_with(|| Arc::new((AtomicU64::new(0), AtomicU64::new(0))));
-        c.0.fetch_add(upload, Ordering::Relaxed);
-        c.1.fetch_add(download, Ordering::Relaxed);
+            .or_insert_with(|| Arc::new(RuleCounterState::new()));
+        c.upload.fetch_add(upload, Ordering::Relaxed);
+        c.download.fetch_add(download, Ordering::Relaxed);
     }
 
     /// Take a snapshot and return a guard whose `commit()` subtracts exactly
@@ -67,18 +126,45 @@ impl TrafficCounter {
     /// Bytes that arrive BETWEEN snapshot and commit are preserved (subtract,
     /// not clear), so no traffic is ever lost.
     pub async fn snapshot(&self) -> TrafficSnapshot<'_> {
-        let map = self.data.read().await;
-        let entries: Vec<TrafficEntry> = map
-            .iter()
-            .map(|(rule_id, c)| TrafficEntry {
+        let snapshot_guard = self.snapshot_gate.lock().await;
+        let mut map = self.data.write().await;
+
+        // Zero-only generations never require a Panel ACK. Once no connection
+        // handle remains, the Acquire live_handles load observes all preceding
+        // AcqRel drops; current counter values can then be checked safely while
+        // the map write lock prevents UDP/Nginx add() from racing the removal.
+        map.retain(|_, state| {
+            state.live_handles.load(Ordering::Acquire) != 0
+                || state.upload.load(Ordering::Acquire) != 0
+                || state.download.load(Ordering::Acquire) != 0
+        });
+
+        let mut entries = Vec::new();
+        let mut captured = Vec::new();
+        for (rule_id, state) in map.iter() {
+            let upload = state.upload.load(Ordering::Acquire);
+            let download = state.download.load(Ordering::Acquire);
+            if upload == 0 && download == 0 {
+                continue;
+            }
+            entries.push(TrafficEntry {
                 rule_id: *rule_id,
-                upload: c.0.load(Ordering::Relaxed),
-                download: c.1.load(Ordering::Relaxed),
-            })
-            .collect();
+                upload,
+                download,
+            });
+            captured.push(SnapshotEntry {
+                rule_id: *rule_id,
+                state: state.clone(),
+                upload,
+                download,
+            });
+        }
+        drop(map);
         TrafficSnapshot {
             counter: self,
             entries,
+            captured,
+            _snapshot_guard: snapshot_guard,
         }
     }
 
@@ -92,8 +178,8 @@ impl TrafficCounter {
         map.drain()
             .map(|(rule_id, c)| TrafficEntry {
                 rule_id,
-                upload: c.0.load(Ordering::Relaxed),
-                download: c.1.load(Ordering::Relaxed),
+                upload: c.upload.load(Ordering::Relaxed),
+                download: c.download.load(Ordering::Relaxed),
             })
             .collect()
     }
@@ -119,28 +205,62 @@ impl TrafficCounter {
 pub struct TrafficSnapshot<'a> {
     counter: &'a TrafficCounter,
     pub entries: Vec<TrafficEntry>,
+    captured: Vec<SnapshotEntry>,
+    _snapshot_guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+struct SnapshotEntry {
+    rule_id: i64,
+    state: RuleCounters,
+    upload: u64,
+    download: u64,
 }
 
 impl TrafficSnapshot<'_> {
     /// Subtract the snapshotted bytes from the live counters. Bytes counted
     /// after the snapshot was taken are untouched. Safe to call once.
     pub async fn commit(self) {
-        // Periodic (not the hot path): take the write lock so fetch_sub AND the
-        // zero-entry cleanup happen without racing an add(). Only the exact
-        // snapshotted bytes are subtracted; bytes counted after the snapshot are
-        // preserved (they show up as a larger prev value → entry not removed).
+        self.commit_with_hook(|_| {}).await;
+    }
+
+    async fn commit_with_hook<F>(self, mut after_subtract: F)
+    where
+        F: FnMut(i64),
+    {
         let mut map = self.counter.data.write().await;
-        for e in &self.entries {
-            let drained = if let Some(c) = map.get(&e.rule_id) {
-                let prev_up = c.0.fetch_sub(e.upload, Ordering::Relaxed);
-                let prev_down = c.1.fetch_sub(e.download, Ordering::Relaxed);
-                // new == 0 iff prev == snapshotted (no adds since the snapshot).
-                prev_up == e.upload && prev_down == e.download
-            } else {
-                false
+        for entry in &self.captured {
+            let remove = {
+                let Some(current) = map.get(&entry.rule_id) else {
+                    continue;
+                };
+                // A prune followed by reuse of the same rule_id creates a new
+                // Arc generation. An old snapshot must never subtract from it.
+                if !Arc::ptr_eq(current, &entry.state) {
+                    continue;
+                }
+                let previous_upload = current.upload.fetch_sub(entry.upload, Ordering::AcqRel);
+                let previous_download =
+                    current.download.fetch_sub(entry.download, Ordering::AcqRel);
+                debug_assert!(previous_upload >= entry.upload, "upload counter underflow");
+                debug_assert!(
+                    previous_download >= entry.download,
+                    "download counter underflow"
+                );
+
+                // Tests can force the exact subtract -> add -> final-drop race.
+                // Production passes an empty inlined closure.
+                after_subtract(entry.rule_id);
+
+                current.live_handles.load(Ordering::Acquire) == 0
+                    && current.upload.load(Ordering::Acquire) == 0
+                    && current.download.load(Ordering::Acquire) == 0
             };
-            if drained {
-                map.remove(&e.rule_id);
+            if remove
+                && map
+                    .get(&entry.rule_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &entry.state))
+            {
+                map.remove(&entry.rule_id);
             }
         }
     }
@@ -1187,6 +1307,169 @@ mod tests {
 
     fn addr(p: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p))
+    }
+
+    fn traffic(entries: &[TrafficEntry], rule_id: i64) -> Option<(u64, u64)> {
+        entries
+            .iter()
+            .find(|entry| entry.rule_id == rule_id)
+            .map(|entry| (entry.upload, entry.download))
+    }
+
+    #[tokio::test]
+    async fn open_handle_reports_incremental_deltas_across_commits() {
+        let counter = TrafficCounter::new();
+        let handle = counter.handle(7).await;
+        handle.add_upload(100);
+        handle.add_download(40);
+
+        let first = counter.snapshot().await;
+        assert_eq!(traffic(&first.entries, 7), Some((100, 40)));
+        first.commit().await;
+        assert!(
+            counter.has_rule(7).await,
+            "live handle keeps zero state registered"
+        );
+
+        handle.add_upload(25);
+        handle.add_download(10);
+        let second = counter.snapshot().await;
+        assert_eq!(traffic(&second.entries, 7), Some((25, 10)));
+        drop(handle);
+        second.commit().await;
+        assert!(!counter.has_rule(7).await);
+    }
+
+    #[tokio::test]
+    async fn add_and_final_drop_between_subtract_and_cleanup_never_loses_bytes() {
+        let counter = TrafficCounter::new();
+        let handle = counter.handle(8).await;
+        handle.add_upload(10);
+        let snapshot = counter.snapshot().await;
+        let mut handle = Some(handle);
+
+        snapshot
+            .commit_with_hook(|rule_id| {
+                assert_eq!(rule_id, 8);
+                let live = handle.take().unwrap();
+                live.add_upload(7);
+                drop(live);
+            })
+            .await;
+
+        let remaining = counter.snapshot().await;
+        assert_eq!(traffic(&remaining.entries, 8), Some((7, 0)));
+        remaining.commit().await;
+        assert!(!counter.has_rule(8).await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_handle_drops_publish_all_prior_traffic() {
+        let counter = Arc::new(TrafficCounter::new());
+        let first = counter.handle(81).await;
+        let second = counter.handle(81).await;
+        let a = tokio::spawn(async move {
+            first.add_upload(13);
+            drop(first);
+        });
+        let b = tokio::spawn(async move {
+            second.add_download(17);
+            drop(second);
+        });
+        a.await.unwrap();
+        b.await.unwrap();
+
+        let snapshot = counter.snapshot().await;
+        assert_eq!(traffic(&snapshot.entries, 81), Some((13, 17)));
+        snapshot.commit().await;
+        assert!(!counter.has_rule(81).await);
+    }
+
+    #[tokio::test]
+    async fn snapshot_gate_releases_on_drop_and_commit() {
+        let counter = Arc::new(TrafficCounter::new());
+        counter.add(82, 1, 0).await;
+        let held = counter.snapshot().await;
+
+        let waiting_counter = counter.clone();
+        let mut waiting = tokio::spawn(async move {
+            let snapshot = waiting_counter.snapshot().await;
+            drop(snapshot);
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err(),
+            "a second snapshot must wait while the first is alive"
+        );
+        drop(held);
+        waiting.await.unwrap();
+
+        let next = counter.snapshot().await;
+        next.commit().await;
+        let after_commit = counter.snapshot().await;
+        drop(after_commit);
+    }
+
+    #[tokio::test]
+    async fn prune_detaches_stale_handle_without_resurrecting_rule() {
+        let counter = TrafficCounter::new();
+        let stale = counter.handle(9).await;
+        counter.prune_rule(9).await;
+        stale.add_upload(12);
+        stale.add_download(4);
+        drop(stale);
+        assert!(!counter.has_rule(9).await);
+        assert!(counter.snapshot().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn old_snapshot_cannot_subtract_from_reused_rule_id_generation() {
+        let counter = TrafficCounter::new();
+        let old_handle = counter.handle(10).await;
+        old_handle.add_upload(100);
+        drop(old_handle);
+        let old_snapshot = counter.snapshot().await;
+
+        counter.prune_rule(10).await;
+        let new_handle = counter.handle(10).await;
+        new_handle.add_upload(30);
+        drop(new_handle);
+        old_snapshot.commit().await;
+
+        let current = counter.snapshot().await;
+        assert_eq!(traffic(&current.entries, 10), Some((30, 0)));
+        current.commit().await;
+    }
+
+    #[tokio::test]
+    async fn zero_byte_handle_is_never_reported_and_cleans_after_close() {
+        let counter = TrafficCounter::new();
+        let handle = counter.handle(11).await;
+        let open = counter.snapshot().await;
+        assert!(open.entries.is_empty());
+        drop(open);
+        assert!(counter.has_rule(11).await);
+
+        drop(handle);
+        let closed = counter.snapshot().await;
+        assert!(closed.entries.is_empty());
+        drop(closed);
+        assert!(!counter.has_rule(11).await);
+    }
+
+    #[tokio::test]
+    async fn dropping_failed_snapshot_keeps_billable_bytes() {
+        let counter = TrafficCounter::new();
+        counter.add(12, 55, 21).await;
+        let failed_upload = counter.snapshot().await;
+        assert_eq!(traffic(&failed_upload.entries, 12), Some((55, 21)));
+        drop(failed_upload);
+
+        let retry = counter.snapshot().await;
+        assert_eq!(traffic(&retry.entries, 12), Some((55, 21)));
+        retry.commit().await;
+        assert!(!counter.has_rule(12).await);
     }
 
     /// read_system_uptime_secs parses /proc/uptime's first field as whole

@@ -18,8 +18,9 @@
 //!
 //! Rate limiting is NOT possible here (the bytes never reach userspace to be
 //! throttled) — the caller only takes this path for unlimited rules. Byte
-//! counts ARE available (splice returns the count moved), so the two totals are
-//! returned for traffic accounting / billing, exactly like the userspace path.
+//! counts ARE available (splice returns the count moved), so each successful
+//! pipe-to-destination write is accounted immediately. Direction totals are
+//! still returned for diagnostics/tests but callers must not add them again.
 //!
 //! This whole module is Linux-only; the caller falls back to the userspace copy
 //! on other targets.
@@ -29,6 +30,8 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use tokio::io::Interest;
 use tokio::net::TcpStream;
+
+use crate::reporter::RuleCounterHandle;
 
 /// Pipe capacity we try to set (64 KiB = 16 × 4 KiB pages), matching realm's
 /// default. Best-effort: if `F_SETPIPE_SZ` fails we keep the kernel default.
@@ -99,7 +102,10 @@ fn shutdown_write(fd: RawFd) {
 /// Pump one direction, `src → dst`, with splice via a private pipe. Returns the
 /// total bytes moved. On return (EOF or error) the destination's write half is
 /// shut down so the peer sees EOF and the opposite pump can finish too.
-async fn pump(src: &TcpStream, dst: &TcpStream) -> io::Result<u64> {
+async fn pump<F>(src: &TcpStream, dst: &TcpStream, account: F) -> io::Result<u64>
+where
+    F: Fn(u64),
+{
     let pipe = Pipe::new()?;
     let src_fd = src.as_raw_fd();
     let dst_fd = dst.as_raw_fd();
@@ -133,6 +139,9 @@ async fn pump(src: &TcpStream, dst: &TcpStream) -> io::Result<u64> {
                     Ok(m) => {
                         left -= m;
                         total += m as u64;
+                        // Count only bytes accepted by the destination socket.
+                        // Bytes merely moved socket→pipe are not forwarded yet.
+                        account(m as u64);
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
                     Err(e) => return Err(e),
@@ -155,12 +164,16 @@ async fn pump(src: &TcpStream, dst: &TcpStream) -> io::Result<u64> {
 /// The streams are wrapped in `Arc` so both pump tasks can drive readiness on
 /// them concurrently (`readable`/`writable`/`try_io` take `&self`); the raw fds
 /// stay valid for the whole operation because the `Arc`s outlive both pumps.
-pub async fn zero_copy_bidirectional(a: TcpStream, b: TcpStream) -> io::Result<(u64, u64)> {
+pub async fn zero_copy_bidirectional(
+    a: TcpStream,
+    b: TcpStream,
+    traffic: &RuleCounterHandle,
+) -> io::Result<(u64, u64)> {
     let a = Arc::new(a);
     let b = Arc::new(b);
     let (a_up, b_up) = (a.clone(), b.clone());
-    let ab = pump(&a_up, &b_up); // a → b
-    let ba = pump(&b, &a); // b → a
+    let ab = pump(&a_up, &b_up, |bytes| traffic.add_upload(bytes)); // a → b
+    let ba = pump(&b, &a, |bytes| traffic.add_download(bytes)); // b → a
     let (r_ab, r_ba) = tokio::join!(ab, ba);
     Ok((r_ab?, r_ba?))
 }
@@ -175,6 +188,8 @@ mod tests {
     /// round-trip and the returned byte counts must be exact.
     #[tokio::test]
     async fn splice_roundtrips_and_counts_bytes() {
+        let counter = crate::reporter::TrafficCounter::new();
+        let traffic = counter.handle(1).await;
         // Echo target: read once, echo back, then close.
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target.local_addr().unwrap();
@@ -192,7 +207,9 @@ mod tests {
         let relay_task = tokio::spawn(async move {
             let (client, _) = relay.accept().await.unwrap();
             let upstream = TcpStream::connect(target_addr).await.unwrap();
-            zero_copy_bidirectional(client, upstream).await.unwrap()
+            zero_copy_bidirectional(client, upstream, &traffic)
+                .await
+                .unwrap()
         });
 
         // Client: send, receive the echo, close.
@@ -207,11 +224,17 @@ mod tests {
         let (up, down) = relay_task.await.unwrap();
         assert_eq!(up, msg.len() as u64, "client→target byte count");
         assert_eq!(down, msg.len() as u64, "target→client byte count");
+        let snapshot = counter.snapshot().await;
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].upload, msg.len() as u64);
+        assert_eq!(snapshot.entries[0].download, msg.len() as u64);
     }
 
     /// A larger transfer (bigger than one pipe-full) must move all bytes.
     #[tokio::test]
     async fn splice_moves_large_payload() {
+        let counter = crate::reporter::TrafficCounter::new();
+        let traffic = counter.handle(2).await;
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_addr = target.local_addr().unwrap();
         // Sink target: drain everything the relay sends.
@@ -233,7 +256,9 @@ mod tests {
         let relay_task = tokio::spawn(async move {
             let (client, _) = relay.accept().await.unwrap();
             let upstream = TcpStream::connect(target_addr).await.unwrap();
-            zero_copy_bidirectional(client, upstream).await.unwrap()
+            zero_copy_bidirectional(client, upstream, &traffic)
+                .await
+                .unwrap()
         });
 
         let mut client = TcpStream::connect(relay_addr).await.unwrap();
@@ -252,5 +277,7 @@ mod tests {
             "target must receive all bytes"
         );
         assert_eq!(up, payload.len() as u64, "up count must equal payload size");
+        let snapshot = counter.snapshot().await;
+        assert_eq!(snapshot.entries[0].upload, payload.len() as u64);
     }
 }

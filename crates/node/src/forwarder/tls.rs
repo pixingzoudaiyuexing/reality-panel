@@ -29,7 +29,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::forwarder::cert_reloader::SharedTlsAcceptor;
 use crate::forwarder::limiter::RateLimit;
 use crate::forwarder::selector::TargetSelector;
-use crate::reporter::{ConnectionTracker, TrafficCounter};
+use crate::reporter::{ConnectionTracker, RuleCounterHandle, TrafficCounter};
 
 /// Maximum time to wait for a TLS handshake to complete. A slow or malicious
 /// client that opens a TCP connection but never completes the handshake would
@@ -56,10 +56,13 @@ pub async fn start_tls_listener(
     loop {
         match listener.accept().await {
             Ok((inbound, client_addr)) => {
+                // Capture the connection's counter generation before spawn and
+                // before the TLS handshake. Failed handshakes create only a
+                // local zero state, which the next snapshot cleans after drop.
+                let traffic = counter.handle(rule_id).await;
                 let targets = targets.clone();
                 let selector = selector.clone();
                 let rate_limit = rate_limit.clone();
-                let counter = counter.clone();
                 let connections = connections.clone();
                 let tls_acceptor = Arc::clone(&tls_acceptor);
 
@@ -116,7 +119,7 @@ pub async fn start_tls_listener(
                         targets,
                         selector,
                         rate_limit,
-                        counter,
+                        traffic,
                         rule_id,
                     )
                     .await
@@ -164,7 +167,7 @@ async fn handle_tls_connection<S>(
     targets: Vec<String>,
     selector: Arc<TargetSelector>,
     rate_limit: RateLimit,
-    counter: Arc<TrafficCounter>,
+    traffic: RuleCounterHandle,
     rule_id: i64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -191,7 +194,11 @@ where
     let outbound = match outbound {
         Some(s) => s,
         None => {
-            tracing::warn!("TLS: no target available for {}", client_addr);
+            tracing::warn!(
+                "TLS rule {}: no target available for {}",
+                rule_id,
+                client_addr
+            );
             return Err("no target available".into());
         }
     };
@@ -203,45 +210,53 @@ where
     let (mut ri, mut wi) = io::split(inbound);
     let (mut ro, mut wo) = outbound.into_split();
 
-    let counter_up = counter.clone();
-    let counter_down = counter.clone();
+    let traffic_up = &traffic;
+    let traffic_down = &traffic;
     let rl_up = rate_limit.clone();
     let rl_down = rate_limit;
 
     let upload = Box::pin(async move {
-        let mut total = 0u64;
         let mut buf = [0u8; 16 * 1024];
-        loop {
+        'copy: loop {
             let n = match ri.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(_) => break,
             };
             rl_up.acquire_upload(n as u64).await;
-            if wo.write_all(&buf[..n]).await.is_err() {
-                break;
+            let mut written = 0;
+            while written < n {
+                match wo.write(&buf[written..n]).await {
+                    Ok(0) | Err(_) => break 'copy,
+                    Ok(bytes) => {
+                        traffic_up.add_upload(bytes as u64);
+                        written += bytes;
+                    }
+                }
             }
-            total += n as u64;
         }
-        counter_up.add(rule_id, total, 0).await;
         let _ = wo.shutdown().await;
     });
     let download = Box::pin(async move {
-        let mut total = 0u64;
         let mut buf = [0u8; 16 * 1024];
-        loop {
+        'copy: loop {
             let n = match ro.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(_) => break,
             };
             rl_down.acquire_download(n as u64).await;
-            if wi.write_all(&buf[..n]).await.is_err() {
-                break;
+            let mut written = 0;
+            while written < n {
+                match wi.write(&buf[written..n]).await {
+                    Ok(0) | Err(_) => break 'copy,
+                    Ok(bytes) => {
+                        traffic_down.add_download(bytes as u64);
+                        written += bytes;
+                    }
+                }
             }
-            total += n as u64;
         }
-        counter_down.add(rule_id, 0, total).await;
         let _ = wi.shutdown().await;
     });
 
@@ -249,4 +264,75 @@ where
 
     tracing::debug!("TLS: connection closed for {}", client_addr);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn decrypted_tls_stream_reports_live_incremental_deltas() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = target.accept().await.unwrap();
+            let mut buffer = [0_u8; 256];
+            loop {
+                match socket.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(size) if socket.write_all(&buffer[..size]).await.is_err() => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let counter = Arc::new(TrafficCounter::new());
+        let traffic = counter.handle(77).await;
+        let (mut client, server) = tokio::io::duplex(1024);
+        let handler = tokio::spawn(handle_tls_connection(
+            server,
+            "127.0.0.1:12345".parse().unwrap(),
+            vec![target_addr.to_string()],
+            Arc::new(TargetSelector::new(
+                relay_shared::protocol::LoadBalanceStrategy::First,
+                1,
+            )),
+            RateLimit::new(None, None),
+            traffic,
+            77,
+        ));
+
+        let first_payload = b"tls-live";
+        client.write_all(first_payload).await.unwrap();
+        let mut first_echo = vec![0_u8; first_payload.len()];
+        client.read_exact(&mut first_echo).await.unwrap();
+        assert_eq!(first_echo, first_payload);
+        let first = counter.snapshot().await;
+        let entry = first
+            .entries
+            .iter()
+            .find(|entry| entry.rule_id == 77)
+            .unwrap();
+        assert_eq!(entry.upload, first_payload.len() as u64);
+        assert_eq!(entry.download, first_payload.len() as u64);
+        first.commit().await;
+
+        let second_payload = b"tls-delta";
+        client.write_all(second_payload).await.unwrap();
+        let mut second_echo = vec![0_u8; second_payload.len()];
+        client.read_exact(&mut second_echo).await.unwrap();
+        assert_eq!(second_echo, second_payload);
+        let second = counter.snapshot().await;
+        let entry = second
+            .entries
+            .iter()
+            .find(|entry| entry.rule_id == 77)
+            .unwrap();
+        assert_eq!(entry.upload, second_payload.len() as u64);
+        assert_eq!(entry.download, second_payload.len() as u64);
+        second.commit().await;
+
+        drop(client);
+        handler.await.unwrap().unwrap();
+    }
 }
