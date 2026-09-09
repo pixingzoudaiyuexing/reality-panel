@@ -1,4 +1,5 @@
 mod acme_dns01;
+mod bbr;
 mod config;
 mod diagnose;
 mod forwarder;
@@ -23,6 +24,29 @@ use tokio::sync::Mutex;
 /// Built-in version string. Single source of truth: the Cargo package version
 /// (`env!("CARGO_PKG_VERSION")`), also used for Panel artifact validation.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const HOST_PREPARATION_ARG: &str = "--prepare-host-runtime";
+
+fn host_preparation_requested(args: &[String]) -> bool {
+    args == [HOST_PREPARATION_ARG]
+}
+
+async fn ensure_native_bbr() -> bbr::EnsureOutcome {
+    tokio::task::spawn_blocking(bbr::ensure)
+        .await
+        .unwrap_or_else(|error| {
+            bbr::EnsureOutcome::Warning(format!("native BBR/fq worker failed: {error}"))
+        })
+}
+
+async fn prepare_host_runtime() -> Result<(), String> {
+    let bbr = ensure_native_bbr().await;
+    if bbr.is_warning() {
+        eprintln!("WARNING: {}", bbr.message());
+    } else {
+        eprintln!("INFO: {}", bbr.message());
+    }
+    xiaoya::reconcile(VERSION).await.map(|_| ())
+}
 
 async fn run_local_recovery_tick(
     manager: &Arc<Mutex<ForwarderManager>>,
@@ -80,6 +104,7 @@ fn main() -> ExitCode {
     // touching the network or spawning the service loop. This matches the
     // conventional CLI contract: version/help must not start the service.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let prepare_host = host_preparation_requested(&args);
     if acme_dns01::is_hook_command(&args) {
         if install_crypto_provider().is_err() {
             eprintln!("ACME DNS-01 hook failed: TLS provider unavailable");
@@ -112,6 +137,7 @@ fn main() -> ExitCode {
                 print_help();
                 return ExitCode::SUCCESS;
             }
+            HOST_PREPARATION_ARG => {}
             // Unknown flags are ignored for forward-compat; the node is
             // configured via env vars (PANEL_URL / NODE_TOKEN / POLL_INTERVAL).
             _ => {}
@@ -156,6 +182,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if prepare_host {
+        return match runtime.block_on(prepare_host_runtime()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("host preparation failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     runtime.block_on(run());
     ExitCode::SUCCESS
 }
@@ -403,6 +438,12 @@ async fn run() {
     {
         let camouflage_sites = camouflage_sites.clone();
         tokio::spawn(async move {
+            let bbr = ensure_native_bbr().await;
+            if bbr.is_warning() {
+                tracing::warn!("{}", bbr.message());
+            } else {
+                tracing::info!("{}", bbr.message());
+            }
             match xiaoya::reconcile(VERSION).await {
                 Ok(ready) => {
                     if forwarder::camouflage_site::cutover_to_xiaoya_shared(
@@ -575,7 +616,15 @@ async fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::install_crypto_provider;
+    use super::{host_preparation_requested, install_crypto_provider, HOST_PREPARATION_ARG};
+
+    #[test]
+    fn internal_host_preparation_command_is_exact_and_not_a_protocol_message() {
+        let exact = vec![HOST_PREPARATION_ARG.to_string()];
+        assert!(host_preparation_requested(&exact));
+        let extra = [HOST_PREPARATION_ARG.to_string(), "unexpected".into()];
+        assert!(!host_preparation_requested(&extra));
+    }
 
     /// v0.4.16: `install_crypto_provider()` must succeed and install the ring
     /// provider process-wide. Before this fix, rustls 0.23 panicked with
