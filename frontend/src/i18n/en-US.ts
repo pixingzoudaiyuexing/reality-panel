@@ -548,6 +548,8 @@ export const enUS: Dict = {
   routingDiscardChanges: 'Discard changes',
   routingContinueEditing: 'Continue editing',
   routingApplyFailed: 'Could not apply routing configuration',
+  routingRefreshFailedAfterSuccess: 'The routing configuration was submitted successfully, but its status could not be refreshed. Refresh the page later.',
+  routingApplyOutcomeUnknown: 'The request timed out or the network was interrupted, so the routing outcome is not confirmed. Do not submit it again while the current state is refreshed.',
   routingErrorScheduleRequired: 'At least one schedule rule must be enabled',
   routingErrorCarrierDefaultRequired: 'Select one global default node first',
   routingErrorCarrierDefaultNotReady: 'The global default node is not ready',

@@ -13,6 +13,8 @@ import { dnsSyncStateDisplay } from '../../utils/realityRuleStatus';
 const { Text } = Typography;
 
 const INITIAL_LOAD_RETRY_DELAYS_MS = [2000, 5000] as const;
+const ROUTING_APPLY_TIMEOUT_MS = 120000;
+const UNKNOWN_OUTCOME_REFRESH_DELAYS_MS = [1000, 3000] as const;
 
 type LoadPreference = (showSpinner?: boolean, allowInitialRetry?: boolean) => Promise<void>;
 
@@ -188,49 +190,76 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
     setDirtyModes((current) => current[mode] === dirty ? current : { ...current, [mode]: dirty });
   };
 
+  const refreshPreferenceView = async (): Promise<RelayPreferenceView> => {
+    const nextView = await fetchPreference();
+    viewRef.current = nextView;
+    setView(nextView);
+    setLoadError(false);
+    return nextView;
+  };
+
+  const recoverUnknownOutcome = async (targetMode: RoutingMode, activeModeBeforeRequest: RoutingMode | null) => {
+    for (let attempt = 0; attempt <= UNKNOWN_OUTCOME_REFRESH_DELAYS_MS.length; attempt += 1) {
+      if (attempt > 0) {
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, UNKNOWN_OUTCOME_REFRESH_DELAYS_MS[attempt - 1]);
+        });
+      }
+      const nextView = await refreshPreferenceView().catch(() => null);
+      if (!nextView) continue;
+      const targetTransitionObserved = nextView.pending_routing_mode === targetMode
+        || (activeModeBeforeRequest !== targetMode && nextView.active_routing_mode === targetMode)
+        || (activeModeBeforeRequest === targetMode && nextView.state !== 'idle');
+      if (targetTransitionObserved) return;
+    }
+  };
+
   const submitRoutingApply = async (request: RoutingApplyRequest): Promise<RoutingApplyResult | null> => {
     if (operationInFlight.current) return null;
     const mode = request.mode;
+    const activeModeBeforeRequest = viewRef.current?.active_routing_mode ?? null;
     operationInFlight.current = true;
     setSubmittingMode(request.mode);
     try {
-      const response = await api.put<unknown, ApiEnvelope<RoutingApplyResult>>(
-        `/groups/${groupId}/routing-apply`,
-        request,
-      );
-      if (response.code !== 0 || !response.data) throw new Error(response.message);
-      const nextView = await fetchPreference();
-      viewRef.current = nextView;
-      setView(nextView);
-      setLoadError(false);
+      let response: ApiEnvelope<RoutingApplyResult>;
+      try {
+        response = await api.put<unknown, ApiEnvelope<RoutingApplyResult>>(
+          `/groups/${groupId}/routing-apply`,
+          request,
+          { timeout: ROUTING_APPLY_TIMEOUT_MS },
+        );
+        if (response.code !== 0 || !response.data) throw new Error(response.message);
+      } catch (error) {
+        const payload = (error as { response?: { data?: ApiEnvelope<RoutingApplyResult> } }).response?.data;
+        const result = payload?.data;
+        if (result) {
+          await refreshPreferenceView().catch(() => null);
+          if (result.config_saved) {
+            setModeDirty(mode, false);
+            const active = result.active_mode ? routingModeLabel(result.active_mode, t) : '-';
+            message.warning(`${t('routingPartialFailure')} ${t('routingStillActive')}: ${active}. ${routingApplyErrorLabel(result.business_error_code, t)}`);
+          } else {
+            message.error(routingApplyErrorLabel(result.business_error_code, t));
+          }
+          return result;
+        }
+        message.warning(t('routingApplyOutcomeUnknown'));
+        await recoverUnknownOutcome(mode, activeModeBeforeRequest);
+        return null;
+      }
+
       if (response.data.config_saved) setModeDirty(mode, false);
       message.success(t(response.data.transition_state === 'switching'
         ? response.data.activation_requested ? 'routingActivationStarted' : 'routingConfigurationApplying'
         : response.data.activation_requested
           ? 'routingActivationSucceeded'
           : 'routingConfigurationSaved'));
-      return response.data;
-    } catch (error) {
-      const payload = (error as { response?: { data?: ApiEnvelope<RoutingApplyResult> } }).response?.data;
-      const result = payload?.data;
-      if (result) {
-        const nextView = await fetchPreference().catch(() => null);
-        if (nextView) {
-          viewRef.current = nextView;
-          setView(nextView);
-          setLoadError(false);
-        }
-        if (result.config_saved) {
-          setModeDirty(mode, false);
-          const active = result.active_mode ? routingModeLabel(result.active_mode, t) : '-';
-          message.warning(`${t('routingPartialFailure')} ${t('routingStillActive')}: ${active}. ${routingApplyErrorLabel(result.business_error_code, t)}`);
-        } else {
-          message.error(routingApplyErrorLabel(result.business_error_code, t));
-        }
-        return result;
+      try {
+        await refreshPreferenceView();
+      } catch {
+        message.warning(t('routingRefreshFailedAfterSuccess'));
       }
-      message.error(t('routingApplyFailed'));
-      return null;
+      return response.data;
     } finally {
       operationInFlight.current = false;
       setSubmittingMode(null);

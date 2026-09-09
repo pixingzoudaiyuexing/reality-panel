@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { message, Modal } from 'antd';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
@@ -158,7 +158,7 @@ describe('RelayPreferencePanel routing function UX', () => {
     fireEvent.click(screen.getByTestId('normal-routing-apply'));
     await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/groups/10/routing-apply', {
       mode: 'normal', default_node_id: 'node-b',
-    }));
+    }, { timeout: 120000 }));
     expect(screen.queryByRole('dialog', { name: 'routingModeConfirmTitle' })).toBeNull();
   });
 
@@ -171,7 +171,7 @@ describe('RelayPreferencePanel routing function UX', () => {
     await confirmModeChange();
     await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/groups/10/routing-apply', {
       mode: 'normal', default_node_id: 'node-b',
-    }));
+    }, { timeout: 120000 }));
   });
 
   it.each([
@@ -184,7 +184,7 @@ describe('RelayPreferencePanel routing function UX', () => {
     fireEvent.click(screen.getByRole('button', { name: action }));
     expect(mockPut).not.toHaveBeenCalled();
     await confirmModeChange();
-    await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/groups/10/routing-apply', payload));
+    await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/groups/10/routing-apply', payload, { timeout: 120000 }));
   });
 
   it('saves an active function without mode confirmation', async () => {
@@ -192,8 +192,76 @@ describe('RelayPreferencePanel routing function UX', () => {
     fireEvent.click(screen.getByRole('button', { name: 'carrier-apply' }));
     await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/groups/10/routing-apply', {
       mode: 'carrier', default_node_id: 'node-a', bindings: [],
-    }));
+    }, { timeout: 120000 }));
     expect(screen.queryByRole('dialog', { name: 'routingModeConfirmTitle' })).toBeNull();
+  });
+
+  it('keeps a successful routing result when the read-model refresh fails', async () => {
+    const success = vi.spyOn(message, 'success');
+    const warning = vi.spyOn(message, 'warning');
+    const error = vi.spyOn(message, 'error');
+    await renderPanel();
+    mockGet.mockRejectedValueOnce(new Error('refresh unavailable'));
+
+    fireEvent.click(within(screen.getByTestId('default-line-candidate-node-b')).getByRole('button', { name: 'routingSetNormalDefault' }));
+    fireEvent.click(screen.getByTestId('normal-routing-apply'));
+
+    await waitFor(() => expect(success).toHaveBeenCalledWith('routingConfigurationSaved'));
+    expect(warning).toHaveBeenCalledWith('routingRefreshFailedAfterSuccess');
+    expect(error).not.toHaveBeenCalledWith('routingApplyFailed');
+    expect(mockPut).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats an unstructured timeout as unknown and refreshes backend switching truth without retrying PUT', async () => {
+    const warning = vi.spyOn(message, 'warning');
+    const error = vi.spyOn(message, 'error');
+    await renderPanel();
+    mockPut.mockRejectedValueOnce({ code: 'ECONNABORTED' });
+    mockGet.mockResolvedValue(ok(preference({
+      active_routing_mode: 'normal',
+      pending_routing_mode: 'carrier',
+      pending_node_id: 'node-a',
+      state: 'switching',
+    })));
+
+    fireEvent.click(screen.getByRole('tab', { name: 'routingFunctionCarrier' }));
+    fireEvent.click(screen.getByRole('button', { name: 'carrier-apply' }));
+    await confirmModeChange();
+
+    await waitFor(() => expect(warning).toHaveBeenCalledWith('routingApplyOutcomeUnknown'));
+    await waitFor(() => expect(screen.getByTestId('routing-mode-control')).toHaveTextContent('routingModeSwitching: routingMode_carrier'));
+    expect(error).not.toHaveBeenCalledWith('routingApplyFailed');
+    expect(mockPut).toHaveBeenCalledTimes(1);
+    expect(mockPut).toHaveBeenCalledWith('/groups/10/routing-apply', {
+      mode: 'carrier', default_node_id: 'node-a', bindings: [],
+    }, { timeout: 120000 });
+  });
+
+  it('keeps submission locked while an unknown outcome refresh is in progress', async () => {
+    let resolveRefresh: ((value: ApiEnvelope<RelayPreferenceView>) => void) | undefined;
+    await renderPanel();
+    mockPut.mockRejectedValueOnce({ code: 'ERR_NETWORK' });
+    mockGet.mockImplementationOnce(() => new Promise<ApiEnvelope<RelayPreferenceView>>((resolve) => {
+      resolveRefresh = resolve;
+    }));
+
+    fireEvent.click(within(screen.getByTestId('default-line-candidate-node-b')).getByRole('button', { name: 'routingSetNormalDefault' }));
+    const submit = screen.getByTestId('normal-routing-apply');
+    fireEvent.click(submit);
+    await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(1));
+    expect(submit).toBeDisabled();
+    fireEvent.click(submit);
+    expect(mockPut).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveRefresh?.(ok(preference({
+        pending_node_id: 'node-b',
+        state: 'switching',
+      })));
+    });
+    await screen.findByText('relayPreferenceSwitchingTo: node-b');
+    expect(submit).toBeDisabled();
+    expect(mockPut).toHaveBeenCalledTimes(1);
   });
 
   it.each([

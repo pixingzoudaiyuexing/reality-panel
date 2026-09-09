@@ -545,6 +545,8 @@ export const zhCN = {
   routingDiscardChanges: '放弃修改',
   routingContinueEditing: '继续编辑',
   routingApplyFailed: '线路配置处理失败',
+  routingRefreshFailedAfterSuccess: '线路配置已提交成功，但状态刷新失败，请稍后刷新页面。',
+  routingApplyOutcomeUnknown: '请求超时或网络中断，线路操作结果暂未确认。请勿重复提交，系统正在刷新当前状态。',
   routingErrorScheduleRequired: '至少需要启用一条定时规则',
   routingErrorCarrierDefaultRequired: '请先设置一台全网默认节点',
   routingErrorCarrierDefaultNotReady: '全网默认节点当前未就绪',
