@@ -11,6 +11,8 @@ const { Text } = Typography;
 interface Props {
   groupId: number;
   t: Tfn;
+  routingManaged?: boolean;
+  active?: boolean;
 }
 
 function requestError(error: unknown, fallback: string): string {
@@ -34,7 +36,7 @@ function errorLabel(error: string, t: Tfn): string {
   return error === 'NO_AVAILABLE_CANDIDATES' ? t('relayFailoverNoCandidates') : error;
 }
 
-export function RelayFailoverPanel({ groupId, t }: Props) {
+export function RelayFailoverPanel({ groupId, t, routingManaged = false, active = false }: Props) {
   const [view, setView] = useState<RelayFailoverView | null>(null);
   const [port, setPort] = useState<number>(443);
   const [failureAfter, setFailureAfter] = useState<number>(5);
@@ -138,13 +140,17 @@ export function RelayFailoverPanel({ groupId, t }: Props) {
           <div className="rp-failover-settings">
             <div className="rp-failover-setting rp-failover-toggle-setting">
               <Text>{t('relayFailoverEnabled')}</Text>
-              <Switch
-                aria-label={t('relayFailoverEnabled')}
-                checked={view.enabled}
-                loading={saving}
-                style={{ alignSelf: 'flex-start' }}
-                onChange={(checked) => void update(checked)}
-              />
+              {routingManaged ? (
+                <Tag color={active ? 'green' : undefined}>{t(active ? 'routingModeActive' : 'routingModeInactive')}</Tag>
+              ) : (
+                <Switch
+                  aria-label={t('relayFailoverEnabled')}
+                  checked={view.enabled}
+                  loading={saving}
+                  style={{ alignSelf: 'flex-start' }}
+                  onChange={(checked) => void update(checked)}
+                />
+              )}
             </div>
             <div className="rp-failover-setting">
               <Text>{t('relayFailoverHealthCheck')}</Text>
@@ -189,7 +195,7 @@ export function RelayFailoverPanel({ groupId, t }: Props) {
               icon={<SaveOutlined />}
               disabled={!dirty || port < 1 || port > 65535 || failureAfter < 1 || failureAfter > 86400}
               loading={saving}
-              onClick={() => void update(view.enabled)}
+              onClick={() => void update(routingManaged ? true : view.enabled)}
             >
               {t('save')}
             </Button>

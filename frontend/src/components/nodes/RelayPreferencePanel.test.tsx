@@ -5,13 +5,14 @@ import type { ApiEnvelope, CarrierAffinityView, RelayPreferenceView, RelayReadyN
 import { zhCN } from '../../i18n/zh-CN';
 import type { Tfn } from './types';
 
-const { mockGet, mockPost, mockCarrierAvailability } = vi.hoisted(() => ({
+const { mockGet, mockPost, mockPut, mockCarrierAvailability } = vi.hoisted(() => ({
   mockGet: vi.fn(),
   mockPost: vi.fn(),
+  mockPut: vi.fn(),
   mockCarrierAvailability: { value: 'ready' as 'loading' | 'ready' | 'error' },
 }));
 
-vi.mock('../../api/client', () => ({ default: { get: mockGet, post: mockPost } }));
+vi.mock('../../api/client', () => ({ default: { get: mockGet, post: mockPost, put: mockPut } }));
 vi.mock('./RelaySchedulePanel', () => ({ RelaySchedulePanel: () => null }));
 vi.mock('./RelayFailoverPanel', () => ({ RelayFailoverPanel: () => null }));
 vi.mock('./CarrierAffinityPanel', async () => {
@@ -79,6 +80,10 @@ function relayNode(nodeId: string, over: Partial<RelayReadyNode> = {}): RelayRea
 function preference(over: Partial<RelayPreferenceView> = {}): RelayPreferenceView {
   return {
     group_id: 10,
+    active_routing_mode: 'normal',
+    pending_routing_mode: null,
+    routing_mode_conflict: [],
+    normal_default_node_id: 'node-a',
     preferred_node_id: 'node-a',
     preferred_node_public_ipv4: '203.0.113.97',
     pending_node_id: null,
@@ -103,6 +108,7 @@ async function openSwitchConfirmation(nodeId = 'node-b') {
 beforeEach(() => {
   mockGet.mockReset();
   mockPost.mockReset();
+  mockPut.mockReset();
   mockCarrierAvailability.value = 'ready';
 });
 
@@ -112,6 +118,101 @@ afterEach(() => {
 });
 
 describe('RelayPreferencePanel', () => {
+  it('shows one unambiguous active routing mode', async () => {
+    mockGet.mockResolvedValue(ok(preference({ active_routing_mode: 'carrier' })));
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    const mode = await screen.findByTestId('routing-mode-control');
+    expect(mode).toHaveTextContent('routingModeCurrent');
+    expect(mode).toHaveTextContent('routingMode_carrier');
+    expect(mode).not.toHaveTextContent('routingModeSwitching');
+  });
+
+  it('keeps source mode active while showing a pending transition', async () => {
+    mockGet.mockResolvedValue(ok(preference({
+      active_routing_mode: 'normal',
+      pending_routing_mode: 'carrier',
+      state: 'switching',
+    })));
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    const mode = await screen.findByTestId('routing-mode-control');
+    expect(mode).toHaveTextContent('routingMode_normal');
+    expect(mode).toHaveTextContent('routingModeSwitching: routingMode_carrier');
+  });
+
+  it('shows rollback truthfully and never labels a terminal mode failure as switching', async () => {
+    mockGet.mockResolvedValueOnce(ok(preference({
+      active_routing_mode: 'normal',
+      pending_routing_mode: 'carrier',
+      pending_node_id: 'node-b',
+      state: 'rolling_back',
+    })));
+    const rendered = render(<RelayPreferencePanel groupId={10} t={t} />);
+    const mode = await screen.findByTestId('routing-mode-control');
+    expect(mode).toHaveTextContent('routingModeRollingBack: routingMode_carrier');
+    expect(mode).not.toHaveTextContent('routingModeSwitching');
+
+    rendered.unmount();
+    mockGet.mockResolvedValueOnce(ok(preference({
+      active_routing_mode: 'normal',
+      pending_routing_mode: 'carrier',
+      state: 'failed_manual_intervention',
+    })));
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    const failedMode = await screen.findByTestId('routing-mode-control');
+    expect(failedMode).not.toHaveTextContent('routingModeSwitching');
+    expect(failedMode).not.toHaveTextContent('routingModeRollingBack');
+  });
+
+  it('submits a mode change through the backend orchestrator only after confirmation', async () => {
+    mockGet.mockResolvedValue(ok(preference({ active_routing_mode: 'normal' })));
+    mockPut.mockResolvedValue(ok({
+      group_id: 10,
+      active_mode: 'normal',
+      pending_mode: 'carrier',
+      transition_state: 'switching',
+      normal_default_node_id: 'node-a',
+      effective_default_node_id: 'node-a',
+      mode_availability: { normal: true, carrier: true, schedule: true, failover: true },
+      last_error: null,
+      conflict_modes: [],
+    }));
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    const selector = await screen.findByLabelText('routingModeCurrent');
+    fireEvent.click(within(selector).getByText('routingMode_carrier'));
+    expect(mockPut).not.toHaveBeenCalled();
+    const dialog = await screen.findByRole('dialog', { name: 'routingModeConfirmTitle' });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'routingModeConfirm' }));
+    await waitFor(() => expect(mockPut).toHaveBeenCalledWith('/groups/10/routing-mode', { mode: 'carrier' }));
+  });
+
+  it('blocks manual default mutation outside NORMAL mode', async () => {
+    mockGet.mockResolvedValue(ok(preference({ active_routing_mode: 'failover' })));
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+    const row = await screen.findByTestId('default-line-candidate-node-b');
+    const button = within(row).getByRole('button', { name: /setAsDefaultLine/ });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(mockPost).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when legacy routing authorities conflict', async () => {
+    mockGet.mockResolvedValue(ok(preference({
+      active_routing_mode: null,
+      routing_mode_conflict: ['carrier', 'schedule'],
+    })));
+    render(<RelayPreferencePanel groupId={10} t={t} />);
+
+    expect(await screen.findByText('routingModeConflict')).toBeInTheDocument();
+    const selector = screen.getByLabelText('routingModeCurrent');
+    expect(selector).toHaveClass('ant-segmented-disabled');
+    expect(screen.getByTestId('routing-mode-control').querySelector('.ant-tag-blue')).toBeNull();
+    const button = within(screen.getByTestId('default-line-candidate-node-b'))
+      .getByRole('button', { name: /setAsDefaultLine/ });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(mockPost).not.toHaveBeenCalled();
+  });
+
   it('shows every default-line candidate directly with Chinese status and no switch drawer', async () => {
     mockGet.mockResolvedValue(ok(preference({
       preferred_node_public_ipv4: '64.118.154.53',

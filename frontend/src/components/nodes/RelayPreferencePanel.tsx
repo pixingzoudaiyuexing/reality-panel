@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Button, Divider, Modal, Space, Spin, Tabs, Tag, Tooltip, Typography, message } from 'antd';
+import { Alert, Button, Divider, Modal, Segmented, Space, Spin, Tabs, Tag, Tooltip, Typography, message } from 'antd';
 import { MedicineBoxOutlined, ReloadOutlined, SwapOutlined } from '@ant-design/icons';
 import api from '../../api/client';
-import type { ApiEnvelope, CarrierAffinityView, CarrierLineCatalog, RelayPreferenceView, RelayReadyNode } from '../../api/types';
+import type { ApiEnvelope, CarrierAffinityView, CarrierLineCatalog, RelayPreferenceView, RelayReadyNode, RoutingMode, RoutingModeView } from '../../api/types';
 import type { Tfn } from './types';
 import { RelaySchedulePanel } from './RelaySchedulePanel';
 import { CarrierAffinityPanel } from './CarrierAffinityPanel';
@@ -76,11 +76,22 @@ function safeLineKey(lineKey: string): string {
   return lineKey.replace(/[^A-Za-z0-9_-]/g, '-');
 }
 
+function routingModeLabel(mode: RoutingMode, t: Tfn): string {
+  const keys = {
+    normal: 'routingMode_normal',
+    carrier: 'routingMode_carrier',
+    schedule: 'routingMode_schedule',
+    failover: 'routingMode_failover',
+  } as const;
+  return t(keys[mode]);
+}
+
 export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange }: Props) {
   const [view, setView] = useState<RelayPreferenceView | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [submittingNodeId, setSubmittingNodeId] = useState<string | null>(null);
+  const [submittingMode, setSubmittingMode] = useState<RoutingMode | null>(null);
   const [carrierView, setCarrierView] = useState<CarrierAffinityView | null>(null);
   const [carrierCatalog, setCarrierCatalog] = useState<CarrierLineCatalog | null>(null);
   const [carrierAvailability, setCarrierAvailability] = useState<'loading' | 'ready' | 'error'>('loading');
@@ -182,7 +193,48 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
     }
   };
 
-  const busy = loading || submittingNodeId !== null;
+  const setRoutingMode = async (mode: RoutingMode) => {
+    if (operationInFlight.current || mode === view?.active_routing_mode) return;
+    operationInFlight.current = true;
+    setSubmittingMode(mode);
+    try {
+      const response = await api.put<unknown, ApiEnvelope<RoutingModeView>>(
+        `/groups/${groupId}/routing-mode`,
+        { mode },
+      );
+      if (response.code !== 0) throw new Error(response.message);
+      const nextView = await fetchPreference();
+      viewRef.current = nextView;
+      setView(nextView);
+      setLoadError(false);
+      message.success(t('routingModeChangeStarted'));
+      return true;
+    } catch (error) {
+      message.error(requestErrorLabel(error, t));
+      return false;
+    } finally {
+      operationInFlight.current = false;
+      setSubmittingMode(null);
+    }
+  };
+
+  const confirmRoutingMode = (mode: RoutingMode) => {
+    if (!view || mode === view.active_routing_mode) return;
+    Modal.confirm({
+      title: t('routingModeConfirmTitle'),
+      content: t('routingModeConfirmDescription'),
+      okText: t('routingModeConfirm'),
+      cancelText: t('cancel'),
+      onOk: async () => {
+        const succeeded = await setRoutingMode(mode);
+        if (!succeeded) throw new Error('routing mode request failed');
+      },
+    });
+  };
+
+  const busy = loading || submittingNodeId !== null || submittingMode !== null;
+  const modeConflict = (view?.routing_mode_conflict?.length ?? 0) > 1;
+  const activeMode = view?.active_routing_mode ?? 'normal';
   const nodeById = new Map((view?.nodes ?? []).map((node) => [node.node_id, node]));
   const nodeLabel = (nodeId: string | null | undefined) => {
     if (!nodeId) return '-';
@@ -242,6 +294,25 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
   return (
     <div className="rp-default-line-panel" data-testid={`relay-preference-${groupId}`}>
       <Divider style={{ margin: '12px 0' }} />
+      <div className="rp-routing-mode-control" data-testid="routing-mode-control">
+        <Space size={8} wrap>
+          <Text strong>{t('routingModeCurrent')}</Text>
+          {!modeConflict ? <Tag color="blue">{routingModeLabel(activeMode, t)}</Tag> : null}
+          {view?.pending_routing_mode && view.state === 'switching' ? <Tag color="processing">{t('routingModeSwitching')}: {routingModeLabel(view.pending_routing_mode, t)}</Tag> : null}
+          {view?.pending_routing_mode && view.state === 'rolling_back' ? <Tag color="warning">{t('routingModeRollingBack')}: {routingModeLabel(view.pending_routing_mode, t)}</Tag> : null}
+        </Space>
+        <Segmented
+          aria-label={t('routingModeCurrent')}
+          value={modeConflict ? undefined : activeMode}
+          disabled={modeConflict || topologyLocked || busy}
+          options={(['normal', 'carrier', 'schedule', 'failover'] as RoutingMode[]).map((mode) => ({
+            value: mode,
+            label: routingModeLabel(mode, t),
+          }))}
+          onChange={(mode) => confirmRoutingMode(mode as RoutingMode)}
+        />
+      </div>
+      {modeConflict ? <Alert type="error" showIcon title={t('routingModeConflict')} style={{ marginBottom: 12 }} /> : null}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 10 }}>
         <Space size={8} wrap>
           <Text strong>{t('defaultLineTitle')}</Text>
@@ -249,6 +320,9 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
             <Text type="secondary" data-testid="relay-preference-current">
               {t('relayPreferenceCurrent')}: <Text code>{nodeLabel(view.preferred_node_id)}</Text>
             </Text>
+          ) : null}
+          {activeMode !== 'normal' && view?.normal_default_node_id ? (
+            <Text type="secondary">{t('routingNormalDefault')}: <Text code>{nodeLabel(view.normal_default_node_id)}</Text></Text>
           ) : null}
         </Space>
         <Tooltip title={t('refresh')}>
@@ -266,7 +340,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
 
       {loading && !view ? <div style={{ textAlign: 'center', padding: 16 }}><Spin size="small" /></div> : null}
       {loadError && !view ? <Alert type="warning" showIcon title={t('relayPreferenceLoadFailed')} /> : null}
-      {view?.state === 'switching' && view.pending_node_id ? (
+      {view?.state === 'switching' && view.pending_node_id && !view.pending_routing_mode ? (
         <Alert
           type="info"
           showIcon
@@ -356,7 +430,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
         const current = node.node_id === view.preferred_node_id;
         const isIdlePreferred = view.state === 'idle' && current;
         const showSwitchAction = !isIdlePreferred && (node.ready || view.state !== 'idle');
-        const canSwitch = node.ready && !topologyLocked && !busy && carrierAvailability !== 'loading';
+        const canSwitch = !modeConflict && activeMode === 'normal' && node.ready && !topologyLocked && !busy && carrierAvailability !== 'loading';
         return (
           <div className="rp-default-line-candidate" data-testid={`default-line-candidate-${node.node_id}`} key={node.node_id}>
             <div className="rp-default-line-candidate-main">
@@ -381,6 +455,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
                   disabled={!canSwitch}
                   loading={submittingNodeId === node.node_id}
                   onClick={() => confirmSwitch(node)}
+                  title={activeMode === 'normal' ? undefined : t('routingModeOwnsDefault')}
                 >
                   {actionLabel(view, node, t)}
                 </Button>
@@ -408,6 +483,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
                 onViewChange={setCarrierView}
                 onCatalogChange={setCarrierCatalog}
                 onAvailabilityChange={setCarrierAvailability}
+                activeMode={activeMode}
               />
             ),
           },
@@ -428,7 +504,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
           {
             key: 'failover',
             label: t('relayFailoverTitle'),
-            children: <RelayFailoverPanel groupId={groupId} t={t} />,
+            children: <RelayFailoverPanel groupId={groupId} t={t} routingManaged active={activeMode === 'failover'} />,
           },
         ]}
       />

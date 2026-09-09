@@ -13,6 +13,8 @@ import { assignCarrierLines, buildCarrierLineOptions, carrierLineMatchesSearch }
 
 const translations: Record<string, string> = {
   carrierAllNetworkDefault: '全网默认',
+  carrierDefaultSelected: '✓ 全网默认',
+  carrierSetDefault: '设为全网默认',
   carrierErrorDefaultAuthority: '全网默认线路请使用“设为默认线路”功能管理',
   carrierErrorFailoverEnabled: '已启用故障切换，无法应用运营商线路策略',
   carrierErrorCatalogStale: '运营商线路目录已过期，请稍后重试',
@@ -46,7 +48,7 @@ const view: CarrierAffinityView = {
   active_policy: { bindings: [
     { line_id: 'default', mode: 'node', node_id: 'node-a' },
     { line_id: 'Dianxin', mode: 'node', node_id: 'node-b' },
-  ] },
+  ], default_node_id: 'node-a' },
   pending_policy: null,
   transaction: { kind: null, state: 'idle', started_at: null, last_error: null, rollback_error: null },
   bindings: [],
@@ -88,7 +90,7 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
   it('shows default only as a derived fixed indicator on the preferred Relay', async () => {
     arrange();
     const preferred = await screen.findByTestId('carrier-node-node-a');
-    expect(within(preferred).getByTestId('carrier-default-node-indicator')).toHaveTextContent('全网默认');
+    expect(within(preferred).getByTestId('carrier-default-node-indicator')).toHaveTextContent('✓ 全网默认');
     expect(within(screen.getByTestId('carrier-node-node-b')).queryByTestId('carrier-default-node-indicator')).not.toBeInTheDocument();
     expect(screen.getByText('carrierLegacyDefaultBinding')).toBeInTheDocument();
 
@@ -130,14 +132,19 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     expect(screen.queryByRole('option', { name: '全网默认' })).not.toBeInTheDocument();
   });
 
-  it('moves the derived default indicator when preferred Relay telemetry changes', async () => {
-    arrange({}, [
-      { ...nodes[0], preferred: false },
-      { ...nodes[1], preferred: true },
-    ]);
+  it('moves the default indicator from the Carrier draft rather than preferred telemetry', async () => {
+    arrange({ active_policy: { ...view.active_policy, default_node_id: 'node-b' } });
     await screen.findByTestId('carrier-node-node-a');
     expect(within(screen.getByTestId('carrier-node-node-a')).queryByTestId('carrier-default-node-indicator')).not.toBeInTheDocument();
-    expect(within(screen.getByTestId('carrier-node-node-b')).getByTestId('carrier-default-node-indicator')).toHaveTextContent('全网默认');
+    expect(within(screen.getByTestId('carrier-node-node-b')).getByTestId('carrier-default-node-indicator')).toHaveTextContent('✓ 全网默认');
+  });
+
+  it('changes Carrier default only in the draft until Apply', async () => {
+    arrange();
+    const nodeB = await screen.findByTestId('carrier-node-node-b');
+    fireEvent.click(within(nodeB).getByRole('button', { name: '设为全网默认' }));
+    expect(within(nodeB).getByTestId('carrier-default-node-indicator')).toHaveTextContent('✓ 全网默认');
+    expect(mockPut).not.toHaveBeenCalled();
   });
 
   it('never includes a legacy default binding in the Carrier PUT payload', async () => {
@@ -145,6 +152,7 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     fireEvent.click(await screen.findByRole('button', { name: /carrierSave/ }));
     await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(1));
     expect(mockPut).toHaveBeenCalledWith('/groups/7/carrier-affinity', {
+      default_node_id: 'node-a',
       bindings: [{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }],
     });
   });

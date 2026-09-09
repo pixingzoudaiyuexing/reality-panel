@@ -420,6 +420,10 @@ export interface RelayReadyNode {
 
 export interface RelayPreferenceView {
   group_id: number;
+  active_routing_mode: RoutingMode | null;
+  pending_routing_mode: RoutingMode | null;
+  routing_mode_conflict: RoutingMode[];
+  normal_default_node_id: string | null;
   preferred_node_id: string | null;
   preferred_node_public_ipv4: string | null;
   pending_node_id: string | null;
@@ -432,7 +436,8 @@ export interface RelayPreferenceView {
 }
 
 export type CarrierLineMode = 'follow_default' | 'node';
-export type RelayTransactionKind = 'preferred_switch' | 'carrier_policy_apply';
+export type RoutingMode = 'normal' | 'carrier' | 'schedule' | 'failover';
+export type RelayTransactionKind = 'preferred_switch' | 'carrier_policy_apply' | 'routing_mode_transition';
 
 export interface CarrierLineBinding {
   line_id: string;
@@ -441,7 +446,20 @@ export interface CarrierLineBinding {
 }
 
 export interface CarrierPolicy {
+  default_node_id?: string | null;
   bindings: CarrierLineBinding[];
+}
+
+export interface RoutingModeView {
+  group_id: number;
+  active_mode: RoutingMode | null;
+  pending_mode: RoutingMode | null;
+  transition_state: RelayPreferencePhase;
+  normal_default_node_id: string | null;
+  effective_default_node_id: string | null;
+  mode_availability: Record<RoutingMode, boolean>;
+  last_error: string | null;
+  conflict_modes: RoutingMode[];
 }
 
 export interface CarrierLineCatalogItem {

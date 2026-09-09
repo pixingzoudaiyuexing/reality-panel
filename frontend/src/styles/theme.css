@@ -862,6 +862,14 @@ html, body, #root {
   margin-top: 14px;
 }
 
+.rp-routing-mode-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
 .rp-section-heading,
 .rp-carrier-editor-toolbar,
 .rp-drawer-footer {
@@ -993,6 +1001,15 @@ html, body, #root {
 }
 
 @media (max-width: 720px) {
+  .rp-routing-mode-control {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .rp-routing-mode-control .ant-segmented {
+    width: 100%;
+  }
+
   .rp-ssh-row {
     grid-template-columns: 28px minmax(0, 1fr);
   }
