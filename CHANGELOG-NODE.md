@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.20] - 2026-09-09
+
+### 改进
+
+- 新节点 bootstrap 改为 Xiaoya-first，仅在 Xiaoya `127.0.0.1:5245` 健康后启用本地 camouflage fallback。
+- 新增 Node-local 原生 BBR + fq 准备，正常启动和新节点安装复用同一实现；不支持时非阻断。
+- 既有节点升级继续恢复历史 LKG，并忽略历史 camouflage 软件资源。
+
+### 兼容性
+
+- 不安装第三方内核，不自动重启，不增加自动历史 backend fallback。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.19 relay-node 可直接升级到 v1.1.20。
+
 ## [1.1.19] - 2026-09-09
 
 统一版本发布。本次仅修正 Panel 前端测试的异步等待；relay-node 没有功能代码变化。

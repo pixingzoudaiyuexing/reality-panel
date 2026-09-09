@@ -2,7 +2,7 @@
 
 > 面向 Reality SNI 中转场景的自托管控制面板：集中管理 Relay 节点、SNI 转发、DNS、证书、伪装站与节点生命周期，同时尽量让数据面不依赖 Panel 持续在线。
 
-**当前稳定版：`v1.1.19`** · **Config Protocol：`10`** · **生产部署：Debian 12 / amd64 / systemd** · **License：AGPL-3.0**
+**当前稳定版：`v1.1.20`** · **Config Protocol：`10`** · **生产部署：Debian 12 / amd64 / systemd** · **License：AGPL-3.0**
 
 ---
 

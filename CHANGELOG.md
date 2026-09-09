@@ -7,6 +7,20 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.20] - 2026-09-09
+
+### 改进
+
+- 新安装的 Relay Node 直接使用 Xiaoya `127.0.0.1:5245` 作为本地 camouflage backend，不再安装历史 5244 服务。
+- 新增幂等的原生 BBR + fq 主机准备；内核不支持时仅记录警告，不阻断节点运行。
+- 新节点部署在 Xiaoya 健康后才写入 5245 fallback，并通过 SSH 和 Panel 状态完成验收。
+
+### 兼容性
+
+- 已升级节点不检查、不迁移、不清理历史 camouflage 资源；旧 LKG 仍可恢复。
+- 无数据库 migration，Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.19 可直接升级到 v1.1.20。
+
 ## [1.1.19] - 2026-09-09
 
 ### 修复
