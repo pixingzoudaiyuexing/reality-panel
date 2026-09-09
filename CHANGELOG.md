@@ -7,6 +7,18 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.19] - 2026-09-09
+
+### 修复
+
+- 修复线路偏好前端测试未等待异步数据完成渲染，导致完整 CI 测试在较慢环境中偶发误报失败的问题。
+
+### 兼容性
+
+- 无产品或运行时功能变化，无数据库 migration。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.18 与 v1.1.19 的 Xiaoya、OpenList 和线路功能实现一致。
+
 ## [1.1.18] - 2026-09-09
 
 ### 新增
