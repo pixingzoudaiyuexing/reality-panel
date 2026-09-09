@@ -112,7 +112,12 @@ function applied(over: Partial<RoutingApplyResult> = {}): RoutingApplyResult {
 async function renderPanel(view = preference()) {
   mockGet.mockResolvedValue(ok(view));
   render(<RelayPreferencePanel groupId={10} t={t} />);
-  await screen.findByTestId('routing-mode-control');
+  const activeMode = view.active_routing_mode ?? 'normal';
+  const activeTab = `routingFunction${activeMode[0].toUpperCase()}${activeMode.slice(1)}`;
+  await waitFor(() => expect(screen.getByRole('tab', { name: activeTab })).toHaveAttribute('aria-selected', 'true'));
+  if (activeMode === 'normal' && view.nodes.length > 0) {
+    await screen.findByTestId(`default-line-candidate-${view.nodes[0].node_id}`);
+  }
 }
 
 async function confirmModeChange() {
