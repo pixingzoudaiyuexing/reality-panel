@@ -424,6 +424,52 @@ pub struct RoutingModeView {
     pub conflict_modes: Vec<RoutingMode>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum RoutingApplyRequest {
+    Normal {
+        default_node_id: String,
+    },
+    Carrier {
+        default_node_id: Option<String>,
+        #[serde(default)]
+        bindings: Vec<CarrierLineBinding>,
+    },
+    Schedule,
+    Failover {
+        health_check_port: u16,
+        failure_after_seconds: u64,
+    },
+}
+
+impl RoutingApplyRequest {
+    pub fn target_mode(&self) -> RoutingMode {
+        match self {
+            Self::Normal { .. } => RoutingMode::Normal,
+            Self::Carrier { .. } => RoutingMode::Carrier,
+            Self::Schedule => RoutingMode::Schedule,
+            Self::Failover { .. } => RoutingMode::Failover,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RoutingApplyResult {
+    pub config_saved: bool,
+    pub activation_requested: bool,
+    pub activation_succeeded: bool,
+    pub active_mode: Option<RoutingMode>,
+    pub target_mode: RoutingMode,
+    pub transition_state: RelayPreferencePhase,
+    pub business_error_code: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug)]
+pub struct RoutingApplyFailure {
+    pub result: RoutingApplyResult,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingModeTransitionOutcome {
     NoChange,
@@ -438,6 +484,8 @@ pub enum RoutingModeTransitionError {
     InboundGroupNotFound,
     Conflict(Vec<RoutingMode>),
     TransactionInProgress,
+    NormalDefaultRequired,
+    NormalDefaultNotReady(String),
     CarrierDefaultRequired,
     CarrierDefaultNotReady(String),
     ScheduleConfigurationMissing,
@@ -458,6 +506,10 @@ impl std::fmt::Display for RoutingModeTransitionError {
             }
             Self::TransactionInProgress => {
                 formatter.write_str("routing transaction already in progress")
+            }
+            Self::NormalDefaultRequired => formatter.write_str("normal default node is required"),
+            Self::NormalDefaultNotReady(node_id) => {
+                write!(formatter, "normal default node is not ready: {node_id}")
             }
             Self::CarrierDefaultRequired => formatter.write_str("carrier default node is required"),
             Self::CarrierDefaultNotReady(node_id) => {
@@ -1942,20 +1994,28 @@ async fn mode_default_target(
     db: &dyn Repository,
     evaluated: &[EvaluatedNode],
     group_id: i64,
+    target_mode: RoutingMode,
     node_id: Option<&str>,
 ) -> Result<(String, String), RoutingModeTransitionError> {
-    let node_id = node_id.ok_or(RoutingModeTransitionError::CarrierDefaultRequired)?;
-    let node = evaluated
+    let missing = match target_mode {
+        RoutingMode::Normal => RoutingModeTransitionError::NormalDefaultRequired,
+        _ => RoutingModeTransitionError::CarrierDefaultRequired,
+    };
+    let node_id = node_id.ok_or(missing)?;
+    let not_ready = || match target_mode {
+        RoutingMode::Normal => RoutingModeTransitionError::NormalDefaultNotReady(node_id.into()),
+        _ => RoutingModeTransitionError::CarrierDefaultNotReady(node_id.into()),
+    };
+    let Some(node) = evaluated
         .iter()
         .find(|candidate| candidate.info.node_id == node_id)
-        .ok_or_else(|| RoutingModeTransitionError::CarrierDefaultNotReady(node_id.into()))?;
+    else {
+        return Err(not_ready());
+    };
     if !node.info.ready || node_is_uninstalling(db, group_id, node_id).await? {
-        return Err(RoutingModeTransitionError::CarrierDefaultNotReady(
-            node_id.into(),
-        ));
+        return Err(not_ready());
     }
-    let value = valid_public_ipv4(node.public_ipv4.as_deref())
-        .ok_or_else(|| RoutingModeTransitionError::CarrierDefaultNotReady(node_id.into()))?;
+    let value = valid_public_ipv4(node.public_ipv4.as_deref()).ok_or_else(not_ready)?;
     Ok((node_id.into(), value))
 }
 
@@ -1975,6 +2035,7 @@ async fn build_mode_transition_records(
                 db,
                 evaluated,
                 group_id,
+                RoutingMode::Carrier,
                 preference.carrier_policy.default_node_id.as_deref(),
             )
             .await?,
@@ -1984,6 +2045,7 @@ async fn build_mode_transition_records(
                 db,
                 evaluated,
                 group_id,
+                RoutingMode::Normal,
                 preference.normal_default_node_id.as_deref(),
             )
             .await?,
@@ -2500,6 +2562,564 @@ pub async fn transition_routing_mode(
         return Err(RoutingModeTransitionError::DnsSchedulingFailed);
     }
     Ok(RoutingModeTransitionOutcome::Started)
+}
+
+fn routing_apply_result(
+    view: &RoutingModeView,
+    target_mode: RoutingMode,
+    config_saved: bool,
+    activation_requested: bool,
+    activation_succeeded: bool,
+    business_error_code: Option<&str>,
+    message: &str,
+) -> RoutingApplyResult {
+    RoutingApplyResult {
+        config_saved,
+        activation_requested,
+        activation_succeeded,
+        active_mode: view.active_mode,
+        target_mode,
+        transition_state: view.transition_state,
+        business_error_code: business_error_code.map(str::to_string),
+        message: message.into(),
+    }
+}
+
+fn routing_apply_failure(
+    view: &RoutingModeView,
+    target_mode: RoutingMode,
+    config_saved: bool,
+    activation_requested: bool,
+    code: &'static str,
+    message: &'static str,
+) -> RoutingApplyFailure {
+    RoutingApplyFailure {
+        result: routing_apply_result(
+            view,
+            target_mode,
+            config_saved,
+            activation_requested,
+            false,
+            Some(code),
+            message,
+        ),
+    }
+}
+
+fn transition_business_error(error: &RoutingModeTransitionError) -> (&'static str, &'static str) {
+    match error {
+        RoutingModeTransitionError::InboundGroupNotFound => {
+            ("INBOUND_GROUP_NOT_FOUND", "inbound group not found")
+        }
+        RoutingModeTransitionError::Conflict(_) => {
+            ("ROUTING_MODE_CONFLICT", "routing mode authority conflict")
+        }
+        RoutingModeTransitionError::TransactionInProgress => (
+            "ROUTING_TRANSACTION_IN_PROGRESS",
+            "routing transaction already in progress",
+        ),
+        RoutingModeTransitionError::NormalDefaultRequired => {
+            ("NORMAL_DEFAULT_REQUIRED", "normal default node is required")
+        }
+        RoutingModeTransitionError::NormalDefaultNotReady(_) => (
+            "NORMAL_DEFAULT_NOT_READY",
+            "normal default node is not ready",
+        ),
+        RoutingModeTransitionError::CarrierDefaultRequired => (
+            "CARRIER_DEFAULT_REQUIRED",
+            "carrier default node is required",
+        ),
+        RoutingModeTransitionError::CarrierDefaultNotReady(_) => (
+            "CARRIER_DEFAULT_NOT_READY",
+            "carrier default node is not ready",
+        ),
+        RoutingModeTransitionError::ScheduleConfigurationMissing => (
+            "SCHEDULE_ENABLED_RULE_REQUIRED",
+            "at least one enabled schedule is required",
+        ),
+        RoutingModeTransitionError::DnsMgrUnavailable => {
+            ("DNSMGR_UNAVAILABLE", "DNS service is unavailable")
+        }
+        RoutingModeTransitionError::ProviderPreflight(_) => (
+            "DNS_PROVIDER_PREFLIGHT_FAILED",
+            "DNS provider preflight failed",
+        ),
+        RoutingModeTransitionError::OwnershipUnverified { .. } => (
+            "DNS_OWNERSHIP_UNVERIFIED",
+            "DNS record ownership could not be verified",
+        ),
+        RoutingModeTransitionError::DnsSchedulingFailed => (
+            "DNS_SCHEDULING_FAILED",
+            "DNS reconciliation could not be scheduled",
+        ),
+        RoutingModeTransitionError::Database(_)
+        | RoutingModeTransitionError::InvalidPreference(_) => (
+            "ROUTING_APPLY_FAILED",
+            "routing configuration could not be applied",
+        ),
+    }
+}
+
+fn carrier_business_error(error: &CarrierPolicyApplyError) -> (&'static str, &'static str) {
+    match error {
+        CarrierPolicyApplyError::CarrierDefaultRequired => (
+            "CARRIER_DEFAULT_REQUIRED",
+            "carrier default node is required",
+        ),
+        CarrierPolicyApplyError::CarrierDefaultNotReady(_) => (
+            "CARRIER_DEFAULT_NOT_READY",
+            "carrier default node is not ready",
+        ),
+        CarrierPolicyApplyError::TransactionInProgress => (
+            "ROUTING_TRANSACTION_IN_PROGRESS",
+            "routing transaction already in progress",
+        ),
+        CarrierPolicyApplyError::RoutingModeConflict(_) => {
+            ("ROUTING_MODE_CONFLICT", "routing mode authority conflict")
+        }
+        CarrierPolicyApplyError::DnsMgrUnavailable => {
+            ("DNSMGR_UNAVAILABLE", "DNS service is unavailable")
+        }
+        CarrierPolicyApplyError::ProviderPreflight(_) => (
+            "DNS_PROVIDER_PREFLIGHT_FAILED",
+            "DNS provider preflight failed",
+        ),
+        CarrierPolicyApplyError::OwnershipUnverified { .. } => (
+            "DNS_OWNERSHIP_UNVERIFIED",
+            "DNS record ownership could not be verified",
+        ),
+        CarrierPolicyApplyError::NodeNotInGroup(_)
+        | CarrierPolicyApplyError::TargetPublicIpv4Invalid(_)
+        | CarrierPolicyApplyError::NodeUninstalling(_) => {
+            ("CARRIER_TARGET_INVALID", "carrier target node is invalid")
+        }
+        CarrierPolicyApplyError::CatalogUnavailable
+        | CarrierPolicyApplyError::CatalogStale
+        | CarrierPolicyApplyError::LineUnavailable(_) => (
+            "CARRIER_CATALOG_UNAVAILABLE",
+            "carrier line catalog is unavailable",
+        ),
+        CarrierPolicyApplyError::DefaultLineOwnedByRelayPreference
+        | CarrierPolicyApplyError::InvalidPolicy(_) => {
+            ("CARRIER_POLICY_INVALID", "carrier policy is invalid")
+        }
+        CarrierPolicyApplyError::InboundGroupNotFound => {
+            ("INBOUND_GROUP_NOT_FOUND", "inbound group not found")
+        }
+        CarrierPolicyApplyError::DnsSchedulingFailed => (
+            "DNS_SCHEDULING_FAILED",
+            "DNS reconciliation could not be scheduled",
+        ),
+        CarrierPolicyApplyError::Database(_) | CarrierPolicyApplyError::InvalidPreference(_) => (
+            "ROUTING_APPLY_FAILED",
+            "routing configuration could not be applied",
+        ),
+    }
+}
+
+fn switch_business_error(error: &StartRelaySwitchError) -> (&'static str, &'static str) {
+    match error {
+        StartRelaySwitchError::InboundGroupNotFound => {
+            ("INBOUND_GROUP_NOT_FOUND", "inbound group not found")
+        }
+        StartRelaySwitchError::NodeNotInGroup => {
+            ("NORMAL_DEFAULT_INVALID", "normal default node is invalid")
+        }
+        StartRelaySwitchError::TargetNotReady(_)
+        | StartRelaySwitchError::TargetPublicIpv4Invalid => (
+            "NORMAL_DEFAULT_NOT_READY",
+            "normal default node is not ready",
+        ),
+        StartRelaySwitchError::DnsMgrUnavailable => {
+            ("DNSMGR_UNAVAILABLE", "DNS service is unavailable")
+        }
+        StartRelaySwitchError::CarrierDnsPreflightFailed(_) => (
+            "DNS_PROVIDER_PREFLIGHT_FAILED",
+            "DNS provider preflight failed",
+        ),
+        StartRelaySwitchError::NoEligibleDnsRules => {
+            ("NO_ELIGIBLE_DNS_RULES", "group has no eligible DNS rules")
+        }
+        StartRelaySwitchError::SwitchInProgress { .. } => (
+            "ROUTING_TRANSACTION_IN_PROGRESS",
+            "routing transaction already in progress",
+        ),
+        StartRelaySwitchError::NodeUninstalling(_) => (
+            "NORMAL_DEFAULT_INVALID",
+            "normal default node is unavailable",
+        ),
+        StartRelaySwitchError::RoutingModeConflict(_) => {
+            ("ROUTING_MODE_CONFLICT", "routing mode authority conflict")
+        }
+        StartRelaySwitchError::SourceNotAuthorized { .. } => (
+            "ROUTING_MODE_CHANGED",
+            "active routing mode changed while applying configuration",
+        ),
+        StartRelaySwitchError::DnsSchedulingFailed(_) => (
+            "DNS_SCHEDULING_FAILED",
+            "DNS reconciliation could not be scheduled",
+        ),
+        StartRelaySwitchError::Database(_) | StartRelaySwitchError::InvalidPreference(_) => (
+            "ROUTING_APPLY_FAILED",
+            "routing configuration could not be applied",
+        ),
+    }
+}
+
+async fn save_inactive_normal_default(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+    node_id: &str,
+) -> Result<(), RoutingModeTransitionError> {
+    let node_id = node_id.trim();
+    if node_id.is_empty() {
+        return Err(RoutingModeTransitionError::NormalDefaultRequired);
+    }
+    let _automatic_policy_guard = crate::service::relay_failover::lock_automatic_policy().await;
+    let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
+    match GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await? {
+        Some(group) if group.group_type == "in" => {}
+        _ => return Err(RoutingModeTransitionError::InboundGroupNotFound),
+    }
+    let mut preference = load_preference(db, group_id).await?;
+    normalize_routing_state(db, group_id, &mut preference).await?;
+    if matches!(
+        preference.state,
+        RelayPreferencePhase::Switching
+            | RelayPreferencePhase::RollingBack
+            | RelayPreferencePhase::FailedManualIntervention
+    ) {
+        return Err(RoutingModeTransitionError::TransactionInProgress);
+    }
+    if preference.active_routing_mode == Some(RoutingMode::Normal) {
+        return Err(RoutingModeTransitionError::TransactionInProgress);
+    }
+    let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
+    if !evaluated.iter().any(|node| node.info.node_id == node_id)
+        || node_is_uninstalling(db, group_id, node_id).await?
+    {
+        return Err(RoutingModeTransitionError::NormalDefaultNotReady(
+            node_id.into(),
+        ));
+    }
+    preference.normal_default_node_id = Some(node_id.into());
+    store_preference(db, group_id, &preference).await?;
+    Ok(())
+}
+
+async fn latest_routing_mode_or(
+    db: &dyn Repository,
+    group_id: i64,
+    fallback: &RoutingModeView,
+) -> RoutingModeView {
+    get_routing_mode(db, group_id)
+        .await
+        .unwrap_or_else(|_| fallback.clone())
+}
+
+fn mode_transition_result_view(
+    initial: &RoutingModeView,
+    target_mode: RoutingMode,
+    outcome: RoutingModeTransitionOutcome,
+) -> RoutingModeView {
+    let mut view = initial.clone();
+    match outcome {
+        RoutingModeTransitionOutcome::Started => {
+            view.pending_mode = Some(target_mode);
+            view.transition_state = RelayPreferencePhase::Switching;
+            view.last_error = None;
+        }
+        RoutingModeTransitionOutcome::NoChange
+        | RoutingModeTransitionOutcome::CommittedWithoutDns => {
+            view.active_mode = Some(target_mode);
+            view.pending_mode = None;
+            view.transition_state = RelayPreferencePhase::Idle;
+            view.last_error = None;
+        }
+    }
+    view
+}
+
+async fn finish_routing_activation(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+    initial: &RoutingModeView,
+    target_mode: RoutingMode,
+    config_saved: bool,
+) -> Result<RoutingApplyResult, RoutingApplyFailure> {
+    match transition_routing_mode(db, node_connections, group_id, target_mode).await {
+        Ok(outcome) => {
+            let view = mode_transition_result_view(initial, target_mode, outcome);
+            let activation_succeeded = !matches!(outcome, RoutingModeTransitionOutcome::Started);
+            Ok(routing_apply_result(
+                &view,
+                target_mode,
+                config_saved,
+                true,
+                activation_succeeded,
+                None,
+                if activation_succeeded {
+                    "routing mode is active"
+                } else {
+                    "routing mode activation started"
+                },
+            ))
+        }
+        Err(error) => {
+            let view = latest_routing_mode_or(db, group_id, initial).await;
+            let (code, message) = transition_business_error(&error);
+            Err(routing_apply_failure(
+                &view,
+                target_mode,
+                config_saved,
+                true,
+                code,
+                message,
+            ))
+        }
+    }
+}
+
+pub async fn apply_routing_configuration(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+    request: RoutingApplyRequest,
+) -> Result<RoutingApplyResult, RoutingApplyFailure> {
+    let target_mode = request.target_mode();
+    let initial = match get_routing_mode(db, group_id).await {
+        Ok(view) => view,
+        Err(error) => {
+            let fallback = RoutingModeView {
+                group_id,
+                active_mode: None,
+                pending_mode: None,
+                transition_state: RelayPreferencePhase::Idle,
+                normal_default_node_id: None,
+                effective_default_node_id: None,
+                mode_availability: RoutingModeAvailability {
+                    normal: false,
+                    carrier: false,
+                    schedule: false,
+                    failover: false,
+                },
+                last_error: None,
+                conflict_modes: Vec::new(),
+            };
+            let (code, message) = match error {
+                RelayPreferenceError::Database(DbError::NotFound) => {
+                    ("INBOUND_GROUP_NOT_FOUND", "inbound group not found")
+                }
+                RelayPreferenceError::RoutingModeConflict(_) => {
+                    ("ROUTING_MODE_CONFLICT", "routing mode authority conflict")
+                }
+                _ => ("ROUTING_APPLY_FAILED", "routing state is unavailable"),
+            };
+            return Err(routing_apply_failure(
+                &fallback,
+                target_mode,
+                false,
+                false,
+                code,
+                message,
+            ));
+        }
+    };
+    if !initial.conflict_modes.is_empty() || initial.active_mode.is_none() {
+        return Err(routing_apply_failure(
+            &initial,
+            target_mode,
+            false,
+            false,
+            "ROUTING_MODE_CONFLICT",
+            "routing mode authority conflict",
+        ));
+    }
+    let already_active = initial.active_mode == Some(target_mode);
+
+    match request {
+        RoutingApplyRequest::Normal { default_node_id } if already_active => {
+            match start_relay_switch(db, node_connections, group_id, &default_node_id).await {
+                Ok(outcome) => {
+                    let mut view = initial.clone();
+                    if matches!(outcome, StartRelaySwitchOutcome::Started { .. }) {
+                        view.transition_state = RelayPreferencePhase::Switching;
+                        view.last_error = None;
+                    }
+                    Ok(routing_apply_result(
+                        &view,
+                        target_mode,
+                        true,
+                        false,
+                        true,
+                        None,
+                        if matches!(outcome, StartRelaySwitchOutcome::Started { .. }) {
+                            "normal default update started"
+                        } else {
+                            "normal default is unchanged"
+                        },
+                    ))
+                }
+                Err(error) => {
+                    let view = latest_routing_mode_or(db, group_id, &initial).await;
+                    let (code, message) = switch_business_error(&error);
+                    Err(routing_apply_failure(
+                        &view,
+                        target_mode,
+                        false,
+                        false,
+                        code,
+                        message,
+                    ))
+                }
+            }
+        }
+        RoutingApplyRequest::Normal { default_node_id } => {
+            if let Err(error) =
+                save_inactive_normal_default(db, node_connections, group_id, &default_node_id).await
+            {
+                let view = latest_routing_mode_or(db, group_id, &initial).await;
+                let (code, message) = transition_business_error(&error);
+                return Err(routing_apply_failure(
+                    &view,
+                    target_mode,
+                    false,
+                    true,
+                    code,
+                    message,
+                ));
+            }
+            finish_routing_activation(db, node_connections, group_id, &initial, target_mode, true)
+                .await
+        }
+        RoutingApplyRequest::Carrier {
+            default_node_id,
+            bindings,
+        } => {
+            let policy = CarrierPolicy {
+                default_node_id,
+                bindings,
+            };
+            match start_carrier_policy_apply(db, node_connections, group_id, policy).await {
+                Ok(outcome) if already_active => {
+                    let mut view = initial.clone();
+                    if outcome == CarrierPolicyApplyOutcome::Started {
+                        view.transition_state = RelayPreferencePhase::Switching;
+                        view.last_error = None;
+                    }
+                    Ok(routing_apply_result(
+                        &view,
+                        target_mode,
+                        true,
+                        false,
+                        true,
+                        None,
+                        "carrier configuration saved",
+                    ))
+                }
+                Ok(_) => {
+                    finish_routing_activation(
+                        db,
+                        node_connections,
+                        group_id,
+                        &initial,
+                        target_mode,
+                        true,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    let view = latest_routing_mode_or(db, group_id, &initial).await;
+                    let (code, message) = carrier_business_error(&error);
+                    Err(routing_apply_failure(
+                        &view,
+                        target_mode,
+                        false,
+                        !already_active,
+                        code,
+                        message,
+                    ))
+                }
+            }
+        }
+        RoutingApplyRequest::Schedule if already_active => Ok(routing_apply_result(
+            &initial,
+            target_mode,
+            false,
+            false,
+            true,
+            None,
+            "schedule mode is already active",
+        )),
+        RoutingApplyRequest::Schedule => {
+            finish_routing_activation(db, node_connections, group_id, &initial, target_mode, false)
+                .await
+        }
+        RoutingApplyRequest::Failover {
+            health_check_port,
+            failure_after_seconds,
+        } => {
+            if let Err(error) = crate::service::relay_failover::update_policy(
+                db,
+                group_id,
+                true,
+                health_check_port,
+                failure_after_seconds,
+            )
+            .await
+            {
+                let view = latest_routing_mode_or(db, group_id, &initial).await;
+                let (code, message) = match error {
+                    crate::service::relay_failover::RelayFailoverError::InboundGroupNotFound => {
+                        ("INBOUND_GROUP_NOT_FOUND", "inbound group not found")
+                    }
+                    crate::service::relay_failover::RelayFailoverError::InvalidInput(_) => (
+                        "FAILOVER_CONFIG_INVALID",
+                        "failover configuration is invalid",
+                    ),
+                    crate::service::relay_failover::RelayFailoverError::InvalidStoredData(_) => {
+                        ("ROUTING_MODE_CONFLICT", "routing mode state is invalid")
+                    }
+                    _ => (
+                        "ROUTING_APPLY_FAILED",
+                        "failover configuration could not be saved",
+                    ),
+                };
+                return Err(routing_apply_failure(
+                    &view,
+                    target_mode,
+                    false,
+                    !already_active,
+                    code,
+                    message,
+                ));
+            }
+            if already_active {
+                let view = latest_routing_mode_or(db, group_id, &initial).await;
+                Ok(routing_apply_result(
+                    &view,
+                    target_mode,
+                    true,
+                    false,
+                    true,
+                    None,
+                    "failover configuration saved",
+                ))
+            } else {
+                finish_routing_activation(
+                    db,
+                    node_connections,
+                    group_id,
+                    &initial,
+                    target_mode,
+                    true,
+                )
+                .await
+            }
+        }
+    }
 }
 
 pub(crate) async fn carrier_policy_is_configured(
@@ -4800,6 +5420,197 @@ mod tests {
         assert_eq!(subsequent.transaction_kind, None);
         assert_eq!(subsequent.switch_source, None);
         assert!(subsequent.dns_records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inactive_normal_configuration_saves_without_effective_or_dns_mutation() {
+        let (repo, connections, _) = switch_fixture().await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Schedule);
+        preference.normal_default_node_id = Some("node-a".into());
+        store_preference(&repo, 7, &preference).await.unwrap();
+
+        save_inactive_normal_default(&repo, &connections, 7, "node-c")
+            .await
+            .unwrap();
+        let saved = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(saved.active_routing_mode, Some(RoutingMode::Schedule));
+        assert_eq!(saved.normal_default_node_id.as_deref(), Some("node-c"));
+        assert_eq!(saved.preferred_node_id.as_deref(), Some("node-a"));
+        assert!(repo
+            .list_dns_record_syncs_for_rule(1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo.scan_prefix("routing_mode:").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn routing_apply_retains_inactive_configuration_when_activation_fails() {
+        let (repo, connections, _) = switch_fixture().await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Schedule);
+        preference.normal_default_node_id = Some("node-a".into());
+        store_preference(&repo, 7, &preference).await.unwrap();
+
+        let normal_failure = apply_routing_configuration(
+            &repo,
+            &connections,
+            7,
+            RoutingApplyRequest::Normal {
+                default_node_id: "node-c".into(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .result;
+        assert!(normal_failure.config_saved);
+        assert!(normal_failure.activation_requested);
+        assert!(!normal_failure.activation_succeeded);
+        assert_eq!(normal_failure.active_mode, Some(RoutingMode::Schedule));
+        assert_eq!(
+            normal_failure.business_error_code.as_deref(),
+            Some("DNS_PROVIDER_PREFLIGHT_FAILED")
+        );
+        let saved = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(saved.normal_default_node_id.as_deref(), Some("node-c"));
+        assert_eq!(saved.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(saved.active_routing_mode, Some(RoutingMode::Schedule));
+
+        let carrier_failure = apply_routing_configuration(
+            &repo,
+            &connections,
+            7,
+            RoutingApplyRequest::Carrier {
+                default_node_id: Some("node-b".into()),
+                bindings: Vec::new(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .result;
+        assert!(carrier_failure.config_saved);
+        assert_eq!(carrier_failure.active_mode, Some(RoutingMode::Schedule));
+        assert_eq!(
+            load_preference(&repo, 7)
+                .await
+                .unwrap()
+                .carrier_policy
+                .default_node_id
+                .as_deref(),
+            Some("node-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_apply_schedule_and_failover_use_existing_mode_authority() {
+        let (repo, connections, _) = switch_fixture().await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Normal);
+        preference.normal_default_node_id = preference.preferred_node_id.clone();
+        store_preference(&repo, 7, &preference).await.unwrap();
+
+        let missing =
+            apply_routing_configuration(&repo, &connections, 7, RoutingApplyRequest::Schedule)
+                .await
+                .unwrap_err()
+                .result;
+        assert_eq!(
+            missing.business_error_code.as_deref(),
+            Some("SCHEDULE_ENABLED_RULE_REQUIRED")
+        );
+        assert_eq!(missing.active_mode, Some(RoutingMode::Normal));
+
+        repo.set(
+            crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY,
+            r#"[{"id":"schedule-a","group_id":7,"target_node_id":"node-b","schedule_type":"daily","enabled":true,"created_at":"x","updated_at":"x","execute_at":null,"time":"12:00","utc_offset_minutes":0,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null}]"#,
+        )
+        .await
+        .unwrap();
+        let scheduled =
+            apply_routing_configuration(&repo, &connections, 7, RoutingApplyRequest::Schedule)
+                .await
+                .unwrap();
+        assert!(scheduled.activation_succeeded);
+        assert_eq!(scheduled.active_mode, Some(RoutingMode::Schedule));
+
+        let failover = apply_routing_configuration(
+            &repo,
+            &connections,
+            7,
+            RoutingApplyRequest::Failover {
+                health_check_port: 8443,
+                failure_after_seconds: 13,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(failover.config_saved);
+        assert!(failover.activation_succeeded);
+        assert_eq!(failover.active_mode, Some(RoutingMode::Failover));
+        let policy = crate::service::relay_failover::load_policy(&repo, 7)
+            .await
+            .unwrap();
+        assert_eq!(policy.health_check_port, 8443);
+        assert_eq!(policy.failure_after_seconds, 13);
+        assert!(
+            routing_source_is_authorized(&repo, 7, RelaySwitchSource::Failover)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !routing_source_is_authorized(&repo, 7, RelaySwitchSource::Schedule)
+                .await
+                .unwrap()
+        );
+
+        let active_update = apply_routing_configuration(
+            &repo,
+            &connections,
+            7,
+            RoutingApplyRequest::Failover {
+                health_check_port: 9443,
+                failure_after_seconds: 21,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(active_update.config_saved);
+        assert!(!active_update.activation_requested);
+        assert!(active_update.activation_succeeded);
+        assert_eq!(active_update.active_mode, Some(RoutingMode::Failover));
+        let updated_policy = crate::service::relay_failover::load_policy(&repo, 7)
+            .await
+            .unwrap();
+        assert_eq!(updated_policy.health_check_port, 9443);
+        assert_eq!(updated_policy.failure_after_seconds, 21);
+    }
+
+    #[tokio::test]
+    async fn routing_apply_reuses_existing_transaction_busy_gate() {
+        let (repo, connections, _) = switch_fixture().await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Normal);
+        preference.normal_default_node_id = preference.preferred_node_id.clone();
+        preference.pending_node_id = Some("node-b".into());
+        preference.transaction_kind = Some(RelayTransactionKind::PreferredSwitch);
+        preference.switch_source = Some(RelaySwitchSource::Manual);
+        preference.state = RelayPreferencePhase::Switching;
+        store_preference(&repo, 7, &preference).await.unwrap();
+
+        let failure =
+            apply_routing_configuration(&repo, &connections, 7, RoutingApplyRequest::Schedule)
+                .await
+                .unwrap_err()
+                .result;
+        assert_eq!(
+            failure.business_error_code.as_deref(),
+            Some("ROUTING_TRANSACTION_IN_PROGRESS")
+        );
+        assert_eq!(
+            load_preference(&repo, 7).await.unwrap().state,
+            RelayPreferencePhase::Switching
+        );
     }
 
     #[tokio::test]

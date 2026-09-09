@@ -3652,17 +3652,42 @@ mod tests {
         let (_, _a) = connections.register(10, Some("node-a".into())).await;
         let (_, _b) = connections.register(10, Some("node-b".into())).await;
 
+        let apply = crate::service::relay_preference::apply_routing_configuration(
+            &db,
+            &connections,
+            10,
+            crate::service::relay_preference::RoutingApplyRequest::Carrier {
+                default_node_id: policy.default_node_id.clone(),
+                bindings: policy.bindings.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(apply.config_saved);
+        assert!(apply.activation_requested);
+        assert!(!apply.activation_succeeded);
+        assert_eq!(apply.active_mode, Some(RoutingMode::Normal));
         assert_eq!(
-            crate::service::relay_preference::transition_routing_mode(
-                &db,
-                &connections,
-                10,
-                RoutingMode::Carrier,
-            )
-            .await
-            .unwrap(),
-            RoutingModeTransitionOutcome::Started
+            apply.transition_state,
+            crate::service::relay_preference::RelayPreferencePhase::Switching
         );
+        assert_eq!(
+            crate::service::relay_preference::load_preference(&db, 10)
+                .await
+                .unwrap()
+                .pending_routing_mode,
+            Some(RoutingMode::Carrier)
+        );
+        assert!(matches!(
+            crate::service::relay_preference::get_routing_mode(&db, 10,)
+                .await
+                .unwrap(),
+            crate::service::relay_preference::RoutingModeView {
+                active_mode: Some(RoutingMode::Normal),
+                pending_mode: Some(RoutingMode::Carrier),
+                ..
+            }
+        ));
         let pending: RelayPreferenceState =
             serde_json::from_str(&db.get("relay_preference:10").await.unwrap().unwrap()).unwrap();
         assert_eq!(pending.active_routing_mode, Some(RoutingMode::Normal));
@@ -3691,17 +3716,21 @@ mod tests {
 
         let mut updated_policy = policy.clone();
         updated_policy.default_node_id = Some("node-a".into());
-        assert_eq!(
-            crate::service::relay_preference::start_carrier_policy_apply(
-                &db,
-                &connections,
-                10,
-                updated_policy.clone(),
-            )
-            .await
-            .unwrap(),
-            crate::service::relay_preference::CarrierPolicyApplyOutcome::Started
-        );
+        let active_apply = crate::service::relay_preference::apply_routing_configuration(
+            &db,
+            &connections,
+            10,
+            crate::service::relay_preference::RoutingApplyRequest::Carrier {
+                default_node_id: updated_policy.default_node_id.clone(),
+                bindings: updated_policy.bindings.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(active_apply.config_saved);
+        assert!(!active_apply.activation_requested);
+        assert!(active_apply.activation_succeeded);
+        assert_eq!(active_apply.active_mode, Some(RoutingMode::Carrier));
         let updating: RelayPreferenceState =
             serde_json::from_str(&db.get("relay_preference:10").await.unwrap().unwrap()).unwrap();
         assert_eq!(updating.dns_records.len(), 2);
@@ -3826,17 +3855,21 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            crate::service::relay_preference::transition_routing_mode(
-                &db,
-                &connections,
-                10,
-                RoutingMode::Normal,
-            )
-            .await
-            .unwrap(),
-            RoutingModeTransitionOutcome::Started
-        );
+        let normal_apply = crate::service::relay_preference::apply_routing_configuration(
+            &db,
+            &connections,
+            10,
+            crate::service::relay_preference::RoutingApplyRequest::Normal {
+                default_node_id: "node-a".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(normal_apply.config_saved);
+        assert!(normal_apply.activation_requested);
+        assert!(!normal_apply.activation_succeeded);
+        assert_eq!(normal_apply.active_mode, Some(RoutingMode::Carrier));
+        assert_eq!(normal_apply.target_mode, RoutingMode::Normal);
         let returning: RelayPreferenceState =
             serde_json::from_str(&db.get("relay_preference:10").await.unwrap().unwrap()).unwrap();
         assert_eq!(returning.active_routing_mode, Some(RoutingMode::Carrier));

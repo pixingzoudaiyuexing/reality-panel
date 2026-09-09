@@ -1060,6 +1060,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enabled_schedule_remains_configuration_only_while_mode_is_inactive() {
+        let repo = test_repo().await;
+        let schedule = one_time_schedule("2026-08-30T12:00:00Z");
+        put_schedule(&repo, &schedule).await;
+        repo.set(
+            "relay_preference:1",
+            &serde_json::to_string(&crate::service::relay_preference::RelayPreferenceState {
+                active_routing_mode: Some(crate::service::relay_preference::RoutingMode::Normal),
+                normal_default_node_id: Some("node-a".into()),
+                preferred_node_id: Some("node-a".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let starter = recording_starter(
+            calls.clone(),
+            SwitchResult {
+                last_result: "started".into(),
+                last_error: None,
+            },
+        );
+
+        run_scheduler_once_with(&repo, utc("2026-08-30T12:00:03Z"), starter)
+            .await
+            .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        let stored = list_schedules(&repo).await.unwrap();
+        assert!(stored[0].enabled);
+        assert_eq!(stored[0].last_run_slot, None);
+        assert_eq!(stored[0].last_result, None);
+    }
+
+    #[tokio::test]
     async fn disabled_schedule_is_not_executed() {
         let repo = test_repo().await;
         let mut schedule = one_time_schedule("2026-08-30T12:00:00Z");

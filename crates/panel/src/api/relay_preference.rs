@@ -27,6 +27,20 @@ pub struct SetRoutingModeRequest {
     pub mode: crate::service::relay_preference::RoutingMode,
 }
 
+fn routing_apply_status(code: &str) -> StatusCode {
+    match code {
+        "INBOUND_GROUP_NOT_FOUND" => StatusCode::NOT_FOUND,
+        "ROUTING_MODE_CONFLICT" | "ROUTING_TRANSACTION_IN_PROGRESS" | "ROUTING_MODE_CHANGED" => {
+            StatusCode::CONFLICT
+        }
+        "DNSMGR_UNAVAILABLE" | "DNS_PROVIDER_PREFLIGHT_FAILED" | "CARRIER_CATALOG_UNAVAILABLE" => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        "ROUTING_APPLY_FAILED" | "DNS_SCHEDULING_FAILED" => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    }
+}
+
 fn safe_carrier_preflight_detail(detail: &str) -> String {
     detail
         .chars()
@@ -199,6 +213,8 @@ pub async fn set_routing_mode(
                 }
                 RoutingModeTransitionError::CarrierDefaultRequired
                 | RoutingModeTransitionError::CarrierDefaultNotReady(_)
+                | RoutingModeTransitionError::NormalDefaultRequired
+                | RoutingModeTransitionError::NormalDefaultNotReady(_)
                 | RoutingModeTransitionError::ScheduleConfigurationMissing
                 | RoutingModeTransitionError::OwnershipUnverified { .. } => {
                     (StatusCode::UNPROCESSABLE_ENTITY, 422, error.to_string())
@@ -216,6 +232,71 @@ pub async fn set_routing_mode(
                 ),
             };
             (status, Json(ApiResponse::<()>::error(code, &message))).into_response()
+        }
+    }
+}
+
+pub async fn apply_routing(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+    Json(request): Json<crate::service::relay_preference::RoutingApplyRequest>,
+) -> Response {
+    let target_mode = request.target_mode();
+    match crate::service::relay_preference::apply_routing_configuration(
+        state.db.as_ref(),
+        &state.node_connections,
+        group_id,
+        request,
+    )
+    .await
+    {
+        Ok(result) => {
+            crate::service::audit::record(
+                &state,
+                Some(admin.user_id),
+                "ROUTING_CONFIGURATION_APPLIED",
+                "device_group",
+                group_id,
+                &format!(
+                    "target_mode={target_mode:?} config_saved={} activation_requested={} activation_succeeded={} transition_state={:?}",
+                    result.config_saved,
+                    result.activation_requested,
+                    result.activation_succeeded,
+                    result.transition_state,
+                ),
+            )
+            .await;
+            Json(ApiResponse::success(result)).into_response()
+        }
+        Err(failure) => {
+            let code = failure
+                .result
+                .business_error_code
+                .as_deref()
+                .unwrap_or("ROUTING_APPLY_FAILED");
+            let status = routing_apply_status(code);
+            crate::service::audit::record(
+                &state,
+                Some(admin.user_id),
+                "ROUTING_CONFIGURATION_APPLY_FAILED",
+                "device_group",
+                group_id,
+                &format!(
+                    "target_mode={target_mode:?} config_saved={} error_code={code}",
+                    failure.result.config_saved,
+                ),
+            )
+            .await;
+            (
+                status,
+                Json(ApiResponse {
+                    code: i32::from(status.as_u16()),
+                    message: code.into(),
+                    data: Some(failure.result),
+                }),
+            )
+                .into_response()
         }
     }
 }
@@ -454,5 +535,25 @@ mod tests {
         assert!(message.starts_with("PROVIDER_PREFLIGHT: line unavailable"));
         assert!(!message.contains('\n'));
         assert!(message.len() <= "PROVIDER_PREFLIGHT: ".len() + 200);
+    }
+
+    #[test]
+    fn routing_apply_business_codes_map_to_stable_http_categories() {
+        assert_eq!(
+            routing_apply_status("SCHEDULE_ENABLED_RULE_REQUIRED"),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            routing_apply_status("ROUTING_TRANSACTION_IN_PROGRESS"),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            routing_apply_status("DNSMGR_UNAVAILABLE"),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            routing_apply_status("ROUTING_APPLY_FAILED"),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

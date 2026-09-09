@@ -1364,6 +1364,44 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn inactive_failover_configuration_never_grants_runtime_authority() {
+        let _test_guard = TEST_LOCK.lock().await;
+        let (repo, connections) = test_repo().await;
+        repo.set(
+            "relay_preference:1",
+            &serde_json::to_string(&RelayPreferenceState {
+                active_routing_mode: Some(crate::service::relay_preference::RoutingMode::Normal),
+                normal_default_node_id: Some("node-a".into()),
+                preferred_node_id: Some("node-a".into()),
+                ..RelayPreferenceState::default()
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let stored = update_policy(&repo, 1, true, 8443, 13).await.unwrap();
+        assert!(stored.enabled);
+        assert_eq!(stored.health_check_port, 8443);
+        assert!(
+            !crate::service::relay_preference::routing_source_is_authorized(
+                &repo,
+                1,
+                crate::service::relay_preference::RelaySwitchSource::Failover,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !get_view(&repo, &connections, 1)
+                .await
+                .unwrap()
+                .policy
+                .enabled
+        );
+    }
+
     #[test]
     fn candidates_require_ready_valid_healthy_scope_and_exclusion_is_sticky() {
         let nodes = vec![
