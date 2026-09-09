@@ -362,6 +362,19 @@ impl Default for RelayPreferenceState {
     }
 }
 
+fn complete_transaction_to_idle(preference: &mut RelayPreferenceState) {
+    preference.pending_routing_mode = None;
+    preference.pending_node_id = None;
+    preference.pending_carrier_policy = None;
+    preference.transaction_kind = None;
+    preference.switch_source = None;
+    preference.state = RelayPreferencePhase::Idle;
+    preference.started_at = None;
+    preference.last_error = None;
+    preference.rollback_error = None;
+    preference.dns_records.clear();
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayReadyNode {
     pub node_id: String,
@@ -2426,12 +2439,7 @@ pub async fn transition_routing_mode(
             && preference.normal_default_node_id != preference.preferred_node_id);
     if !needs_dns {
         preference.active_routing_mode = Some(target_mode);
-        preference.pending_routing_mode = None;
-        preference.switch_source = None;
-        preference.state = RelayPreferencePhase::Idle;
-        preference.started_at = None;
-        preference.last_error = None;
-        preference.rollback_error = None;
+        complete_transaction_to_idle(&mut preference);
         store_preference(db, group_id, &preference).await?;
         return Ok(RoutingModeTransitionOutcome::CommittedWithoutDns);
     }
@@ -2461,15 +2469,7 @@ pub async fn transition_routing_mode(
     .await?;
     if records.is_empty() {
         preference.active_routing_mode = Some(target_mode);
-        preference.pending_routing_mode = None;
-        preference.pending_node_id = None;
-        preference.transaction_kind = None;
-        preference.switch_source = None;
-        preference.state = RelayPreferencePhase::Idle;
-        preference.started_at = None;
-        preference.last_error = None;
-        preference.rollback_error = None;
-        preference.dns_records.clear();
+        complete_transaction_to_idle(&mut preference);
         store_preference(db, group_id, &preference).await?;
         return Ok(RoutingModeTransitionOutcome::CommittedWithoutDns);
     }
@@ -4725,7 +4725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_mode_journal_commit_clears_previous_terminal_transaction_state() {
+    async fn no_dns_mode_transition_clears_previous_terminal_transaction_state() {
         let (repo, connections, _) = switch_fixture().await;
         repo.set(
             crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY,
@@ -4734,19 +4734,28 @@ mod tests {
         .await
         .unwrap();
         let mut preference = load_preference(&repo, 7).await.unwrap();
-        preference.active_routing_mode = Some(RoutingMode::Carrier);
+        preference.active_routing_mode = Some(RoutingMode::Schedule);
         preference.pending_routing_mode = Some(RoutingMode::Normal);
         preference.normal_default_node_id = preference.preferred_node_id.clone();
         preference.carrier_policy = CarrierPolicy {
             default_node_id: preference.preferred_node_id.clone(),
             bindings: Vec::new(),
         };
+        preference.pending_carrier_policy = Some(CarrierPolicy {
+            default_node_id: Some("node-b".into()),
+            bindings: vec![carrier_binding(
+                "Dianxin",
+                CarrierLineMode::Node,
+                Some("node-b"),
+            )],
+        });
         preference.pending_node_id = Some("node-b".into());
         preference.transaction_kind = Some(RelayTransactionKind::RoutingModeTransition);
         preference.switch_source = Some(RelaySwitchSource::ModeTransition);
         preference.state = RelayPreferencePhase::FailedRolledBack;
         preference.started_at = Some("2026-09-09T00:00:00Z".into());
         preference.last_error = Some("DNS_PROVIDER_FAILED".into());
+        preference.rollback_error = Some("DNS_ROLLBACK_FAILED".into());
         preference.dns_records = vec![carrier_record(
             1,
             "Dianxin",
@@ -4758,21 +4767,39 @@ mod tests {
         store_preference(&repo, 7, &preference).await.unwrap();
 
         assert_eq!(
-            transition_routing_mode(&repo, &connections, 7, RoutingMode::Schedule)
+            transition_routing_mode(&repo, &connections, 7, RoutingMode::Failover)
                 .await
                 .unwrap(),
             RoutingModeTransitionOutcome::CommittedWithoutDns
         );
         let committed = load_preference(&repo, 7).await.unwrap();
-        assert_eq!(committed.active_routing_mode, Some(RoutingMode::Schedule));
+        assert_eq!(committed.active_routing_mode, Some(RoutingMode::Failover));
         assert_eq!(committed.pending_routing_mode, None);
         assert_eq!(committed.pending_node_id, None);
+        assert_eq!(committed.pending_carrier_policy, None);
         assert_eq!(committed.transaction_kind, None);
         assert_eq!(committed.switch_source, None);
         assert_eq!(committed.state, RelayPreferencePhase::Idle);
         assert_eq!(committed.started_at, None);
         assert_eq!(committed.last_error, None);
+        assert_eq!(committed.rollback_error, None);
         assert!(committed.dns_records.is_empty());
+
+        assert_eq!(
+            transition_routing_mode(&repo, &connections, 7, RoutingMode::Schedule)
+                .await
+                .unwrap(),
+            RoutingModeTransitionOutcome::CommittedWithoutDns
+        );
+        let subsequent = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(subsequent.active_routing_mode, Some(RoutingMode::Schedule));
+        assert_eq!(subsequent.state, RelayPreferencePhase::Idle);
+        assert_eq!(subsequent.pending_routing_mode, None);
+        assert_eq!(subsequent.pending_node_id, None);
+        assert_eq!(subsequent.pending_carrier_policy, None);
+        assert_eq!(subsequent.transaction_kind, None);
+        assert_eq!(subsequent.switch_source, None);
+        assert!(subsequent.dns_records.is_empty());
     }
 
     #[tokio::test]
