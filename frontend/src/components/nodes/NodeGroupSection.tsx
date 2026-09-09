@@ -29,6 +29,8 @@ interface Props {
   onDelete?: (row: NodeDisplayRow) => void;
   showRelayPreference?: boolean;
   onDiagnoseNode?: (groupId: number, node: RelayReadyNode) => void;
+  expanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
 }
 
 /** Per-group summary: online/total (placeholders excluded) + aggregate live
@@ -47,7 +49,7 @@ function groupSummary(rows: NodeDisplayRow[]) {
 /** One group block: header bar (name · ID · online/total · aggregate ↑↓) +
  *  either a desktop table or mobile list. Collapsible. A group with only a
  *  placeholder row shows "no node reporting". */
-export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade, onLifecycle, artifactVersions, onDelete, showRelayPreference = false, onDiagnoseNode }: Props) {
+export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade, onLifecycle, artifactVersions, onDelete, showRelayPreference = false, onDiagnoseNode, expanded = true, onExpandedChange }: Props) {
   const [relayPreference, setRelayPreference] = useState<RelayPreferenceView | null>(null);
   const head = rows[0];
   const { total, online, up, down } = groupSummary(rows);
@@ -113,7 +115,8 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
 
   return (
     <Collapse
-      defaultActiveKey={['1']}
+      activeKey={expanded ? ['1'] : []}
+      onChange={(keys) => onExpandedChange?.(keys.includes('1'))}
       style={{ marginBottom: 16 }}
       items={[{ key: '1', label: header, children: body }]}
     />

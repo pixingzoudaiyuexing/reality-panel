@@ -16,6 +16,27 @@ type AnyNodeRow = NodeDisplayRow;
 
 const terminalOperationStatuses = new Set(['SUCCESS', 'FAILED', 'TIMEOUT']);
 const terminalBatchStatuses = new Set(['SUCCESS', 'PARTIAL_SUCCESS', 'FAILED', 'INTERRUPTED']);
+const EXPANDED_GROUP_STORAGE_KEY = 'reality-panel:node-status:expanded-group';
+
+function readExpandedGroupId(): number | null {
+  try {
+    const raw = window.localStorage.getItem(EXPANDED_GROUP_STORAGE_KEY);
+    if (raw === null) return null;
+    const value = Number(raw);
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistExpandedGroupId(groupId: number | null) {
+  try {
+    if (groupId === null) window.localStorage.removeItem(EXPANDED_GROUP_STORAGE_KEY);
+    else window.localStorage.setItem(EXPANDED_GROUP_STORAGE_KEY, String(groupId));
+  } catch {
+    // Storage can be unavailable in private/restricted browser contexts.
+  }
+}
 
 /** Hook: is the viewport mobile-width? Re-evaluates on resize. */
 function useIsMobile(breakpoint = 768): boolean {
@@ -60,6 +81,7 @@ export default function NodeStatus() {
   const [uninstallRow, setUninstallRow] = useState<AnyNodeRow | null>(null);
   const [uninstallConfirmation, setUninstallConfirmation] = useState('');
   const [nodeDiagnosisTarget, setNodeDiagnosisTarget] = useState<{ groupId: number; nodeId: string; label: string } | null>(null);
+  const [expandedGroupId, setExpandedGroupId] = useState<number | null>(readExpandedGroupId);
   // Guards against overlapping polls: on a slow network (axios 10s timeout vs
   // 5s interval) a new tick could otherwise fire before the previous request
   // returned, stacking requests.
@@ -313,6 +335,20 @@ export default function NodeStatus() {
   const rows: AnyNodeRow[] | null = isAdmin ? adminRows : userRows;
   const groups = useMemo(() => (rows ? stableGroupedRows(rows) : null), [rows]);
 
+  useEffect(() => {
+    if (!groups || expandedGroupId === null) return;
+    if (!groups.some(([groupId]) => groupId === expandedGroupId)) {
+      setExpandedGroupId(null);
+      persistExpandedGroupId(null);
+    }
+  }, [expandedGroupId, groups]);
+
+  const toggleExpandedGroup = (groupId: number, expanded: boolean) => {
+    const next = expanded ? groupId : null;
+    setExpandedGroupId(next);
+    persistExpandedGroupId(next);
+  };
+
   const title = t('nodeStatus');
   const activeTaskCount = backgroundTasks.filter((operation) => !terminalOperationStatuses.has(operation.status)).length
     + batchOperations.filter((batch) => !terminalBatchStatuses.has(batch.status)).length;
@@ -392,6 +428,8 @@ export default function NodeStatus() {
           onDelete={isAdmin ? handleDelete : undefined}
           showRelayPreference={isAdmin && inboundGroupIds.has(gid)}
           onDiagnoseNode={isAdmin ? handleDiagnoseNode : undefined}
+          expanded={expandedGroupId === gid}
+          onExpandedChange={(expanded) => toggleExpandedGroup(gid, expanded)}
         />
       ))}
       <NodeDetailDrawer

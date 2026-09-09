@@ -41,12 +41,87 @@ const artifactCatalog = ok({
 });
 
 const renderPage = () => render(<MemoryRouter><NodeStatus /></MemoryRouter>);
+const rememberGroup = (groupId: number) => window.localStorage.setItem(
+  'reality-panel:node-status:expanded-group',
+  String(groupId),
+);
+const groupHeader = (name: string) => screen.getByText(name).closest('[role="button"]') as HTMLElement;
 
 beforeEach(() => {
   mockGet.mockReset();
   mockPost.mockReset();
   mockUseAuth.mockReset();
   vi.useFakeTimers();
+  window.localStorage.clear();
+});
+
+describe('NodeStatus single-open group persistence', () => {
+  const rows = [
+    { ...sharedNode, group_id: 1, group_name: 'group-a', node_id: 'node-a' },
+    { ...sharedNode, group_id: 2, group_name: 'group-b', node_id: 'node-b' },
+  ];
+
+  function setup(groupRows = rows) {
+    mockUseAuth.mockReturnValue({ isAdmin: false });
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/nodes/shared') return Promise.resolve(ok(groupRows));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+  }
+
+  it('starts collapsed and keeps at most one group open', async () => {
+    setup();
+    renderPage();
+    await flush();
+    expect(screen.queryByText('node-a')).not.toBeInTheDocument();
+    expect(screen.queryByText('node-b')).not.toBeInTheDocument();
+
+    fireEvent.click(groupHeader('group-a'));
+    expect(groupHeader('group-a')).toHaveAttribute('aria-expanded', 'true');
+    expect(groupHeader('group-b')).toHaveAttribute('aria-expanded', 'false');
+    expect(window.localStorage.getItem('reality-panel:node-status:expanded-group')).toBe('1');
+
+    fireEvent.click(groupHeader('group-b'));
+    expect(groupHeader('group-a')).toHaveAttribute('aria-expanded', 'false');
+    expect(groupHeader('group-b')).toHaveAttribute('aria-expanded', 'true');
+    expect(window.localStorage.getItem('reality-panel:node-status:expanded-group')).toBe('2');
+
+    fireEvent.click(groupHeader('group-b'));
+    expect(groupHeader('group-b')).toHaveAttribute('aria-expanded', 'false');
+    expect(window.localStorage.getItem('reality-panel:node-status:expanded-group')).toBeNull();
+  });
+
+  it('restores the remembered group after remount', async () => {
+    setup();
+    rememberGroup(2);
+    const first = renderPage();
+    await flush();
+    expect(groupHeader('group-b')).toHaveAttribute('aria-expanded', 'true');
+    expect(groupHeader('group-a')).toHaveAttribute('aria-expanded', 'false');
+    first.unmount();
+
+    renderPage();
+    await flush();
+    expect(groupHeader('group-b')).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  it('clears a stale saved group id', async () => {
+    setup(rows.slice(0, 1));
+    rememberGroup(999);
+    renderPage();
+    await flush();
+    expect(screen.queryByText('node-a')).not.toBeInTheDocument();
+    expect(window.localStorage.getItem('reality-panel:node-status:expanded-group')).toBeNull();
+  });
+
+  it('ignores malformed or unavailable localStorage without crashing', async () => {
+    setup();
+    window.localStorage.setItem('reality-panel:node-status:expanded-group', 'not-a-group');
+    renderPage();
+    await flush();
+    expect(screen.getByText('group-a')).toBeInTheDocument();
+    expect(screen.queryByText('node-a')).not.toBeInTheDocument();
+  });
 });
 afterEach(() => {
   vi.runOnlyPendingTimers();
@@ -62,6 +137,7 @@ describe('NodeStatus page data source', () => {
       return Promise.reject(new Error(`unexpected ${url}`));
     });
 
+    rememberGroup(1);
     renderPage();
     await flush();
 
@@ -95,6 +171,7 @@ describe('NodeStatus page data source', () => {
 
   it('mounts Relay preference management only for admin inbound groups', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
+    rememberGroup(1);
     mockGet.mockImplementation((url: string) => {
       if (url === '/nodes') return Promise.resolve(ok([
         adminNode,
@@ -233,6 +310,7 @@ describe('NodeStatus targeted diagnosis entry point', () => {
   function setup() {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     mockPost.mockResolvedValue(ok({ group_id: 1, node_id: 'n1', healthy: true, checks: [] }));
+    rememberGroup(1);
     mockGet.mockImplementation((url: string) => {
       if (url === '/nodes') return Promise.resolve(ok([adminNode]));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
@@ -303,6 +381,7 @@ describe('NodeStatus log drawer', () => {
 
   function mockLogPage(logs: string, action = 'logs') {
     mockUseAuth.mockReturnValue({ isAdmin: true });
+    rememberGroup(1);
     mockGet.mockImplementation((url: string) => {
       if (url === '/nodes') return Promise.resolve(ok([logNode]));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
@@ -370,6 +449,7 @@ describe('NodeStatus background lifecycle operations', () => {
 
   it('closes a running Drawer, cancels UI polling, and never reopens on a late response', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
+    rememberGroup(1);
     let resolvePoll!: (value: ReturnType<typeof ok<NodeOperation>>) => void;
     const latePoll = new Promise<ReturnType<typeof ok<NodeOperation>>>((resolve) => { resolvePoll = resolve; });
     mockGet.mockImplementation((url: string) => {
@@ -686,6 +766,7 @@ describe('NodeStatus rendered group order is stable across refreshes', () => {
 
   it('renders a multi-node group with stable node order (admin /nodes)', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
+    rememberGroup(1);
     mockGet.mockImplementation((url: string) => {
       if (url === '/nodes')
         return Promise.resolve(
