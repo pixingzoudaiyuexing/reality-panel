@@ -7,6 +7,18 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.16] - 2026-09-09
+
+### 修复
+
+- 同步线路功能测试与 v1.1.15 的最终 Tab 文案，并修正异步 Tab 内容挂载的测试等待，确保正式 Release 前端测试稳定通过。
+
+### 兼容性
+
+- 无业务功能变化，无数据库 migration。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.15 与 v1.1.16 功能实现一致，可直接升级。
+
 ## [1.1.15] - 2026-09-09
 
 ### 改进
