@@ -201,7 +201,7 @@ describe('NodeStatus page data source', () => {
         bindings: [],
         catalog_stale: false,
       }));
-      if (url === '/groups/1/carrier-lines') return Promise.resolve(ok({ lines: [], stale: false }));
+      if (url === '/groups/1/carrier-lines') return Promise.resolve(ok({ lines: [], stale: false, issues: [] }));
       if (url === '/admin/relay-schedules') return Promise.resolve(ok([]));
       return Promise.reject(new Error(`unexpected ${url}`));
     });
@@ -326,7 +326,7 @@ describe('NodeStatus targeted diagnosis entry point', () => {
         bindings: [],
         catalog_stale: false,
       }));
-      if (url === '/groups/1/carrier-lines') return Promise.resolve(ok({ lines: [], stale: false }));
+      if (url === '/groups/1/carrier-lines') return Promise.resolve(ok({ lines: [], stale: false, issues: [] }));
       if (url === '/admin/relay-schedules') return Promise.resolve(ok([]));
       return Promise.reject(new Error(`unexpected ${url}`));
     });

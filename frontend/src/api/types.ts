@@ -488,7 +488,31 @@ export interface CarrierLineCatalogItem {
 export interface CarrierLineCatalog {
   lines: CarrierLineCatalogItem[];
   stale: boolean;
+  issues: CarrierCatalogIssue[];
 }
+
+export interface CarrierCatalogIssueRule {
+  rule_id: number;
+  name: string;
+  sni: string;
+}
+
+export interface CarrierCatalogIssueZone {
+  domain_id: number;
+  zone: string;
+  provider_type: string | null;
+  line_count: number;
+  rules: CarrierCatalogIssueRule[];
+}
+
+export type CarrierCatalogIssue =
+  | { kind: 'no_eligible_rules' }
+  | {
+    kind: 'incompatible_line_catalogs';
+    reason: 'no_common_line_ids' | string;
+    actionable: { level: 'rule'; rule_id: number } | { level: 'zone'; domain_id: number } | null;
+    zones: CarrierCatalogIssueZone[];
+  };
 
 export interface CarrierAffinityBindingView extends CarrierLineBinding {
   effective_node_id: string | null;

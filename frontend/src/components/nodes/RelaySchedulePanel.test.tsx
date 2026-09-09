@@ -74,7 +74,7 @@ const carrierPolicy: CarrierPolicy = { bindings: [
   { line_id: 'Dianxin', mode: 'follow_default', node_id: null },
   { line_id: 'Liantong', mode: 'node', node_id: 'node-b' },
 ] };
-const carrierCatalog: CarrierLineCatalog = { stale: false, lines: [
+const carrierCatalog: CarrierLineCatalog = { stale: false, issues: [], lines: [
   { id: 'Dianxin', name: '电信', parent: null },
   { id: 'Liantong', name: '联通', parent: null },
 ] };

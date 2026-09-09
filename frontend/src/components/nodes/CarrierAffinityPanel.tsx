@@ -2,7 +2,7 @@ import { Alert, Button, Empty, Select, Space, Spin, Tag, Typography } from 'antd
 import { SaveOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import api from '../../api/client';
-import type { ApiEnvelope, CarrierAffinityView, CarrierLineBinding, CarrierLineCatalog, RelayDnsRecordView, RelayReadyNode, RoutingApplyRequest, RoutingApplyResult, RoutingMode } from '../../api/types';
+import type { ApiEnvelope, CarrierAffinityView, CarrierCatalogIssue, CarrierLineBinding, CarrierLineCatalog, RelayDnsRecordView, RelayReadyNode, RoutingApplyRequest, RoutingApplyResult, RoutingMode } from '../../api/types';
 import type { Tfn } from './types';
 import {
   assignCarrierLines,
@@ -51,6 +51,39 @@ function nodeLines(bindings: CarrierLineBinding[], nodeId: string, defaultNodeId
     .filter((binding) => binding.mode === 'node' ? binding.node_id === nodeId : defaultNodeId === nodeId)
     .map((binding) => binding.line_id)
     .sort((left, right) => left.localeCompare(right));
+}
+
+function CarrierCatalogIssueAlert({ issue, t }: { issue: CarrierCatalogIssue; t: Tfn }) {
+  if (issue.kind === 'no_eligible_rules') {
+    return <Alert type="warning" showIcon title={t('carrierNoEligibleRules')} style={{ margin: '10px 0' }} />;
+  }
+  const actionableRule = issue.actionable?.level === 'rule' ? issue.actionable.rule_id : null;
+  const actionableZone = issue.actionable?.level === 'zone' ? issue.actionable.domain_id : null;
+  return (
+    <Alert
+      type="error"
+      showIcon
+      title={t('carrierCatalogIncompatible')}
+      description={(
+        <Space orientation="vertical" size={4}>
+          <Text>{issue.actionable ? t('carrierCatalogActionable') : t('carrierCatalogAmbiguous')}</Text>
+          {issue.zones.map((zone) => (
+            <div key={zone.domain_id} data-testid={`carrier-issue-zone-${zone.domain_id}`}>
+              <Text strong={actionableZone === zone.domain_id}>{zone.zone}</Text>
+              <Text type="secondary"> {zone.provider_type ?? '-'} · {zone.line_count} {t('carrierCatalogLineCount')}</Text>
+              {zone.rules.map((rule) => (
+                <div key={rule.rule_id} style={{ marginLeft: 12 }}>
+                  <Text strong={actionableRule === rule.rule_id}>Rule {rule.rule_id} · {rule.name}</Text>
+                  <Text code style={{ marginLeft: 8, overflowWrap: 'anywhere' }}>{rule.sni}</Text>
+                </div>
+              ))}
+            </div>
+          ))}
+        </Space>
+      )}
+      style={{ margin: '10px 0' }}
+    />
+  );
 }
 
 export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalogChange, onAvailabilityChange, activeMode = 'normal', disabled = false, onApply, onDirtyChange }: Props) {
@@ -157,6 +190,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
       </div>
       {transactionBusy ? <Alert type="info" showIcon title={t('carrierBusy')} style={{ margin: '10px 0' }} /> : null}
       {catalog?.stale ? <Alert type="warning" showIcon title={t('carrierCatalogStale')} style={{ margin: '10px 0' }} /> : null}
+      {(catalog?.issues ?? []).map((issue, index) => <CarrierCatalogIssueAlert key={`${issue.kind}-${index}`} issue={issue} t={t} />)}
       {activeMode !== 'carrier' ? <Alert type="info" showIcon title={t('routingModeInactiveConfig')} style={{ margin: '10px 0' }} /> : null}
       {hasLegacyDefaultBinding ? <Alert type="warning" showIcon title={t('carrierLegacyDefaultBinding')} style={{ margin: '10px 0' }} /> : null}
       {view?.transaction.state === 'failed_manual_intervention' ? <Alert type="error" showIcon title={t('carrierSplitTitle')} description={t('carrierSplitDescription')} style={{ margin: '10px 0' }} /> : null}

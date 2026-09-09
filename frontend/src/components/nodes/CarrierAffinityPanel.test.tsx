@@ -20,6 +20,11 @@ const translations: Record<string, string> = {
   carrierErrorTransactionInProgress: '当前有线路事务正在执行',
   carrierErrorOwnershipUnverified: 'DNS 记录所有权无法确认',
   carrierErrorProviderPreflight: 'DNS 服务预检查失败',
+  carrierCatalogIncompatible: '发现不兼容的运营商分流规则，请调整',
+  carrierCatalogActionable: '已定位到可调整的规则或 DNS Zone。',
+  carrierCatalogAmbiguous: '这些规则对应的 DNS 线路目录没有共同可用线路。',
+  carrierCatalogLineCount: '条线路',
+  carrierNoEligibleRules: '当前没有可用于运营商分流的生效规则',
   carrierSaveFailed: '运营商线路策略应用失败',
   routingSaveAndActivate: '保存并启用',
   routingSaveChanges: '保存修改',
@@ -32,6 +37,7 @@ const nodes: RelayReadyNode[] = [
 ];
 const catalog: CarrierLineCatalog = {
   stale: false,
+  issues: [],
   lines: [
     { id: 'default', name: '全网默认', parent: null },
     { id: 'Dianxin', name: '电信', parent: null },
@@ -67,9 +73,9 @@ const applied = (over: Partial<RoutingApplyResult> = {}): RoutingApplyResult => 
 });
 const mockApply = vi.fn(async () => applied());
 
-function arrange(over: Partial<CarrierAffinityView> = {}, displayedNodes = nodes, activeMode: 'normal' | 'carrier' = 'normal') {
+function arrange(over: Partial<CarrierAffinityView> = {}, displayedNodes = nodes, activeMode: 'normal' | 'carrier' = 'normal', catalogResponse: CarrierLineCatalog = catalog) {
   const response = { ...view, ...over };
-  mockGet.mockImplementation((url: string) => Promise.resolve(ok(url.endsWith('/carrier-lines') ? catalog : response)));
+  mockGet.mockImplementation((url: string) => Promise.resolve(ok(url.endsWith('/carrier-lines') ? catalogResponse : response)));
   return render(<CarrierAffinityPanel groupId={7} nodes={displayedNodes} t={t} activeMode={activeMode} onApply={mockApply} />);
 }
 
@@ -188,5 +194,57 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     arrange({ transaction: { kind: 'carrier_policy_apply', state: 'switching', started_at: 'now', last_error: null, rollback_error: null } });
     expect(await screen.findByText('carrierBusy')).toBeInTheDocument();
     expect(screen.getByLabelText('node-a carrierLine')).toBeDisabled();
+  });
+
+  it('renders a specific actionable Rule warning without changing Apply payload', async () => {
+    arrange({}, nodes, 'normal', {
+      ...catalog,
+      lines: [{ id: 'default', name: '全网默认', parent: null }],
+      issues: [{
+        kind: 'incompatible_line_catalogs',
+        reason: 'no_common_line_ids',
+        actionable: { level: 'rule', rule_id: 15 },
+        zones: [
+          { domain_id: 10, zone: 'huawei.example', provider_type: 'huawei', line_count: 2, rules: [
+            { rule_id: 14, name: '美国1', sni: 'a.huawei.example' },
+            { rule_id: 16, name: '美国3', sni: 'b.huawei.example' },
+          ] },
+          { domain_id: 20, zone: 'cloudflare.example', provider_type: 'cloudflare', line_count: 1, rules: [
+            { rule_id: 15, name: '美国2', sni: 'apan1.cloudflare.example' },
+          ] },
+        ],
+      }],
+    });
+    expect(await screen.findByText('发现不兼容的运营商分流规则，请调整')).toBeInTheDocument();
+    expect(screen.getByText(/Rule 15 · 美国2/)).toBeInTheDocument();
+    expect(screen.getByText('apan1.cloudflare.example')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /保存并启用/ }));
+    await waitFor(() => expect(mockApply).toHaveBeenCalledWith({
+      mode: 'carrier',
+      default_node_id: 'node-a',
+      bindings: [{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }],
+    }));
+  });
+
+  it('renders ambiguous and no-eligible catalog warnings separately', async () => {
+    const ambiguous = arrange({}, nodes, 'normal', {
+      ...catalog,
+      issues: [{
+        kind: 'incompatible_line_catalogs',
+        reason: 'no_common_line_ids',
+        actionable: null,
+        zones: [
+          { domain_id: 10, zone: 'a.example', provider_type: 'a', line_count: 1, rules: [{ rule_id: 1, name: 'A', sni: 'a.example' }] },
+          { domain_id: 20, zone: 'b.example', provider_type: 'b', line_count: 1, rules: [{ rule_id: 2, name: 'B', sni: 'b.example' }] },
+        ],
+      }],
+    });
+    expect(await screen.findByText('这些规则对应的 DNS 线路目录没有共同可用线路。')).toBeInTheDocument();
+    ambiguous.unmount();
+    mockGet.mockReset();
+
+    arrange({}, nodes, 'normal', { ...catalog, issues: [{ kind: 'no_eligible_rules' }] });
+    expect(await screen.findByText('当前没有可用于运营商分流的生效规则')).toBeInTheDocument();
   });
 });
