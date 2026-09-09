@@ -377,6 +377,7 @@ pub struct RelayPreferenceView {
     pub group_id: i64,
     pub active_routing_mode: Option<RoutingMode>,
     pub pending_routing_mode: Option<RoutingMode>,
+    pub routing_mode_conflict: Vec<RoutingMode>,
     pub normal_default_node_id: Option<String>,
     pub preferred_node_id: Option<String>,
     pub preferred_node_public_ipv4: Option<String>,
@@ -1420,6 +1421,8 @@ fn active_transaction_references_node(preference: &RelayPreferenceState, node_id
         RelayPreferencePhase::Switching | RelayPreferencePhase::RollingBack
     ) && (preference.preferred_node_id.as_deref() == Some(node_id)
         || preference.pending_node_id.as_deref() == Some(node_id)
+        || preference.normal_default_node_id.as_deref() == Some(node_id)
+        || preference.carrier_policy.default_node_id.as_deref() == Some(node_id)
         || preference
             .carrier_policy
             .bindings
@@ -1429,10 +1432,11 @@ fn active_transaction_references_node(preference: &RelayPreferenceState, node_id
             .pending_carrier_policy
             .as_ref()
             .is_some_and(|policy| {
-                policy
-                    .bindings
-                    .iter()
-                    .any(|binding| binding.node_id.as_deref() == Some(node_id))
+                policy.default_node_id.as_deref() == Some(node_id)
+                    || policy
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.node_id.as_deref() == Some(node_id))
             }))
 }
 
@@ -1442,9 +1446,18 @@ fn remove_node_references(preference: &mut RelayPreferenceState, node_id: &str) 
         .bindings
         .retain(|binding| binding.node_id.as_deref() != Some(node_id));
     if let Some(pending) = preference.pending_carrier_policy.as_mut() {
+        if pending.default_node_id.as_deref() == Some(node_id) {
+            pending.default_node_id = None;
+        }
         pending
             .bindings
             .retain(|binding| binding.node_id.as_deref() != Some(node_id));
+    }
+    if preference.normal_default_node_id.as_deref() == Some(node_id) {
+        preference.normal_default_node_id = None;
+    }
+    if preference.carrier_policy.default_node_id.as_deref() == Some(node_id) {
+        preference.carrier_policy.default_node_id = None;
     }
     if preference.preferred_node_id.as_deref() == Some(node_id) {
         preference.preferred_node_id = None;
@@ -1597,6 +1610,40 @@ fn carrier_policy_diff(
             })
         })
         .collect()
+}
+
+fn carrier_policy_transaction_diff(
+    active: &CarrierPolicy,
+    requested: &CarrierPolicy,
+) -> Vec<CarrierPolicyChange> {
+    let mut changes = carrier_policy_diff(active, requested);
+    if active.default_node_id != requested.default_node_id {
+        let active_by_line = active
+            .bindings
+            .iter()
+            .map(|binding| (binding.line_id.as_str(), binding))
+            .collect::<BTreeMap<_, _>>();
+        for binding in requested
+            .bindings
+            .iter()
+            .filter(|binding| binding.mode == CarrierLineMode::FollowDefault)
+        {
+            if changes
+                .iter()
+                .all(|change| change.line_id != binding.line_id)
+            {
+                changes.push(CarrierPolicyChange {
+                    line_id: binding.line_id.clone(),
+                    old: active_by_line
+                        .get(binding.line_id.as_str())
+                        .map(|binding| (*binding).clone()),
+                    new: Some(binding.clone()),
+                });
+            }
+        }
+        changes.sort_by(|left, right| left.line_id.cmp(&right.line_id));
+    }
+    changes
 }
 
 async fn default_relay_value(
@@ -2104,7 +2151,7 @@ pub async fn start_carrier_policy_apply(
     }
     let active_policy = carrier_policy_without_default_authority(&preference.carrier_policy);
     let removed_legacy_default = active_policy != preference.carrier_policy;
-    let changes = carrier_policy_diff(&active_policy, &requested);
+    let changes = carrier_policy_transaction_diff(&active_policy, &requested);
     let default_changed = active_policy.default_node_id != requested.default_node_id;
     if active_mode != RoutingMode::Carrier {
         preference.carrier_policy = requested;
@@ -2153,20 +2200,6 @@ pub async fn start_carrier_policy_apply(
 
     let eligible_rule_ids =
         crate::service::dnsmgr::eligible_rule_ids_for_group(db, group_id).await?;
-    if eligible_rule_ids.is_empty() {
-        preference.carrier_policy = requested;
-        preference.pending_carrier_policy = None;
-        preference.transaction_kind = None;
-        preference.switch_source = None;
-        preference.state = RelayPreferencePhase::Idle;
-        preference.started_at = None;
-        preference.last_error = None;
-        preference.rollback_error = None;
-        preference.dns_records.clear();
-        store_preference(db, group_id, &preference).await?;
-        return Ok(CarrierPolicyApplyOutcome::CommittedWithoutDns);
-    }
-
     let evaluated = evaluate_group_nodes(db, node_connections, group_id)
         .await
         .map_err(|error| match error {
@@ -2220,11 +2253,25 @@ pub async fn start_carrier_policy_apply(
             let (_, value) = carrier_binding_target(
                 binding,
                 default_value.as_deref(),
-                preference.preferred_node_id.as_deref(),
+                requested.default_node_id.as_deref(),
                 &evaluated,
             )?;
             targets.insert(change.line_id.clone(), value);
         }
+    }
+    if eligible_rule_ids.is_empty() {
+        preference.preferred_node_id = requested.default_node_id.clone();
+        preference.carrier_policy = requested;
+        preference.pending_carrier_policy = None;
+        preference.transaction_kind = None;
+        preference.switch_source = None;
+        preference.state = RelayPreferencePhase::Idle;
+        preference.started_at = None;
+        preference.last_error = None;
+        preference.rollback_error = None;
+        preference.dns_records.clear();
+        store_preference(db, group_id, &preference).await?;
+        return Ok(CarrierPolicyApplyOutcome::CommittedWithoutDns);
     }
     let client = crate::service::dnsmgr::load_client(db)
         .await
@@ -2415,6 +2462,14 @@ pub async fn transition_routing_mode(
     if records.is_empty() {
         preference.active_routing_mode = Some(target_mode);
         preference.pending_routing_mode = None;
+        preference.pending_node_id = None;
+        preference.transaction_kind = None;
+        preference.switch_source = None;
+        preference.state = RelayPreferencePhase::Idle;
+        preference.started_at = None;
+        preference.last_error = None;
+        preference.rollback_error = None;
+        preference.dns_records.clear();
         store_preference(db, group_id, &preference).await?;
         return Ok(RoutingModeTransitionOutcome::CommittedWithoutDns);
     }
@@ -2897,7 +2952,9 @@ async fn start_relay_switch_locked(
         &target_public_ipv4,
     )
     .await?;
-    if carrier_policy_has_follow_default_bindings(&preference.carrier_policy) {
+    if active_mode == RoutingMode::Carrier
+        && carrier_policy_has_follow_default_bindings(&preference.carrier_policy)
+    {
         let client = crate::service::dnsmgr::load_client(db)
             .await
             .map_err(|error| StartRelaySwitchError::CarrierDnsPreflightFailed(error.to_string()))?
@@ -3268,6 +3325,9 @@ async fn finalize_rollback(
         return Ok(FinalizeOutcome::Pending);
     }
     preference.state = RelayPreferencePhase::FailedRolledBack;
+    if preference.transaction_kind == Some(RelayTransactionKind::RoutingModeTransition) {
+        preference.pending_routing_mode = None;
+    }
     preference.rollback_error = None;
     let error = preference
         .last_error
@@ -3590,7 +3650,10 @@ async fn recheck_carrier_commit_targets(
         };
         let node_id = match binding.mode {
             CarrierLineMode::Node => binding.node_id.as_deref(),
-            CarrierLineMode::FollowDefault => preference.preferred_node_id.as_deref(),
+            CarrierLineMode::FollowDefault => pending
+                .default_node_id
+                .as_deref()
+                .or(preference.preferred_node_id.as_deref()),
         };
         let Some(node_id) = node_id else {
             let Some(current_value) = valid_public_ipv4(Some(&group.connect_host)) else {
@@ -4062,7 +4125,16 @@ pub async fn get_relay_preference(
     node_connections: &NodeConnections,
     group_id: i64,
 ) -> Result<RelayPreferenceView, RelayPreferenceError> {
-    let preference = ensure_preference_initialized(db, node_connections, group_id).await?;
+    let preference = match ensure_preference_initialized(db, node_connections, group_id).await {
+        Ok(preference) => preference,
+        Err(RelayPreferenceError::RoutingModeConflict(_)) => load_preference(db, group_id).await?,
+        Err(error) => return Err(error),
+    };
+    let routing_mode_conflict = if preference.active_routing_mode.is_none() {
+        legacy_conflict_modes(db, group_id, &preference).await?
+    } else {
+        Vec::new()
+    };
     let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
     let mut dns_records = Vec::with_capacity(preference.dns_records.len());
     for record in &preference.dns_records {
@@ -4129,6 +4201,7 @@ pub async fn get_relay_preference(
         group_id,
         active_routing_mode: preference.active_routing_mode,
         pending_routing_mode: preference.pending_routing_mode,
+        routing_mode_conflict,
         normal_default_node_id: preference.normal_default_node_id,
         preferred_node_id,
         preferred_node_public_ipv4: preferred_ip,
@@ -4489,6 +4562,25 @@ mod tests {
             Err(RelayPreferenceError::RoutingModeConflict(modes))
                 if modes == vec![RoutingMode::Carrier, RoutingMode::Schedule]
         ));
+        store_preference(&repo, 7, &preference).await.unwrap();
+        let preference_view = get_relay_preference(&repo, &NodeConnections::new(), 7)
+            .await
+            .unwrap();
+        assert_eq!(preference_view.active_routing_mode, None);
+        assert_eq!(
+            preference_view.routing_mode_conflict,
+            vec![RoutingMode::Carrier, RoutingMode::Schedule]
+        );
+        let mode_view = get_routing_mode(&repo, 7).await.unwrap();
+        assert_eq!(mode_view.active_mode, None);
+        assert_eq!(
+            mode_view.conflict_modes,
+            vec![RoutingMode::Carrier, RoutingMode::Schedule]
+        );
+        assert_eq!(
+            load_preference(&repo, 7).await.unwrap().active_routing_mode,
+            None
+        );
 
         repo.delete(crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY)
             .await
@@ -4553,6 +4645,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inactive_carrier_config_cannot_join_a_normal_default_transaction() {
+        let (repo, connections, _) = switch_fixture().await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Normal);
+        preference.normal_default_node_id = preference.preferred_node_id.clone();
+        preference.carrier_policy = CarrierPolicy {
+            default_node_id: Some("node-a".into()),
+            bindings: vec![carrier_binding(
+                "Dianxin",
+                CarrierLineMode::FollowDefault,
+                None,
+            )],
+        };
+        store_preference(&repo, 7, &preference).await.unwrap();
+
+        assert!(matches!(
+            start_relay_switch(&repo, &connections, 7, "node-c").await,
+            Ok(StartRelaySwitchOutcome::Started { .. })
+        ));
+        let switching = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(switching.switch_source, Some(RelaySwitchSource::Manual));
+        assert!(switching
+            .dns_records
+            .iter()
+            .all(|record| record.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY));
+    }
+
+    #[tokio::test]
     async fn non_dns_mode_transitions_commit_without_intermediate_normal() {
         let (repo, connections, _) = switch_fixture().await;
         repo.set(
@@ -4586,6 +4706,73 @@ mod tests {
         assert_eq!(switched.active_routing_mode, Some(RoutingMode::Failover));
         assert_eq!(switched.pending_routing_mode, None);
         assert_eq!(switched.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(
+            transition_routing_mode(&repo, &connections, 7, RoutingMode::Schedule)
+                .await
+                .unwrap(),
+            RoutingModeTransitionOutcome::CommittedWithoutDns
+        );
+        assert_eq!(
+            transition_routing_mode(&repo, &connections, 7, RoutingMode::Normal)
+                .await
+                .unwrap(),
+            RoutingModeTransitionOutcome::CommittedWithoutDns
+        );
+        let normal = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(normal.active_routing_mode, Some(RoutingMode::Normal));
+        assert_eq!(normal.pending_routing_mode, None);
+        assert_eq!(normal.preferred_node_id.as_deref(), Some("node-a"));
+    }
+
+    #[tokio::test]
+    async fn empty_mode_journal_commit_clears_previous_terminal_transaction_state() {
+        let (repo, connections, _) = switch_fixture().await;
+        repo.set(
+            crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY,
+            r#"[{"id":"schedule-a","group_id":7,"target_node_id":"node-b","schedule_type":"daily","enabled":true,"created_at":"x","updated_at":"x","execute_at":null,"time":"12:00","utc_offset_minutes":0,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null}]"#,
+        )
+        .await
+        .unwrap();
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Carrier);
+        preference.pending_routing_mode = Some(RoutingMode::Normal);
+        preference.normal_default_node_id = preference.preferred_node_id.clone();
+        preference.carrier_policy = CarrierPolicy {
+            default_node_id: preference.preferred_node_id.clone(),
+            bindings: Vec::new(),
+        };
+        preference.pending_node_id = Some("node-b".into());
+        preference.transaction_kind = Some(RelayTransactionKind::RoutingModeTransition);
+        preference.switch_source = Some(RelaySwitchSource::ModeTransition);
+        preference.state = RelayPreferencePhase::FailedRolledBack;
+        preference.started_at = Some("2026-09-09T00:00:00Z".into());
+        preference.last_error = Some("DNS_PROVIDER_FAILED".into());
+        preference.dns_records = vec![carrier_record(
+            1,
+            "Dianxin",
+            RelayDnsAction::Delete,
+            None,
+            RelayDnsAction::Upsert,
+            Some("203.0.113.5"),
+        )];
+        store_preference(&repo, 7, &preference).await.unwrap();
+
+        assert_eq!(
+            transition_routing_mode(&repo, &connections, 7, RoutingMode::Schedule)
+                .await
+                .unwrap(),
+            RoutingModeTransitionOutcome::CommittedWithoutDns
+        );
+        let committed = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(committed.active_routing_mode, Some(RoutingMode::Schedule));
+        assert_eq!(committed.pending_routing_mode, None);
+        assert_eq!(committed.pending_node_id, None);
+        assert_eq!(committed.transaction_kind, None);
+        assert_eq!(committed.switch_source, None);
+        assert_eq!(committed.state, RelayPreferencePhase::Idle);
+        assert_eq!(committed.started_at, None);
+        assert_eq!(committed.last_error, None);
+        assert!(committed.dns_records.is_empty());
     }
 
     #[tokio::test]
@@ -4611,6 +4798,66 @@ mod tests {
         assert_eq!(unchanged.active_routing_mode, Some(RoutingMode::Normal));
         assert_eq!(unchanged.pending_routing_mode, None);
         assert!(unchanged.dns_records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_carrier_without_dns_rules_still_validates_and_commits_its_default() {
+        let (repo, connections, _) = switch_fixture().await;
+        set_rule_paused(&repo, 1, true).await;
+        set_rule_paused(&repo, 3, true).await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Carrier);
+        preference.normal_default_node_id = Some("node-a".into());
+        preference.carrier_policy = CarrierPolicy {
+            default_node_id: Some("node-a".into()),
+            bindings: Vec::new(),
+        };
+        store_preference(&repo, 7, &preference).await.unwrap();
+
+        assert!(matches!(
+            start_carrier_policy_apply(
+                &repo,
+                &connections,
+                7,
+                CarrierPolicy {
+                    default_node_id: Some("missing-node".into()),
+                    bindings: Vec::new(),
+                },
+            )
+            .await,
+            Err(CarrierPolicyApplyError::NodeNotInGroup(node_id))
+                if node_id == "missing-node"
+        ));
+        assert_eq!(
+            load_preference(&repo, 7)
+                .await
+                .unwrap()
+                .preferred_node_id
+                .as_deref(),
+            Some("node-a")
+        );
+        assert_eq!(
+            start_carrier_policy_apply(
+                &repo,
+                &connections,
+                7,
+                CarrierPolicy {
+                    default_node_id: Some("node-c".into()),
+                    bindings: Vec::new(),
+                },
+            )
+            .await
+            .unwrap(),
+            CarrierPolicyApplyOutcome::CommittedWithoutDns
+        );
+        let committed = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(committed.preferred_node_id.as_deref(), Some("node-c"));
+        assert_eq!(
+            committed.carrier_policy.default_node_id.as_deref(),
+            Some("node-c")
+        );
+        assert_eq!(committed.normal_default_node_id.as_deref(), Some("node-a"));
+        assert!(committed.dns_records.is_empty());
     }
 
     #[tokio::test]
@@ -4697,6 +4944,7 @@ mod tests {
         ));
         let rolled_back = load_preference(&repo, 7).await.unwrap();
         assert_eq!(rolled_back.active_routing_mode, Some(RoutingMode::Normal));
+        assert_eq!(rolled_back.pending_routing_mode, None);
         assert_eq!(rolled_back.preferred_node_id.as_deref(), Some("node-a"));
         assert_eq!(rolled_back.state, RelayPreferencePhase::FailedRolledBack);
     }
@@ -4833,15 +5081,27 @@ mod tests {
             RelayPreferencePhase::RollingBack,
         ] {
             let preference = RelayPreferenceState {
+                normal_default_node_id: Some("node-c".into()),
                 preferred_node_id: Some("node-a".into()),
                 pending_node_id: Some("node-b".into()),
+                carrier_policy: CarrierPolicy {
+                    default_node_id: Some("node-d".into()),
+                    bindings: Vec::new(),
+                },
+                pending_carrier_policy: Some(CarrierPolicy {
+                    default_node_id: Some("node-e".into()),
+                    bindings: Vec::new(),
+                }),
                 state: phase,
                 transaction_kind: Some(RelayTransactionKind::PreferredSwitch),
                 ..RelayPreferenceState::default()
             };
             assert!(active_transaction_references_node(&preference, "node-a"));
             assert!(active_transaction_references_node(&preference, "node-b"));
-            assert!(!active_transaction_references_node(&preference, "node-c"));
+            assert!(active_transaction_references_node(&preference, "node-c"));
+            assert!(active_transaction_references_node(&preference, "node-d"));
+            assert!(active_transaction_references_node(&preference, "node-e"));
+            assert!(!active_transaction_references_node(&preference, "node-f"));
         }
         let idle = RelayPreferenceState {
             preferred_node_id: Some("node-a".into()),
@@ -4854,11 +5114,12 @@ mod tests {
     #[test]
     fn terminal_uninstall_cleanup_removes_every_node_reference() {
         let mut preference = RelayPreferenceState {
+            normal_default_node_id: Some("node-a".into()),
             preferred_node_id: Some("node-a".into()),
             pending_node_id: Some("node-a".into()),
             state: RelayPreferencePhase::FailedRolledBack,
             carrier_policy: CarrierPolicy {
-                default_node_id: None,
+                default_node_id: Some("node-a".into()),
                 bindings: vec![carrier_binding(
                     "Dianxin",
                     CarrierLineMode::Node,
@@ -4866,7 +5127,7 @@ mod tests {
                 )],
             },
             pending_carrier_policy: Some(CarrierPolicy {
-                default_node_id: None,
+                default_node_id: Some("node-a".into()),
                 bindings: vec![carrier_binding(
                     "Liantong",
                     CarrierLineMode::Node,
@@ -4878,6 +5139,8 @@ mod tests {
         remove_node_references(&mut preference, "node-a");
         assert_eq!(preference.preferred_node_id, None);
         assert_eq!(preference.pending_node_id, None);
+        assert_eq!(preference.normal_default_node_id, None);
+        assert_eq!(preference.carrier_policy.default_node_id, None);
         assert!(preference.carrier_policy.bindings.is_empty());
         assert!(preference
             .pending_carrier_policy
@@ -4885,6 +5148,14 @@ mod tests {
             .unwrap()
             .bindings
             .is_empty());
+        assert_eq!(
+            preference
+                .pending_carrier_policy
+                .as_ref()
+                .unwrap()
+                .default_node_id,
+            None
+        );
     }
 
     #[test]
@@ -5732,6 +6003,26 @@ mod tests {
     }
 
     #[test]
+    fn carrier_default_change_reschedules_every_follow_default_line() {
+        let active = CarrierPolicy {
+            default_node_id: Some("node-a".into()),
+            bindings: vec![
+                carrier_binding("Dianxin", CarrierLineMode::FollowDefault, None),
+                carrier_binding("Liantong", CarrierLineMode::Node, Some("node-c")),
+            ],
+        };
+        let requested = CarrierPolicy {
+            default_node_id: Some("node-b".into()),
+            bindings: active.bindings.clone(),
+        };
+
+        let changes = carrier_policy_transaction_diff(&active, &requested);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].line_id, "Dianxin");
+        assert_eq!(changes[0].old, changes[0].new);
+    }
+
+    #[test]
     fn carrier_transaction_records_cannot_claim_default_line_authority() {
         let provider_specific = vec![carrier_record(
             1,
@@ -5840,6 +6131,52 @@ mod tests {
             )
             .unwrap(),
             (Some("node-c".into()), Some("203.0.113.7".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_default_health_failure_keeps_last_default_and_mode() {
+        let (repo, _, _) = switch_fixture().await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Carrier);
+        preference.normal_default_node_id = Some("node-b".into());
+        preference.preferred_node_id = Some("node-a".into());
+        preference.carrier_policy = CarrierPolicy {
+            default_node_id: Some("node-a".into()),
+            bindings: Vec::new(),
+        };
+        store_preference(&repo, 7, &preference).await.unwrap();
+        crate::service::dnsmgr::schedule_rule(&repo, 1)
+            .await
+            .unwrap();
+
+        repo.set(
+            "node_status:7:node-a",
+            &status(serde_json::json!({
+                "public_ipv4": "203.0.113.5",
+                "active_listener_rule_ids": [1, 3],
+                "reconciliation": {"state": "APPLY_FAILED", "recovery_source": "NONE"}
+            })),
+        )
+        .await
+        .unwrap();
+        crate::service::dnsmgr::schedule_rule(&repo, 1)
+            .await
+            .unwrap();
+
+        let default = repo
+            .find_dns_record_sync(1, crate::service::dnsmgr::DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(default.desired_action, "UPSERT");
+        assert_eq!(default.expected_value.as_deref(), Some("203.0.113.5"));
+        let unchanged = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(unchanged.active_routing_mode, Some(RoutingMode::Carrier));
+        assert_eq!(unchanged.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(
+            unchanged.carrier_policy.default_node_id.as_deref(),
+            Some("node-a")
         );
     }
 

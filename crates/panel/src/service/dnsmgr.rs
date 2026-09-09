@@ -3689,6 +3689,143 @@ mod tests {
         assert_eq!(carrier.preferred_node_id.as_deref(), Some("node-b"));
         assert_eq!(carrier.normal_default_node_id.as_deref(), Some("node-a"));
 
+        let mut updated_policy = policy.clone();
+        updated_policy.default_node_id = Some("node-a".into());
+        assert_eq!(
+            crate::service::relay_preference::start_carrier_policy_apply(
+                &db,
+                &connections,
+                10,
+                updated_policy.clone(),
+            )
+            .await
+            .unwrap(),
+            crate::service::relay_preference::CarrierPolicyApplyOutcome::Started
+        );
+        let updating: RelayPreferenceState =
+            serde_json::from_str(&db.get("relay_preference:10").await.unwrap().unwrap()).unwrap();
+        assert_eq!(updating.dns_records.len(), 2);
+        assert_eq!(
+            updating
+                .dns_records
+                .iter()
+                .map(|record| record.line_key.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([DEFAULT_LINE_KEY, "dnsmgr:Dianxin"])
+        );
+        assert!(updating
+            .dns_records
+            .iter()
+            .all(|record| record.target_value.as_deref() == Some("192.0.2.20")));
+        for sync in db.list_dns_record_syncs_for_rule(100).await.unwrap() {
+            reconcile_one(&db, sync, &mock.client).await;
+        }
+        crate::service::relay_preference::finalize_switching_group_for_test(&db, &connections, 10)
+            .await
+            .unwrap();
+        let updated: RelayPreferenceState =
+            serde_json::from_str(&db.get("relay_preference:10").await.unwrap().unwrap()).unwrap();
+        assert_eq!(updated.carrier_policy, updated_policy);
+        assert_eq!(updated.preferred_node_id.as_deref(), Some("node-a"));
+
+        db.set(
+            crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY,
+            r#"[{"id":"schedule-a","group_id":10,"target_node_id":"node-b","schedule_type":"daily","enabled":true,"created_at":"x","updated_at":"x","execute_at":null,"time":"12:00","utc_offset_minutes":0,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null}]"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::service::relay_preference::transition_routing_mode(
+                &db,
+                &connections,
+                10,
+                RoutingMode::Schedule,
+            )
+            .await
+            .unwrap(),
+            RoutingModeTransitionOutcome::Started
+        );
+        let carrier_to_schedule: RelayPreferenceState =
+            serde_json::from_str(&db.get("relay_preference:10").await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            carrier_to_schedule.active_routing_mode,
+            Some(RoutingMode::Carrier)
+        );
+        assert_eq!(
+            carrier_to_schedule.pending_routing_mode,
+            Some(RoutingMode::Schedule)
+        );
+        assert!(carrier_to_schedule
+            .dns_records
+            .iter()
+            .all(|record| record.line_key != DEFAULT_LINE_KEY));
+        for sync in db.list_dns_record_syncs_for_rule(100).await.unwrap() {
+            reconcile_one(&db, sync, &mock.client).await;
+        }
+        crate::service::relay_preference::finalize_switching_group_for_test(&db, &connections, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RelayPreferenceState>(
+                &db.get("relay_preference:10").await.unwrap().unwrap()
+            )
+            .unwrap()
+            .active_routing_mode,
+            Some(RoutingMode::Schedule)
+        );
+
+        for target_mode in [
+            RoutingMode::Carrier,
+            RoutingMode::Failover,
+            RoutingMode::Carrier,
+        ] {
+            let expected_source = match target_mode {
+                RoutingMode::Carrier => {
+                    let current: RelayPreferenceState = serde_json::from_str(
+                        &db.get("relay_preference:10").await.unwrap().unwrap(),
+                    )
+                    .unwrap();
+                    current.active_routing_mode.unwrap()
+                }
+                RoutingMode::Failover => RoutingMode::Carrier,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                crate::service::relay_preference::transition_routing_mode(
+                    &db,
+                    &connections,
+                    10,
+                    target_mode,
+                )
+                .await
+                .unwrap(),
+                RoutingModeTransitionOutcome::Started
+            );
+            let pending: RelayPreferenceState =
+                serde_json::from_str(&db.get("relay_preference:10").await.unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(pending.active_routing_mode, Some(expected_source));
+            assert_eq!(pending.pending_routing_mode, Some(target_mode));
+            for sync in db.list_dns_record_syncs_for_rule(100).await.unwrap() {
+                reconcile_one(&db, sync, &mock.client).await;
+            }
+            crate::service::relay_preference::finalize_switching_group_for_test(
+                &db,
+                &connections,
+                10,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                serde_json::from_str::<RelayPreferenceState>(
+                    &db.get("relay_preference:10").await.unwrap().unwrap()
+                )
+                .unwrap()
+                .active_routing_mode,
+                Some(target_mode)
+            );
+        }
+
         assert_eq!(
             crate::service::relay_preference::transition_routing_mode(
                 &db,
@@ -3714,7 +3851,7 @@ mod tests {
             serde_json::from_str(&db.get("relay_preference:10").await.unwrap().unwrap()).unwrap();
         assert_eq!(normal.active_routing_mode, Some(RoutingMode::Normal));
         assert_eq!(normal.preferred_node_id.as_deref(), Some("node-a"));
-        assert_eq!(normal.carrier_policy, policy);
+        assert_eq!(normal.carrier_policy, updated_policy);
         assert!(normal.pending_routing_mode.is_none());
     }
 
