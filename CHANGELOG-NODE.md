@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.14] - 2026-09-09
+
+统一版本发布。本次线路模式、Carrier 全网默认及 NodeStatus UX 改动均位于 Panel；relay-node 没有功能代码变化。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.13 relay-node 与 v1.1.14 Panel 功能兼容；v1.1.14 Node artifact 仅同步发布版本号。
+
 ## [1.1.13] - 2026-09-08
 
 统一版本发布。本次 Hotfix 仅修改 Panel backend/frontend；relay-node 没有功能代码变化。
