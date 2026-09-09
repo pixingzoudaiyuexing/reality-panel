@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.17] - 2026-09-09
+
+统一版本发布。本次仅修正 Panel 前端线路提交结果提示；relay-node 没有功能代码变化。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.16 relay-node 与 v1.1.17 Panel 功能兼容；v1.1.17 Node artifact 仅同步发布版本号。
+
 ## [1.1.16] - 2026-09-09
 
 统一版本发布。本次仅修正 Panel 前端测试；relay-node 没有功能代码变化。
