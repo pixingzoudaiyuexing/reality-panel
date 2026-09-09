@@ -1493,8 +1493,8 @@ pub struct CreateRuleRequest {
     /// target directly, no outbound group needed).
     #[serde(default)]
     pub device_group_out: Option<i64>,
-    /// "group" (default) = forward via outbound group; "direct" = inbound
-    /// connects to target_addr:target_port directly.
+    /// "direct" (default) = inbound connects to target_addr:target_port
+    /// directly. Legacy "group" requests are rejected by the current API.
     #[serde(default = "default_forward_mode")]
     pub forward_mode: String,
     /// v0.4.0: forwarding topology. Defaults to Direct. The panel accepts
@@ -1544,7 +1544,7 @@ pub struct CreateRuleRequest {
 }
 
 fn default_forward_mode() -> String {
-    "group".to_string()
+    "direct".to_string()
 }
 
 /// Update an existing rule. All fields optional — only provided fields are
@@ -1823,6 +1823,41 @@ impl<T: Serialize> ApiResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn create_rule_json() -> serde_json::Value {
+        serde_json::json!({
+            "name": "test-rule",
+            "protocol": "tcp",
+            "device_group_in": 1,
+            "target_addr": "127.0.0.1",
+            "target_port": 443
+        })
+    }
+
+    #[test]
+    fn create_rule_omitted_forward_mode_defaults_to_direct() {
+        let request: CreateRuleRequest = serde_json::from_value(create_rule_json()).unwrap();
+        assert_eq!(request.forward_mode, "direct");
+    }
+
+    #[test]
+    fn create_rule_explicit_forward_mode_is_preserved() {
+        let mut value = create_rule_json();
+        value["forward_mode"] = serde_json::json!("direct");
+        let direct: CreateRuleRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(direct.forward_mode, "direct");
+
+        let mut value = create_rule_json();
+        value["forward_mode"] = serde_json::json!("group");
+        let group: CreateRuleRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(group.forward_mode, "group");
+    }
+
+    #[test]
+    fn update_rule_omitted_forward_mode_remains_none() {
+        let request: UpdateRuleRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(request.forward_mode, None);
+    }
 
     // ── PublicTransport / NodeTransport / RouteMode parsing ──
 
