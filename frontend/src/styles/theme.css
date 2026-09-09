@@ -1006,10 +1006,6 @@ html, body, #root {
     flex-direction: column;
   }
 
-  .rp-routing-mode-control .ant-segmented {
-    width: 100%;
-  }
-
   .rp-ssh-row {
     grid-template-columns: 28px minmax(0, 1fr);
   }

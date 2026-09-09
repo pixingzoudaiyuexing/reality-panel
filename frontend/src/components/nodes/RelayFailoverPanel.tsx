@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Button, InputNumber, Space, Spin, Switch, Tag, Typography, message } from 'antd';
+import { Alert, Button, InputNumber, Space, Spin, Tag, Typography, message } from 'antd';
 import { SaveOutlined, UndoOutlined } from '@ant-design/icons';
 import api from '../../api/client';
-import type { ApiEnvelope, RelayFailoverView } from '../../api/types';
+import type { ApiEnvelope, RelayFailoverView, RoutingApplyRequest, RoutingApplyResult } from '../../api/types';
 import type { Tfn } from './types';
 import { relayReadyReasonLabel } from './shared';
 
@@ -11,8 +11,10 @@ const { Text } = Typography;
 interface Props {
   groupId: number;
   t: Tfn;
-  routingManaged?: boolean;
   active?: boolean;
+  disabled?: boolean;
+  onApply: (request: RoutingApplyRequest) => Promise<RoutingApplyResult | null>;
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 function requestError(error: unknown, fallback: string): string {
@@ -36,7 +38,7 @@ function errorLabel(error: string, t: Tfn): string {
   return error === 'NO_AVAILABLE_CANDIDATES' ? t('relayFailoverNoCandidates') : error;
 }
 
-export function RelayFailoverPanel({ groupId, t, routingManaged = false, active = false }: Props) {
+export function RelayFailoverPanel({ groupId, t, active = false, disabled = false, onApply, onDirtyChange }: Props) {
   const [view, setView] = useState<RelayFailoverView | null>(null);
   const [port, setPort] = useState<number>(443);
   const [failureAfter, setFailureAfter] = useState<number>(5);
@@ -78,27 +80,24 @@ export function RelayFailoverPanel({ groupId, t, routingManaged = false, active 
   }, [load]);
 
   useEffect(() => {
-    if (!view?.enabled) return;
+    if (!active) return;
     const timer = window.setInterval(() => void load(true), 2000);
     return () => window.clearInterval(timer);
-  }, [load, view?.enabled]);
+  }, [active, load]);
 
-  const update = async (enabled: boolean) => {
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
+
+  const update = async () => {
     setSaving(true);
     try {
-      const response = await api.put<unknown, ApiEnvelope<RelayFailoverView>>(
-        `/groups/${groupId}/relay-failover`,
-        {
-          enabled,
-          health_check_port: port,
-          failure_after_seconds: failureAfter,
-        },
-      );
-      if (response.code !== 0 || !response.data) throw new Error(response.message);
-      applyView(response.data);
-      message.success(t('relayFailoverSaved'));
-    } catch (error) {
-      message.error(requestError(error, t('relayFailoverSaveFailed')));
+      const result = await onApply({
+        mode: 'failover',
+        health_check_port: port,
+        failure_after_seconds: failureAfter,
+      });
+      if (result?.config_saved) await load();
     } finally {
       setSaving(false);
     }
@@ -140,17 +139,7 @@ export function RelayFailoverPanel({ groupId, t, routingManaged = false, active 
           <div className="rp-failover-settings">
             <div className="rp-failover-setting rp-failover-toggle-setting">
               <Text>{t('relayFailoverEnabled')}</Text>
-              {routingManaged ? (
-                <Tag color={active ? 'green' : undefined}>{t(active ? 'routingModeActive' : 'routingModeInactive')}</Tag>
-              ) : (
-                <Switch
-                  aria-label={t('relayFailoverEnabled')}
-                  checked={view.enabled}
-                  loading={saving}
-                  style={{ alignSelf: 'flex-start' }}
-                  onChange={(checked) => void update(checked)}
-                />
-              )}
+              <Tag color={active ? 'green' : undefined}>{t(active ? 'routingModeActive' : 'routingModeInactive')}</Tag>
             </div>
             <div className="rp-failover-setting">
               <Text>{t('relayFailoverHealthCheck')}</Text>
@@ -193,11 +182,11 @@ export function RelayFailoverPanel({ groupId, t, routingManaged = false, active 
               size="small"
               type="primary"
               icon={<SaveOutlined />}
-              disabled={!dirty || port < 1 || port > 65535 || failureAfter < 1 || failureAfter > 86400}
+              disabled={disabled || (active && !dirty) || port < 1 || port > 65535 || failureAfter < 1 || failureAfter > 86400}
               loading={saving}
-              onClick={() => void update(routingManaged ? true : view.enabled)}
+              onClick={() => void update()}
             >
-              {t('save')}
+              {t(active ? 'routingSaveChanges' : 'routingSaveAndActivate')}
             </Button>
           </div>
 

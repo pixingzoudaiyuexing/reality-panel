@@ -462,6 +462,23 @@ export interface RoutingModeView {
   conflict_modes: RoutingMode[];
 }
 
+export type RoutingApplyRequest =
+  | { mode: 'normal'; default_node_id: string }
+  | { mode: 'carrier'; default_node_id: string | null; bindings: CarrierLineBinding[] }
+  | { mode: 'schedule' }
+  | { mode: 'failover'; health_check_port: number; failure_after_seconds: number };
+
+export interface RoutingApplyResult {
+  config_saved: boolean;
+  activation_requested: boolean;
+  activation_succeeded: boolean;
+  active_mode: RoutingMode | null;
+  target_mode: RoutingMode;
+  transition_state: RelayPreferencePhase;
+  business_error_code: string | null;
+  message: string;
+}
+
 export interface CarrierLineCatalogItem {
   id: string;
   name: string;

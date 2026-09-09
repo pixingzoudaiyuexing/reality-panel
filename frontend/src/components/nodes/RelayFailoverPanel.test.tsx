@@ -1,17 +1,17 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ApiEnvelope, RelayFailoverView } from '../../api/types';
+import type { ApiEnvelope, RelayFailoverView, RoutingApplyResult } from '../../api/types';
 import { zhCN } from '../../i18n/zh-CN';
 import type { Tfn } from './types';
 
-const { mockGet, mockPut, mockPost } = vi.hoisted(() => ({
+const { mockGet, mockPost, mockApply } = vi.hoisted(() => ({
   mockGet: vi.fn(),
-  mockPut: vi.fn(),
   mockPost: vi.fn(),
+  mockApply: vi.fn(),
 }));
 
 vi.mock('../../api/client', () => ({
-  default: { get: mockGet, put: mockPut, post: mockPost },
+  default: { get: mockGet, post: mockPost },
 }));
 
 import { RelayFailoverPanel } from './RelayFailoverPanel';
@@ -71,15 +71,24 @@ function failover(over: Partial<RelayFailoverView> = {}): RelayFailoverView {
 
 beforeEach(() => {
   mockGet.mockReset();
-  mockPut.mockReset();
   mockPost.mockReset();
+  mockApply.mockReset();
   mockGet.mockResolvedValue(ok(failover()));
-  mockPut.mockResolvedValue(ok(failover({ enabled: true })));
   mockPost.mockResolvedValue(ok(failover({ excluded_failed_node_ids: [] })));
+  mockApply.mockResolvedValue({
+    config_saved: true,
+    activation_requested: true,
+    activation_succeeded: true,
+    active_mode: 'failover',
+    target_mode: 'failover',
+    transition_state: 'idle',
+    business_error_code: null,
+    message: 'ok',
+  } satisfies RoutingApplyResult);
 });
 
-async function renderPanel() {
-  render(<RelayFailoverPanel groupId={10} t={t} />);
+async function renderPanel(active = false) {
+  render(<RelayFailoverPanel groupId={10} t={t} active={active} onApply={mockApply} />);
   await screen.findByTestId('relay-failover-10');
 }
 
@@ -98,22 +107,20 @@ describe('RelayFailoverPanel', () => {
     expect(within(excluded).getByRole('button', { name: /重新纳入备选/ })).toBeEnabled();
   });
 
-  it('uses a compact default switch and no longer describes fallback as random', async () => {
+  it('shows read-only inactive status and no independent authority switch', async () => {
     await renderPanel();
-    const toggle = screen.getByRole('switch', { name: '自动故障切换' });
-    expect(toggle).toHaveStyle({ alignSelf: 'flex-start' });
-    expect(toggle.closest('.rp-failover-toggle-setting')).toBeInTheDocument();
+    expect(screen.getByText('未启用')).toBeInTheDocument();
+    expect(screen.queryByRole('switch', { name: '自动故障切换' })).toBeNull();
     expect(screen.getByText(/同组已就绪且检查正常的可用节点/)).toBeInTheDocument();
     expect(screen.queryByText(/随机选择/)).toBeNull();
   });
 
-  it('enables failover with the current validated settings', async () => {
+  it('saves and activates failover with the current validated settings', async () => {
     await renderPanel();
-    fireEvent.click(screen.getByRole('switch', { name: '自动故障切换' }));
-    await waitFor(() => expect(mockPut).toHaveBeenCalledWith(
-      '/groups/10/relay-failover',
-      { enabled: true, health_check_port: 443, failure_after_seconds: 5 },
-    ));
+    fireEvent.click(screen.getByRole('button', { name: /保存并启用/ }));
+    await waitFor(() => expect(mockApply).toHaveBeenCalledWith({
+      mode: 'failover', health_check_port: 443, failure_after_seconds: 5,
+    }));
   });
 
   it('saves a custom TCP port and continuous failure threshold', async () => {
@@ -121,10 +128,9 @@ describe('RelayFailoverPanel', () => {
     fireEvent.change(screen.getByLabelText('健康检查端口'), { target: { value: '8443' } });
     fireEvent.change(screen.getByLabelText('故障判定时间'), { target: { value: '13' } });
     fireEvent.click(screen.getByRole('button', { name: /保\s*存/ }));
-    await waitFor(() => expect(mockPut).toHaveBeenCalledWith(
-      '/groups/10/relay-failover',
-      { enabled: false, health_check_port: 8443, failure_after_seconds: 13 },
-    ));
+    await waitFor(() => expect(mockApply).toHaveBeenCalledWith({
+      mode: 'failover', health_check_port: 8443, failure_after_seconds: 13,
+    }));
   });
 
   it('reincludes only through the dedicated health-checked endpoint', async () => {
@@ -145,14 +151,15 @@ describe('RelayFailoverPanel', () => {
     expect(await screen.findByText(/当前节点仍未通过健康检查/)).toBeInTheDocument();
   });
 
-  it('keeps policy conflicts visible instead of silently enabling', async () => {
-    mockPut.mockRejectedValue({
-      response: { data: { message: '该分组已启用定时切换，请先停用后再启用故障切换。' } },
-    });
-    await renderPanel();
-    fireEvent.click(screen.getByRole('switch', { name: '自动故障切换' }));
-    expect(await screen.findByText(/该分组已启用定时切换/)).toBeInTheDocument();
-    expect(screen.getByRole('switch', { name: '自动故障切换' })).not.toBeChecked();
+  it('uses Save changes without an independent mode switch while active', async () => {
+    await renderPanel(true);
+    expect(screen.getByText('当前生效')).toBeInTheDocument();
+    expect(screen.queryByRole('switch', { name: '自动故障切换' })).toBeNull();
+    fireEvent.change(screen.getByLabelText('健康检查端口'), { target: { value: '8443' } });
+    fireEvent.click(screen.getByRole('button', { name: /保存修改/ }));
+    await waitFor(() => expect(mockApply).toHaveBeenCalledWith({
+      mode: 'failover', health_check_port: 8443, failure_after_seconds: 5,
+    }));
   });
 
   it('does not present a started Relay transaction as failover success', async () => {

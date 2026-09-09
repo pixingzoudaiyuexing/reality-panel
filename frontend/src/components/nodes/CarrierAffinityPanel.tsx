@@ -1,10 +1,9 @@
-import { Alert, Button, Empty, Select, Space, Spin, Tag, Typography, message } from 'antd';
+import { Alert, Button, Empty, Select, Space, Spin, Tag, Typography } from 'antd';
 import { SaveOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import api from '../../api/client';
-import type { ApiEnvelope, CarrierAffinityView, CarrierLineBinding, CarrierLineCatalog, RelayDnsRecordView, RelayReadyNode } from '../../api/types';
+import type { ApiEnvelope, CarrierAffinityView, CarrierLineBinding, CarrierLineCatalog, RelayDnsRecordView, RelayReadyNode, RoutingApplyRequest, RoutingApplyResult, RoutingMode } from '../../api/types';
 import type { Tfn } from './types';
-import { carrierApplyErrorMessage } from './carrierErrors';
 import {
   assignCarrierLines,
   buildCarrierLineOptions,
@@ -23,7 +22,10 @@ interface Props {
   onViewChange?: (view: CarrierAffinityView | null) => void;
   onCatalogChange?: (catalog: CarrierLineCatalog | null) => void;
   onAvailabilityChange?: (state: 'loading' | 'ready' | 'error') => void;
-  activeMode?: 'normal' | 'carrier' | 'schedule' | 'failover';
+  activeMode?: RoutingMode;
+  disabled?: boolean;
+  onApply: (request: RoutingApplyRequest) => Promise<RoutingApplyResult | null>;
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 function normalize(defaultNodeId: string | null | undefined, bindings: CarrierLineBinding[]): string {
@@ -51,7 +53,7 @@ function nodeLines(bindings: CarrierLineBinding[], nodeId: string, defaultNodeId
     .sort((left, right) => left.localeCompare(right));
 }
 
-export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalogChange, onAvailabilityChange, activeMode = 'normal' }: Props) {
+export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalogChange, onAvailabilityChange, activeMode = 'normal', disabled = false, onApply, onDirtyChange }: Props) {
   const [view, setView] = useState<CarrierAffinityView | null>(null);
   const [catalog, setCatalog] = useState<CarrierLineCatalog | null>(null);
   const [draft, setDraft] = useState<CarrierLineBinding[]>([]);
@@ -95,9 +97,9 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
     return () => window.clearInterval(timer);
   }, [load, view?.transaction.state]);
 
-  const activePolicy = view?.active_policy;
+  const savedPolicy = view?.pending_policy ?? view?.active_policy;
   const dirty = normalize(draftDefaultNodeId, draft)
-    !== normalize(activePolicy?.default_node_id ?? view?.default_node_id, activePolicy?.bindings ?? []);
+    !== normalize(savedPolicy?.default_node_id ?? view?.default_node_id, savedPolicy?.bindings ?? []);
   const transactionBusy = view?.transaction.state === 'switching' || view?.transaction.state === 'rolling_back';
   const mutationLocked = transactionBusy || view?.transaction.state === 'failed_manual_intervention';
   const catalogUnavailable = !catalog || catalog.stale;
@@ -117,30 +119,24 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
     return buildCarrierLineOptions(ids, names);
   }, [catalog, draft, names]);
 
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
+
   const assignLines = (nodeId: string, selected: string[]) => {
     setDraft((current) => assignCarrierLines(current, nodeId, selected, draftDefaultNodeId));
   };
 
   const save = async () => {
-    if (!dirty || mutationLocked || catalogUnavailable) return;
+    if ((activeMode === 'carrier' && !dirty) || mutationLocked || catalogUnavailable || disabled) return;
     setSaving(true);
     try {
-      const response = await api.put<unknown, ApiEnvelope<CarrierAffinityView>>(`/groups/${groupId}/carrier-affinity`, {
+      const result = await onApply({
+        mode: 'carrier',
         default_node_id: draftDefaultNodeId,
         bindings: mutableCarrierBindings(draft),
       });
-      if (response.code !== 0 || !response.data) throw new Error(response.message);
-      setView(response.data);
-      setDraft(mutableCarrierBindings(response.data.pending_policy?.bindings ?? response.data.active_policy.bindings));
-      setDraftDefaultNodeId(
-        response.data.pending_policy?.default_node_id
-          ?? response.data.active_policy.default_node_id
-          ?? response.data.default_node_id,
-      );
-      onViewChange?.(response.data);
-      message.success(t(activeMode === 'carrier' ? 'carrierSaveStarted' : 'carrierSaveInactive'));
-    } catch (error) {
-      message.error(carrierApplyErrorMessage(error, t));
+      if (result?.config_saved) await load();
     } finally {
       setSaving(false);
     }
@@ -152,8 +148,12 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   return (
     <section data-testid="carrier-affinity-panel" className="rp-routing-section">
       <div className="rp-section-heading">
-        <Space size={8} wrap>{status ? <Tag color={status.color}>{status.label}</Tag> : null}</Space>
-        <Button size="small" type="primary" icon={<SaveOutlined />} loading={saving} disabled={!dirty || mutationLocked || catalogUnavailable} onClick={() => void save()}>{t('carrierSave')}</Button>
+        <Space size={8} wrap>
+          {activeMode === 'carrier'
+            ? status ? <Tag color={status.color}>{status.label}</Tag> : null
+            : <Tag>{t('routingModeInactive')}</Tag>}
+        </Space>
+        <Button size="small" type="primary" icon={<SaveOutlined />} loading={saving} disabled={(activeMode === 'carrier' && !dirty) || mutationLocked || catalogUnavailable || disabled} onClick={() => void save()}>{t(activeMode === 'carrier' ? 'routingSaveChanges' : 'routingSaveAndActivate')}</Button>
       </div>
       {transactionBusy ? <Alert type="info" showIcon title={t('carrierBusy')} style={{ margin: '10px 0' }} /> : null}
       {catalog?.stale ? <Alert type="warning" showIcon title={t('carrierCatalogStale')} style={{ margin: '10px 0' }} /> : null}
@@ -172,12 +172,12 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
                 {draftDefaultNodeId === node.node_id ? (
                   <Tag color="blue" data-testid="carrier-default-node-indicator">{t('carrierDefaultSelected')}</Tag>
                 ) : (
-                  <Button size="small" disabled={mutationLocked} onClick={() => setDraftDefaultNodeId(node.node_id)}>{t('carrierSetDefault')}</Button>
+                  <Button size="small" disabled={mutationLocked || disabled} onClick={() => setDraftDefaultNodeId(node.node_id)}>{t('carrierSetDefault')}</Button>
                 )}
                 {effectiveDefaultNodeId === node.node_id && activeMode !== 'carrier' ? <Text type="secondary">{t('routingEffectiveDefault')}</Text> : null}
               </Space>
               <Space orientation="vertical" size={4} style={{ width: '100%' }}>
-                <Select mode="multiple" showSearch aria-label={`${node.node_id} ${t('carrierLine')}`} value={nodeLines(draft, node.node_id, draftDefaultNodeId)} disabled={mutationLocked || catalogUnavailable} placeholder={t('carrierNotConfigured')} options={lineOptions} filterOption={(query, option) => carrierLineMatchesSearch(query, { value: String(option?.value ?? ''), label: String(option?.label ?? '') })} onChange={(values) => assignLines(node.node_id, values)} style={{ width: '100%' }} />
+                <Select mode="multiple" showSearch aria-label={`${node.node_id} ${t('carrierLine')}`} value={nodeLines(draft, node.node_id, draftDefaultNodeId)} disabled={mutationLocked || catalogUnavailable || disabled} placeholder={t('carrierNotConfigured')} options={lineOptions} filterOption={(query, option) => carrierLineMatchesSearch(query, { value: String(option?.value ?? ''), label: String(option?.label ?? '') })} onChange={(values) => assignLines(node.node_id, values)} style={{ width: '100%' }} />
               </Space>
             </div>
           ))}

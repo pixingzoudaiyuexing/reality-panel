@@ -1,14 +1,12 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { message } from 'antd';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { CarrierAffinityView, CarrierLineCatalog, RelayReadyNode } from '../../api/types';
+import type { CarrierAffinityView, CarrierLineCatalog, RelayReadyNode, RoutingApplyResult } from '../../api/types';
 import type { Tfn } from './types';
 
-const { mockGet, mockPut } = vi.hoisted(() => ({ mockGet: vi.fn(), mockPut: vi.fn() }));
-vi.mock('../../api/client', () => ({ default: { get: mockGet, put: mockPut } }));
+const { mockGet } = vi.hoisted(() => ({ mockGet: vi.fn() }));
+vi.mock('../../api/client', () => ({ default: { get: mockGet } }));
 
 import { CarrierAffinityPanel } from './CarrierAffinityPanel';
-import { carrierApplyErrorMessage } from './carrierErrors';
 import { assignCarrierLines, buildCarrierLineOptions, carrierLineMatchesSearch } from './carrierCatalog';
 
 const translations: Record<string, string> = {
@@ -23,6 +21,8 @@ const translations: Record<string, string> = {
   carrierErrorOwnershipUnverified: 'DNS 记录所有权无法确认',
   carrierErrorProviderPreflight: 'DNS 服务预检查失败',
   carrierSaveFailed: '运营商线路策略应用失败',
+  routingSaveAndActivate: '保存并启用',
+  routingSaveChanges: '保存修改',
 };
 const t = ((key: string) => translations[key] ?? key) as Tfn;
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
@@ -54,16 +54,30 @@ const view: CarrierAffinityView = {
   bindings: [],
   catalog_stale: false,
 };
+const applied = (over: Partial<RoutingApplyResult> = {}): RoutingApplyResult => ({
+  config_saved: true,
+  activation_requested: true,
+  activation_succeeded: false,
+  active_mode: 'normal',
+  target_mode: 'carrier',
+  transition_state: 'switching',
+  business_error_code: null,
+  message: 'started',
+  ...over,
+});
+const mockApply = vi.fn(async () => applied());
 
-function arrange(over: Partial<CarrierAffinityView> = {}, displayedNodes = nodes) {
+function arrange(over: Partial<CarrierAffinityView> = {}, displayedNodes = nodes, activeMode: 'normal' | 'carrier' = 'normal') {
   const response = { ...view, ...over };
   mockGet.mockImplementation((url: string) => Promise.resolve(ok(url.endsWith('/carrier-lines') ? catalog : response)));
-  mockPut.mockResolvedValue(ok(response));
-  render(<CarrierAffinityPanel groupId={7} nodes={displayedNodes} t={t} />);
+  return render(<CarrierAffinityPanel groupId={7} nodes={displayedNodes} t={t} activeMode={activeMode} onApply={mockApply} />);
 }
 
 describe('CarrierAffinityPanel node-oriented editor', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockApply.mockResolvedValue(applied());
+  });
 
   it('shows every Relay and keeps an offline Relay editable', async () => {
     arrange();
@@ -144,43 +158,30 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     const nodeB = await screen.findByTestId('carrier-node-node-b');
     fireEvent.click(within(nodeB).getByRole('button', { name: '设为全网默认' }));
     expect(within(nodeB).getByTestId('carrier-default-node-indicator')).toHaveTextContent('✓ 全网默认');
-    expect(mockPut).not.toHaveBeenCalled();
+    expect(mockApply).not.toHaveBeenCalled();
   });
 
-  it('never includes a legacy default binding in the Carrier PUT payload', async () => {
+  it('never includes a legacy default binding in the routing Apply payload', async () => {
     arrange();
-    fireEvent.click(await screen.findByRole('button', { name: /carrierSave/ }));
-    await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(1));
-    expect(mockPut).toHaveBeenCalledWith('/groups/7/carrier-affinity', {
+    fireEvent.click(await screen.findByRole('button', { name: /保存并启用/ }));
+    await waitFor(() => expect(mockApply).toHaveBeenCalledTimes(1));
+    expect(mockApply).toHaveBeenCalledWith({
+      mode: 'carrier',
       default_node_id: 'node-a',
       bindings: [{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }],
     });
   });
 
-  it.each([
-    ['DEFAULT_LINE_OWNED_BY_RELAY_PREFERENCE', '全网默认线路请使用“设为默认线路”功能管理'],
-    ['FAILOVER_ENABLED', '已启用故障切换，无法应用运营商线路策略'],
-    ['CATALOG_STALE', '运营商线路目录已过期，请稍后重试'],
-    ['DNSMGR_UNAVAILABLE', 'DNS 服务暂不可用'],
-    ['TRANSACTION_IN_PROGRESS', '当前有线路事务正在执行'],
-    ['OWNERSHIP_UNVERIFIED', 'DNS 记录所有权无法确认'],
-  ])('maps known backend error %s', (backendMessage, expected) => {
-    expect(carrierApplyErrorMessage({ response: { data: { message: backendMessage } } }, t)).toBe(expected);
-  });
-
-  it('shows only bounded provider preflight detail and hides unknown internals', () => {
-    expect(carrierApplyErrorMessage({ response: { data: { message: 'PROVIDER_PREFLIGHT: DNSMgr request timed out' } } }, t))
-      .toBe('DNS 服务预检查失败: DNSMgr request timed out');
-    expect(carrierApplyErrorMessage({ response: { data: { message: 'database password=secret' } } }, t))
-      .toBe('运营商线路策略应用失败');
-  });
-
-  it('shows a useful known save error instead of the generic fallback', async () => {
-    const errorSpy = vi.spyOn(message, 'error');
-    arrange();
-    mockPut.mockRejectedValueOnce({ response: { data: { message: 'DEFAULT_LINE_OWNED_BY_RELAY_PREFERENCE' } } });
-    fireEvent.click(await screen.findByRole('button', { name: /carrierSave/ }));
-    await waitFor(() => expect(errorSpy).toHaveBeenCalledWith('全网默认线路请使用“设为默认线路”功能管理'));
+  it('uses Save and activate while inactive and Save changes while active', async () => {
+    const inactive = arrange();
+    expect(await screen.findByRole('button', { name: /保存并启用/ })).toBeEnabled();
+    inactive.unmount();
+    mockGet.mockReset();
+    arrange({ active_policy: {
+      default_node_id: 'node-a',
+      bindings: [{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }],
+    } }, nodes, 'carrier');
+    expect(await screen.findByRole('button', { name: /保存修改/ })).toBeDisabled();
   });
 
   it('locks edits while the existing DNS transaction is active', async () => {

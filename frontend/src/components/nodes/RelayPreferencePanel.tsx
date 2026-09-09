@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Button, Divider, Modal, Segmented, Space, Spin, Tabs, Tag, Tooltip, Typography, message } from 'antd';
-import { MedicineBoxOutlined, ReloadOutlined, SwapOutlined } from '@ant-design/icons';
+import { Alert, Button, Divider, Modal, Space, Spin, Tabs, Tag, Tooltip, Typography, message } from 'antd';
+import { MedicineBoxOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons';
 import api from '../../api/client';
-import type { ApiEnvelope, CarrierAffinityView, CarrierLineCatalog, RelayPreferenceView, RelayReadyNode, RoutingMode, RoutingModeView } from '../../api/types';
+import type { ApiEnvelope, CarrierAffinityView, CarrierLineCatalog, RelayPreferenceView, RelayReadyNode, RoutingApplyRequest, RoutingApplyResult, RoutingMode } from '../../api/types';
 import type { Tfn } from './types';
 import { RelaySchedulePanel } from './RelaySchedulePanel';
 import { CarrierAffinityPanel } from './CarrierAffinityPanel';
-import { isCarrierMutableLineId } from './carrierCatalog';
 import { RelayFailoverPanel } from './RelayFailoverPanel';
 import { relayReadyReasonLabel } from './shared';
 import { dnsSyncStateDisplay } from '../../utils/realityRuleStatus';
@@ -46,32 +45,6 @@ function switchErrorLabel(error: string | null, t: Tfn): string {
   return key ? t(key) : error;
 }
 
-function requestErrorLabel(error: unknown, t: Tfn): string {
-  const response = (error as { response?: { status?: number; data?: { message?: string } } }).response;
-  const statusLabels: Record<number, Parameters<Tfn>[0]> = {
-    404: 'relaySwitchHttpNotFound',
-    409: 'relaySwitchHttpConflict',
-    422: 'relaySwitchHttpUnprocessable',
-    500: 'relaySwitchHttpFailed',
-  };
-  const friendly = t(statusLabels[response?.status ?? 0] ?? 'relaySwitchHttpFailed');
-  return response?.data?.message ? `${friendly}: ${response.data.message}` : friendly;
-}
-
-function actionLabel(view: RelayPreferenceView, node: RelayReadyNode, t: Tfn): string {
-  if (!node.ready) return t('relayPreferenceUnavailable');
-  if (view.state === 'switching' || view.state === 'rolling_back') {
-    return node.node_id === view.pending_node_id
-      ? t('relayPreferenceSwitching')
-      : t('relayPreferenceSwitchLocked');
-  }
-  if (view.state.startsWith('failed')) {
-    if (node.node_id === view.pending_node_id) return t('relayPreferenceRetry');
-    if (node.node_id === view.preferred_node_id) return t('relayPreferenceReconfirm');
-  }
-  return t('setAsDefaultLine');
-}
-
 function safeLineKey(lineKey: string): string {
   return lineKey.replace(/[^A-Za-z0-9_-]/g, '-');
 }
@@ -86,15 +59,40 @@ function routingModeLabel(mode: RoutingMode, t: Tfn): string {
   return t(keys[mode]);
 }
 
+function routingApplyErrorLabel(code: string | null | undefined, t: Tfn): string {
+  const keys: Record<string, Parameters<Tfn>[0]> = {
+    SCHEDULE_ENABLED_RULE_REQUIRED: 'routingErrorScheduleRequired',
+    CARRIER_DEFAULT_REQUIRED: 'routingErrorCarrierDefaultRequired',
+    CARRIER_DEFAULT_NOT_READY: 'routingErrorCarrierDefaultNotReady',
+    NORMAL_DEFAULT_REQUIRED: 'routingErrorNormalDefaultRequired',
+    NORMAL_DEFAULT_NOT_READY: 'routingErrorNormalDefaultNotReady',
+    NORMAL_DEFAULT_INVALID: 'routingErrorNormalDefaultRequired',
+    ROUTING_TRANSACTION_IN_PROGRESS: 'routingErrorTransactionInProgress',
+    ROUTING_MODE_CONFLICT: 'routingErrorModeConflict',
+    ROUTING_MODE_CHANGED: 'routingErrorModeChanged',
+    DNSMGR_UNAVAILABLE: 'routingErrorDnsMgrUnavailable',
+    DNS_PROVIDER_PREFLIGHT_FAILED: 'routingErrorProviderPreflight',
+    DNS_OWNERSHIP_UNVERIFIED: 'routingErrorOwnership',
+    CARRIER_CATALOG_UNAVAILABLE: 'carrierCatalogStale',
+    CARRIER_POLICY_INVALID: 'carrierSaveFailed',
+    CARRIER_TARGET_INVALID: 'routingErrorCarrierTargetInvalid',
+    FAILOVER_CONFIG_INVALID: 'routingErrorFailoverInvalid',
+    NO_ELIGIBLE_DNS_RULES: 'relaySwitchErrorNoRules',
+  };
+  return t(keys[code ?? ''] ?? 'routingApplyFailed');
+}
+
 export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange }: Props) {
   const [view, setView] = useState<RelayPreferenceView | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
-  const [submittingNodeId, setSubmittingNodeId] = useState<string | null>(null);
   const [submittingMode, setSubmittingMode] = useState<RoutingMode | null>(null);
+  const [selectedMode, setSelectedMode] = useState<RoutingMode | null>(null);
+  const [normalDraftNodeId, setNormalDraftNodeId] = useState<string | null>(null);
+  const [dirtyModes, setDirtyModes] = useState<Partial<Record<RoutingMode, boolean>>>({});
+  const [discardRevisions, setDiscardRevisions] = useState<Partial<Record<RoutingMode, number>>>({});
   const [carrierView, setCarrierView] = useState<CarrierAffinityView | null>(null);
   const [carrierCatalog, setCarrierCatalog] = useState<CarrierLineCatalog | null>(null);
-  const [carrierAvailability, setCarrierAvailability] = useState<'loading' | 'ready' | 'error'>('loading');
   const operationInFlight = useRef(false);
   const viewRef = useRef<RelayPreferenceView | null>(null);
   const retryTimerRef = useRef<number | null>(null);
@@ -155,6 +153,10 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
 
   useEffect(() => {
     viewRef.current = null;
+    setSelectedMode(null);
+    setNormalDraftNodeId(null);
+    setDirtyModes({});
+    setDiscardRevisions({});
     void load(true, true);
   }, [load]);
 
@@ -170,69 +172,116 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
     return () => window.clearInterval(timer);
   }, [load, view?.state]);
 
-  const setPreferred = async (nodeId: string) => {
-    if (operationInFlight.current) return;
-    operationInFlight.current = true;
-    setSubmittingNodeId(nodeId);
-    try {
-      const response = await api.post<unknown, ApiEnvelope<RelayPreferenceView>>(
-        `/groups/${groupId}/relay-preference`,
-        { node_id: nodeId },
+  useEffect(() => {
+    if (!view) return;
+    if (selectedMode === null) setSelectedMode(view.active_routing_mode ?? 'normal');
+    if (!dirtyModes.normal) {
+      setNormalDraftNodeId(
+        view.pending_routing_mode === null && view.state === 'switching'
+          ? view.pending_node_id ?? view.normal_default_node_id ?? view.preferred_node_id
+          : view.normal_default_node_id ?? view.preferred_node_id,
       );
-      if (response.code !== 0) throw new Error(response.message);
-      setView(await fetchPreference());
-      setLoadError(false);
-      message.success(t('relaySwitchStarted'));
-      return true;
-    } catch (error) {
-      message.error(requestErrorLabel(error, t));
-      return false;
-    } finally {
-      operationInFlight.current = false;
-      setSubmittingNodeId(null);
     }
+  }, [dirtyModes.normal, selectedMode, view]);
+
+  const setModeDirty = (mode: RoutingMode, dirty: boolean) => {
+    setDirtyModes((current) => current[mode] === dirty ? current : { ...current, [mode]: dirty });
   };
 
-  const setRoutingMode = async (mode: RoutingMode) => {
-    if (operationInFlight.current || mode === view?.active_routing_mode) return;
+  const submitRoutingApply = async (request: RoutingApplyRequest): Promise<RoutingApplyResult | null> => {
+    if (operationInFlight.current) return null;
+    const mode = request.mode;
     operationInFlight.current = true;
-    setSubmittingMode(mode);
+    setSubmittingMode(request.mode);
     try {
-      const response = await api.put<unknown, ApiEnvelope<RoutingModeView>>(
-        `/groups/${groupId}/routing-mode`,
-        { mode },
+      const response = await api.put<unknown, ApiEnvelope<RoutingApplyResult>>(
+        `/groups/${groupId}/routing-apply`,
+        request,
       );
-      if (response.code !== 0) throw new Error(response.message);
+      if (response.code !== 0 || !response.data) throw new Error(response.message);
       const nextView = await fetchPreference();
       viewRef.current = nextView;
       setView(nextView);
       setLoadError(false);
-      message.success(t('routingModeChangeStarted'));
-      return true;
+      if (response.data.config_saved) setModeDirty(mode, false);
+      message.success(t(response.data.transition_state === 'switching'
+        ? response.data.activation_requested ? 'routingActivationStarted' : 'routingConfigurationApplying'
+        : response.data.activation_requested
+          ? 'routingActivationSucceeded'
+          : 'routingConfigurationSaved'));
+      return response.data;
     } catch (error) {
-      message.error(requestErrorLabel(error, t));
-      return false;
+      const payload = (error as { response?: { data?: ApiEnvelope<RoutingApplyResult> } }).response?.data;
+      const result = payload?.data;
+      if (result) {
+        const nextView = await fetchPreference().catch(() => null);
+        if (nextView) {
+          viewRef.current = nextView;
+          setView(nextView);
+          setLoadError(false);
+        }
+        if (result.config_saved) {
+          setModeDirty(mode, false);
+          const active = result.active_mode ? routingModeLabel(result.active_mode, t) : '-';
+          message.warning(`${t('routingPartialFailure')} ${t('routingStillActive')}: ${active}. ${routingApplyErrorLabel(result.business_error_code, t)}`);
+        } else {
+          message.error(routingApplyErrorLabel(result.business_error_code, t));
+        }
+        return result;
+      }
+      message.error(t('routingApplyFailed'));
+      return null;
     } finally {
       operationInFlight.current = false;
       setSubmittingMode(null);
     }
   };
 
-  const confirmRoutingMode = (mode: RoutingMode) => {
-    if (!view || mode === view.active_routing_mode) return;
+  const applyRouting = (request: RoutingApplyRequest): Promise<RoutingApplyResult | null> => {
+    if (!view || request.mode === view.active_routing_mode) return submitRoutingApply(request);
+    return new Promise((resolve) => {
+      Modal.confirm({
+        title: t('routingModeConfirmTitle'),
+        content: `${t('routingEnableStopsCurrent')} ${routingModeLabel(view.active_routing_mode ?? 'normal', t)} → ${routingModeLabel(request.mode, t)}. ${t('routingPreviousConfigRetained')}`,
+        okText: t('routingModeConfirm'),
+        cancelText: t('cancel'),
+        onCancel: () => resolve(null),
+        onOk: async () => {
+          resolve(await submitRoutingApply(request));
+        },
+      });
+    });
+  };
+
+  const requestTabChange = (mode: RoutingMode) => {
+    if (mode === selectedMode) return;
+    const currentMode = selectedMode;
+    if (!currentMode || !dirtyModes[currentMode]) {
+      setSelectedMode(mode);
+      return;
+    }
     Modal.confirm({
-      title: t('routingModeConfirmTitle'),
-      content: t('routingModeConfirmDescription'),
-      okText: t('routingModeConfirm'),
-      cancelText: t('cancel'),
-      onOk: async () => {
-        const succeeded = await setRoutingMode(mode);
-        if (!succeeded) throw new Error('routing mode request failed');
+      title: t('routingUnsavedTitle'),
+      content: t('routingUnsavedDescription'),
+      okText: t('routingDiscardChanges'),
+      cancelText: t('routingContinueEditing'),
+      okButtonProps: { danger: true },
+      onOk: () => {
+        setModeDirty(currentMode, false);
+        if (currentMode === 'normal') {
+          setNormalDraftNodeId(view?.normal_default_node_id ?? view?.preferred_node_id ?? null);
+        } else {
+          setDiscardRevisions((current) => ({
+            ...current,
+            [currentMode]: (current[currentMode] ?? 0) + 1,
+          }));
+        }
+        setSelectedMode(mode);
       },
     });
   };
 
-  const busy = loading || submittingNodeId !== null || submittingMode !== null;
+  const busy = loading || submittingMode !== null;
   const modeConflict = (view?.routing_mode_conflict?.length ?? 0) > 1;
   const activeMode = view?.active_routing_mode ?? 'normal';
   const nodeById = new Map((view?.nodes ?? []).map((node) => [node.node_id, node]));
@@ -240,90 +289,27 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
     if (!nodeId) return '-';
     return nodeById.get(nodeId)?.public_ipv4 ?? nodeId;
   };
-  const catalogNames = new Map((carrierCatalog?.lines ?? []).map((line) => [line.id, line.name || line.id]));
-  const activeCarrierBindings = (carrierView?.active_policy.bindings ?? [])
-    .filter((binding) => isCarrierMutableLineId(binding.line_id));
-  const followDefault = activeCarrierBindings.filter((binding) => binding.mode === 'follow_default');
-  const explicit = activeCarrierBindings.filter((binding) => binding.mode === 'node');
   const topologyLocked = view?.state === 'switching'
     || view?.state === 'rolling_back'
     || view?.state === 'failed_manual_intervention';
-
-  const switchImpact = (targetNodeId: string) => (
-    <Space orientation="vertical" size={8} style={{ display: 'flex' }} data-testid="default-line-switch-impact">
-      <Text>{t('relaySwitchImpactDefault')}: {nodeLabel(view?.preferred_node_id)} → {nodeLabel(targetNodeId)}</Text>
-      {carrierAvailability === 'error' ? (
-        <Alert type="warning" showIcon title={t('carrierPolicyUnavailable')} />
-      ) : (
-        <>
-          <div>
-            <Text strong>{t('relaySwitchImpactFollow')}</Text>
-            {followDefault.length > 0
-              ? followDefault.map((binding) => (
-                <div key={binding.line_id}>{catalogNames.get(binding.line_id) ?? binding.line_id}: {nodeLabel(view?.preferred_node_id)} → {nodeLabel(targetNodeId)}</div>
-              ))
-              : <div><Text type="secondary">{t('relaySwitchImpactNone')}</Text></div>}
-          </div>
-          <div>
-            <Text strong>{t('relaySwitchImpactExplicit')}</Text>
-            {explicit.length > 0
-              ? explicit.map((binding) => (
-                <div key={binding.line_id}>{catalogNames.get(binding.line_id) ?? binding.line_id}: {t('relaySwitchImpactKeeps')} {nodeLabel(binding.node_id)}</div>
-              ))
-              : <div><Text type="secondary">{t('relaySwitchImpactNone')}</Text></div>}
-          </div>
-          <Text type="secondary">{t('relaySwitchImpactUnconfigured')}</Text>
-        </>
-      )}
-    </Space>
-  );
-
-  const confirmSwitch = (node: RelayReadyNode) => {
-    Modal.confirm({
-      title: t('relaySwitchConfirmTitle'),
-      content: switchImpact(node.node_id),
-      okText: t('relaySwitchConfirm'),
-      cancelText: t('cancel'),
-      onOk: async () => {
-        const succeeded = await setPreferred(node.node_id);
-        if (!succeeded) throw new Error('switch request failed');
-      },
-    });
-  };
+  const normalSavedNodeId = view?.normal_default_node_id ?? view?.preferred_node_id ?? null;
+  const normalActive = activeMode === 'normal';
+  const normalCanSubmit = Boolean(normalDraftNodeId)
+    && !modeConflict
+    && !topologyLocked
+    && !busy
+    && (!normalActive || Boolean(dirtyModes.normal));
 
   return (
     <div className="rp-default-line-panel" data-testid={`relay-preference-${groupId}`}>
       <Divider style={{ margin: '12px 0' }} />
       <div className="rp-routing-mode-control" data-testid="routing-mode-control">
         <Space size={8} wrap>
-          <Text strong>{t('routingModeCurrent')}</Text>
+          <Text strong>{t('lineFeaturesTitle')}</Text>
+          <Text type="secondary">{t('routingModeCurrent')}</Text>
           {!modeConflict ? <Tag color="blue">{routingModeLabel(activeMode, t)}</Tag> : null}
           {view?.pending_routing_mode && view.state === 'switching' ? <Tag color="processing">{t('routingModeSwitching')}: {routingModeLabel(view.pending_routing_mode, t)}</Tag> : null}
           {view?.pending_routing_mode && view.state === 'rolling_back' ? <Tag color="warning">{t('routingModeRollingBack')}: {routingModeLabel(view.pending_routing_mode, t)}</Tag> : null}
-        </Space>
-        <Segmented
-          aria-label={t('routingModeCurrent')}
-          value={modeConflict ? undefined : activeMode}
-          disabled={modeConflict || topologyLocked || busy}
-          options={(['normal', 'carrier', 'schedule', 'failover'] as RoutingMode[]).map((mode) => ({
-            value: mode,
-            label: routingModeLabel(mode, t),
-          }))}
-          onChange={(mode) => confirmRoutingMode(mode as RoutingMode)}
-        />
-      </div>
-      {modeConflict ? <Alert type="error" showIcon title={t('routingModeConflict')} style={{ marginBottom: 12 }} /> : null}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 10 }}>
-        <Space size={8} wrap>
-          <Text strong>{t('defaultLineTitle')}</Text>
-          {view?.preferred_node_id ? (
-            <Text type="secondary" data-testid="relay-preference-current">
-              {t('relayPreferenceCurrent')}: <Text code>{nodeLabel(view.preferred_node_id)}</Text>
-            </Text>
-          ) : null}
-          {activeMode !== 'normal' && view?.normal_default_node_id ? (
-            <Text type="secondary">{t('routingNormalDefault')}: <Text code>{nodeLabel(view.normal_default_node_id)}</Text></Text>
-          ) : null}
         </Space>
         <Tooltip title={t('refresh')}>
           <Button
@@ -332,11 +318,12 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
             icon={<ReloadOutlined />}
             aria-label={t('refresh')}
             loading={loading && view !== null}
-            disabled={submittingNodeId !== null}
+            disabled={submittingMode !== null}
             onClick={() => void load(true)}
           />
         </Tooltip>
       </div>
+      {modeConflict ? <Alert type="error" showIcon title={t('routingModeConflict')} style={{ marginBottom: 12 }} /> : null}
 
       {loading && !view ? <div style={{ textAlign: 'center', padding: 16 }}><Spin size="small" /></div> : null}
       {loadError && !view ? <Alert type="warning" showIcon title={t('relayPreferenceLoadFailed')} /> : null}
@@ -424,87 +411,130 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
         </div>
       ) : null}
 
-      {view && view.nodes.length === 0 ? <Alert type="warning" showIcon title={t('relayPreferenceNoNodes')} /> : null}
-      {view?.nodes.map((node) => {
-        const reasons = node.ready_reasons.map((reason) => relayReadyReasonLabel(reason, t));
-        const current = node.node_id === view.preferred_node_id;
-        const isIdlePreferred = view.state === 'idle' && current;
-        const showSwitchAction = !isIdlePreferred && (node.ready || view.state !== 'idle');
-        const canSwitch = !modeConflict && activeMode === 'normal' && node.ready && !topologyLocked && !busy && carrierAvailability !== 'loading';
-        return (
-          <div className="rp-default-line-candidate" data-testid={`default-line-candidate-${node.node_id}`} key={node.node_id}>
-            <div className="rp-default-line-candidate-main">
-              <Space size={6} wrap>
-                <Text strong className="rp-mono">{node.public_ipv4 ?? node.node_id}</Text>
-                <Tag color={node.online ? 'green' : undefined}>{node.online ? t('online') : t('offline')}</Tag>
-                <Tag color={node.ready ? 'green' : 'red'}>{node.ready ? t('relayReady') : t('relayNotReady')}</Tag>
-                {current ? <Tag color="blue">{t('defaultLineCurrent')}</Tag> : null}
-              </Space>
-              {node.public_ipv4 ? <Text type="secondary" code>{node.node_id}</Text> : null}
-              {!node.ready && reasons.length > 0 ? <Text type="danger">{reasons.join(' · ')}</Text> : null}
-            </div>
-            <Space size={4} wrap>
-              {onDiagnoseNode ? (
-                <Button size="small" icon={<MedicineBoxOutlined />} onClick={() => onDiagnoseNode(node)}>{t('diagnose')}</Button>
-              ) : null}
-              {showSwitchAction ? (
-                <Button
-                  size="small"
-                  type="primary"
-                  icon={<SwapOutlined />}
-                  disabled={!canSwitch}
-                  loading={submittingNodeId === node.node_id}
-                  onClick={() => confirmSwitch(node)}
-                  title={activeMode === 'normal' ? undefined : t('routingModeOwnsDefault')}
-                >
-                  {actionLabel(view, node, t)}
-                </Button>
-              ) : null}
-            </Space>
-          </div>
-        );
-      })}
-
-      <Divider style={{ margin: '14px 0 10px' }} />
-      <Text strong>{t('lineFeaturesTitle')}</Text>
       <Tabs
         className="rp-line-feature-tabs"
-        defaultActiveKey="carrier"
+        activeKey={selectedMode ?? activeMode}
+        onChange={(mode) => requestTabChange(mode as RoutingMode)}
         items={[
           {
+            key: 'normal',
+            label: t('routingFunctionNormal'),
+            children: (
+              <section className="rp-line-feature-section" data-testid="normal-routing-panel">
+                <div className="rp-section-heading">
+                  <Space size={8} wrap>
+                    <Tag color={normalActive ? 'green' : undefined}>{t(normalActive ? 'routingModeActive' : 'routingModeInactive')}</Tag>
+                    {view?.preferred_node_id ? (
+                      <Text type="secondary" data-testid="relay-preference-current">
+                        {t('relayPreferenceCurrent')}: <Text code>{nodeLabel(view.preferred_node_id)}</Text>
+                      </Text>
+                    ) : null}
+                  </Space>
+                  <Button
+                    size="small"
+                    type="primary"
+                    icon={<SaveOutlined />}
+                    data-testid="normal-routing-apply"
+                    disabled={!normalCanSubmit}
+                    loading={submittingMode === 'normal'}
+                    onClick={() => normalDraftNodeId && void applyRouting({ mode: 'normal', default_node_id: normalDraftNodeId })}
+                  >
+                    {t(normalActive ? 'routingSaveChanges' : 'routingSaveAndActivate')}
+                  </Button>
+                </div>
+                {view && view.nodes.length === 0 ? <Alert type="warning" showIcon title={t('relayPreferenceNoNodes')} /> : null}
+                {view?.nodes.map((node) => {
+                  const reasons = node.ready_reasons.map((reason) => relayReadyReasonLabel(reason, t));
+                  const effective = node.node_id === view.preferred_node_id;
+                  const selected = node.node_id === normalDraftNodeId;
+                  return (
+                    <div className="rp-default-line-candidate" data-testid={`default-line-candidate-${node.node_id}`} key={node.node_id}>
+                      <div className="rp-default-line-candidate-main">
+                        <Space size={6} wrap>
+                          <Text strong className="rp-mono">{node.public_ipv4 ?? node.node_id}</Text>
+                          <Tag color={node.online ? 'green' : undefined}>{node.online ? t('online') : t('offline')}</Tag>
+                          <Tag color={node.ready ? 'green' : 'red'}>{node.ready ? t('relayReady') : t('relayNotReady')}</Tag>
+                          {effective ? <Tag>{t('routingEffectiveDefault')}</Tag> : null}
+                          {selected ? <Tag color="blue">{t('routingNormalSelected')}</Tag> : null}
+                        </Space>
+                        {node.public_ipv4 ? <Text type="secondary" code>{node.node_id}</Text> : null}
+                        {!node.ready && reasons.length > 0 ? <Text type="danger">{reasons.join(' · ')}</Text> : null}
+                      </div>
+                      <Space size={4} wrap>
+                        {onDiagnoseNode ? (
+                          <Button size="small" icon={<MedicineBoxOutlined />} onClick={() => onDiagnoseNode(node)}>{t('diagnose')}</Button>
+                        ) : null}
+                        {!selected && node.ready ? (
+                          <Button
+                            size="small"
+                            disabled={topologyLocked || busy || modeConflict}
+                            onClick={() => {
+                              setNormalDraftNodeId(node.node_id);
+                              setModeDirty('normal', node.node_id !== normalSavedNodeId);
+                            }}
+                          >
+                            {t('routingSetNormalDefault')}
+                          </Button>
+                        ) : null}
+                      </Space>
+                    </div>
+                  );
+                })}
+              </section>
+            ),
+          },
+          {
             key: 'carrier',
-            label: t('carrierAffinityTitle'),
+            label: t('routingFunctionCarrier'),
             children: (
               <CarrierAffinityPanel
+                key={`carrier-${discardRevisions.carrier ?? 0}`}
                 groupId={groupId}
                 nodes={view?.nodes ?? []}
                 t={t}
                 dnsRecords={view?.dns_records ?? []}
                 onViewChange={setCarrierView}
                 onCatalogChange={setCarrierCatalog}
-                onAvailabilityChange={setCarrierAvailability}
                 activeMode={activeMode}
+                disabled={modeConflict || topologyLocked}
+                onApply={applyRouting}
+                onDirtyChange={(dirty) => setModeDirty('carrier', dirty)}
               />
             ),
           },
           {
             key: 'schedule',
-            label: t('relayScheduleTitle'),
+            label: t('routingFunctionSchedule'),
             children: (
               <RelaySchedulePanel
+                key={`schedule-${discardRevisions.schedule ?? 0}`}
                 groupId={groupId}
                 nodes={view?.nodes ?? []}
                 t={t}
                 carrierPolicy={carrierView?.active_policy}
                 carrierCatalog={carrierCatalog}
                 topologyState={view?.state}
+                active={activeMode === 'schedule'}
+                disabled={modeConflict || topologyLocked || busy}
+                activating={submittingMode === 'schedule'}
+                onActivate={() => applyRouting({ mode: 'schedule' })}
               />
             ),
           },
           {
             key: 'failover',
-            label: t('relayFailoverTitle'),
-            children: <RelayFailoverPanel groupId={groupId} t={t} routingManaged active={activeMode === 'failover'} />,
+            label: t('routingFunctionFailover'),
+            children: (
+              <RelayFailoverPanel
+                key={`failover-${discardRevisions.failover ?? 0}`}
+                groupId={groupId}
+                t={t}
+                active={activeMode === 'failover'}
+                disabled={modeConflict || topologyLocked}
+                onApply={applyRouting}
+                onDirtyChange={(dirty) => setModeDirty('failover', dirty)}
+              />
+            ),
           },
         ]}
       />

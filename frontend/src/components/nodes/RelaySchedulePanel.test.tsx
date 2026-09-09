@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { Modal } from 'antd';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CarrierLineCatalog, CarrierPolicy, RelayReadyNode, RelaySchedule } from '../../api/types';
@@ -61,6 +62,8 @@ beforeEach(() => {
   mockPost.mockReset();
   mockPut.mockReset();
   mockDelete.mockReset();
+  mockActivate.mockReset();
+  mockActivate.mockResolvedValue(null);
   mockGet.mockResolvedValue(ok([]));
   mockPost.mockResolvedValue(ok(schedule()));
   mockPut.mockResolvedValue(ok(schedule()));
@@ -75,10 +78,11 @@ const carrierCatalog: CarrierLineCatalog = { stale: false, lines: [
   { id: 'Dianxin', name: '电信', parent: null },
   { id: 'Liantong', name: '联通', parent: null },
 ] };
+const mockActivate = vi.fn(async () => null);
 
-async function renderPanel(items: RelaySchedule[] = [], props: { topologyState?: 'failed_manual_intervention'; withPolicy?: boolean } = {}) {
+async function renderPanel(items: RelaySchedule[] = [], props: { topologyState?: 'failed_manual_intervention'; withPolicy?: boolean; active?: boolean } = {}) {
   mockGet.mockResolvedValue(ok(items));
-  render(<RelaySchedulePanel groupId={10} nodes={nodes} t={t} carrierPolicy={props.withPolicy ? carrierPolicy : undefined} carrierCatalog={props.withPolicy ? carrierCatalog : undefined} topologyState={props.topologyState} />);
+  render(<RelaySchedulePanel groupId={10} nodes={nodes} t={t} carrierPolicy={props.withPolicy ? carrierPolicy : undefined} carrierCatalog={props.withPolicy ? carrierCatalog : undefined} topologyState={props.topologyState} active={props.active} onActivate={mockActivate} />);
   await waitFor(() => expect(mockGet).toHaveBeenCalledWith('/admin/relay-schedules'));
   const visibleItems = items.filter((item) => item.group_id === 10);
   if (visibleItems.length === 0) {
@@ -108,6 +112,17 @@ async function openCreate() {
 }
 
 describe('RelaySchedulePanel', () => {
+  it('offers activation only while Schedule mode is inactive', async () => {
+    await renderPanel([schedule()]);
+    fireEvent.click(screen.getByRole('button', { name: '启用定时规则' }));
+    expect(mockActivate).toHaveBeenCalledTimes(1);
+  });
+
+  it('has no meaningless page-level save or activation CTA while active', async () => {
+    await renderPanel([schedule()], { active: true });
+    expect(screen.queryByRole('button', { name: '启用定时规则' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '保存修改' })).toBeNull();
+  });
   it('shows only this group schedules and formats one-time, daily, and weekly', async () => {
     await renderPanel([
       schedule({ id: 'once', schedule_type: 'one_time', execute_at: '2026-09-01T08:00:00Z', time: null, utc_offset_minutes: null }),
@@ -243,6 +258,19 @@ describe('RelaySchedulePanel', () => {
     expect(payload).not.toHaveProperty('last_run_at');
   });
 
+  it('protects unsaved Schedule form changes inside its own modal', async () => {
+    const confirm = vi.spyOn(Modal, 'confirm');
+    await renderPanel([schedule()]);
+    fireEvent.click(within(screen.getByTestId('relay-schedule-schedule-1')).getByRole('button', { name: /编辑/ }));
+    const editor = await screen.findByRole('dialog', { name: '编辑计划' });
+    const enabled = within(editor).getByRole('switch');
+    await userEvent.click(enabled);
+    await waitFor(() => expect(enabled).not.toBeChecked());
+    fireEvent.click(screen.getByRole('button', { name: /取\s*消/ }));
+    expect(confirm).toHaveBeenCalledWith(expect.objectContaining({ title: '当前修改尚未保存' }));
+    expect(screen.getByRole('dialog', { name: '编辑计划' })).toBeInTheDocument();
+  });
+
   it('uses dedicated enable and disable endpoints', async () => {
     await renderPanel([
       schedule({ id: 'enabled', enabled: true }),
@@ -282,7 +310,7 @@ describe('RelaySchedulePanel', () => {
 
   it('contains load failure locally and supports manual refresh', async () => {
     mockGet.mockRejectedValueOnce(new Error('network')).mockResolvedValueOnce(ok([]));
-    render(<RelaySchedulePanel groupId={10} nodes={nodes} t={t} />);
+    render(<RelaySchedulePanel groupId={10} nodes={nodes} t={t} onActivate={mockActivate} />);
     const alert = (await screen.findByText('定时切换计划加载失败')).closest('[role="alert"]') as HTMLElement;
     expect(screen.getByTestId('relay-schedules-10')).toBeInTheDocument();
     fireEvent.click(within(alert).getByRole('button', { name: /刷\s*新/ }));

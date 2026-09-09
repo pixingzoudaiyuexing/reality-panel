@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Button,
@@ -28,6 +28,7 @@ import type {
   RelayReadyNode,
   RelaySchedule,
   RelayScheduleType,
+  RoutingApplyResult,
   UpdateRelayScheduleRequest,
 } from '../../api/types';
 import type { Tfn } from './types';
@@ -43,6 +44,10 @@ interface Props {
   carrierPolicy?: CarrierPolicy;
   carrierCatalog?: CarrierLineCatalog | null;
   topologyState?: RelayPreferencePhase;
+  active?: boolean;
+  disabled?: boolean;
+  activating?: boolean;
+  onActivate: () => Promise<RoutingApplyResult | null>;
 }
 
 interface ScheduleFormValues {
@@ -119,7 +124,7 @@ function requestError(error: unknown, fallback: string): string {
   return message ? `${fallback}: ${message}` : fallback;
 }
 
-export function RelaySchedulePanel({ groupId, nodes, t, carrierPolicy, carrierCatalog, topologyState }: Props) {
+export function RelaySchedulePanel({ groupId, nodes, t, carrierPolicy, carrierCatalog, topologyState, active = false, disabled = false, activating = false, onActivate }: Props) {
   const [schedules, setSchedules] = useState<RelaySchedule[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
@@ -128,6 +133,8 @@ export function RelaySchedulePanel({ groupId, nodes, t, carrierPolicy, carrierCa
   const [saving, setSaving] = useState(false);
   const [actionId, setActionId] = useState<string | null>(null);
   const [form] = Form.useForm<ScheduleFormValues>();
+  const formDirtyRef = useRef(false);
+  const markFormDirty = () => { formDirtyRef.current = true; };
   const scheduleType = Form.useWatch('schedule_type', form) ?? 'one_time';
   const offsetMinutes = Form.useWatch('utc_offset_minutes', form);
 
@@ -164,18 +171,20 @@ export function RelaySchedulePanel({ groupId, nodes, t, carrierPolicy, carrierCa
   const openCreate = () => {
     setEditing(null);
     form.resetFields();
-    form.setFieldsValue({
+    const values: Partial<ScheduleFormValues> = {
       schedule_type: 'one_time',
       enabled: true,
       utc_offset_minutes: -new Date().getTimezoneOffset(),
       weekdays: [],
-    });
+    };
+    form.setFieldsValue(values);
+    formDirtyRef.current = false;
     setModalOpen(true);
   };
 
   const openEdit = (schedule: RelaySchedule) => {
     setEditing(schedule);
-    form.setFieldsValue({
+    const values: ScheduleFormValues = {
       target_node_id: schedule.target_node_id,
       schedule_type: schedule.schedule_type,
       execute_at: toLocalDateTimeInput(schedule.execute_at),
@@ -183,7 +192,9 @@ export function RelaySchedulePanel({ groupId, nodes, t, carrierPolicy, carrierCa
       utc_offset_minutes: schedule.utc_offset_minutes ?? undefined,
       weekdays: schedule.weekdays,
       enabled: schedule.enabled,
-    });
+    };
+    form.setFieldsValue(values);
+    formDirtyRef.current = false;
     setModalOpen(true);
   };
 
@@ -208,6 +219,7 @@ export function RelaySchedulePanel({ groupId, nodes, t, carrierPolicy, carrierCa
         } satisfies CreateRelayScheduleRequest);
       if (response.code !== 0) throw new Error(response.message);
       message.success(t(editing ? 'relayScheduleUpdated' : 'relayScheduleCreated'));
+      formDirtyRef.current = false;
       setModalOpen(false);
       await load();
     } catch (error) {
@@ -249,8 +261,19 @@ export function RelaySchedulePanel({ groupId, nodes, t, carrierPolicy, carrierCa
   return (
     <section data-testid={`relay-schedules-${groupId}`} className="rp-line-feature-section">
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 10 }}>
-        <span />
+        <Tag color={active ? 'green' : undefined}>{t(active ? 'routingModeActive' : 'routingModeInactive')}</Tag>
         <Space size={4}>
+          {!active ? (
+            <Button
+              size="small"
+              type="primary"
+              loading={activating}
+              disabled={disabled}
+              onClick={() => void onActivate()}
+            >
+              {t('routingActivateSchedule')}
+            </Button>
+          ) : null}
           <Button size="small" icon={<PlusOutlined />} onClick={openCreate}>{t('relayScheduleCreateSwitch')}</Button>
           <Tooltip title={t('refresh')}>
             <Button
@@ -340,36 +363,49 @@ export function RelaySchedulePanel({ groupId, nodes, t, carrierPolicy, carrierCa
         confirmLoading={saving}
         okText={t('save')}
         cancelText={t('cancel')}
-        onCancel={() => setModalOpen(false)}
+        onCancel={() => {
+          if (!formDirtyRef.current && !form.isFieldsTouched()) {
+            setModalOpen(false);
+            return;
+          }
+          Modal.confirm({
+            title: t('routingUnsavedTitle'),
+            content: t('routingUnsavedDescription'),
+            okText: t('routingDiscardChanges'),
+            cancelText: t('routingContinueEditing'),
+            okButtonProps: { danger: true },
+            onOk: () => setModalOpen(false),
+          });
+        }}
         onOk={() => form.submit()}
         destroyOnHidden
       >
-        <Form form={form} layout="vertical" onFinish={submit}>
+        <Form form={form} layout="vertical" onFinish={submit} onClickCapture={markFormDirty} onMouseDownCapture={markFormDirty} onInputCapture={markFormDirty}>
           <Form.Item name="target_node_id" label={t('relayScheduleTarget')} rules={[{ required: true }]}>
-            <Select options={nodeOptions} />
+            <Select options={nodeOptions} onSelect={markFormDirty} />
           </Form.Item>
           <Form.Item name="schedule_type" label={t('relayScheduleType')} rules={[{ required: true }]}>
             <Select options={[
               { value: 'one_time', label: t('relayScheduleOneTime') },
               { value: 'daily', label: t('relayScheduleDaily') },
               { value: 'weekly', label: t('relayScheduleWeekly') },
-            ]} />
+            ]} onSelect={markFormDirty} />
           </Form.Item>
           {scheduleType === 'one_time' ? (
             <Form.Item name="execute_at" label={t('relayScheduleExecuteAt')} rules={[{ required: true }]}>
-              <Input type="datetime-local" />
+              <Input type="datetime-local" onInput={markFormDirty} />
             </Form.Item>
           ) : (
             <>
               <Form.Item name="time" label={t('relayScheduleTime')} rules={[{ required: true }]}>
-                <Input type="time" />
+                <Input type="time" onInput={markFormDirty} />
               </Form.Item>
               <Form.Item
                 name="utc_offset_minutes"
                 label={t('relayScheduleUtcOffset')}
                 rules={[{ required: true }]}
               >
-                <Select aria-label={t('relayScheduleUtcOffset')} options={utcOffsetOptions(offsetMinutes)} showSearch optionFilterProp="label" />
+                <Select aria-label={t('relayScheduleUtcOffset')} options={utcOffsetOptions(offsetMinutes)} showSearch optionFilterProp="label" onSelect={markFormDirty} />
               </Form.Item>
             </>
           )}
@@ -379,7 +415,7 @@ export function RelaySchedulePanel({ groupId, nodes, t, carrierPolicy, carrierCa
             </Form.Item>
           ) : null}
           <Form.Item name="enabled" label={t('relayScheduleStatus')} valuePropName="checked">
-            <Switch />
+            <Switch onClick={markFormDirty} />
           </Form.Item>
         </Form>
       </Modal>
