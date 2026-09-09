@@ -7,6 +7,19 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.18] - 2026-09-09
+
+### 新增
+
+- Relay Node 在保留 Legacy OpenList `127.0.0.1:5244` 的同时，新增独立 Xiaoya BYOA `127.0.0.1:5245` camouflage backend。
+- Xiaoya 仅在 `/ping` 返回 HTTP 200 和 `pong` 后切换，并继续复用现有 Nginx 校验、运行时回滚和 LKG 提交机制。
+
+### 兼容性
+
+- Legacy OpenList 容器、数据和生命周期保持不变；切换后不提供自动回退。
+- 无数据库 migration，Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.17 可直接升级到 v1.1.18。
+
 ## [1.1.17] - 2026-09-09
 
 ### 修复

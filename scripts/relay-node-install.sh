@@ -44,7 +44,7 @@ cd / 2>/dev/null || true
 
 # Bump this when releasing a new version. The binary is downloaded from
 # GitHub Releases assets.
-SCRIPT_VERSION="1.1.17"
+SCRIPT_VERSION="1.1.18"
 REPO="pixingzoudaiyuexing/reality-panel"
 
 GREEN='\033[0;32m'

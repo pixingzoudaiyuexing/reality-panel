@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.18] - 2026-09-09
+
+### 新增
+
+- 新增 Node-local Xiaoya BYOA 管理，在保留 Legacy OpenList `127.0.0.1:5244` 的同时提供独立的 `127.0.0.1:5245` camouflage backend。
+- Xiaoya 经严格健康检查后，使用现有 Nginx apply 和 LKG 事务完成 backend 切换；未知容器或端口占用会安全拒绝。
+- 节点诊断显示当前实际使用的 camouflage backend。
+
+### 兼容性
+
+- Legacy OpenList 安装、数据、更新和卸载行为不变；Xiaoya 故障不会自动回退到 OpenList。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.17 relay-node 可直接升级到 v1.1.18。
+
 ## [1.1.17] - 2026-09-09
 
 统一版本发布。本次仅修正 Panel 前端线路提交结果提示；relay-node 没有功能代码变化。
