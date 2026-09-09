@@ -124,6 +124,17 @@ impl From<DbError> for RelayScheduleError {
     }
 }
 
+impl From<crate::service::relay_preference::RelayPreferenceError> for RelayScheduleError {
+    fn from(error: crate::service::relay_preference::RelayPreferenceError) -> Self {
+        match error {
+            crate::service::relay_preference::RelayPreferenceError::Database(error) => {
+                Self::Database(error)
+            }
+            other => Self::InvalidStoredData(other.to_string()),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct NormalizedFields {
     schedule_type: RelayScheduleType,
@@ -335,6 +346,8 @@ pub async fn create_schedule(
     };
 
     if schedule.enabled
+        && !crate::service::relay_preference::has_explicit_routing_mode(db, schedule.group_id)
+            .await?
         && crate::service::relay_failover::enabled_for_group(db, schedule.group_id)
             .await
             .map_err(|error| RelayScheduleError::FailoverStateUnavailable(error.to_string()))?
@@ -397,6 +410,8 @@ pub async fn update_schedule(
         schedule.enabled = enabled;
     }
     if schedule.enabled
+        && !crate::service::relay_preference::has_explicit_routing_mode(db, schedule.group_id)
+            .await?
         && crate::service::relay_failover::enabled_for_group(db, schedule.group_id)
             .await
             .map_err(|error| RelayScheduleError::FailoverStateUnavailable(error.to_string()))?
@@ -471,6 +486,8 @@ pub async fn set_schedule_enabled(
         .find(|schedule| schedule.id == id)
         .ok_or(RelayScheduleError::ScheduleNotFound)?;
     if enabled
+        && !crate::service::relay_preference::has_explicit_routing_mode(db, schedule.group_id)
+            .await?
         && crate::service::relay_failover::enabled_for_group(db, schedule.group_id)
             .await
             .map_err(|error| RelayScheduleError::FailoverStateUnavailable(error.to_string()))?
@@ -488,6 +505,10 @@ pub(crate) async fn has_enabled_schedule_for_group(
     db: &dyn Repository,
     group_id: i64,
 ) -> Result<bool, RelayScheduleError> {
+    let preference = crate::service::relay_preference::load_preference(db, group_id).await?;
+    if let Some(mode) = preference.active_routing_mode {
+        return Ok(mode == crate::service::relay_preference::RoutingMode::Schedule);
+    }
     let _guard = RELAY_SCHEDULE_MUTATION_LOCK.lock().await;
     Ok(load_schedules(db)
         .await?
@@ -652,7 +673,7 @@ fn production_switch_starter(
         let node_connections = node_connections.clone();
         Box::pin(async move {
             map_switch_result(
-                crate::service::relay_preference::start_relay_switch(
+                crate::service::relay_preference::start_relay_switch_for_schedule(
                     db.as_ref(),
                     &node_connections,
                     group_id,
@@ -679,6 +700,7 @@ async fn claim_schedule(
     occurrence: &ScheduleOccurrence,
     now: DateTime<Utc>,
 ) -> Result<Option<ClaimedSchedule>, RelayScheduleError> {
+    let _authority_guard = crate::service::relay_failover::lock_automatic_policy().await;
     let _guard = RELAY_SCHEDULE_MUTATION_LOCK.lock().await;
     let mut schedules = load_schedules(db).await?;
     let Some(schedule) = schedules
@@ -687,6 +709,15 @@ async fn claim_schedule(
     else {
         return Ok(None);
     };
+    if !crate::service::relay_preference::routing_source_is_authorized(
+        db,
+        schedule.group_id,
+        crate::service::relay_preference::RelaySwitchSource::Schedule,
+    )
+    .await?
+    {
+        return Ok(None);
+    }
     if !schedule.enabled || schedule.last_run_slot.as_deref() == Some(occurrence.slot.as_str()) {
         return Ok(None);
     }

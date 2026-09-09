@@ -17,8 +17,14 @@ pub struct SetRelayPreferenceRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct SetCarrierAffinityRequest {
+    pub default_node_id: Option<String>,
     #[serde(default)]
     pub bindings: Vec<crate::service::relay_preference::CarrierLineBinding>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetRoutingModeRequest {
+    pub mode: crate::service::relay_preference::RoutingMode,
 }
 
 fn safe_carrier_preflight_detail(detail: &str) -> String {
@@ -42,19 +48,21 @@ fn carrier_apply_error_response(
             409,
             "DEFAULT_LINE_OWNED_BY_RELAY_PREFERENCE".into(),
         ),
+        CarrierPolicyApplyError::RoutingModeConflict(_) => {
+            (StatusCode::CONFLICT, 409, "ROUTING_MODE_CONFLICT".into())
+        }
         CarrierPolicyApplyError::TransactionInProgress => {
             (StatusCode::CONFLICT, 409, "TRANSACTION_IN_PROGRESS".into())
         }
         CarrierPolicyApplyError::NodeUninstalling(_) => {
             (StatusCode::CONFLICT, 409, error.to_string())
         }
-        CarrierPolicyApplyError::FailoverEnabled => {
-            (StatusCode::CONFLICT, 409, "FAILOVER_ENABLED".into())
-        }
         CarrierPolicyApplyError::InvalidPolicy(_)
         | CarrierPolicyApplyError::LineUnavailable(_)
         | CarrierPolicyApplyError::NodeNotInGroup(_)
-        | CarrierPolicyApplyError::TargetPublicIpv4Invalid(_) => {
+        | CarrierPolicyApplyError::TargetPublicIpv4Invalid(_)
+        | CarrierPolicyApplyError::CarrierDefaultRequired
+        | CarrierPolicyApplyError::CarrierDefaultNotReady(_) => {
             (StatusCode::UNPROCESSABLE_ENTITY, 422, error.to_string())
         }
         CarrierPolicyApplyError::OwnershipUnverified { .. } => (
@@ -85,8 +93,7 @@ fn carrier_apply_error_response(
         ),
         CarrierPolicyApplyError::Database(_)
         | CarrierPolicyApplyError::InvalidPreference(_)
-        | CarrierPolicyApplyError::DnsSchedulingFailed
-        | CarrierPolicyApplyError::FailoverStateUnavailable(_) => (
+        | CarrierPolicyApplyError::DnsSchedulingFailed => (
             StatusCode::INTERNAL_SERVER_ERROR,
             500,
             "carrier policy could not be applied".into(),
@@ -121,6 +128,94 @@ pub async fn get_relay_preference(
         Err(error) => {
             tracing::error!("get_relay_preference {}: {}", group_id, error);
             axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn get_routing_mode(
+    _admin: AdminOnly,
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+) -> Response {
+    match crate::service::relay_preference::get_routing_mode(state.db.as_ref(), group_id).await {
+        Ok(view) => Json(ApiResponse::success(view)).into_response(),
+        Err(crate::service::relay_preference::RelayPreferenceError::Database(
+            crate::db::error::DbError::NotFound,
+        )) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<()>::error(404, "Inbound group not found")),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(group_id, "get routing mode failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn set_routing_mode(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+    Json(request): Json<SetRoutingModeRequest>,
+) -> Response {
+    use crate::service::relay_preference::RoutingModeTransitionError;
+    match crate::service::relay_preference::transition_routing_mode(
+        state.db.as_ref(),
+        &state.node_connections,
+        group_id,
+        request.mode,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            crate::service::audit::record(
+                &state,
+                Some(admin.user_id),
+                "ROUTING_MODE_REQUESTED",
+                "device_group",
+                group_id,
+                &format!("target_mode={:?} outcome={outcome:?}", request.mode),
+            )
+            .await;
+            match crate::service::relay_preference::get_routing_mode(state.db.as_ref(), group_id)
+                .await
+            {
+                Ok(view) => Json(ApiResponse::success(view)).into_response(),
+                Err(error) => {
+                    tracing::error!(group_id, "routing mode response failed: {error}");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
+        Err(error) => {
+            let (status, code, message) = match &error {
+                RoutingModeTransitionError::InboundGroupNotFound => {
+                    (StatusCode::NOT_FOUND, 404, error.to_string())
+                }
+                RoutingModeTransitionError::Conflict(_)
+                | RoutingModeTransitionError::TransactionInProgress => {
+                    (StatusCode::CONFLICT, 409, error.to_string())
+                }
+                RoutingModeTransitionError::CarrierDefaultRequired
+                | RoutingModeTransitionError::CarrierDefaultNotReady(_)
+                | RoutingModeTransitionError::ScheduleConfigurationMissing
+                | RoutingModeTransitionError::OwnershipUnverified { .. } => {
+                    (StatusCode::UNPROCESSABLE_ENTITY, 422, error.to_string())
+                }
+                RoutingModeTransitionError::DnsMgrUnavailable
+                | RoutingModeTransitionError::ProviderPreflight(_) => {
+                    (StatusCode::SERVICE_UNAVAILABLE, 503, error.to_string())
+                }
+                RoutingModeTransitionError::Database(_)
+                | RoutingModeTransitionError::InvalidPreference(_)
+                | RoutingModeTransitionError::DnsSchedulingFailed => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    500,
+                    "routing mode could not be changed".into(),
+                ),
+            };
+            (status, Json(ApiResponse::<()>::error(code, &message))).into_response()
         }
     }
 }
@@ -165,7 +260,9 @@ pub async fn set_relay_preference(
                     )
                 }
                 StartRelaySwitchError::SwitchInProgress { .. }
-                | StartRelaySwitchError::NodeUninstalling(_) => {
+                | StartRelaySwitchError::NodeUninstalling(_)
+                | StartRelaySwitchError::RoutingModeConflict(_)
+                | StartRelaySwitchError::SourceNotAuthorized { .. } => {
                     (StatusCode::CONFLICT, 409, error.to_string())
                 }
                 StartRelaySwitchError::Database(_)
@@ -277,6 +374,7 @@ pub async fn set_carrier_affinity(
 ) -> Response {
     use crate::service::relay_preference::CarrierPolicyApplyError;
     let policy = crate::service::relay_preference::CarrierPolicy {
+        default_node_id: request.default_node_id,
         bindings: request.bindings,
     };
     let outcome = match crate::service::relay_preference::start_carrier_policy_apply(
@@ -302,7 +400,6 @@ pub async fn set_carrier_affinity(
                 CarrierPolicyApplyError::Database(_)
                     | CarrierPolicyApplyError::InvalidPreference(_)
                     | CarrierPolicyApplyError::DnsSchedulingFailed
-                    | CarrierPolicyApplyError::FailoverStateUnavailable(_)
             ) {
                 tracing::error!(group_id, "set carrier affinity failed: {error}");
             }

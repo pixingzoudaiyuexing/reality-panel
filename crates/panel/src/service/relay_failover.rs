@@ -159,6 +159,9 @@ impl From<crate::service::relay_preference::RelayPreferenceError> for RelayFailo
             crate::service::relay_preference::RelayPreferenceError::InvalidPreference(error) => {
                 Self::InvalidStoredData(error.to_string())
             }
+            crate::service::relay_preference::RelayPreferenceError::RoutingModeConflict(modes) => {
+                Self::InvalidStoredData(format!("routing mode authority conflict: {modes:?}"))
+            }
         }
     }
 }
@@ -260,6 +263,21 @@ async fn store_policy(
     Ok(())
 }
 
+pub(crate) async fn arm_for_routing_mode(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<(), RelayFailoverError> {
+    ensure_inbound_group(db, group_id).await?;
+    let _guard = FAILOVER_MUTATION_LOCK.lock().await;
+    let mut policy = load_policy(db, group_id).await?;
+    policy.enabled = true;
+    policy.last_result = None;
+    policy.last_error = None;
+    store_policy(db, group_id, &policy).await?;
+    remove_runtime(group_id);
+    Ok(())
+}
+
 fn validate_policy(policy: &RelayFailoverPolicy) -> Result<(), RelayFailoverError> {
     if policy.model_version != MODEL_VERSION {
         return Err(RelayFailoverError::InvalidStoredData(format!(
@@ -295,6 +313,10 @@ pub(crate) async fn enabled_for_group(
     db: &dyn Repository,
     group_id: i64,
 ) -> Result<bool, RelayFailoverError> {
+    let preference = crate::service::relay_preference::load_preference(db, group_id).await?;
+    if let Some(mode) = preference.active_routing_mode {
+        return Ok(mode == crate::service::relay_preference::RoutingMode::Failover);
+    }
     Ok(load_policy(db, group_id).await?.enabled)
 }
 
@@ -315,7 +337,8 @@ pub async fn update_policy(
     validate_policy(&candidate)?;
 
     let _policy_guard = lock_automatic_policy().await;
-    if enabled {
+    if enabled && !crate::service::relay_preference::has_explicit_routing_mode(db, group_id).await?
+    {
         if crate::service::relay_schedule::has_enabled_schedule_for_group(db, group_id).await? {
             return Err(RelayFailoverError::ScheduleEnabled);
         }
@@ -661,6 +684,20 @@ async fn process_group(state: &AppState, group_id: i64, policy: RelayFailoverPol
     let Ok(_operation_guard) = runtime.operation.try_lock() else {
         return;
     };
+    match crate::service::relay_preference::routing_source_is_authorized(
+        state.db.as_ref(),
+        group_id,
+        crate::service::relay_preference::RelaySwitchSource::Failover,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            tracing::warn!(group_id, "failover routing authority read failed: {error}");
+            return;
+        }
+    }
     let preference = match crate::service::relay_preference::load_preference(
         state.db.as_ref(),
         group_id,
@@ -853,6 +890,17 @@ async fn process_group(state: &AppState, group_id: i64, policy: RelayFailoverPol
     if !runtime_is_current(group_id, &runtime) {
         return;
     }
+    if !matches!(
+        crate::service::relay_preference::routing_source_is_authorized(
+            state.db.as_ref(),
+            group_id,
+            crate::service::relay_preference::RelaySwitchSource::Failover,
+        )
+        .await,
+        Ok(true)
+    ) {
+        return;
+    }
     let policy =
         match mark_failed_node_excluded(state.db.as_ref(), group_id, &current_node_id, &policy)
             .await
@@ -1030,7 +1078,14 @@ pub async fn get_view(
     group_id: i64,
 ) -> Result<RelayFailoverView, RelayFailoverError> {
     ensure_inbound_group(db, group_id).await?;
-    let policy = load_policy(db, group_id).await?;
+    let mut policy = load_policy(db, group_id).await?;
+    policy.enabled = crate::service::relay_preference::routing_source_is_authorized(
+        db,
+        group_id,
+        crate::service::relay_preference::RelaySwitchSource::Failover,
+    )
+    .await
+    .unwrap_or(false);
     let preference = crate::service::relay_preference::load_preference(db, group_id).await?;
     let ready_nodes = crate::service::relay_preference::evaluate_group_ready_nodes(
         db,
@@ -1718,6 +1773,7 @@ mod tests {
         let (repo, connections) = test_repo().await;
         let preference = crate::service::relay_preference::RelayPreferenceState {
             carrier_policy: crate::service::relay_preference::CarrierPolicy {
+                default_node_id: None,
                 bindings: vec![crate::service::relay_preference::CarrierLineBinding {
                     line_id: "Dianxin".into(),
                     mode: crate::service::relay_preference::CarrierLineMode::FollowDefault,
@@ -1745,6 +1801,7 @@ mod tests {
                 &connections,
                 1,
                 crate::service::relay_preference::CarrierPolicy {
+                    default_node_id: None,
                     bindings: vec![crate::service::relay_preference::CarrierLineBinding {
                         line_id: "Dianxin".into(),
                         mode: crate::service::relay_preference::CarrierLineMode::FollowDefault,
@@ -1753,7 +1810,7 @@ mod tests {
                 },
             )
             .await,
-            Err(crate::service::relay_preference::CarrierPolicyApplyError::FailoverEnabled)
+            Ok(crate::service::relay_preference::CarrierPolicyApplyOutcome::SavedInactive)
         ));
     }
 

@@ -92,8 +92,29 @@ pub struct CarrierLineBinding {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CarrierPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_node_id: Option<String>,
     #[serde(default)]
     pub bindings: Vec<CarrierLineBinding>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingMode {
+    Normal,
+    Carrier,
+    Schedule,
+    Failover,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelaySwitchSource {
+    Manual,
+    Schedule,
+    Failover,
+    Carrier,
+    ModeTransition,
 }
 
 #[allow(dead_code)] // RC9-S4 persisted model; consumed by the Carrier Policy API in S5.
@@ -101,6 +122,7 @@ pub struct CarrierPolicy {
 #[allow(clippy::enum_variant_names)] // Public error vocabulary intentionally names the validated ID field.
 pub enum CarrierPolicyValidationError {
     InvalidLineId,
+    InvalidDefaultNodeId,
     DefaultLineOwnedByRelayPreference,
     DuplicateLineId,
     UnexpectedNodeId,
@@ -114,6 +136,7 @@ fn carrier_line_uses_default_authority(line_id: &str) -> bool {
 
 fn carrier_policy_without_default_authority(policy: &CarrierPolicy) -> CarrierPolicy {
     CarrierPolicy {
+        default_node_id: policy.default_node_id.clone(),
         bindings: policy
             .bindings
             .iter()
@@ -140,6 +163,12 @@ fn carrier_policy_has_follow_default_bindings(policy: &CarrierPolicy) -> bool {
 impl CarrierPolicy {
     #[allow(dead_code)] // RC9-S4 persisted model; consumed by the Carrier Policy API in S5.
     pub fn normalize(mut self) -> Result<Self, CarrierPolicyValidationError> {
+        if let Some(node_id) = self.default_node_id.as_mut() {
+            *node_id = node_id.trim().to_string();
+            if node_id.is_empty() || node_id.chars().any(char::is_control) {
+                return Err(CarrierPolicyValidationError::InvalidDefaultNodeId);
+            }
+        }
         let mut seen = BTreeSet::new();
         for binding in &mut self.bindings {
             if binding.line_id.is_empty()
@@ -182,6 +211,7 @@ impl CarrierPolicy {
 pub enum RelayTransactionKind {
     PreferredSwitch,
     CarrierPolicyApply,
+    RoutingModeTransition,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +260,12 @@ pub struct RelayDnsTransactionRecord {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RelayPreferenceState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_routing_mode: Option<RoutingMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_routing_mode: Option<RoutingMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_default_node_id: Option<String>,
     pub preferred_node_id: Option<String>,
     pub pending_node_id: Option<String>,
     pub state: RelayPreferencePhase,
@@ -245,10 +281,18 @@ pub struct RelayPreferenceState {
     pub pending_carrier_policy: Option<CarrierPolicy>,
     #[serde(default)]
     pub transaction_kind: Option<RelayTransactionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_source: Option<RelaySwitchSource>,
 }
 
 #[derive(Deserialize)]
 struct RelayPreferenceStateWire {
+    #[serde(default)]
+    active_routing_mode: Option<RoutingMode>,
+    #[serde(default)]
+    pending_routing_mode: Option<RoutingMode>,
+    #[serde(default)]
+    normal_default_node_id: Option<String>,
     preferred_node_id: Option<String>,
     pending_node_id: Option<String>,
     state: RelayPreferencePhase,
@@ -264,6 +308,8 @@ struct RelayPreferenceStateWire {
     pending_carrier_policy: Option<CarrierPolicy>,
     #[serde(default)]
     transaction_kind: Option<RelayTransactionKind>,
+    #[serde(default)]
+    switch_source: Option<RelaySwitchSource>,
 }
 
 impl<'de> Deserialize<'de> for RelayPreferenceState {
@@ -277,6 +323,9 @@ impl<'de> Deserialize<'de> for RelayPreferenceState {
                 .then_some(RelayTransactionKind::PreferredSwitch)
         });
         Ok(Self {
+            active_routing_mode: wire.active_routing_mode,
+            pending_routing_mode: wire.pending_routing_mode,
+            normal_default_node_id: wire.normal_default_node_id,
             preferred_node_id: wire.preferred_node_id,
             pending_node_id: wire.pending_node_id,
             state: wire.state,
@@ -287,6 +336,7 @@ impl<'de> Deserialize<'de> for RelayPreferenceState {
             carrier_policy: wire.carrier_policy,
             pending_carrier_policy: wire.pending_carrier_policy,
             transaction_kind,
+            switch_source: wire.switch_source,
         })
     }
 }
@@ -294,6 +344,9 @@ impl<'de> Deserialize<'de> for RelayPreferenceState {
 impl Default for RelayPreferenceState {
     fn default() -> Self {
         Self {
+            active_routing_mode: None,
+            pending_routing_mode: None,
+            normal_default_node_id: None,
             preferred_node_id: None,
             pending_node_id: None,
             state: RelayPreferencePhase::Idle,
@@ -304,6 +357,7 @@ impl Default for RelayPreferenceState {
             carrier_policy: CarrierPolicy::default(),
             pending_carrier_policy: None,
             transaction_kind: None,
+            switch_source: None,
         }
     }
 }
@@ -321,6 +375,9 @@ pub struct RelayReadyNode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayPreferenceView {
     pub group_id: i64,
+    pub active_routing_mode: Option<RoutingMode>,
+    pub pending_routing_mode: Option<RoutingMode>,
+    pub normal_default_node_id: Option<String>,
     pub preferred_node_id: Option<String>,
     pub preferred_node_public_ipv4: Option<String>,
     pub pending_node_id: Option<String>,
@@ -330,6 +387,102 @@ pub struct RelayPreferenceView {
     pub rollback_error: Option<String>,
     pub dns_records: Vec<RelayDnsRecordView>,
     pub nodes: Vec<RelayReadyNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingModeAvailability {
+    pub normal: bool,
+    pub carrier: bool,
+    pub schedule: bool,
+    pub failover: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingModeView {
+    pub group_id: i64,
+    pub active_mode: Option<RoutingMode>,
+    pub pending_mode: Option<RoutingMode>,
+    pub transition_state: RelayPreferencePhase,
+    pub normal_default_node_id: Option<String>,
+    pub effective_default_node_id: Option<String>,
+    pub mode_availability: RoutingModeAvailability,
+    pub last_error: Option<String>,
+    pub conflict_modes: Vec<RoutingMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingModeTransitionOutcome {
+    NoChange,
+    CommittedWithoutDns,
+    Started,
+}
+
+#[derive(Debug)]
+pub enum RoutingModeTransitionError {
+    Database(DbError),
+    InvalidPreference(serde_json::Error),
+    InboundGroupNotFound,
+    Conflict(Vec<RoutingMode>),
+    TransactionInProgress,
+    CarrierDefaultRequired,
+    CarrierDefaultNotReady(String),
+    ScheduleConfigurationMissing,
+    DnsMgrUnavailable,
+    ProviderPreflight(String),
+    OwnershipUnverified { rule_id: i64, line_id: String },
+    DnsSchedulingFailed,
+}
+
+impl std::fmt::Display for RoutingModeTransitionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => write!(formatter, "database error: {error}"),
+            Self::InvalidPreference(error) => write!(formatter, "invalid routing state: {error}"),
+            Self::InboundGroupNotFound => formatter.write_str("inbound group not found"),
+            Self::Conflict(modes) => {
+                write!(formatter, "routing mode authority conflict: {modes:?}")
+            }
+            Self::TransactionInProgress => {
+                formatter.write_str("routing transaction already in progress")
+            }
+            Self::CarrierDefaultRequired => formatter.write_str("carrier default node is required"),
+            Self::CarrierDefaultNotReady(node_id) => {
+                write!(formatter, "carrier default node is not ready: {node_id}")
+            }
+            Self::ScheduleConfigurationMissing => {
+                formatter.write_str("an enabled schedule is required")
+            }
+            Self::DnsMgrUnavailable => formatter.write_str("DNSMgr is disabled or not configured"),
+            Self::ProviderPreflight(error) => {
+                write!(formatter, "DNS provider preflight failed: {error}")
+            }
+            Self::OwnershipUnverified { rule_id, line_id } => write!(
+                formatter,
+                "DNS ownership could not be verified for rule {rule_id} line {line_id}"
+            ),
+            Self::DnsSchedulingFailed => {
+                formatter.write_str("failed to schedule routing mode transition")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RoutingModeTransitionError {}
+
+impl From<DbError> for RoutingModeTransitionError {
+    fn from(error: DbError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<RelayPreferenceError> for RoutingModeTransitionError {
+    fn from(error: RelayPreferenceError) -> Self {
+        match error {
+            RelayPreferenceError::Database(error) => Self::Database(error),
+            RelayPreferenceError::InvalidPreference(error) => Self::InvalidPreference(error),
+            RelayPreferenceError::RoutingModeConflict(modes) => Self::Conflict(modes),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -427,6 +580,7 @@ fn reported_public_ipv4(status: &StoredNodeStatus) -> Option<&str> {
 pub enum RelayPreferenceError {
     Database(DbError),
     InvalidPreference(serde_json::Error),
+    RoutingModeConflict(Vec<RoutingMode>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,9 +612,16 @@ pub enum StartRelaySwitchError {
     DnsMgrUnavailable,
     CarrierDnsPreflightFailed(String),
     NoEligibleDnsRules,
-    SwitchInProgress { pending_node_id: Option<String> },
+    SwitchInProgress {
+        pending_node_id: Option<String>,
+    },
     DnsSchedulingFailed(DbError),
     NodeUninstalling(String),
+    RoutingModeConflict(Vec<RoutingMode>),
+    SourceNotAuthorized {
+        source: RelaySwitchSource,
+        active_mode: RoutingMode,
+    },
 }
 
 #[derive(Debug)]
@@ -475,14 +636,15 @@ pub enum CarrierPolicyApplyError {
     LineUnavailable(String),
     NodeNotInGroup(String),
     TargetPublicIpv4Invalid(String),
+    CarrierDefaultRequired,
+    CarrierDefaultNotReady(String),
     DnsMgrUnavailable,
     DefaultLineOwnedByRelayPreference,
     ProviderPreflight(String),
     OwnershipUnverified { rule_id: i64, line_id: String },
     DnsSchedulingFailed,
-    FailoverEnabled,
-    FailoverStateUnavailable(String),
     NodeUninstalling(String),
+    RoutingModeConflict(Vec<RoutingMode>),
 }
 
 impl std::fmt::Display for CarrierPolicyApplyError {
@@ -502,6 +664,12 @@ impl std::fmt::Display for CarrierPolicyApplyError {
             Self::TargetPublicIpv4Invalid(node_id) => {
                 write!(f, "target node public IPv4 is invalid: {node_id}")
             }
+            Self::CarrierDefaultRequired => {
+                write!(f, "carrier policy requires exactly one default node")
+            }
+            Self::CarrierDefaultNotReady(node_id) => {
+                write!(f, "carrier default node is not ready: {node_id}")
+            }
             Self::DnsMgrUnavailable => write!(f, "DNSMgr is disabled or not configured"),
             Self::DefaultLineOwnedByRelayPreference => {
                 write!(
@@ -515,14 +683,11 @@ impl std::fmt::Display for CarrierPolicyApplyError {
                 "DNS ownership could not be verified for rule {rule_id} line {line_id}"
             ),
             Self::DnsSchedulingFailed => write!(f, "failed to schedule carrier DNS transaction"),
-            Self::FailoverEnabled => {
-                write!(f, "该分组已启用故障切换，请先停用后再启用运营商策略。")
-            }
-            Self::FailoverStateUnavailable(error) => {
-                write!(f, "failover policy state is unavailable: {error}")
-            }
             Self::NodeUninstalling(node_id) => {
                 write!(f, "节点 {node_id} 正在卸载，当前不能参与线路切换。")
+            }
+            Self::RoutingModeConflict(modes) => {
+                write!(f, "routing mode authority conflict: {modes:?}")
             }
         }
     }
@@ -560,6 +725,16 @@ impl std::fmt::Display for StartRelaySwitchError {
             Self::NodeUninstalling(node_id) => {
                 write!(f, "节点 {node_id} 正在卸载，当前不能参与线路切换。")
             }
+            Self::RoutingModeConflict(modes) => {
+                write!(f, "routing mode authority conflict: {modes:?}")
+            }
+            Self::SourceNotAuthorized {
+                source,
+                active_mode,
+            } => write!(
+                f,
+                "{source:?} default switch is not authorized in {active_mode:?} mode"
+            ),
         }
     }
 }
@@ -583,6 +758,7 @@ impl From<RelayPreferenceError> for CarrierPolicyApplyError {
         match error {
             RelayPreferenceError::Database(error) => Self::Database(error),
             RelayPreferenceError::InvalidPreference(error) => Self::InvalidPreference(error),
+            RelayPreferenceError::RoutingModeConflict(modes) => Self::RoutingModeConflict(modes),
         }
     }
 }
@@ -592,6 +768,9 @@ impl std::fmt::Display for RelayPreferenceError {
         match self {
             Self::Database(error) => write!(f, "database error: {error}"),
             Self::InvalidPreference(error) => write!(f, "invalid relay preference: {error}"),
+            Self::RoutingModeConflict(modes) => {
+                write!(f, "routing mode authority conflict: {modes:?}")
+            }
         }
     }
 }
@@ -775,6 +954,189 @@ pub(crate) async fn load_preference(
     }
 }
 
+async fn legacy_enabled_schedule(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<bool, RelayPreferenceError> {
+    let Some(raw) = db
+        .get(crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let schedules: Vec<crate::service::relay_schedule::RelaySchedule> =
+        serde_json::from_str(&raw).map_err(RelayPreferenceError::InvalidPreference)?;
+    Ok(schedules
+        .iter()
+        .any(|schedule| schedule.group_id == group_id && schedule.enabled))
+}
+
+async fn legacy_enabled_failover(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<bool, RelayPreferenceError> {
+    let Some(raw) = db
+        .get(&format!(
+            "{}{}",
+            crate::service::relay_failover::RELAY_FAILOVER_KEY_PREFIX,
+            group_id
+        ))
+        .await?
+    else {
+        return Ok(false);
+    };
+    let policy: crate::service::relay_failover::RelayFailoverPolicy =
+        serde_json::from_str(&raw).map_err(RelayPreferenceError::InvalidPreference)?;
+    Ok(policy.enabled)
+}
+
+async fn infer_legacy_routing_mode(
+    db: &dyn Repository,
+    group_id: i64,
+    preference: &RelayPreferenceState,
+) -> Result<RoutingMode, RelayPreferenceError> {
+    let mut modes = Vec::new();
+    if carrier_policy_has_mutable_bindings(&preference.carrier_policy) {
+        modes.push(RoutingMode::Carrier);
+    }
+    if legacy_enabled_schedule(db, group_id).await? {
+        modes.push(RoutingMode::Schedule);
+    }
+    if legacy_enabled_failover(db, group_id).await? {
+        modes.push(RoutingMode::Failover);
+    }
+    match modes.as_slice() {
+        [] => Ok(RoutingMode::Normal),
+        [mode] => Ok(*mode),
+        _ => Err(RelayPreferenceError::RoutingModeConflict(modes)),
+    }
+}
+
+async fn resolved_routing_mode(
+    db: &dyn Repository,
+    group_id: i64,
+    preference: &RelayPreferenceState,
+) -> Result<RoutingMode, RelayPreferenceError> {
+    match preference.active_routing_mode {
+        Some(mode) => Ok(mode),
+        None => infer_legacy_routing_mode(db, group_id, preference).await,
+    }
+}
+
+async fn normalize_routing_state(
+    db: &dyn Repository,
+    group_id: i64,
+    preference: &mut RelayPreferenceState,
+) -> Result<bool, RelayPreferenceError> {
+    let mut changed = false;
+    if preference.normal_default_node_id.is_none() {
+        preference.normal_default_node_id = preference.preferred_node_id.clone();
+        changed = preference.normal_default_node_id.is_some();
+    }
+    if preference.active_routing_mode.is_none() {
+        let mode = infer_legacy_routing_mode(db, group_id, preference).await?;
+        preference.active_routing_mode = Some(mode);
+        if mode == RoutingMode::Carrier && preference.carrier_policy.default_node_id.is_none() {
+            preference.carrier_policy.default_node_id = preference.preferred_node_id.clone();
+        }
+        changed = true;
+    }
+    Ok(changed)
+}
+
+async fn legacy_conflict_modes(
+    db: &dyn Repository,
+    group_id: i64,
+    preference: &RelayPreferenceState,
+) -> Result<Vec<RoutingMode>, RelayPreferenceError> {
+    let mut modes = Vec::new();
+    if carrier_policy_has_mutable_bindings(&preference.carrier_policy) {
+        modes.push(RoutingMode::Carrier);
+    }
+    if legacy_enabled_schedule(db, group_id).await? {
+        modes.push(RoutingMode::Schedule);
+    }
+    if legacy_enabled_failover(db, group_id).await? {
+        modes.push(RoutingMode::Failover);
+    }
+    Ok((modes.len() > 1).then_some(modes).unwrap_or_default())
+}
+
+fn source_authorized(mode: RoutingMode, source: RelaySwitchSource) -> bool {
+    matches!(
+        (mode, source),
+        (RoutingMode::Normal, RelaySwitchSource::Manual)
+            | (RoutingMode::Schedule, RelaySwitchSource::Schedule)
+            | (RoutingMode::Failover, RelaySwitchSource::Failover)
+            | (RoutingMode::Carrier, RelaySwitchSource::Carrier)
+            | (_, RelaySwitchSource::ModeTransition)
+    )
+}
+
+pub(crate) async fn routing_source_is_authorized(
+    db: &dyn Repository,
+    group_id: i64,
+    source: RelaySwitchSource,
+) -> Result<bool, RelayPreferenceError> {
+    let preference = load_preference(db, group_id).await?;
+    Ok(source_authorized(
+        resolved_routing_mode(db, group_id, &preference).await?,
+        source,
+    ))
+}
+
+pub(crate) async fn has_explicit_routing_mode(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<bool, RelayPreferenceError> {
+    Ok(load_preference(db, group_id)
+        .await?
+        .active_routing_mode
+        .is_some())
+}
+
+pub async fn get_routing_mode(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<RoutingModeView, RelayPreferenceError> {
+    match GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await? {
+        Some(group) if group.group_type == "in" => {}
+        _ => return Err(RelayPreferenceError::Database(DbError::NotFound)),
+    }
+    let preference = load_preference(db, group_id).await?;
+    let conflict_modes = if preference.active_routing_mode.is_none() {
+        legacy_conflict_modes(db, group_id, &preference).await?
+    } else {
+        Vec::new()
+    };
+    let active_mode = if conflict_modes.is_empty() {
+        Some(resolved_routing_mode(db, group_id, &preference).await?)
+    } else {
+        None
+    };
+    let carrier = preference.carrier_policy.default_node_id.is_some();
+    let schedule = legacy_enabled_schedule(db, group_id).await.unwrap_or(false);
+    Ok(RoutingModeView {
+        group_id,
+        active_mode,
+        pending_mode: preference.pending_routing_mode,
+        transition_state: preference.state,
+        normal_default_node_id: preference
+            .normal_default_node_id
+            .clone()
+            .or_else(|| preference.preferred_node_id.clone()),
+        effective_default_node_id: preference.preferred_node_id,
+        mode_availability: RoutingModeAvailability {
+            normal: true,
+            carrier,
+            schedule,
+            failover: true,
+        },
+        last_error: preference.last_error,
+        conflict_modes,
+    })
+}
+
 async fn store_preference(
     db: &dyn Repository,
     group_id: i64,
@@ -805,11 +1167,6 @@ pub(crate) async fn dns_transaction_authorizes(
     let Ok(preference) = serde_json::from_str::<RelayPreferenceState>(&raw) else {
         return Ok(false);
     };
-    if preference.transaction_kind == Some(RelayTransactionKind::CarrierPolicyApply)
-        && line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY
-    {
-        return Ok(false);
-    }
     if preference.transaction_kind.is_none()
         || !matches!(
             preference.state,
@@ -817,6 +1174,29 @@ pub(crate) async fn dns_transaction_authorizes(
         )
     {
         return Ok(false);
+    }
+    if line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY {
+        let mode = match resolved_routing_mode(db, rule.device_group_in, &preference).await {
+            Ok(mode) => mode,
+            Err(_) => return Ok(false),
+        };
+        let authorized = match preference.transaction_kind {
+            Some(RelayTransactionKind::CarrierPolicyApply) => {
+                mode == RoutingMode::Carrier
+                    && preference.switch_source == Some(RelaySwitchSource::Carrier)
+            }
+            Some(RelayTransactionKind::RoutingModeTransition) => {
+                preference.pending_routing_mode.is_some()
+                    && preference.switch_source == Some(RelaySwitchSource::ModeTransition)
+            }
+            Some(RelayTransactionKind::PreferredSwitch) => preference
+                .switch_source
+                .is_some_and(|source| source_authorized(mode, source)),
+            None => false,
+        };
+        if !authorized {
+            return Ok(false);
+        }
     }
     Ok(preference.dns_records.iter().any(|record| {
         if record.rule_id != rule_id || record.fqdn != fqdn || record.line_key != line_key {
@@ -876,11 +1256,6 @@ pub async fn resolve_dns_target_for_rule(
         Err(_) => return Ok(RelayDnsTarget::Invalid("RELAY_PREFERENCE_INVALID")),
     };
     let selected_node_id = match preference.state {
-        RelayPreferencePhase::Switching
-            if preference.transaction_kind == Some(RelayTransactionKind::CarrierPolicyApply) =>
-        {
-            preference.preferred_node_id.as_deref()
-        }
         RelayPreferencePhase::Switching => {
             if let Some(value) = rule_id
                 .and_then(|rule_id| {
@@ -897,12 +1272,14 @@ pub async fn resolve_dns_target_for_rule(
                     None => RelayDnsTarget::Invalid("TARGET_VALUE_UNAVAILABLE"),
                 });
             }
-            preference.pending_node_id.as_deref()
-        }
-        RelayPreferencePhase::RollingBack
-            if preference.transaction_kind == Some(RelayTransactionKind::CarrierPolicyApply) =>
-        {
-            preference.preferred_node_id.as_deref()
+            if matches!(
+                preference.transaction_kind,
+                Some(RelayTransactionKind::CarrierPolicyApply)
+            ) {
+                preference.preferred_node_id.as_deref()
+            } else {
+                preference.pending_node_id.as_deref()
+            }
         }
         RelayPreferencePhase::RollingBack => {
             let rollback_value = rule_id
@@ -914,10 +1291,13 @@ pub async fn resolve_dns_target_for_rule(
                     })
                 })
                 .and_then(|record| record.rollback_value.as_deref());
-            return Ok(match valid_public_ipv4(rollback_value) {
-                Some(value) => RelayDnsTarget::Resolved(value),
-                None => RelayDnsTarget::Invalid("ROLLBACK_VALUE_UNAVAILABLE"),
-            });
+            if rollback_value.is_some() {
+                return Ok(match valid_public_ipv4(rollback_value) {
+                    Some(value) => RelayDnsTarget::Resolved(value),
+                    None => RelayDnsTarget::Invalid("ROLLBACK_VALUE_UNAVAILABLE"),
+                });
+            }
+            preference.preferred_node_id.as_deref()
         }
         RelayPreferencePhase::Failed
         | RelayPreferencePhase::FailedRolledBack
@@ -1009,19 +1389,19 @@ pub async fn ensure_preference_initialized(
         return Ok(RelayPreferenceState::default());
     }
     let mut preference = load_preference(db, group_id).await?;
-    if preference.preferred_node_id.is_some() {
-        return Ok(preference);
-    }
-
-    let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
-
-    let mut ready_node_ids = Vec::new();
-    for node in evaluated.iter().filter(|node| node.info.ready) {
-        if !node_is_uninstalling(db, group_id, &node.info.node_id).await? {
-            ready_node_ids.push(node.info.node_id.clone());
+    let mut changed = false;
+    if preference.preferred_node_id.is_none() {
+        let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
+        let mut ready_node_ids = Vec::new();
+        for node in evaluated.iter().filter(|node| node.info.ready) {
+            if !node_is_uninstalling(db, group_id, &node.info.node_id).await? {
+                ready_node_ids.push(node.info.node_id.clone());
+            }
         }
+        changed = initialize_preference_if_unique_ready(&mut preference, &ready_node_ids);
     }
-    if initialize_preference_if_unique_ready(&mut preference, &ready_node_ids) {
+    changed |= normalize_routing_state(db, group_id, &mut preference).await?;
+    if changed {
         store_preference(db, group_id, &preference).await?;
     }
 
@@ -1184,6 +1564,7 @@ pub enum CarrierPolicyApplyOutcome {
     NoChange,
     Started,
     CommittedWithoutDns,
+    SavedInactive,
 }
 
 fn carrier_policy_diff(
@@ -1267,21 +1648,42 @@ pub(crate) async fn carrier_line_desired_for_rule(
         },
         None => RelayPreferenceState::default(),
     };
+    let active_mode = resolved_routing_mode(db, rule.device_group_in, &preference)
+        .await
+        .map_err(|error| DbError::Other(sqlx::Error::Protocol(error.to_string())))?;
     let mut desired = BTreeMap::new();
     let mut configured_lines = HashSet::new();
-    for binding in preference
-        .carrier_policy
-        .bindings
-        .iter()
-        .filter(|binding| !carrier_line_uses_default_authority(&binding.line_id))
-    {
+    for binding in preference.carrier_policy.bindings.iter().filter(|binding| {
+        active_mode == RoutingMode::Carrier
+            && !carrier_line_uses_default_authority(&binding.line_id)
+    }) {
         configured_lines.insert(binding.line_id.clone());
         let value = match binding.mode {
             CarrierLineMode::FollowDefault => {
-                match resolve_dns_target_for_rule(db, rule.device_group_in, Some(rule_id)).await? {
-                    RelayDnsTarget::Resolved(value) => valid_public_ipv4(Some(&value)),
-                    RelayDnsTarget::NotSet => valid_public_ipv4(Some(&group.connect_host)),
-                    RelayDnsTarget::Frozen | RelayDnsTarget::Invalid(_) => None,
+                let node_id = preference
+                    .carrier_policy
+                    .default_node_id
+                    .as_deref()
+                    .or_else(|| {
+                        preference
+                            .active_routing_mode
+                            .is_none()
+                            .then_some(preference.preferred_node_id.as_deref())
+                            .flatten()
+                    });
+                match node_id {
+                    Some(node_id) => {
+                        match stored_node_public_ipv4(db, rule.device_group_in, node_id).await? {
+                            RelayDnsTarget::Resolved(value) => Some(value),
+                            RelayDnsTarget::NotSet
+                            | RelayDnsTarget::Frozen
+                            | RelayDnsTarget::Invalid(_) => None,
+                        }
+                    }
+                    None if preference.active_routing_mode.is_none() => {
+                        valid_public_ipv4(Some(&group.connect_host))
+                    }
+                    None => None,
                 }
             }
             CarrierLineMode::Node => match binding.node_id.as_deref() {
@@ -1438,26 +1840,207 @@ fn map_snapshot_error(
     }
 }
 
+fn map_mode_snapshot_error(
+    rule_id: i64,
+    line_id: &str,
+    error: crate::service::dnsmgr::LineRecordSnapshotError,
+) -> RoutingModeTransitionError {
+    use crate::service::dnsmgr::LineRecordSnapshotError;
+    match error {
+        LineRecordSnapshotError::OwnershipUnverified => {
+            RoutingModeTransitionError::OwnershipUnverified {
+                rule_id,
+                line_id: line_id.into(),
+            }
+        }
+        LineRecordSnapshotError::Database => {
+            RoutingModeTransitionError::ProviderPreflight("database read failed".into())
+        }
+        LineRecordSnapshotError::Provider(error) => {
+            RoutingModeTransitionError::ProviderPreflight(error.to_string())
+        }
+        LineRecordSnapshotError::InvalidRule
+        | LineRecordSnapshotError::InvalidLine
+        | LineRecordSnapshotError::NoMatchingZone => RoutingModeTransitionError::ProviderPreflight(
+            format!("rule {rule_id} line {line_id} is no longer resolvable"),
+        ),
+    }
+}
+
+fn snapshot_rollback(
+    snapshot: crate::service::dnsmgr::LineRecordSnapshot,
+) -> (RelayDnsAction, Option<String>, Option<String>) {
+    match snapshot {
+        crate::service::dnsmgr::LineRecordSnapshot::Absent => (RelayDnsAction::Delete, None, None),
+        crate::service::dnsmgr::LineRecordSnapshot::PanelOwned { value, record_id } => {
+            (RelayDnsAction::Upsert, Some(value), Some(record_id))
+        }
+    }
+}
+
+async fn mode_default_target(
+    db: &dyn Repository,
+    evaluated: &[EvaluatedNode],
+    group_id: i64,
+    node_id: Option<&str>,
+) -> Result<(String, String), RoutingModeTransitionError> {
+    let node_id = node_id.ok_or(RoutingModeTransitionError::CarrierDefaultRequired)?;
+    let node = evaluated
+        .iter()
+        .find(|candidate| candidate.info.node_id == node_id)
+        .ok_or_else(|| RoutingModeTransitionError::CarrierDefaultNotReady(node_id.into()))?;
+    if !node.info.ready || node_is_uninstalling(db, group_id, node_id).await? {
+        return Err(RoutingModeTransitionError::CarrierDefaultNotReady(
+            node_id.into(),
+        ));
+    }
+    let value = valid_public_ipv4(node.public_ipv4.as_deref())
+        .ok_or_else(|| RoutingModeTransitionError::CarrierDefaultNotReady(node_id.into()))?;
+    Ok((node_id.into(), value))
+}
+
+async fn build_mode_transition_records(
+    db: &dyn Repository,
+    client: &crate::integrations::dnsmgr::DnsMgrClient,
+    group_id: i64,
+    preference: &RelayPreferenceState,
+    source: RoutingMode,
+    target: RoutingMode,
+    eligible_rule_ids: &[i64],
+    evaluated: &[EvaluatedNode],
+) -> Result<(Vec<RelayDnsTransactionRecord>, Option<String>), RoutingModeTransitionError> {
+    let target_default = match target {
+        RoutingMode::Carrier => Some(
+            mode_default_target(
+                db,
+                evaluated,
+                group_id,
+                preference.carrier_policy.default_node_id.as_deref(),
+            )
+            .await?,
+        ),
+        RoutingMode::Normal => Some(
+            mode_default_target(
+                db,
+                evaluated,
+                group_id,
+                preference.normal_default_node_id.as_deref(),
+            )
+            .await?,
+        ),
+        RoutingMode::Schedule | RoutingMode::Failover => None,
+    };
+    let source_policy = (source == RoutingMode::Carrier)
+        .then_some(&preference.carrier_policy)
+        .cloned()
+        .unwrap_or_default();
+    let target_policy = (target == RoutingMode::Carrier)
+        .then_some(&preference.carrier_policy)
+        .cloned()
+        .unwrap_or_default();
+    let line_changes = carrier_policy_diff(&source_policy, &target_policy);
+    let mut targets = BTreeMap::new();
+    let carrier_default_value = target_default.as_ref().map(|(_, value)| value.as_str());
+    let carrier_default_node_id = target_default.as_ref().map(|(node_id, _)| node_id.as_str());
+    for change in &line_changes {
+        if let Some(binding) = change.new.as_ref() {
+            let (_, value) = carrier_binding_target(
+                binding,
+                carrier_default_value,
+                carrier_default_node_id,
+                evaluated,
+            )
+            .map_err(|error| RoutingModeTransitionError::ProviderPreflight(error.to_string()))?;
+            targets.insert(change.line_id.clone(), value);
+        }
+    }
+
+    let include_default = target_default.is_some();
+    let mut records = Vec::with_capacity(
+        eligible_rule_ids.len() * (line_changes.len() + usize::from(include_default)),
+    );
+    for rule_id in eligible_rule_ids {
+        let rule = RuleRepository::find_rule_by_id(db, *rule_id, &ResourceScope::All)
+            .await?
+            .ok_or_else(|| {
+                RoutingModeTransitionError::ProviderPreflight(format!(
+                    "eligible rule {rule_id} disappeared"
+                ))
+            })?;
+        let fqdn = rule
+            .sni
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if let Some((_, target_value)) = target_default.as_ref() {
+            let snapshot = crate::service::dnsmgr::inspect_default_line_record_for_transaction(
+                db, client, *rule_id,
+            )
+            .await
+            .map_err(|error| map_mode_snapshot_error(*rule_id, "default", error))?;
+            let (rollback_action, rollback_value, rollback_record_id) = snapshot_rollback(snapshot);
+            records.push(RelayDnsTransactionRecord {
+                rule_id: *rule_id,
+                fqdn: fqdn.clone(),
+                line_id: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
+                line_key: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
+                target_action: RelayDnsAction::Upsert,
+                target_value: Some(target_value.clone()),
+                rollback_action,
+                rollback_value,
+                target_record_id: None,
+                rollback_record_id,
+                target_state: None,
+                target_error: None,
+            });
+        }
+        for change in &line_changes {
+            let snapshot =
+                crate::service::dnsmgr::inspect_line_record(db, client, *rule_id, &change.line_id)
+                    .await
+                    .map_err(|error| map_mode_snapshot_error(*rule_id, &change.line_id, error))?;
+            let (rollback_action, rollback_value, rollback_record_id) = snapshot_rollback(snapshot);
+            let (target_action, target_value) = match change.new.as_ref() {
+                Some(_) => match targets.get(&change.line_id).cloned().flatten() {
+                    Some(value) => (RelayDnsAction::Upsert, Some(value)),
+                    None => (RelayDnsAction::Delete, None),
+                },
+                None => (RelayDnsAction::Delete, None),
+            };
+            records.push(RelayDnsTransactionRecord {
+                rule_id: *rule_id,
+                fqdn: fqdn.clone(),
+                line_id: change.line_id.clone(),
+                line_key: carrier_sync_key(&change.line_id),
+                target_action,
+                target_value,
+                rollback_action,
+                rollback_value,
+                target_record_id: None,
+                rollback_record_id,
+                target_state: None,
+                target_error: None,
+            });
+        }
+    }
+    Ok((records, target_default.map(|(node_id, _)| node_id)))
+}
+
 pub async fn start_carrier_policy_apply(
     db: &dyn Repository,
     node_connections: &NodeConnections,
     group_id: i64,
     requested: CarrierPolicy,
 ) -> Result<CarrierPolicyApplyOutcome, CarrierPolicyApplyError> {
-    let requested = requested.normalize().map_err(|error| match error {
+    let mut requested = requested.normalize().map_err(|error| match error {
         CarrierPolicyValidationError::DefaultLineOwnedByRelayPreference => {
             CarrierPolicyApplyError::DefaultLineOwnedByRelayPreference
         }
         error => CarrierPolicyApplyError::InvalidPolicy(error),
     })?;
     let _automatic_policy_guard = crate::service::relay_failover::lock_automatic_policy().await;
-    if !requested.bindings.is_empty()
-        && crate::service::relay_failover::enabled_for_group(db, group_id)
-            .await
-            .map_err(|error| CarrierPolicyApplyError::FailoverStateUnavailable(error.to_string()))?
-    {
-        return Err(CarrierPolicyApplyError::FailoverEnabled);
-    }
     let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
     let group = GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await?;
     let Some(group) = group.filter(|group| group.group_type == "in") else {
@@ -1470,7 +2053,23 @@ pub async fn start_carrier_policy_apply(
             RelayPreferenceError::InvalidPreference(error) => {
                 CarrierPolicyApplyError::InvalidPreference(error)
             }
+            RelayPreferenceError::RoutingModeConflict(modes) => {
+                CarrierPolicyApplyError::RoutingModeConflict(modes)
+            }
         })?;
+    if normalize_routing_state(db, group_id, &mut preference).await? {
+        store_preference(db, group_id, &preference).await?;
+    }
+    let active_mode = preference
+        .active_routing_mode
+        .expect("normalized routing state has active mode");
+    if requested.default_node_id.is_none() {
+        requested.default_node_id = preference
+            .carrier_policy
+            .default_node_id
+            .clone()
+            .or_else(|| preference.preferred_node_id.clone());
+    }
     if matches!(
         preference.state,
         RelayPreferencePhase::Switching
@@ -1479,35 +2078,46 @@ pub async fn start_carrier_policy_apply(
     ) {
         return Err(CarrierPolicyApplyError::TransactionInProgress);
     }
-    for binding in &requested.bindings {
-        let node_id = match binding.mode {
-            CarrierLineMode::Node => binding.node_id.as_deref(),
-            CarrierLineMode::FollowDefault => preference.preferred_node_id.as_deref(),
-        };
-        if let Some(node_id) = node_id {
-            if node_is_uninstalling(db, group_id, node_id)
-                .await
-                .map_err(|error| match error {
-                    RelayPreferenceError::Database(error) => {
-                        CarrierPolicyApplyError::Database(error)
-                    }
-                    RelayPreferenceError::InvalidPreference(error) => {
-                        CarrierPolicyApplyError::InvalidPreference(error)
-                    }
-                })?
-            {
-                return Err(CarrierPolicyApplyError::NodeUninstalling(node_id.into()));
-            }
+    for node_id in requested.default_node_id.iter().map(String::as_str).chain(
+        requested
+            .bindings
+            .iter()
+            .filter_map(|binding| match binding.mode {
+                CarrierLineMode::Node => binding.node_id.as_deref(),
+                CarrierLineMode::FollowDefault => requested.default_node_id.as_deref(),
+            }),
+    ) {
+        if node_is_uninstalling(db, group_id, node_id)
+            .await
+            .map_err(|error| match error {
+                RelayPreferenceError::Database(error) => CarrierPolicyApplyError::Database(error),
+                RelayPreferenceError::InvalidPreference(error) => {
+                    CarrierPolicyApplyError::InvalidPreference(error)
+                }
+                RelayPreferenceError::RoutingModeConflict(modes) => {
+                    CarrierPolicyApplyError::RoutingModeConflict(modes)
+                }
+            })?
+        {
+            return Err(CarrierPolicyApplyError::NodeUninstalling(node_id.into()));
         }
     }
     let active_policy = carrier_policy_without_default_authority(&preference.carrier_policy);
     let removed_legacy_default = active_policy != preference.carrier_policy;
     let changes = carrier_policy_diff(&active_policy, &requested);
-    if changes.is_empty() {
+    let default_changed = active_policy.default_node_id != requested.default_node_id;
+    if active_mode != RoutingMode::Carrier {
+        preference.carrier_policy = requested;
+        preference.pending_carrier_policy = None;
+        store_preference(db, group_id, &preference).await?;
+        return Ok(CarrierPolicyApplyOutcome::SavedInactive);
+    }
+    if changes.is_empty() && !default_changed {
         if removed_legacy_default {
             preference.carrier_policy = requested;
             preference.pending_carrier_policy = None;
             preference.transaction_kind = None;
+            preference.switch_source = None;
             preference.state = RelayPreferencePhase::Idle;
             preference.started_at = None;
             preference.last_error = None;
@@ -1547,6 +2157,7 @@ pub async fn start_carrier_policy_apply(
         preference.carrier_policy = requested;
         preference.pending_carrier_policy = None;
         preference.transaction_kind = None;
+        preference.switch_source = None;
         preference.state = RelayPreferencePhase::Idle;
         preference.started_at = None;
         preference.last_error = None;
@@ -1563,6 +2174,26 @@ pub async fn start_carrier_policy_apply(
             RelayPreferenceError::InvalidPreference(error) => {
                 CarrierPolicyApplyError::InvalidPreference(error)
             }
+            RelayPreferenceError::RoutingModeConflict(modes) => {
+                CarrierPolicyApplyError::RoutingModeConflict(modes)
+            }
+        })?;
+    let carrier_default_node_id = requested
+        .default_node_id
+        .as_deref()
+        .ok_or(CarrierPolicyApplyError::CarrierDefaultRequired)?;
+    let carrier_default = evaluated
+        .iter()
+        .find(|node| node.info.node_id == carrier_default_node_id)
+        .ok_or_else(|| CarrierPolicyApplyError::NodeNotInGroup(carrier_default_node_id.into()))?;
+    if !carrier_default.info.ready {
+        return Err(CarrierPolicyApplyError::CarrierDefaultNotReady(
+            carrier_default_node_id.into(),
+        ));
+    }
+    let carrier_default_value = valid_public_ipv4(carrier_default.public_ipv4.as_deref())
+        .ok_or_else(|| {
+            CarrierPolicyApplyError::TargetPublicIpv4Invalid(carrier_default_node_id.into())
         })?;
     let needs_default = changes.iter().any(|change| {
         change
@@ -1576,7 +2207,7 @@ pub async fn start_carrier_policy_apply(
                 db,
                 group_id,
                 &group.connect_host,
-                preference.preferred_node_id.as_deref(),
+                requested.default_node_id.as_deref(),
             )
             .await?,
         )
@@ -1600,7 +2231,7 @@ pub async fn start_carrier_policy_apply(
         .map_err(|error| CarrierPolicyApplyError::ProviderPreflight(error.to_string()))?
         .ok_or(CarrierPolicyApplyError::DnsMgrUnavailable)?;
 
-    let mut records = Vec::with_capacity(changes.len() * eligible_rule_ids.len());
+    let mut records = Vec::with_capacity((changes.len() + 1) * eligible_rule_ids.len());
     for rule_id in &eligible_rule_ids {
         let rule = RuleRepository::find_rule_by_id(db, *rule_id, &ResourceScope::All)
             .await?
@@ -1616,6 +2247,33 @@ pub async fn start_carrier_policy_apply(
             .trim()
             .trim_end_matches('.')
             .to_ascii_lowercase();
+        let snapshot = crate::service::dnsmgr::inspect_default_line_record_for_transaction(
+            db, &client, *rule_id,
+        )
+        .await
+        .map_err(|error| map_snapshot_error(*rule_id, "default", error))?;
+        let (rollback_action, rollback_value, rollback_record_id) = match snapshot {
+            crate::service::dnsmgr::LineRecordSnapshot::Absent => {
+                (RelayDnsAction::Delete, None, None)
+            }
+            crate::service::dnsmgr::LineRecordSnapshot::PanelOwned { value, record_id } => {
+                (RelayDnsAction::Upsert, Some(value), Some(record_id))
+            }
+        };
+        records.push(RelayDnsTransactionRecord {
+            rule_id: *rule_id,
+            fqdn: fqdn.clone(),
+            line_id: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
+            line_key: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
+            target_action: RelayDnsAction::Upsert,
+            target_value: Some(carrier_default_value.clone()),
+            rollback_action,
+            rollback_value,
+            target_record_id: None,
+            rollback_record_id,
+            target_state: None,
+            target_error: None,
+        });
         for change in &changes {
             let snapshot =
                 crate::service::dnsmgr::inspect_line_record(db, &client, *rule_id, &change.line_id)
@@ -1653,21 +2311,18 @@ pub async fn start_carrier_policy_apply(
         }
     }
 
-    if !carrier_transaction_records_are_provider_specific(&records) {
-        return Err(CarrierPolicyApplyError::DefaultLineOwnedByRelayPreference);
-    }
-
     preference.carrier_policy = active_policy;
-    preference.pending_node_id = None;
+    preference.pending_node_id = Some(carrier_default_node_id.into());
     preference.pending_carrier_policy = Some(requested);
     preference.transaction_kind = Some(RelayTransactionKind::CarrierPolicyApply);
+    preference.switch_source = Some(RelaySwitchSource::Carrier);
     preference.state = RelayPreferencePhase::Switching;
     preference.started_at = Some(Utc::now().to_rfc3339());
     preference.last_error = None;
     preference.rollback_error = None;
     preference.dns_records = records;
     store_preference(db, group_id, &preference).await?;
-    if schedule_carrier_transaction_records(db, &preference.dns_records, false)
+    if schedule_carrier_transaction_records(db, group_id, &preference.dns_records, false)
         .await
         .is_err()
     {
@@ -1677,11 +2332,129 @@ pub async fn start_carrier_policy_apply(
     Ok(CarrierPolicyApplyOutcome::Started)
 }
 
+pub async fn transition_routing_mode(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+    target_mode: RoutingMode,
+) -> Result<RoutingModeTransitionOutcome, RoutingModeTransitionError> {
+    let _automatic_policy_guard = crate::service::relay_failover::lock_automatic_policy().await;
+    let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
+    match GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await? {
+        Some(group) if group.group_type == "in" => {}
+        _ => return Err(RoutingModeTransitionError::InboundGroupNotFound),
+    }
+    let mut preference = load_preference(db, group_id).await?;
+    if matches!(
+        preference.state,
+        RelayPreferencePhase::Switching
+            | RelayPreferencePhase::RollingBack
+            | RelayPreferencePhase::FailedManualIntervention
+    ) {
+        return Err(RoutingModeTransitionError::TransactionInProgress);
+    }
+    normalize_routing_state(db, group_id, &mut preference).await?;
+    let source_mode = preference
+        .active_routing_mode
+        .expect("normalized routing state has active mode");
+    if source_mode == target_mode {
+        store_preference(db, group_id, &preference).await?;
+        return Ok(RoutingModeTransitionOutcome::NoChange);
+    }
+    if target_mode == RoutingMode::Schedule && !legacy_enabled_schedule(db, group_id).await? {
+        return Err(RoutingModeTransitionError::ScheduleConfigurationMissing);
+    }
+    if target_mode == RoutingMode::Failover {
+        crate::service::relay_failover::arm_for_routing_mode(db, group_id)
+            .await
+            .map_err(|error| RoutingModeTransitionError::ProviderPreflight(error.to_string()))?;
+    }
+    if target_mode == RoutingMode::Carrier && preference.carrier_policy.default_node_id.is_none() {
+        return Err(RoutingModeTransitionError::CarrierDefaultRequired);
+    }
+
+    let needs_dns = source_mode == RoutingMode::Carrier
+        || target_mode == RoutingMode::Carrier
+        || (target_mode == RoutingMode::Normal
+            && preference.normal_default_node_id != preference.preferred_node_id);
+    if !needs_dns {
+        preference.active_routing_mode = Some(target_mode);
+        preference.pending_routing_mode = None;
+        preference.switch_source = None;
+        preference.state = RelayPreferencePhase::Idle;
+        preference.started_at = None;
+        preference.last_error = None;
+        preference.rollback_error = None;
+        store_preference(db, group_id, &preference).await?;
+        return Ok(RoutingModeTransitionOutcome::CommittedWithoutDns);
+    }
+
+    let eligible_rule_ids =
+        crate::service::dnsmgr::eligible_rule_ids_for_group(db, group_id).await?;
+    if eligible_rule_ids.is_empty() {
+        return Err(RoutingModeTransitionError::ProviderPreflight(
+            "group has no eligible DNS rules".into(),
+        ));
+    }
+    let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
+    let client = crate::service::dnsmgr::load_client(db)
+        .await
+        .map_err(|error| RoutingModeTransitionError::ProviderPreflight(error.to_string()))?
+        .ok_or(RoutingModeTransitionError::DnsMgrUnavailable)?;
+    let (records, target_default_node_id) = build_mode_transition_records(
+        db,
+        &client,
+        group_id,
+        &preference,
+        source_mode,
+        target_mode,
+        &eligible_rule_ids,
+        &evaluated,
+    )
+    .await?;
+    if records.is_empty() {
+        preference.active_routing_mode = Some(target_mode);
+        preference.pending_routing_mode = None;
+        store_preference(db, group_id, &preference).await?;
+        return Ok(RoutingModeTransitionOutcome::CommittedWithoutDns);
+    }
+
+    preference.pending_routing_mode = Some(target_mode);
+    preference.pending_node_id =
+        target_default_node_id.or_else(|| preference.preferred_node_id.clone());
+    preference.transaction_kind = Some(RelayTransactionKind::RoutingModeTransition);
+    preference.switch_source = Some(RelaySwitchSource::ModeTransition);
+    preference.state = RelayPreferencePhase::Switching;
+    preference.started_at = Some(Utc::now().to_rfc3339());
+    preference.last_error = None;
+    preference.rollback_error = None;
+    preference.dns_records = records;
+    store_preference(db, group_id, &preference).await?;
+    if schedule_transaction_records(db, &preference.dns_records, false)
+        .await
+        .is_err()
+    {
+        begin_rollback(
+            db,
+            group_id,
+            preference,
+            String::new(),
+            "DNS_SCHEDULING_FAILED",
+        )
+        .await?;
+        return Err(RoutingModeTransitionError::DnsSchedulingFailed);
+    }
+    Ok(RoutingModeTransitionOutcome::Started)
+}
+
 pub(crate) async fn carrier_policy_is_configured(
     db: &dyn Repository,
     group_id: i64,
 ) -> Result<bool, RelayPreferenceError> {
     let preference = load_preference(db, group_id).await?;
+    if let Some(mode) = preference.active_routing_mode {
+        return Ok(mode == RoutingMode::Carrier);
+    }
     Ok(
         carrier_policy_has_mutable_bindings(&preference.carrier_policy)
             || preference
@@ -1707,6 +2480,11 @@ pub(crate) async fn refresh_carrier_desired(
         };
         let preference: RelayPreferenceState =
             serde_json::from_str(&raw).map_err(RelayPreferenceError::InvalidPreference)?;
+        if resolved_routing_mode(state.db.as_ref(), group_id, &preference).await?
+            != RoutingMode::Carrier
+        {
+            continue;
+        }
         if !carrier_policy_has_mutable_bindings(&preference.carrier_policy)
             || preference.state != RelayPreferencePhase::Idle
         {
@@ -1725,7 +2503,9 @@ pub(crate) async fn refresh_carrier_desired(
         {
             let node_id = match binding.mode {
                 CarrierLineMode::Node => binding.node_id.as_deref(),
-                CarrierLineMode::FollowDefault => preference.preferred_node_id.as_deref(),
+                CarrierLineMode::FollowDefault => {
+                    preference.carrier_policy.default_node_id.as_deref()
+                }
             };
             let value = node_id.and_then(|node_id| {
                 evaluated
@@ -1894,8 +2674,41 @@ pub async fn start_relay_switch(
     group_id: i64,
     target_node_id: &str,
 ) -> Result<StartRelaySwitchOutcome, StartRelaySwitchError> {
+    start_relay_switch_from_source(
+        db,
+        node_connections,
+        group_id,
+        target_node_id,
+        RelaySwitchSource::Manual,
+    )
+    .await
+}
+
+pub(crate) async fn start_relay_switch_for_schedule(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+    target_node_id: &str,
+) -> Result<StartRelaySwitchOutcome, StartRelaySwitchError> {
+    start_relay_switch_from_source(
+        db,
+        node_connections,
+        group_id,
+        target_node_id,
+        RelaySwitchSource::Schedule,
+    )
+    .await
+}
+
+async fn start_relay_switch_from_source(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+    target_node_id: &str,
+    source: RelaySwitchSource,
+) -> Result<StartRelaySwitchOutcome, StartRelaySwitchError> {
     let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
-    start_relay_switch_locked(db, node_connections, group_id, target_node_id).await
+    start_relay_switch_locked(db, node_connections, group_id, target_node_id, source).await
 }
 
 /// Start an automatic switch only if the preferred Relay observed by the
@@ -1917,6 +2730,9 @@ pub(crate) async fn start_relay_switch_if_current(
             RelayPreferenceError::InvalidPreference(error) => {
                 StartRelaySwitchError::InvalidPreference(error)
             }
+            RelayPreferenceError::RoutingModeConflict(modes) => {
+                StartRelaySwitchError::RoutingModeConflict(modes)
+            }
         })?;
     if !matches!(
         preference.state,
@@ -1927,9 +2743,15 @@ pub(crate) async fn start_relay_switch_if_current(
     {
         return Ok(None);
     }
-    start_relay_switch_locked(db, node_connections, group_id, target_node_id)
-        .await
-        .map(Some)
+    start_relay_switch_locked(
+        db,
+        node_connections,
+        group_id,
+        target_node_id,
+        RelaySwitchSource::Failover,
+    )
+    .await
+    .map(Some)
 }
 
 async fn start_relay_switch_locked(
@@ -1937,6 +2759,7 @@ async fn start_relay_switch_locked(
     node_connections: &NodeConnections,
     group_id: i64,
     target_node_id: &str,
+    source: RelaySwitchSource,
 ) -> Result<StartRelaySwitchOutcome, StartRelaySwitchError> {
     let target_node_id = target_node_id.trim();
 
@@ -1953,7 +2776,33 @@ async fn start_relay_switch_locked(
         Err(RelayPreferenceError::InvalidPreference(error)) => {
             return Err(StartRelaySwitchError::InvalidPreference(error))
         }
+        Err(RelayPreferenceError::RoutingModeConflict(modes)) => {
+            return Err(StartRelaySwitchError::RoutingModeConflict(modes))
+        }
     };
+    let normalized = normalize_routing_state(db, group_id, &mut preference)
+        .await
+        .map_err(|error| match error {
+            RelayPreferenceError::Database(error) => StartRelaySwitchError::Database(error),
+            RelayPreferenceError::InvalidPreference(error) => {
+                StartRelaySwitchError::InvalidPreference(error)
+            }
+            RelayPreferenceError::RoutingModeConflict(modes) => {
+                StartRelaySwitchError::RoutingModeConflict(modes)
+            }
+        })?;
+    let active_mode = preference
+        .active_routing_mode
+        .expect("normalized routing state has an active mode");
+    if !source_authorized(active_mode, source) {
+        return Err(StartRelaySwitchError::SourceNotAuthorized {
+            source,
+            active_mode,
+        });
+    }
+    if normalized {
+        store_preference(db, group_id, &preference).await?;
+    }
     for node_id in [
         Some(target_node_id),
         preference.preferred_node_id.as_deref(),
@@ -1967,6 +2816,9 @@ async fn start_relay_switch_locked(
                 RelayPreferenceError::Database(error) => StartRelaySwitchError::Database(error),
                 RelayPreferenceError::InvalidPreference(error) => {
                     StartRelaySwitchError::InvalidPreference(error)
+                }
+                RelayPreferenceError::RoutingModeConflict(modes) => {
+                    StartRelaySwitchError::RoutingModeConflict(modes)
                 }
             })?
         {
@@ -1996,6 +2848,9 @@ async fn start_relay_switch_locked(
             RelayPreferenceError::Database(error) => StartRelaySwitchError::Database(error),
             RelayPreferenceError::InvalidPreference(error) => {
                 StartRelaySwitchError::InvalidPreference(error)
+            }
+            RelayPreferenceError::RoutingModeConflict(modes) => {
+                StartRelaySwitchError::RoutingModeConflict(modes)
             }
         })?;
     let Some(target) = evaluated
@@ -2059,6 +2914,7 @@ async fn start_relay_switch_locked(
     }
     preference.pending_node_id = Some(target_node_id.to_string());
     preference.transaction_kind = Some(RelayTransactionKind::PreferredSwitch);
+    preference.switch_source = Some(source);
     preference.state = RelayPreferencePhase::Switching;
     preference.started_at = Some(Utc::now().to_rfc3339());
     preference.last_error = None;
@@ -2083,6 +2939,9 @@ async fn start_relay_switch_locked(
             }
             Err(RelayPreferenceError::InvalidPreference(rollback_error)) => {
                 return Err(StartRelaySwitchError::InvalidPreference(rollback_error))
+            }
+            Err(RelayPreferenceError::RoutingModeConflict(modes)) => {
+                return Err(StartRelaySwitchError::RoutingModeConflict(modes))
             }
         }
         return Err(StartRelaySwitchError::DnsSchedulingFailed(error));
@@ -2212,21 +3071,45 @@ async fn schedule_transaction_records(
     Ok(())
 }
 
-fn carrier_transaction_records_are_provider_specific(
+fn carrier_transaction_records_have_single_default_authority(
     records: &[RelayDnsTransactionRecord],
 ) -> bool {
-    records.iter().all(|record| {
-        record.line_key != crate::service::dnsmgr::DEFAULT_LINE_KEY
-            && !carrier_line_uses_default_authority(&record.line_id)
-    })
+    let mut default_counts = BTreeMap::<i64, usize>::new();
+    let valid = records.iter().all(|record| {
+        if record.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY {
+            *default_counts.entry(record.rule_id).or_default() += 1;
+            carrier_line_uses_default_authority(&record.line_id)
+        } else {
+            !carrier_line_uses_default_authority(&record.line_id)
+        }
+    });
+    valid
+        && (default_counts.is_empty()
+            || (default_counts.values().all(|count| *count == 1)
+                && default_counts.len()
+                    == records
+                        .iter()
+                        .map(|record| record.rule_id)
+                        .collect::<BTreeSet<_>>()
+                        .len()))
 }
 
 async fn schedule_carrier_transaction_records(
     db: &dyn Repository,
+    group_id: i64,
     records: &[RelayDnsTransactionRecord],
     rollback: bool,
 ) -> Result<(), ()> {
-    if !carrier_transaction_records_are_provider_specific(records) {
+    let preference = load_preference(db, group_id).await.map_err(|_| ())?;
+    let legacy_carrier_transaction = preference.active_routing_mode.is_none()
+        && preference.transaction_kind == Some(RelayTransactionKind::CarrierPolicyApply);
+    if !carrier_transaction_records_have_single_default_authority(records)
+        || (!legacy_carrier_transaction
+            && !matches!(
+                routing_source_is_authorized(db, group_id, RelaySwitchSource::Carrier).await,
+                Ok(true)
+            ))
+    {
         return Err(());
     }
     schedule_transaction_records(db, records, rollback).await
@@ -2253,7 +3136,7 @@ async fn begin_carrier_rollback(
         });
     }
     store_preference(db, group_id, &preference).await?;
-    if schedule_carrier_transaction_records(db, &preference.dns_records, true)
+    if schedule_carrier_transaction_records(db, group_id, &preference.dns_records, true)
         .await
         .is_err()
     {
@@ -2623,7 +3506,12 @@ async fn finalize_carrier_policy_group(
         .pending_carrier_policy
         .take()
         .expect("carrier transaction checked pending policy");
+    if preference.carrier_policy.default_node_id.is_some() {
+        preference.preferred_node_id = preference.carrier_policy.default_node_id.clone();
+    }
+    preference.pending_node_id = None;
     preference.transaction_kind = None;
+    preference.switch_source = None;
     preference.state = RelayPreferencePhase::Idle;
     preference.started_at = None;
     preference.last_error = None;
@@ -2676,6 +3564,27 @@ async fn recheck_carrier_commit_targets(
         return Ok(Err("CARRIER_GROUP_UNAVAILABLE_AFTER_DNS"));
     };
     for (line_id, expected_value) in changed_targets {
+        if line_id == crate::service::dnsmgr::DEFAULT_LINE_KEY {
+            let Some(node_id) = pending.default_node_id.as_deref() else {
+                return Ok(Err("CARRIER_DEFAULT_NODE_MISSING"));
+            };
+            let Some(node) = evaluated
+                .iter()
+                .find(|candidate| candidate.info.node_id == node_id)
+            else {
+                return Ok(Err("CARRIER_DEFAULT_NODE_NOT_READY_AFTER_DNS"));
+            };
+            let Some(current_value) = valid_public_ipv4(node.public_ipv4.as_deref()) else {
+                return Ok(Err("CARRIER_DEFAULT_PUBLIC_IPV4_UNAVAILABLE_AFTER_DNS"));
+            };
+            if current_value != expected_value {
+                return Ok(Err("CARRIER_DEFAULT_PUBLIC_IPV4_CHANGED"));
+            }
+            if !node.info.ready {
+                return Ok(Err("CARRIER_DEFAULT_NODE_NOT_READY_AFTER_DNS"));
+            }
+            continue;
+        }
         let Some(binding) = bindings.get(line_id) else {
             return Ok(Err("CARRIER_TARGET_BINDING_MISSING"));
         };
@@ -2711,6 +3620,123 @@ async fn recheck_carrier_commit_targets(
     Ok(Ok(()))
 }
 
+async fn finalize_routing_mode_transition(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+    mut preference: RelayPreferenceState,
+) -> Result<FinalizeOutcome, RelayPreferenceError> {
+    if preference.state == RelayPreferencePhase::RollingBack {
+        return finalize_rollback(db, group_id, preference).await;
+    }
+    if preference.state != RelayPreferencePhase::Switching {
+        return Ok(FinalizeOutcome::Pending);
+    }
+    let Some(target_mode) = preference.pending_routing_mode else {
+        return begin_rollback(
+            db,
+            group_id,
+            preference,
+            String::new(),
+            "ROUTING_TARGET_MODE_MISSING",
+        )
+        .await;
+    };
+    if preference.dns_records.is_empty() {
+        return begin_rollback(
+            db,
+            group_id,
+            preference,
+            String::new(),
+            "ROUTING_TRANSACTION_JOURNAL_MISSING",
+        )
+        .await;
+    }
+    let current_rule_ids = crate::service::dnsmgr::eligible_rule_ids_for_group(db, group_id)
+        .await?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let transaction_rule_ids = preference
+        .dns_records
+        .iter()
+        .map(|record| record.rule_id)
+        .collect::<BTreeSet<_>>();
+    if current_rule_ids != transaction_rule_ids {
+        return begin_rollback(
+            db,
+            group_id,
+            preference,
+            String::new(),
+            "DNS_RULE_SET_CHANGED",
+        )
+        .await;
+    }
+    for record in &preference.dns_records {
+        let Some(sync) = db
+            .find_dns_record_sync(record.rule_id, &record.line_key)
+            .await?
+        else {
+            return Ok(FinalizeOutcome::Pending);
+        };
+        if !sync_matches_action(&sync, record.target_action, record.target_value.as_deref()) {
+            return Ok(FinalizeOutcome::Pending);
+        }
+        if let Some(error) = terminal_dns_error(&sync) {
+            return begin_rollback(db, group_id, preference, String::new(), &error).await;
+        }
+        if !transaction_record_provider_applied(db, &sync, record, false).await? {
+            return Ok(FinalizeOutcome::Pending);
+        }
+    }
+
+    if matches!(target_mode, RoutingMode::Carrier | RoutingMode::Normal) {
+        let Some(target_node_id) = preference.pending_node_id.clone() else {
+            return begin_rollback(
+                db,
+                group_id,
+                preference,
+                String::new(),
+                "ROUTING_TARGET_NODE_MISSING",
+            )
+            .await;
+        };
+        let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
+        if !evaluated
+            .iter()
+            .any(|node| node.info.node_id == target_node_id && node.info.ready)
+        {
+            return begin_rollback(
+                db,
+                group_id,
+                preference,
+                target_node_id,
+                "ROUTING_TARGET_NOT_READY_AFTER_DNS",
+            )
+            .await;
+        }
+    }
+
+    let from_node_id = preference.preferred_node_id.clone();
+    if matches!(target_mode, RoutingMode::Carrier | RoutingMode::Normal) {
+        preference.preferred_node_id = preference.pending_node_id.clone();
+    }
+    preference.active_routing_mode = Some(target_mode);
+    preference.pending_routing_mode = None;
+    preference.pending_node_id = None;
+    preference.transaction_kind = None;
+    preference.switch_source = None;
+    preference.state = RelayPreferencePhase::Idle;
+    preference.started_at = None;
+    preference.last_error = None;
+    preference.rollback_error = None;
+    preference.dns_records.clear();
+    store_preference(db, group_id, &preference).await?;
+    Ok(FinalizeOutcome::Committed {
+        from_node_id,
+        to_node_id: preference.preferred_node_id.unwrap_or_default(),
+    })
+}
+
 async fn finalize_switching_group(
     db: &dyn Repository,
     node_connections: &NodeConnections,
@@ -2718,6 +3744,9 @@ async fn finalize_switching_group(
 ) -> Result<FinalizeOutcome, RelayPreferenceError> {
     let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
     let mut preference = load_preference(db, group_id).await?;
+    if preference.transaction_kind == Some(RelayTransactionKind::RoutingModeTransition) {
+        return finalize_routing_mode_transition(db, node_connections, group_id, preference).await;
+    }
     if preference.transaction_kind == Some(RelayTransactionKind::CarrierPolicyApply) {
         return finalize_carrier_policy_group(db, node_connections, group_id, preference).await;
     }
@@ -2871,6 +3900,11 @@ async fn finalize_switching_group(
     }
 
     let from_node_id = preference.preferred_node_id.clone();
+    if preference.switch_source == Some(RelaySwitchSource::Manual)
+        && preference.active_routing_mode == Some(RoutingMode::Normal)
+    {
+        preference.normal_default_node_id = Some(target_node_id.clone());
+    }
     preference.preferred_node_id = Some(target_node_id.clone());
     preference.pending_node_id = None;
     preference.state = RelayPreferencePhase::Idle;
@@ -2879,6 +3913,7 @@ async fn finalize_switching_group(
     preference.rollback_error = None;
     preference.dns_records.clear();
     preference.transaction_kind = None;
+    preference.switch_source = None;
     store_preference(db, group_id, &preference).await?;
     Ok(FinalizeOutcome::Committed {
         from_node_id,
@@ -3092,6 +4127,9 @@ pub async fn get_relay_preference(
 
     Ok(RelayPreferenceView {
         group_id,
+        active_routing_mode: preference.active_routing_mode,
+        pending_routing_mode: preference.pending_routing_mode,
+        normal_default_node_id: preference.normal_default_node_id,
         preferred_node_id,
         preferred_node_public_ipv4: preferred_ip,
         pending_node_id: preference.pending_node_id,
@@ -3386,9 +4424,300 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn legacy_routing_mode_inference_is_explicit_and_conflict_safe() {
+        let (repo, _, _) = switch_fixture().await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(preference.active_routing_mode, None);
+        assert_eq!(preference.normal_default_node_id, None);
+        assert_eq!(
+            infer_legacy_routing_mode(&repo, 7, &preference)
+                .await
+                .unwrap(),
+            RoutingMode::Normal
+        );
+
+        preference.carrier_policy = CarrierPolicy {
+            default_node_id: None,
+            bindings: vec![carrier_binding(
+                "Dianxin",
+                CarrierLineMode::Node,
+                Some("node-b"),
+            )],
+        };
+        assert_eq!(
+            infer_legacy_routing_mode(&repo, 7, &preference)
+                .await
+                .unwrap(),
+            RoutingMode::Carrier
+        );
+        assert!(normalize_routing_state(&repo, 7, &mut preference)
+            .await
+            .unwrap());
+        assert_eq!(preference.active_routing_mode, Some(RoutingMode::Carrier));
+        assert_eq!(preference.normal_default_node_id.as_deref(), Some("node-a"));
+        assert_eq!(
+            preference.carrier_policy.default_node_id.as_deref(),
+            Some("node-a")
+        );
+
+        preference.active_routing_mode = None;
+        preference.carrier_policy = CarrierPolicy::default();
+        repo.set(
+            crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY,
+            r#"[{"id":"schedule-a","group_id":7,"target_node_id":"node-b","schedule_type":"daily","enabled":true,"created_at":"x","updated_at":"x","execute_at":null,"time":"12:00","utc_offset_minutes":0,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null}]"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            infer_legacy_routing_mode(&repo, 7, &preference)
+                .await
+                .unwrap(),
+            RoutingMode::Schedule
+        );
+
+        preference.carrier_policy = CarrierPolicy {
+            default_node_id: None,
+            bindings: vec![carrier_binding(
+                "Dianxin",
+                CarrierLineMode::Node,
+                Some("node-b"),
+            )],
+        };
+        assert!(matches!(
+            infer_legacy_routing_mode(&repo, 7, &preference).await,
+            Err(RelayPreferenceError::RoutingModeConflict(modes))
+                if modes == vec![RoutingMode::Carrier, RoutingMode::Schedule]
+        ));
+
+        repo.delete(crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY)
+            .await
+            .unwrap();
+        preference.carrier_policy = CarrierPolicy::default();
+        repo.set(
+            &format!(
+                "{}7",
+                crate::service::relay_failover::RELAY_FAILOVER_KEY_PREFIX
+            ),
+            &serde_json::to_string(&crate::service::relay_failover::RelayFailoverPolicy {
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            infer_legacy_routing_mode(&repo, 7, &preference)
+                .await
+                .unwrap(),
+            RoutingMode::Failover
+        );
+    }
+
+    #[tokio::test]
+    async fn source_aware_gate_blocks_stale_manual_schedule_and_failover_work() {
+        let (repo, connections, _) = switch_fixture().await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Normal);
+        preference.normal_default_node_id = preference.preferred_node_id.clone();
+        store_preference(&repo, 7, &preference).await.unwrap();
+        assert!(matches!(
+            start_relay_switch_for_schedule(&repo, &connections, 7, "node-c").await,
+            Err(StartRelaySwitchError::SourceNotAuthorized {
+                source: RelaySwitchSource::Schedule,
+                active_mode: RoutingMode::Normal,
+            })
+        ));
+        assert!(matches!(
+            start_relay_switch_if_current(&repo, &connections, 7, "node-a", "node-c").await,
+            Err(StartRelaySwitchError::SourceNotAuthorized {
+                source: RelaySwitchSource::Failover,
+                active_mode: RoutingMode::Normal,
+            })
+        ));
+
+        preference.active_routing_mode = Some(RoutingMode::Schedule);
+        store_preference(&repo, 7, &preference).await.unwrap();
+        assert!(matches!(
+            start_relay_switch(&repo, &connections, 7, "node-c").await,
+            Err(StartRelaySwitchError::SourceNotAuthorized {
+                source: RelaySwitchSource::Manual,
+                active_mode: RoutingMode::Schedule,
+            })
+        ));
+        assert!(matches!(
+            start_relay_switch_for_schedule(&repo, &connections, 7, "node-c").await,
+            Ok(StartRelaySwitchOutcome::Started { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_dns_mode_transitions_commit_without_intermediate_normal() {
+        let (repo, connections, _) = switch_fixture().await;
+        repo.set(
+            crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY,
+            r#"[{"id":"schedule-a","group_id":7,"target_node_id":"node-b","schedule_type":"daily","enabled":true,"created_at":"x","updated_at":"x","execute_at":null,"time":"12:00","utc_offset_minutes":0,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null}]"#,
+        )
+        .await
+        .unwrap();
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Normal);
+        preference.normal_default_node_id = preference.preferred_node_id.clone();
+        store_preference(&repo, 7, &preference).await.unwrap();
+
+        assert_eq!(
+            transition_routing_mode(&repo, &connections, 7, RoutingMode::Schedule)
+                .await
+                .unwrap(),
+            RoutingModeTransitionOutcome::CommittedWithoutDns
+        );
+        assert_eq!(
+            load_preference(&repo, 7).await.unwrap().active_routing_mode,
+            Some(RoutingMode::Schedule)
+        );
+        assert_eq!(
+            transition_routing_mode(&repo, &connections, 7, RoutingMode::Failover)
+                .await
+                .unwrap(),
+            RoutingModeTransitionOutcome::CommittedWithoutDns
+        );
+        let switched = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(switched.active_routing_mode, Some(RoutingMode::Failover));
+        assert_eq!(switched.pending_routing_mode, None);
+        assert_eq!(switched.preferred_node_id.as_deref(), Some("node-a"));
+    }
+
+    #[tokio::test]
+    async fn carrier_activation_requires_one_ready_default_before_dns() {
+        let (repo, connections, _) = switch_fixture().await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Normal);
+        preference.normal_default_node_id = preference.preferred_node_id.clone();
+        preference.carrier_policy = CarrierPolicy {
+            default_node_id: None,
+            bindings: vec![carrier_binding(
+                "Dianxin",
+                CarrierLineMode::Node,
+                Some("node-b"),
+            )],
+        };
+        store_preference(&repo, 7, &preference).await.unwrap();
+        assert!(matches!(
+            transition_routing_mode(&repo, &connections, 7, RoutingMode::Carrier).await,
+            Err(RoutingModeTransitionError::CarrierDefaultRequired)
+        ));
+        let unchanged = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(unchanged.active_routing_mode, Some(RoutingMode::Normal));
+        assert_eq!(unchanged.pending_routing_mode, None);
+        assert!(unchanged.dns_records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persisted_mode_transition_failure_rolls_back_to_source_mode() {
+        let (repo, connections, _) = switch_fixture().await;
+        let mut records = Vec::new();
+        for rule_id in [1, 3] {
+            records.push(RelayDnsTransactionRecord {
+                rule_id,
+                fqdn: if rule_id == 1 {
+                    "op1.example.com".into()
+                } else {
+                    "op3.example.com".into()
+                },
+                line_id: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
+                line_key: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
+                target_action: RelayDnsAction::Upsert,
+                target_value: Some("203.0.113.6".into()),
+                rollback_action: RelayDnsAction::Upsert,
+                rollback_value: Some("203.0.113.5".into()),
+                target_record_id: None,
+                rollback_record_id: None,
+                target_state: None,
+                target_error: None,
+            });
+            records.push(carrier_record(
+                rule_id,
+                "Dianxin",
+                RelayDnsAction::Upsert,
+                Some("203.0.113.6"),
+                RelayDnsAction::Delete,
+                None,
+            ));
+        }
+        let preference = RelayPreferenceState {
+            active_routing_mode: Some(RoutingMode::Normal),
+            pending_routing_mode: Some(RoutingMode::Carrier),
+            normal_default_node_id: Some("node-a".into()),
+            preferred_node_id: Some("node-a".into()),
+            pending_node_id: Some("node-b".into()),
+            state: RelayPreferencePhase::Switching,
+            transaction_kind: Some(RelayTransactionKind::RoutingModeTransition),
+            switch_source: Some(RelaySwitchSource::ModeTransition),
+            dns_records: records.clone(),
+            ..RelayPreferenceState::default()
+        };
+        store_preference(&repo, 7, &preference).await.unwrap();
+        schedule_transaction_records(&repo, &records, false)
+            .await
+            .unwrap();
+        for rule_id in [1, 3] {
+            set_sync_state(&repo, rule_id, "PROPAGATED", None, None).await;
+            set_line_sync_state(
+                &repo,
+                rule_id,
+                "dnsmgr:Dianxin",
+                "FAILED",
+                Some("DNS_CONFLICT"),
+            )
+            .await;
+        }
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::RollbackStarted { .. }
+        ));
+        let rolling_back = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(rolling_back.active_routing_mode, Some(RoutingMode::Normal));
+        assert_eq!(
+            rolling_back.pending_routing_mode,
+            Some(RoutingMode::Carrier)
+        );
+
+        for rule_id in [1, 3] {
+            set_sync_state(&repo, rule_id, "PROPAGATED", None, None).await;
+            set_line_sync_state(&repo, rule_id, "dnsmgr:Dianxin", "PROPAGATED", None).await;
+        }
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::RolledBack { .. }
+        ));
+        let rolled_back = load_preference(&repo, 7).await.unwrap();
+        assert_eq!(rolled_back.active_routing_mode, Some(RoutingMode::Normal));
+        assert_eq!(rolled_back.preferred_node_id.as_deref(), Some("node-a"));
+        assert_eq!(rolled_back.state, RelayPreferencePhase::FailedRolledBack);
+    }
+
+    #[test]
+    fn v1113_state_deserializes_without_routing_fields() {
+        let state: RelayPreferenceState = serde_json::from_str(
+            r#"{"preferred_node_id":"node-a","pending_node_id":null,"state":"idle","started_at":null,"last_error":null,"rollback_error":null,"dns_records":[],"carrier_policy":{"bindings":[{"line_id":"Dianxin","mode":"node","node_id":"node-b"}]},"pending_carrier_policy":null,"transaction_kind":null}"#,
+        )
+        .unwrap();
+        assert_eq!(state.active_routing_mode, None);
+        assert_eq!(state.pending_routing_mode, None);
+        assert_eq!(state.normal_default_node_id, None);
+        assert_eq!(state.switch_source, None);
+        assert_eq!(state.carrier_policy.default_node_id, None);
+    }
+
     #[test]
     fn carrier_policy_normalizes_and_roundtrips_without_display_data() {
         let policy = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![
                 CarrierLineBinding {
                     line_id: "Dianxin_Shandong".into(),
@@ -3414,6 +4743,7 @@ mod tests {
         );
 
         let case_sensitive = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![
                 CarrierLineBinding {
                     line_id: "Dianxin".into(),
@@ -3433,6 +4763,7 @@ mod tests {
     #[test]
     fn carrier_policy_rejects_duplicate_and_invalid_mode_payloads() {
         let duplicate = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![
                 CarrierLineBinding {
                     line_id: "Dianxin".into(),
@@ -3452,6 +4783,7 @@ mod tests {
         );
         assert_eq!(
             CarrierPolicy {
+                default_node_id: None,
                 bindings: vec![CarrierLineBinding {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::FollowDefault,
@@ -3463,6 +4795,7 @@ mod tests {
         );
         assert_eq!(
             CarrierPolicy {
+                default_node_id: None,
                 bindings: vec![CarrierLineBinding {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::Node,
@@ -3479,6 +4812,7 @@ mod tests {
         for line_id in ["default", "Default", "default_view", "0"] {
             assert_eq!(
                 CarrierPolicy {
+                    default_node_id: None,
                     bindings: vec![CarrierLineBinding {
                         line_id: line_id.into(),
                         mode: CarrierLineMode::Node,
@@ -3524,6 +4858,7 @@ mod tests {
             pending_node_id: Some("node-a".into()),
             state: RelayPreferencePhase::FailedRolledBack,
             carrier_policy: CarrierPolicy {
+                default_node_id: None,
                 bindings: vec![carrier_binding(
                     "Dianxin",
                     CarrierLineMode::Node,
@@ -3531,6 +4866,7 @@ mod tests {
                 )],
             },
             pending_carrier_policy: Some(CarrierPolicy {
+                default_node_id: None,
                 bindings: vec![carrier_binding(
                     "Liantong",
                     CarrierLineMode::Node,
@@ -3556,6 +4892,7 @@ mod tests {
         let state = RelayPreferenceState {
             transaction_kind: Some(RelayTransactionKind::CarrierPolicyApply),
             pending_carrier_policy: Some(CarrierPolicy {
+                default_node_id: None,
                 bindings: vec![CarrierLineBinding {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::Node,
@@ -3930,6 +5267,7 @@ mod tests {
             &NodeConnections::new(),
             7,
             CarrierPolicy {
+                default_node_id: None,
                 bindings: vec![CarrierLineBinding {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::Node,
@@ -3953,6 +5291,7 @@ mod tests {
             &connections,
             7,
             CarrierPolicy {
+                default_node_id: None,
                 bindings: vec![carrier_binding(
                     "default",
                     CarrierLineMode::Node,
@@ -3978,6 +5317,7 @@ mod tests {
         let (repo, connections, _) = switch_fixture().await;
         let mut preference = load_preference(&repo, 7).await.unwrap();
         preference.carrier_policy = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![carrier_binding(
                 "default_view",
                 CarrierLineMode::Node,
@@ -4002,7 +5342,7 @@ mod tests {
             start_carrier_policy_apply(&repo, &connections, 7, CarrierPolicy::default(),)
                 .await
                 .unwrap(),
-            CarrierPolicyApplyOutcome::CommittedWithoutDns
+            CarrierPolicyApplyOutcome::SavedInactive
         );
         let cleaned = load_preference(&repo, 7).await.unwrap();
         assert!(cleaned.carrier_policy.bindings.is_empty());
@@ -4359,6 +5699,7 @@ mod tests {
     #[test]
     fn carrier_policy_diff_covers_upsert_delete_and_noop() {
         let active = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-b")),
                 carrier_binding("Dianxin_Shandong", CarrierLineMode::FollowDefault, None),
@@ -4366,6 +5707,7 @@ mod tests {
         };
         assert!(carrier_policy_diff(&active, &active).is_empty());
         let requested = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-c")),
                 carrier_binding("Liantong", CarrierLineMode::FollowDefault, None),
@@ -4399,7 +5741,7 @@ mod tests {
             RelayDnsAction::Delete,
             None,
         )];
-        assert!(carrier_transaction_records_are_provider_specific(
+        assert!(carrier_transaction_records_have_single_default_authority(
             &provider_specific
         ));
 
@@ -4417,9 +5759,9 @@ mod tests {
             target_state: None,
             target_error: None,
         };
-        assert!(!carrier_transaction_records_are_provider_specific(&[
-            default_record
-        ]));
+        assert!(carrier_transaction_records_have_single_default_authority(
+            &[default_record]
+        ));
     }
 
     #[test]
@@ -4505,6 +5847,7 @@ mod tests {
     async fn carrier_apply_commits_only_after_every_line_converges() {
         let (repo, connections, _) = switch_fixture().await;
         let requested = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
                 CarrierLineMode::FollowDefault,
@@ -4632,6 +5975,7 @@ mod tests {
         ] {
             let (repo, connections, _) = switch_fixture().await;
             let requested = CarrierPolicy {
+                default_node_id: None,
                 bindings: vec![carrier_binding(
                     "Dianxin",
                     CarrierLineMode::Node,
@@ -4667,6 +6011,7 @@ mod tests {
     async fn carrier_commit_rechecks_follow_default_but_ignores_unchanged_unhealthy_explicit() {
         let (repo, connections, _) = switch_fixture().await;
         let active = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![carrier_binding(
                 "Liantong",
                 CarrierLineMode::Node,
@@ -4674,6 +6019,7 @@ mod tests {
             )],
         };
         let requested = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![
                 carrier_binding("Liantong", CarrierLineMode::Node, Some("node-b")),
                 carrier_binding("Dianxin", CarrierLineMode::FollowDefault, None),
@@ -4710,6 +6056,7 @@ mod tests {
 
         let (repo, connections, _) = switch_fixture().await;
         let requested = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
                 CarrierLineMode::FollowDefault,
@@ -4747,6 +6094,7 @@ mod tests {
         for remove_rule in [false, true] {
             let (repo, connections, _) = switch_fixture().await;
             let active = CarrierPolicy {
+                default_node_id: None,
                 bindings: vec![carrier_binding(
                     "Dianxin",
                     CarrierLineMode::Node,
@@ -4833,6 +6181,7 @@ mod tests {
     async fn carrier_failure_rolls_back_old_and_created_records_after_restart() {
         let (repo, connections, _) = switch_fixture().await;
         let active = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
                 CarrierLineMode::Node,
@@ -4864,6 +6213,7 @@ mod tests {
                 preferred_node_id: Some("node-a".into()),
                 carrier_policy: active.clone(),
                 pending_carrier_policy: Some(CarrierPolicy {
+                    default_node_id: None,
                     bindings: vec![
                         carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-c")),
                         carrier_binding("Liantong", CarrierLineMode::Node, Some("node-c")),
@@ -4923,6 +6273,7 @@ mod tests {
     async fn rule_pause_resume_restores_active_carrier_policy_with_current_default() {
         let (repo, _, _) = switch_fixture().await;
         let active = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-b")),
                 carrier_binding("Dianxin_Shandong", CarrierLineMode::FollowDefault, None),
@@ -4998,6 +6349,7 @@ mod tests {
         let (repo, _, _) = switch_fixture().await;
         let mut preference = load_preference(&repo, 7).await.unwrap();
         preference.carrier_policy = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
                 CarrierLineMode::Node,
@@ -5025,6 +6377,7 @@ mod tests {
     async fn preferred_switch_journal_moves_default_and_follow_default_only() {
         let (repo, connections, _) = switch_fixture().await;
         let policy = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-b")),
                 carrier_binding("Dianxin_Shandong", CarrierLineMode::FollowDefault, None),
@@ -5143,6 +6496,7 @@ mod tests {
     async fn preferred_switch_does_not_reschedule_unchanged_explicit_lines() {
         let (repo, _, _) = switch_fixture().await;
         let policy = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-b")),
                 carrier_binding("Dianxin_Shandong", CarrierLineMode::FollowDefault, None),
@@ -5271,6 +6625,7 @@ mod tests {
             ));
         }
         let policy = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-b")),
                 carrier_binding("Dianxin_Shandong", CarrierLineMode::FollowDefault, None),
@@ -5331,7 +6686,10 @@ mod tests {
     async fn carrier_apply_is_busy_for_preferred_and_already_preferred_stays_noop() {
         let (repo, connections, _) = switch_fixture().await;
         let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Normal);
+        preference.normal_default_node_id = preference.preferred_node_id.clone();
         preference.carrier_policy = CarrierPolicy {
+            default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
                 CarrierLineMode::FollowDefault,
@@ -5460,6 +6818,10 @@ mod tests {
     #[tokio::test]
     async fn concurrent_conditional_failover_decisions_start_exactly_one_switch() {
         let (repo, connections, _) = switch_fixture().await;
+        let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Failover);
+        preference.normal_default_node_id = preference.preferred_node_id.clone();
+        store_preference(&repo, 7, &preference).await.unwrap();
         let first = start_relay_switch_if_current(&repo, &connections, 7, "node-a", "node-c");
         let second = start_relay_switch_if_current(&repo, &connections, 7, "node-a", "node-c");
         let (first, second) = tokio::join!(first, second);
@@ -5485,6 +6847,8 @@ mod tests {
     async fn conditional_failover_retries_after_completed_rollback_but_not_during_transaction() {
         let (repo, connections, _) = switch_fixture().await;
         let mut preference = load_preference(&repo, 7).await.unwrap();
+        preference.active_routing_mode = Some(RoutingMode::Failover);
+        preference.normal_default_node_id = preference.preferred_node_id.clone();
         preference.state = RelayPreferencePhase::RollingBack;
         store_preference(&repo, 7, &preference).await.unwrap();
         assert_eq!(

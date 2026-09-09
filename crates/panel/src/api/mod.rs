@@ -242,6 +242,11 @@ pub fn routes() -> Router<AppState> {
                 .post(relay_preference::set_relay_preference),
         )
         .route(
+            "/groups/{group_id}/routing-mode",
+            axum::routing::get(relay_preference::get_routing_mode)
+                .put(relay_preference::set_routing_mode),
+        )
+        .route(
             "/groups/{group_id}/carrier-lines",
             axum::routing::get(carrier_lines::get_group_carrier_lines),
         )
