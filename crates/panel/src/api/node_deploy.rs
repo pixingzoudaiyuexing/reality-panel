@@ -34,6 +34,7 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_LOGS: usize = 100;
 const MAX_CONCURRENT_DEPLOYMENTS: usize = 4;
+const XIAOYA_VERIFY_COMMAND: &str = "test \"$(docker inspect -f '{{index .Config.Labels \"io.reality-panel.managed\"}}|{{.State.Running}}|{{.HostConfig.RestartPolicy.Name}}|{{range .Mounts}}{{if eq .Destination \"/opt/alist/data\"}}{{.Source}}{{end}}{{end}}' relay-panel-xiaoya-byoa)\" = 'xiaoya-byoa|true|unless-stopped|/var/lib/relay-panel/xiaoya-byoa'; docker port relay-panel-xiaoya-byoa 5244/tcp | grep -Fx '127.0.0.1:5245' >/dev/null; test \"$(curl -fsS --max-time 10 http://127.0.0.1:5245/ping)\" = pong; grep -Fq 'proxy_pass http://127.0.0.1:5245;' /etc/nginx/conf.d/relay-panel-fallback.conf";
 #[derive(Deserialize)]
 pub struct TestSshRequest {
     pub host: String,
@@ -396,8 +397,8 @@ impl DeploymentRunner for SystemSshRunner {
             verify_command(&mut session, "DOCKER_FAILED", "systemctl is-active --quiet docker")?;
             verify_command(
                 &mut session,
-                "OPENLIST_FAILED",
-                "docker inspect -f '{{.State.Running}}' relay-panel-openlist | grep -Fx true >/dev/null; docker port relay-panel-openlist 5244 | grep -Fx '127.0.0.1:5244' >/dev/null; curl -fsS --max-time 10 http://127.0.0.1:5244/ >/dev/null",
+                "XIAOYA_FAILED",
+                XIAOYA_VERIFY_COMMAND,
             )?;
             verify_command(&mut session, "NGINX_FAILED", "nginx -t")?;
             verify_command(
@@ -711,7 +712,7 @@ async fn run_task(
                 &id,
                 DeploymentStage::Configuring,
                 "RUNNING",
-                "relay-node, Docker, Nginx Stream, OpenList, fallback, and Certbot base configured",
+                "relay-node, Docker, Nginx Stream, Xiaoya, fallback, and Certbot base configured",
                 &secrets,
             )
             .await;
@@ -1948,23 +1949,34 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
     }
 
     #[test]
-    fn bootstrap_preserves_lkg_and_uses_public_camouflage_with_loopback_openlist() {
+    fn bootstrap_is_xiaoya_first_and_does_not_install_historical_camouflage() {
         assert!(INSTALL_SCRIPT.contains("/opt/relay-node/node-id"));
         assert!(!INSTALL_SCRIPT.contains("touch /opt/relay-node/node-id"));
         assert!(!INSTALL_SCRIPT.contains("config-cache.json"));
-        assert!(INSTALL_SCRIPT.contains("127.0.0.1:5244:5244"));
+        assert!(INSTALL_SCRIPT.contains("--prepare-host-runtime"));
+        assert!(!INSTALL_SCRIPT.contains("127.0.0.1:5244:5244"));
         assert!(INSTALL_SCRIPT.contains("listen 8443 ssl default_server"));
         assert!(INSTALL_SCRIPT.contains("listen [::]:8443 ssl default_server"));
-        assert!(INSTALL_SCRIPT.contains("/var/lib/relay-panel/openlist"));
-        assert!(INSTALL_SCRIPT.contains("/var/lib/relay-panel/openlist-ownership.json"));
-        assert!(INSTALL_SCRIPT.contains("OPENLIST_CONTAINER_CREATED=false"));
-        assert!(INSTALL_SCRIPT.contains("OPENLIST_DATA_CREATED=false"));
+        assert!(INSTALL_SCRIPT.contains("proxy_pass http://127.0.0.1:5245;"));
+        assert!(!INSTALL_SCRIPT.contains("/var/lib/relay-panel/openlist"));
+        assert!(!INSTALL_SCRIPT.contains("relay-panel-openlist"));
         assert!(INSTALL_SCRIPT.contains("/var/www/relay-panel-certbot/.well-known/acme-challenge"));
         assert!(INSTALL_SCRIPT.contains("existing_env_value CAMOUFLAGE_SITES_STATE_DIR"));
         assert!(INSTALL_SCRIPT.contains("existing_env_value CERTIFICATE_STATE_DIR"));
+        assert!(INSTALL_SCRIPT.contains("\"openlist\": true"));
         assert!(
             INSTALL_SCRIPT.contains("cmp -s /opt/relay-node/provisioning-capabilities.json.tmp")
         );
+        assert!(XIAOYA_VERIFY_COMMAND.contains("relay-panel-xiaoya-byoa"));
+        assert!(XIAOYA_VERIFY_COMMAND.contains("127.0.0.1:5245"));
+        assert!(XIAOYA_VERIFY_COMMAND.contains("/ping"));
+        assert!(XIAOYA_VERIFY_COMMAND.contains("proxy_pass http://127.0.0.1:5245;"));
+        assert!(!XIAOYA_VERIFY_COMMAND.contains("127.0.0.1:5244"));
+        assert!(Command::new("bash")
+            .args(["-n", "-c", XIAOYA_VERIFY_COMMAND])
+            .status()
+            .unwrap()
+            .success());
     }
 
     #[tokio::test]
@@ -2044,7 +2056,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
                 &second.id,
                 DeploymentStage::Verifying,
                 "RUNNING",
-                "checking OpenList",
+                "checking Xiaoya",
                 &secrets(),
             )
             .await;
@@ -2053,8 +2065,8 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
         assert!(!first_logs.contains("wrong-password"));
         assert!(!first_logs.contains("abc"));
         assert!(!second_logs.contains("wrong-password"));
-        assert!(second_logs.contains("checking OpenList"));
-        assert!(!first_logs.contains("checking OpenList"));
+        assert!(second_logs.contains("checking Xiaoya"));
+        assert!(!first_logs.contains("checking Xiaoya"));
     }
 
     #[test]
@@ -2073,10 +2085,10 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
     fn bootstrap_failure_step_is_visible_without_secrets() {
         let error = DeployError::new(
             "REMOTE_COMMAND_FAILED",
-            "[bootstrap] verify-openlist: start\nBOOTSTRAP_FAILED_STEP=verify-openlist exit=7 password=wrong-password token=node-token-secret",
+            "[bootstrap] host-preparation: start\nBOOTSTRAP_FAILED_STEP=host-preparation exit=7 password=wrong-password token=node-token-secret",
         );
         let message = public_error(&error, &secrets());
-        assert!(message.contains("BOOTSTRAP_FAILED_STEP=verify-openlist exit=7"));
+        assert!(message.contains("BOOTSTRAP_FAILED_STEP=host-preparation exit=7"));
         assert!(!message.contains("wrong-password"));
         assert!(!message.contains("node-token-secret"));
     }
@@ -2095,19 +2107,20 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
 
     #[test]
     fn bootstrap_script_is_idempotent_and_scoped_to_relaypanel_resources() {
-        assert!(INSTALL_SCRIPT.contains("docker inspect relay-panel-openlist"));
-        assert!(INSTALL_SCRIPT.contains("docker start relay-panel-openlist"));
+        assert!(INSTALL_SCRIPT.contains("/opt/relay-node/relay-node --prepare-host-runtime"));
+        assert!(!INSTALL_SCRIPT.contains("docker inspect relay-panel-xiaoya-byoa"));
+        assert!(!INSTALL_SCRIPT.contains("docker run"));
         assert!(INSTALL_SCRIPT.contains("/etc/systemd/system/relay-node.service"));
         assert!(INSTALL_SCRIPT.contains("ensure_relay_panel_stream_layout"));
         assert!(INSTALL_SCRIPT.contains("/etc/nginx/relay-panel-stream.d/relay-panel-sni.conf"));
         assert!(INSTALL_SCRIPT.contains("NGINX_STREAM_CONFLICT"));
-        assert!(INSTALL_SCRIPT.contains("! -uid 1001 -o ! -gid 1001"));
         assert!(INSTALL_SCRIPT.contains("BOOTSTRAP_FAILED_STEP="));
-        assert!(INSTALL_SCRIPT.contains("step verify-openlist"));
+        assert!(!INSTALL_SCRIPT.contains("step verify-openlist"));
+        assert!(!INSTALL_SCRIPT.contains("127.0.0.1:5244"));
         assert!(INSTALL_SCRIPT.contains("current_sha"));
         assert!(INSTALL_SCRIPT.contains("RELAY_NODE_RESTART_REQUIRED"));
         assert!(INSTALL_SCRIPT.contains("is_managed_listener_config"));
-        assert!(!INSTALL_SCRIPT.contains("rm -rf /var/lib/relay-panel/openlist"));
+        assert!(!INSTALL_SCRIPT.contains("/var/lib/relay-panel/openlist"));
         assert!(!INSTALL_SCRIPT.contains("rm -rf /etc/nginx"));
         assert!(!INSTALL_SCRIPT.contains("rm -f /opt/relay-node/config-cache"));
         assert!(!INSTALL_SCRIPT.contains("find \"$(managed_path /opt/relay-node)\""));
@@ -2272,7 +2285,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
         assert!(rendered.contains("listen 8443 ssl default_server;"));
         assert!(rendered.contains("listen [::]:8443 ssl default_server;"));
         assert!(!rendered.contains("listen 127.0.0.1:8443"));
-        assert!(rendered.contains("proxy_pass http://127.0.0.1:5244;"));
+        assert!(rendered.contains("proxy_pass http://127.0.0.1:5245;"));
 
         let active =
             "# generated by relay-node; TLS camouflage sites\n# preserve active generation\n";
@@ -2524,7 +2537,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
 
     #[tokio::test]
     async fn remote_service_verification_failures_never_report_success() {
-        for category in ["RELAY_NODE_FAILED", "OPENLIST_FAILED", "NGINX_FAILED"] {
+        for category in ["RELAY_NODE_FAILED", "XIAOYA_FAILED", "NGINX_FAILED"] {
             let runner = Arc::new(FakeRunner::new(FakeBehavior::VerifyFailure(category)));
             let state = test_state(test_registry(
                 runner.clone(),
@@ -2645,7 +2658,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
                 ),
                 (
                     DeploymentStage::Configuring,
-                    "relay-node, Docker, Nginx Stream, OpenList, fallback, and Certbot base configured",
+                    "relay-node, Docker, Nginx Stream, Xiaoya, fallback, and Certbot base configured",
                 ),
                 (
                     DeploymentStage::Verifying,
