@@ -553,7 +553,10 @@ fn certificate_and_camouflage(
         },
         site_status: status.site_status,
         tls_listener_port: desired.map(|site| site.tls_listener_port).unwrap_or(8443),
-        local_backend: "127.0.0.1:5244".into(),
+        local_backend: site
+            .as_ref()
+            .map(|site| site.local_backend.clone())
+            .unwrap_or_else(|| "unknown".into()),
         http_status: None,
     };
     (certificate, camouflage)
@@ -894,6 +897,7 @@ mod tests {
     use super::*;
     use crate::forwarder::camouflage_site::{
         CamouflageSiteConfig, CamouflageSitesManifest, CertificateReference, OPENLIST_BACKEND,
+        XIAOYA_BACKEND,
     };
     use crate::forwarder::certificate_lifecycle::CertificateLifecycleConfig;
     use crate::forwarder::nginx_sni::NginxSniConfig;
@@ -1205,6 +1209,30 @@ mod tests {
             assert!(key_match, "generated certificate and key must match");
             assert_eq!(error.is_none(), expected, "SAN {san} against SNI {sni}");
         }
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn diagnosis_reports_the_actual_active_camouflage_backend() {
+        use time::{Duration as TimeDuration, OffsetDateTime};
+
+        let dir = diagnosis_test_dir("active-backend");
+        let certificate = diagnosis_certificate(
+            &dir,
+            "xiaoya",
+            "q1.example.com",
+            OffsetDateTime::now_utc() - TimeDuration::days(1),
+            OffsetDateTime::now_utc() + TimeDuration::days(90),
+        );
+        let (mut manager, desired) = diagnosis_manager(&dir, certificate);
+        let mut site = manager.active_site_for_sni("q1.example.com").unwrap();
+        site.local_backend = XIAOYA_BACKEND.into();
+        assert!(manager.apply_candidate(CamouflageSitesManifest { sites: vec![site] }));
+
+        let (_, camouflage) =
+            certificate_and_camouflage(&manager, Some("q1.example.com"), Some(&desired));
+        assert_eq!(camouflage.local_backend, XIAOYA_BACKEND);
 
         std::fs::remove_dir_all(dir).unwrap();
     }

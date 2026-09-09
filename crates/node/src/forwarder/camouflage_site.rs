@@ -28,7 +28,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 pub const CAMOUFLAGE_TLS_PORT: u16 = 8443;
-pub const OPENLIST_BACKEND: &str = "127.0.0.1:5244";
+pub const LEGACY_OPENLIST_BACKEND: &str = "127.0.0.1:5244";
+pub const XIAOYA_BACKEND: &str = crate::xiaoya::XIAOYA_BACKEND;
+#[cfg(test)]
+pub const OPENLIST_BACKEND: &str = LEGACY_OPENLIST_BACKEND;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CamouflageSitesManifest {
@@ -104,6 +107,7 @@ pub struct CamouflageSiteManager {
     acme_jitter_seed: u64,
     acme_jitter_percent: u32,
     dependency_notify: Arc<Notify>,
+    preferred_backend: String,
 }
 
 #[derive(Clone)]
@@ -225,6 +229,7 @@ impl CamouflageSiteManager {
             acme_jitter_seed,
             acme_jitter_percent: 10,
             dependency_notify: Arc::new(Notify::new()),
+            preferred_backend: LEGACY_OPENLIST_BACKEND.to_string(),
         }
     }
 
@@ -314,6 +319,13 @@ impl CamouflageSiteManager {
         if let Some(manifest) = recovered.as_ref() {
             match self.apply_runtime(manifest) {
                 Ok(()) => {
+                    if manifest
+                        .sites
+                        .iter()
+                        .any(|site| site.local_backend == XIAOYA_BACKEND)
+                    {
+                        self.preferred_backend = XIAOYA_BACKEND.to_string();
+                    }
                     self.active = Some(manifest.clone());
                     self.runtime_revision = self.runtime_revision.wrapping_add(1);
                     recovered_applied = true;
@@ -426,7 +438,7 @@ impl CamouflageSiteManager {
                 id: desired_site.site_id.clone(),
                 sni: desired_site.sni.clone(),
                 tls_listener_port: desired_site.tls_listener_port,
-                local_backend: OPENLIST_BACKEND.to_string(),
+                local_backend: self.preferred_backend.clone(),
                 certificate,
             });
         }
@@ -533,7 +545,7 @@ impl CamouflageSiteManager {
                 id: desired_site.site_id.clone(),
                 sni: desired_site.sni.clone(),
                 tls_listener_port: desired_site.tls_listener_port,
-                local_backend: OPENLIST_BACKEND.to_string(),
+                local_backend: self.preferred_backend.clone(),
                 certificate,
             });
         }
@@ -1951,7 +1963,7 @@ fn prepare_panel_certificate_install(
                     id: desired.site_id.clone(),
                     sni: desired.sni.clone(),
                     tls_listener_port: desired.tls_listener_port,
-                    local_backend: OPENLIST_BACKEND.to_string(),
+                    local_backend: manager.preferred_backend.clone(),
                     certificate,
                 });
             }
@@ -2188,6 +2200,61 @@ pub async fn runtime_apply_guard(
     gate.lock_owned().await
 }
 
+pub async fn cutover_to_xiaoya_shared(
+    shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
+    _ready: &crate::xiaoya::XiaoyaReady,
+) -> bool {
+    let _apply_lease = runtime_apply_guard(shared).await;
+    let (config, active, runtime_revision, candidate) = {
+        let mut current = shared.lock().await;
+        let Some(active) = current.active.clone() else {
+            current.preferred_backend = XIAOYA_BACKEND.to_string();
+            return true;
+        };
+        if active.sites.iter().any(|site| {
+            site.local_backend != LEGACY_OPENLIST_BACKEND && site.local_backend != XIAOYA_BACKEND
+        }) {
+            tracing::error!("refusing Xiaoya cutover from an unknown camouflage backend");
+            return false;
+        }
+        let mut candidate = active.clone();
+        for site in &mut candidate.sites {
+            site.local_backend = XIAOYA_BACKEND.to_string();
+        }
+        if candidate == active {
+            current.preferred_backend = XIAOYA_BACKEND.to_string();
+            return true;
+        }
+        (
+            current.config.clone(),
+            active,
+            current.runtime_revision,
+            candidate,
+        )
+    };
+
+    let active_for_apply = active.clone();
+    let candidate_for_apply = candidate.clone();
+    let activated = tokio::task::spawn_blocking(move || {
+        activate_candidate_external(config, Some(active_for_apply), candidate_for_apply)
+    })
+    .await
+    .unwrap_or(false);
+    if !activated {
+        return false;
+    }
+
+    let mut current = shared.lock().await;
+    if current.runtime_revision != runtime_revision || current.active.as_ref() != Some(&active) {
+        tracing::error!("camouflage state changed while the Xiaoya cutover held the apply gate");
+        return false;
+    }
+    current.active = Some(candidate);
+    current.preferred_backend = XIAOYA_BACKEND.to_string();
+    current.runtime_revision = current.runtime_revision.wrapping_add(1);
+    true
+}
+
 pub async fn finalize_for_listener_snis_shared_under_apply_gate(
     shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
     referenced_snis: &HashSet<String>,
@@ -2286,6 +2353,7 @@ pub async fn runtime_observation_shared(
 pub fn validate_manifest(manifest: &CamouflageSitesManifest) -> Result<(), String> {
     let mut ids = HashSet::new();
     let mut names = HashSet::new();
+    let mut local_backend: Option<&str> = None;
     for site in &manifest.sites {
         if !is_safe_id(&site.id) {
             return Err("invalid camouflage site id".to_string());
@@ -2296,9 +2364,13 @@ pub fn validate_manifest(manifest: &CamouflageSitesManifest) -> Result<(), Strin
         if site.tls_listener_port != CAMOUFLAGE_TLS_PORT {
             return Err("camouflage TLS listener must use port 8443".to_string());
         }
-        if site.local_backend != OPENLIST_BACKEND {
-            return Err("camouflage backend must be local OpenList".to_string());
+        if site.local_backend != LEGACY_OPENLIST_BACKEND && site.local_backend != XIAOYA_BACKEND {
+            return Err("camouflage backend must be a managed local backend".to_string());
         }
+        if local_backend.is_some_and(|backend| backend != site.local_backend.as_str()) {
+            return Err("camouflage sites must use one managed local backend".to_string());
+        }
+        local_backend = Some(site.local_backend.as_str());
         if !ids.insert(site.id.clone()) {
             return Err("duplicate camouflage site id".to_string());
         }
@@ -2913,6 +2985,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_and_xiaoya_are_the_only_valid_local_backends() {
+        let dir = unique_dir("managed-backends");
+        let legacy = manifest(&dir);
+        assert!(validate_manifest(&legacy).is_ok());
+
+        let mut xiaoya = legacy;
+        xiaoya.sites[0].local_backend = XIAOYA_BACKEND.into();
+        assert!(validate_manifest(&xiaoya).is_ok());
+
+        let mut mixed = xiaoya.clone();
+        mixed.sites.push(site(&dir, "op2", "op2.example.com"));
+        assert!(validate_manifest(&mixed).is_err());
+
+        xiaoya.sites[0].local_backend = "127.0.0.1:5246".into();
+        assert!(validate_manifest(&xiaoya).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn failed_candidate_validation_does_not_overwrite_lkg() {
         let dir = unique_dir("validation-lkg");
         let mut manager = manager(&dir, "true", "true");
@@ -3156,6 +3247,116 @@ mod tests {
         assert_eq!(restarted.active, Some(expected));
         let runtime = fs::read_to_string(&restarted.config.nginx.conf_path).unwrap();
         assert!(runtime.contains("op1.example.com"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn healthy_xiaoya_cutover_updates_runtime_and_persists_lkg() {
+        let dir = unique_dir("xiaoya-cutover");
+        let mut state = manager(&dir, "true", "true");
+        assert!(state.apply_candidate(manifest(&dir)));
+        let shared = Arc::new(AsyncMutex::new(state));
+
+        assert!(cutover_to_xiaoya_shared(&shared, &crate::xiaoya::ready_for_test()).await);
+
+        let state = shared.lock().await;
+        assert_eq!(
+            state.active.as_ref().unwrap().sites[0].local_backend,
+            XIAOYA_BACKEND
+        );
+        assert_eq!(state.preferred_backend, XIAOYA_BACKEND);
+        assert_eq!(
+            state.load_lkg().unwrap().sites[0].local_backend,
+            XIAOYA_BACKEND
+        );
+        assert!(fs::read_to_string(&state.config.nginx.conf_path)
+            .unwrap()
+            .contains("proxy_pass http://127.0.0.1:5245"));
+        drop(state);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn failed_xiaoya_apply_keeps_legacy_runtime_and_lkg() {
+        let dir = unique_dir("xiaoya-apply-failure");
+        let mut state = manager(&dir, "true", "true");
+        assert!(state.apply_candidate(manifest(&dir)));
+        let lkg_before = fs::read(state.lkg_path()).unwrap();
+        let runtime_before = fs::read(&state.config.nginx.conf_path).unwrap();
+        state.config.nginx.test_cmd = "false".into();
+        let shared = Arc::new(AsyncMutex::new(state));
+
+        assert!(!cutover_to_xiaoya_shared(&shared, &crate::xiaoya::ready_for_test()).await);
+
+        let state = shared.lock().await;
+        assert_eq!(state.preferred_backend, LEGACY_OPENLIST_BACKEND);
+        assert_eq!(fs::read(state.lkg_path()).unwrap(), lkg_before);
+        assert_eq!(
+            fs::read(&state.config.nginx.conf_path).unwrap(),
+            runtime_before
+        );
+        assert_eq!(
+            state.active.as_ref().unwrap().sites[0].local_backend,
+            LEGACY_OPENLIST_BACKEND
+        );
+        drop(state);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn xiaoya_cutover_uses_current_active_manifest_not_an_old_snapshot() {
+        let dir = unique_dir("xiaoya-current-snapshot");
+        let mut state = manager(&dir, "true", "true");
+        let old = manifest(&dir);
+        assert!(state.apply_candidate(old));
+        let newer = CamouflageSitesManifest {
+            sites: vec![site(&dir, "new-panel-site", "new.example.com")],
+        };
+        assert!(state.apply_candidate(newer.clone()));
+        let shared = Arc::new(AsyncMutex::new(state));
+
+        assert!(cutover_to_xiaoya_shared(&shared, &crate::xiaoya::ready_for_test()).await);
+
+        let state = shared.lock().await;
+        let active = state.active.as_ref().unwrap();
+        assert_eq!(active.sites.len(), 1);
+        assert_eq!(active.sites[0].id, "new-panel-site");
+        assert_eq!(active.sites[0].sni, "new.example.com");
+        assert_eq!(active.sites[0].local_backend, XIAOYA_BACKEND);
+        drop(state);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn healthy_xiaoya_without_lkg_selects_xiaoya_for_next_candidate() {
+        let dir = unique_dir("xiaoya-first-candidate");
+        let shared = Arc::new(AsyncMutex::new(manager(&dir, "true", "true")));
+        assert!(cutover_to_xiaoya_shared(&shared, &crate::xiaoya::ready_for_test()).await);
+
+        let mut state = shared.lock().await;
+        let snapshot = state
+            .desired_reconcile_snapshot(&[desired_site("op1", "op1.example.com")], true)
+            .unwrap();
+        assert_eq!(snapshot.manifest.sites[0].local_backend, XIAOYA_BACKEND);
+        drop(state);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restart_preserves_xiaoya_lkg_without_automatic_openlist_failback() {
+        let dir = unique_dir("xiaoya-restart");
+        let mut first = manager(&dir, "true", "true");
+        let mut xiaoya = manifest(&dir);
+        xiaoya.sites[0].local_backend = XIAOYA_BACKEND.into();
+        assert!(first.apply_candidate(xiaoya.clone()));
+
+        let mut restarted = manager(&dir, "true", "true");
+        assert!(restarted.restore_and_apply());
+        assert_eq!(restarted.active, Some(xiaoya));
+        assert_eq!(restarted.preferred_backend, XIAOYA_BACKEND);
+        assert!(fs::read_to_string(&restarted.config.nginx.conf_path)
+            .unwrap()
+            .contains("proxy_pass http://127.0.0.1:5245"));
         let _ = fs::remove_dir_all(dir);
     }
 

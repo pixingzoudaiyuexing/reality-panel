@@ -10,6 +10,7 @@ mod reconciler;
 mod reporter;
 mod updater;
 mod ws_client;
+mod xiaoya;
 
 use config::NodeConfig;
 use forwarder::{nginx_sni_traffic::NginxSniTrafficConfig, ForwarderManager};
@@ -395,6 +396,33 @@ async fn run() {
                 reconciler::ReconciliationInput::degraded_local_recovery(),
             )
             .await;
+    }
+
+    // Xiaoya is additive: existing camouflage and listener LKGs are restored
+    // before this bounded, one-shot Node-local reconciliation begins.
+    {
+        let camouflage_sites = camouflage_sites.clone();
+        tokio::spawn(async move {
+            match xiaoya::reconcile(VERSION).await {
+                Ok(ready) => {
+                    if forwarder::camouflage_site::cutover_to_xiaoya_shared(
+                        &camouflage_sites,
+                        &ready,
+                    )
+                    .await
+                    {
+                        tracing::info!("managed camouflage backend converged to Xiaoya");
+                    } else {
+                        tracing::warn!(
+                            "Xiaoya is healthy but camouflage cutover failed; retained prior state"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    "Xiaoya reconcile did not complete; retained prior camouflage state: {error}"
+                ),
+            }
+        });
     }
 
     // v0.3.0: stable per-node identity. Generated once and persisted to a
