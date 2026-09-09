@@ -18,6 +18,8 @@
 
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use std::fmt::Display;
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,7 +66,7 @@ pub async fn serve_udp_listener(
     let port = listen_addr.port();
 
     // v1.2.x: targets are resolved LAZILY per new session (see
-    // select_udp_target) rather than once here at listener start. The old
+    // open_udp_session) rather than once here at listener start. The old
     // boot-time resolution pinned a DDNS target to whatever IP it had when the
     // rule was pushed; the IP never refreshed until the rule/node restarted,
     // silently blackholing UDP (WireGuard / game / DNS-forward) traffic after a
@@ -144,36 +146,20 @@ pub async fn serve_udp_listener(
         let outbound_sock = if let Some(sock) = existing {
             sock
         } else {
-            // New session: bind an ephemeral outbound socket + pick/connect the
-            // target, all WITHOUT holding any map guard.
-            let outbound = match super::outbound::udp_outbound_socket(source_ipv4).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("UDP port {}: failed to bind outbound: {}", port, e);
-                    continue;
-                }
-            };
-            // Pick a target per the rule's load-balance strategy AND resolve it
-            // now, through the 30s DNS cache, so a DDNS target follows IP
-            // changes (see select_udp_target). UDP affinity: this happens once
-            // per NEW session, so all datagrams from the same client stay pinned
-            // to the IP chosen here until the session idles out.
-            let target = match select_udp_target(&targets, &selector, port).await {
-                Some(t) => t,
-                None => {
-                    tracing::warn!("UDP port {}: no resolvable target for session", port);
-                    continue;
-                }
-            };
-            if let Err(e) = outbound.connect(target).await {
-                tracing::warn!(
-                    "UDP port {}: failed to connect to target {}: {}",
-                    port,
-                    target,
-                    e
-                );
-                continue;
-            }
+            // New session: bind one ephemeral outbound socket, then resolve and
+            // connect candidates in selector order, all without a map guard.
+            let (outbound, target) =
+                match open_udp_session(source_ipv4, &targets, &selector, port).await {
+                    Ok(Some(session)) => session,
+                    Ok(None) => {
+                        tracing::warn!("UDP port {}: no connectable target for session", port);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("UDP port {}: failed to bind outbound: {}", port, e);
+                        continue;
+                    }
+                };
             let outbound = Arc::new(outbound);
 
             // Publish via the entry API (per-shard lock, sync — no .await while
@@ -262,40 +248,109 @@ pub async fn serve_udp_listener(
     }
 }
 
-/// Resolve the outbound target for a NEW UDP session, honoring the rule's
-/// load-balance order and following DNS changes.
-///
-/// v1.2.x: unlike the pre-split code — which resolved every target ONCE at
-/// listener startup and reused those addresses forever — this re-resolves
-/// through the shared DNS cache (`resolve_cached`, 30s TTL) at session-open
-/// time. A DDNS target whose IP changes is picked up by the next new session
-/// within the cache TTL, instead of being pinned to the boot-time IP until the
-/// rule or node restarts. (Established sessions keep their socket and age out on
-/// the 60s idle timeout, after which new datagrams open a fresh session against
-/// the current IP.)
-///
-/// Returns the first target, in selector order, that resolves to at least one
-/// address; None when none resolve.
-async fn select_udp_target(
+/// Bind and connect the outbound socket for one NEW UDP session. Binding occurs
+/// before selector.order(), so a local bind failure neither advances a
+/// round-robin cursor nor changes target health.
+async fn open_udp_session(
+    source_ipv4: Option<Ipv4Addr>,
     targets: &[String],
     selector: &TargetSelector,
     port: u16,
-) -> Option<SocketAddr> {
-    for idx in selector.order() {
-        let Some(t) = targets.get(idx) else { continue };
-        match super::outbound::resolve_cached(t).await {
-            Ok(addrs) => {
-                if let Some(addr) = addrs.into_iter().next() {
-                    return Some(addr);
-                }
-                tracing::debug!("UDP port {}: target {} resolved to no address", port, t);
+) -> Result<Option<(UdpSocket, SocketAddr)>, super::outbound::OutboundError> {
+    open_udp_session_with(
+        source_ipv4,
+        targets,
+        selector,
+        port,
+        super::outbound::udp_outbound_socket,
+        |target| async move { super::outbound::resolve_cached(&target).await },
+        |socket, target| async move {
+            match socket.connect(target).await {
+                Ok(()) => Ok(socket),
+                Err(error) => Err((socket, error)),
             }
-            Err(e) => {
-                tracing::debug!("UDP port {}: failed to resolve target {}: {}", port, t, e);
+        },
+    )
+    .await
+}
+
+/// Testable new-session state machine. The socket is returned after a failed
+/// connect so the same single bind is reused for every candidate.
+#[allow(clippy::too_many_arguments)]
+async fn open_udp_session_with<
+    S,
+    Bind,
+    BindFuture,
+    Resolve,
+    ResolveFuture,
+    Connect,
+    ConnectFuture,
+    BindError,
+    ResolveError,
+    ConnectError,
+>(
+    source_ipv4: Option<Ipv4Addr>,
+    targets: &[String],
+    selector: &TargetSelector,
+    port: u16,
+    bind: Bind,
+    mut resolve: Resolve,
+    mut connect: Connect,
+) -> Result<Option<(S, SocketAddr)>, BindError>
+where
+    Bind: FnOnce(Option<Ipv4Addr>) -> BindFuture,
+    BindFuture: Future<Output = Result<S, BindError>>,
+    Resolve: FnMut(String) -> ResolveFuture,
+    ResolveFuture: Future<Output = Result<Vec<SocketAddr>, ResolveError>>,
+    Connect: FnMut(S, SocketAddr) -> ConnectFuture,
+    ConnectFuture: Future<Output = Result<S, (S, ConnectError)>>,
+    ResolveError: Display,
+    ConnectError: Display,
+{
+    let mut socket = bind(source_ipv4).await?;
+    for idx in selector.order() {
+        let Some(target) = targets.get(idx) else {
+            continue;
+        };
+        let addresses = match resolve(target.clone()).await {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                tracing::debug!(
+                    "UDP port {}: failed to resolve target {}: {}",
+                    port,
+                    target,
+                    error
+                );
+                continue;
+            }
+        };
+        let Some(address) = addresses.into_iter().next() else {
+            tracing::debug!(
+                "UDP port {}: target {} resolved to no address",
+                port,
+                target
+            );
+            continue;
+        };
+        match connect(socket, address).await {
+            Ok(connected) => {
+                selector.report(idx, true);
+                return Ok(Some((connected, address)));
+            }
+            Err((returned, error)) => {
+                selector.report(idx, false);
+                tracing::warn!(
+                    "UDP port {}: failed to connect to target {} ({}): {}",
+                    port,
+                    target,
+                    address,
+                    error
+                );
+                socket = returned;
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Classify whether a `recv_from` error is worth retrying (mirrors the TCP
@@ -320,46 +375,211 @@ fn is_transient_recv_error(e: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use relay_shared::protocol::LoadBalanceStrategy;
+    use std::io;
+    use std::sync::Mutex;
 
-    // All targets below are IP literals ("ip:port"), which resolve LOCALLY via
-    // lookup_host with no DNS query — keeping these tests hermetic (no network).
-
-    /// Failover order picks the first (primary) target and resolves it.
-    #[tokio::test]
-    async fn select_udp_target_picks_first_in_order() {
-        let targets = vec!["127.0.0.1:9".to_string(), "127.0.0.2:9".to_string()];
-        let selector = TargetSelector::new(LoadBalanceStrategy::Failover, 2);
-        let got = select_udp_target(&targets, &selector, 5000).await;
-        assert_eq!(got, Some("127.0.0.1:9".parse().unwrap()));
+    fn addr(index: u8) -> SocketAddr {
+        format!("127.0.0.{index}:9").parse().unwrap()
     }
 
-    /// Round-robin advances the shared cursor across successive new sessions,
-    /// so consecutive sessions pin to different targets.
     #[tokio::test]
-    async fn select_udp_target_follows_round_robin() {
-        let targets = vec!["127.0.0.1:9".to_string(), "127.0.0.2:9".to_string()];
+    async fn first_candidate_success_avoids_later_candidates() {
+        let targets = vec!["first".to_string(), "second".to_string()];
+        let selector = TargetSelector::new(LoadBalanceStrategy::Failover, 2);
+        let resolved = Arc::new(Mutex::new(Vec::new()));
+        let observed = resolved.clone();
+        let result = open_udp_session_with(
+            None,
+            &targets,
+            &selector,
+            5000,
+            |_| async { Ok::<_, io::Error>(7_u8) },
+            move |target| {
+                let observed = observed.clone();
+                async move {
+                    observed.lock().unwrap().push(target.clone());
+                    Ok::<_, io::Error>(vec![if target == "first" { addr(1) } else { addr(2) }])
+                }
+            },
+            |socket, _| async move { Ok::<_, (u8, io::Error)>(socket) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.map(|(_, target)| target), Some(addr(1)));
+        assert_eq!(*resolved.lock().unwrap(), vec!["first"]);
+    }
+
+    #[tokio::test]
+    async fn connect_failure_falls_through_and_updates_selector_health() {
+        let targets = vec!["first".to_string(), "second".to_string()];
+        let selector = TargetSelector::new(LoadBalanceStrategy::Failover, 2);
+        for _ in 0..3 {
+            let result = open_udp_session_with(
+                None,
+                &targets,
+                &selector,
+                5000,
+                |_| async { Ok::<_, io::Error>(()) },
+                |target| async move {
+                    Ok::<_, io::Error>(vec![if target == "first" { addr(1) } else { addr(2) }])
+                },
+                |socket, target| async move {
+                    if target == addr(1) {
+                        Err((
+                            socket,
+                            io::Error::new(io::ErrorKind::ConnectionRefused, "refused"),
+                        ))
+                    } else {
+                        Ok(socket)
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.map(|(_, target)| target), Some(addr(2)));
+        }
+        assert_eq!(
+            selector.order(),
+            vec![1],
+            "failed primary must enter circuit break"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_failure_falls_through_without_circuit_penalty() {
+        let targets = vec!["bad-dns".to_string(), "second".to_string()];
+        let selector = TargetSelector::new(LoadBalanceStrategy::Failover, 2);
+        for _ in 0..4 {
+            let result = open_udp_session_with(
+                None,
+                &targets,
+                &selector,
+                5000,
+                |_| async { Ok::<_, io::Error>(()) },
+                |target| async move {
+                    if target == "bad-dns" {
+                        Err(io::Error::new(io::ErrorKind::NotFound, "dns failed"))
+                    } else {
+                        Ok(vec![addr(2)])
+                    }
+                },
+                |socket, _| async move { Ok::<_, ((), io::Error)>(socket) },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.map(|(_, target)| target), Some(addr(2)));
+            assert_eq!(selector.order(), vec![0, 1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_bind_failure_does_not_advance_or_penalize_targets() {
+        let targets = vec!["first".to_string(), "second".to_string()];
         let selector = TargetSelector::new(LoadBalanceStrategy::RoundRobin, 2);
-        let a = select_udp_target(&targets, &selector, 5000).await.unwrap();
-        let b = select_udp_target(&targets, &selector, 5000).await.unwrap();
-        assert_eq!(a, "127.0.0.1:9".parse().unwrap());
-        assert_eq!(b, "127.0.0.2:9".parse().unwrap());
+        let result = open_udp_session_with(
+            None,
+            &targets,
+            &selector,
+            5000,
+            |_| async {
+                Err::<(), _>(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "bind failed",
+                ))
+            },
+            |_| async { Ok::<_, io::Error>(vec![addr(1)]) },
+            |socket, _| async move { Ok::<_, ((), io::Error)>(socket) },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(selector.order(), vec![0, 1]);
     }
 
-    /// A target that can't be resolved (no port → immediate parse error, no DNS)
-    /// is skipped, falling through to the next resolvable target in order.
     #[tokio::test]
-    async fn select_udp_target_skips_unresolvable() {
-        let targets = vec!["nocolon-no-port".to_string(), "127.0.0.1:9".to_string()];
-        let selector = TargetSelector::new(LoadBalanceStrategy::Failover, 2);
-        let got = select_udp_target(&targets, &selector, 5000).await;
-        assert_eq!(got, Some("127.0.0.1:9".parse().unwrap()));
+    async fn round_robin_order_and_single_bind_are_preserved() {
+        let targets = vec!["first".to_string(), "second".to_string()];
+        let selector = TargetSelector::new(LoadBalanceStrategy::RoundRobin, 2);
+        let binds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut selected = Vec::new();
+        for _ in 0..2 {
+            let binds = binds.clone();
+            let result = open_udp_session_with(
+                None,
+                &targets,
+                &selector,
+                5000,
+                move |_| {
+                    let binds = binds.clone();
+                    async move {
+                        binds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Ok::<_, io::Error>(())
+                    }
+                },
+                |target| async move {
+                    Ok::<_, io::Error>(vec![if target == "first" { addr(1) } else { addr(2) }])
+                },
+                |socket, _| async move { Ok::<_, ((), io::Error)>(socket) },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            selected.push(result.1);
+        }
+        assert_eq!(selected, vec![addr(1), addr(2)]);
+        assert_eq!(binds.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
-    /// No targets → None (the caller drops the datagram and warns).
     #[tokio::test]
-    async fn select_udp_target_none_when_empty() {
-        let targets: Vec<String> = vec![];
-        let selector = TargetSelector::new(LoadBalanceStrategy::RoundRobin, 0);
-        assert!(select_udp_target(&targets, &selector, 5000).await.is_none());
+    async fn existing_session_stays_pinned_while_new_session_advances_round_robin() {
+        let inbound = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let inbound_addr = inbound.local_addr().unwrap();
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let targets = vec![
+            first.local_addr().unwrap().to_string(),
+            second.local_addr().unwrap().to_string(),
+        ];
+        let listener = tokio::spawn(serve_udp_listener(
+            inbound,
+            targets,
+            Arc::new(TargetSelector::new(LoadBalanceStrategy::RoundRobin, 2)),
+            RateLimit::new(None, None),
+            Arc::new(TrafficCounter::new()),
+            Arc::new(ConnectionTracker::new()),
+            9,
+            None,
+        ));
+
+        let client_one = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_one.send_to(b"one", inbound_addr).await.unwrap();
+        client_one.send_to(b"two", inbound_addr).await.unwrap();
+        let mut buffer = [0_u8; 16];
+        let first_len = time::timeout(Duration::from_secs(1), first.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..first_len], b"one");
+        let second_len = time::timeout(Duration::from_secs(1), first.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..second_len], b"two");
+        assert!(
+            time::timeout(Duration::from_millis(50), second.recv(&mut buffer))
+                .await
+                .is_err(),
+            "an existing session must not reselect its target"
+        );
+
+        let client_two = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_two.send_to(b"three", inbound_addr).await.unwrap();
+        let third_len = time::timeout(Duration::from_secs(1), second.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..third_len], b"three");
+
+        listener.abort();
+        let _ = listener.await;
     }
 }
