@@ -10,3 +10,7 @@ migration_adds_password_columns  # SQLite-only: Migration 26 idempotency test
 
 # PG-only schema-seed guard — SQLite bootstraps via SCHEMA_SQL without a seed-version table.
 apply_schema_seeds_baseline_version  # PG-only: schema_version seed baseline check
+
+# PG-only: revision 34 migrates pre-existing PostgreSQL dns_record_syncs;
+# SQLite's equivalent legacy fixture is migration 50 in db/schema.rs tests.
+migration_34_preserves_rc8_sync_and_enables_composite_identity
