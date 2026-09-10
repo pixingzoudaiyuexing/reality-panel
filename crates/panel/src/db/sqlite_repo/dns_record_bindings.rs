@@ -1,6 +1,9 @@
 use super::SqliteRepository;
 use crate::db::error::DbError;
-use crate::db::repo::{DnsRecordBinding, DnsRecordBindingRepository, NewDnsRecordBinding};
+use crate::db::repo::{
+    DetachedDnsRecordBindingAdoption, DnsRecordBinding, DnsRecordBindingRepository,
+    NewDnsRecordBinding,
+};
 use async_trait::async_trait;
 
 #[async_trait]
@@ -109,6 +112,37 @@ impl DnsRecordBindingRepository for SqliteRepository {
         .bind(observed_at)
         .bind(updated_at)
         .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    async fn adopt_detached_dns_record_binding(
+        &self,
+        adoption: &DetachedDnsRecordBindingAdoption,
+    ) -> Result<u64, DbError> {
+        Ok(sqlx::query(
+            "UPDATE dns_record_bindings SET rule_id = ?, desired_value = ?, state = 'BOUND', \
+                 last_observed_at = ?, last_error_category = NULL, updated_at = ? \
+             WHERE id = ? AND rule_id IS NULL AND fqdn = ? AND zone_id = ? \
+               AND zone_name = ? AND host = ? AND record_type = ? AND line = ? \
+               AND line_key = ? AND record_id = ? AND desired_value = ? \
+               AND state = 'BOUND' AND last_error_category IS NULL",
+        )
+        .bind(adoption.rule_id)
+        .bind(&adoption.desired_value)
+        .bind(&adoption.observed_at)
+        .bind(&adoption.updated_at)
+        .bind(adoption.binding_id)
+        .bind(&adoption.fqdn)
+        .bind(adoption.zone_id)
+        .bind(&adoption.zone_name)
+        .bind(&adoption.host)
+        .bind(&adoption.record_type)
+        .bind(&adoption.line)
+        .bind(&adoption.line_key)
+        .bind(&adoption.record_id)
+        .bind(&adoption.previous_desired_value)
         .execute(&self.pool)
         .await?
         .rows_affected())

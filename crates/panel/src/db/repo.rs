@@ -734,6 +734,24 @@ pub struct NewDnsRecordBinding {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct DetachedDnsRecordBindingAdoption {
+    pub binding_id: i64,
+    pub rule_id: i64,
+    pub fqdn: String,
+    pub zone_id: i64,
+    pub zone_name: String,
+    pub host: String,
+    pub record_type: String,
+    pub line: String,
+    pub line_key: String,
+    pub record_id: String,
+    pub previous_desired_value: String,
+    pub desired_value: String,
+    pub observed_at: String,
+    pub updated_at: String,
+}
+
 #[async_trait]
 pub trait DnsRecordBindingRepository: Send + Sync {
     async fn insert_dns_record_binding(
@@ -775,6 +793,14 @@ pub trait DnsRecordBindingRepository: Send + Sync {
         desired_value: &str,
         observed_at: &str,
         updated_at: &str,
+    ) -> Result<u64, DbError>;
+
+    /// Atomically transfer preserved Panel ownership to a replacement Rule.
+    /// Every identity field remains in the predicate so stale metadata or a
+    /// concurrent claimant can never be overwritten.
+    async fn adopt_detached_dns_record_binding(
+        &self,
+        adoption: &DetachedDnsRecordBindingAdoption,
     ) -> Result<u64, DbError>;
 }
 

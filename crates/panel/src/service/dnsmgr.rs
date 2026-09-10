@@ -7,8 +7,8 @@
 use crate::api::AppState;
 use crate::db::repo::GroupRepository;
 use crate::db::repo::{
-    DnsRecordBinding, DnsRecordSync, NewDnsRecordBinding, NewDnsRecordSync, ResourceScope,
-    RuleRepository,
+    DetachedDnsRecordBindingAdoption, DnsRecordBinding, DnsRecordSync, NewDnsRecordBinding,
+    NewDnsRecordSync, ResourceScope, RuleRepository,
 };
 use crate::db::Repository;
 use crate::integrations::dnsmgr::{
@@ -655,9 +655,10 @@ impl EnsureRecordResult {
 }
 
 /// Ensure the exact A record authorized by one eligible SNI Rule. Provider
-/// bindings are bookkeeping only: the Rule-derived desired state grants write
-/// authority. DNSMgr writes are single-attempt and always followed by read-back
-/// verification; public DNS propagation is intentionally separate.
+/// writes to an existing record require current ownership or exact detached
+/// Panel provenance. New records may be created only when provider discovery
+/// confirms absence. Every write is single-attempt and followed by read-back;
+/// public DNS propagation is intentionally separate.
 pub(crate) async fn ensure_record(
     db: &dyn Repository,
     client: &DnsMgrClient,
@@ -719,6 +720,26 @@ pub(crate) async fn ensure_record(
     };
 
     let discovery = discover_records(client, &zone, input.record_type, &line).await;
+    let detached_binding = if binding.is_none() {
+        match &discovery {
+            RecordDiscovery::SingleMatchingRecord(record) => {
+                match detached_binding_authorizing_record(db, input, &fqdn, &zone, &line, record)
+                    .await
+                {
+                    Ok(binding) => Some(binding),
+                    Err(failure) => return EnsureRecordResult::Failed(failure),
+                }
+            }
+            RecordDiscovery::MultipleMatchingRecords(_) => {
+                return EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+            }
+            RecordDiscovery::NoRecord
+            | RecordDiscovery::ConflictingRecordType(_)
+            | RecordDiscovery::UpstreamFailure(_) => None,
+        }
+    } else {
+        None
+    };
     if line.key != DEFAULT_LINE_KEY {
         return match discovery {
             RecordDiscovery::UpstreamFailure(error) => {
@@ -749,13 +770,14 @@ pub(crate) async fn ensure_record(
                 .await
             }
             RecordDiscovery::SingleMatchingRecord(record)
-                if binding_matches_record(
-                    binding.as_ref(),
-                    &fqdn,
-                    &zone,
-                    input.record_type,
-                    &record,
-                ) =>
+                if detached_binding.is_some()
+                    || binding_matches_record(
+                        binding.as_ref(),
+                        &fqdn,
+                        &zone,
+                        input.record_type,
+                        &record,
+                    ) =>
             {
                 handle_discovered_records(
                     db,
@@ -767,6 +789,7 @@ pub(crate) async fn ensure_record(
                     ttl,
                     expected_ip,
                     binding.as_ref(),
+                    detached_binding.as_ref(),
                     std::slice::from_ref(&record),
                 )
                 .await
@@ -816,6 +839,7 @@ pub(crate) async fn ensure_record(
                 ttl,
                 expected_ip,
                 binding.as_ref(),
+                detached_binding.as_ref(),
                 std::slice::from_ref(&record),
             )
             .await
@@ -831,11 +855,54 @@ pub(crate) async fn ensure_record(
                 ttl,
                 expected_ip,
                 binding.as_ref(),
+                detached_binding.as_ref(),
                 &records,
             )
             .await
         }
     }
+}
+
+fn detached_binding_matches_record(
+    binding: &DnsRecordBinding,
+    fqdn: &NormalizedFqdn,
+    zone: &ResolvedZone,
+    record_type: DnsRecordType,
+    line: &ProviderLine,
+    record: &DiscoveredRecord,
+) -> bool {
+    binding.rule_id.is_none()
+        && binding.state == "BOUND"
+        && binding.last_error_category.is_none()
+        && binding_matches_record(Some(binding), fqdn, zone, record_type, record)
+        && binding.line == line.raw_id
+        && binding.line_key == line.key
+}
+
+async fn detached_binding_authorizing_record(
+    db: &dyn Repository,
+    input: &EnsureRecordInput,
+    fqdn: &NormalizedFqdn,
+    zone: &ResolvedZone,
+    line: &ProviderLine,
+    record: &DiscoveredRecord,
+) -> Result<DnsRecordBinding, EnsureRecordFailure> {
+    let zone_id = i64::try_from(zone.domain_id).map_err(|_| EnsureRecordFailure::Database)?;
+    let binding = db
+        .find_dns_record_binding_by_record(zone_id, &record.record.record_id)
+        .await
+        .map_err(|_| EnsureRecordFailure::Database)?
+        .ok_or(EnsureRecordFailure::OwnershipUnverified)?;
+    if !detached_binding_matches_record(&binding, fqdn, zone, input.record_type, line, record) {
+        return Err(EnsureRecordFailure::OwnershipUnverified);
+    }
+    let [provider_value] = record.record.values.as_slice() else {
+        return Err(EnsureRecordFailure::OwnershipUnverified);
+    };
+    if provider_value != &input.expected_value && provider_value != &binding.desired_value {
+        return Err(EnsureRecordFailure::OwnershipUnverified);
+    }
+    Ok(binding)
 }
 
 pub(crate) async fn ensure_record_absent(
@@ -1127,9 +1194,10 @@ async fn handle_discovered_records(
     ttl: u32,
     expected_ip: IpAddr,
     binding: Option<&DnsRecordBinding>,
+    detached_binding: Option<&DnsRecordBinding>,
     records: &[DiscoveredRecord],
 ) -> EnsureRecordResult {
-    let bound = binding.and_then(|binding| {
+    let bound = binding.or(detached_binding).and_then(|binding| {
         records.iter().find(|record| {
             binding_matches_record(Some(binding), fqdn, zone, input.record_type, record)
         })
@@ -1140,9 +1208,18 @@ async fn handle_discovered_records(
         if record_value_matches(&record.record.values, expected_ip) {
             continue;
         }
-        if let Err(result) =
-            update_provider_record_and_verify(db, client, input, zone, line, ttl, binding, record)
-                .await
+        if let Err(result) = update_provider_record_and_verify(
+            db,
+            client,
+            input,
+            zone,
+            line,
+            ttl,
+            binding,
+            record,
+            detached_binding.is_some(),
+        )
+        .await
         {
             return result;
         }
@@ -1155,8 +1232,8 @@ async fn handle_discovered_records(
             && binding.state == "BOUND"
             && binding.last_error_category.is_none()
     });
-    if (!binding_is_current || updated)
-        && persist_verified_binding(
+    if detached_binding.is_some() || !binding_is_current || updated {
+        if let Err(error) = persist_verified_binding(
             db,
             input,
             fqdn,
@@ -1164,11 +1241,12 @@ async fn handle_discovered_records(
             line,
             &canonical.record.record_id,
             binding,
+            false,
         )
         .await
-        .is_err()
-    {
-        return EnsureRecordResult::Failed(EnsureRecordFailure::Database);
+        {
+            return EnsureRecordResult::Failed(error.as_ensure_failure());
+        }
     }
 
     if updated {
@@ -1240,7 +1318,7 @@ async fn create_and_verify(
             return EnsureRecordResult::Failed(EnsureRecordFailure::PostWriteNotVerified);
         }
     };
-    if persist_verified_binding(
+    if let Err(error) = persist_verified_binding(
         db,
         input,
         fqdn,
@@ -1248,11 +1326,16 @@ async fn create_and_verify(
         &verified.line,
         &verified.record.record_id,
         stale_binding,
+        true,
     )
     .await
-    .is_err()
     {
-        return EnsureRecordResult::MutationOutcomeUnknown;
+        return match error {
+            PersistVerifiedBindingError::Database => EnsureRecordResult::MutationOutcomeUnknown,
+            PersistVerifiedBindingError::OwnershipUnverified => {
+                EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+            }
+        };
     }
     if let Some(binding) = stale_binding {
         EnsureRecordResult::Recreated {
@@ -1276,6 +1359,7 @@ async fn update_provider_record_and_verify(
     ttl: u32,
     binding: Option<&DnsRecordBinding>,
     record: &DiscoveredRecord,
+    require_unique_readback: bool,
 ) -> Result<(), EnsureRecordResult> {
     let mutation = mutation_request(input, zone, line, ttl);
     let write_result = client
@@ -1304,7 +1388,7 @@ async fn update_provider_record_and_verify(
     let verified = discover_records(client, zone, input.record_type, line).await;
     let exact = match verified {
         RecordDiscovery::SingleMatchingRecord(record) => Some(record),
-        RecordDiscovery::MultipleMatchingRecords(records) => records
+        RecordDiscovery::MultipleMatchingRecords(records) if !require_unique_readback => records
             .into_iter()
             .find(|candidate| candidate.record.record_id == record.record.record_id),
         _ => None,
@@ -1351,21 +1435,23 @@ async fn persist_verified_binding(
     line: &ProviderLine,
     record_id: &str,
     binding: Option<&DnsRecordBinding>,
-) -> Result<(), ()> {
+    allow_insert: bool,
+) -> Result<(), PersistVerifiedBindingError> {
     let now = utc_now();
-    let zone_id = i64::try_from(zone.domain_id).map_err(|_| ())?;
+    let zone_id =
+        i64::try_from(zone.domain_id).map_err(|_| PersistVerifiedBindingError::Database)?;
     let existing_provider_binding = db
         .find_dns_record_binding_by_record(zone_id, record_id)
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| PersistVerifiedBindingError::Database)?;
     if let Some(binding) = binding {
         if existing_provider_binding
             .as_ref()
             .is_some_and(|existing| existing.id != binding.id)
         {
-            return Ok(());
+            return Err(PersistVerifiedBindingError::OwnershipUnverified);
         }
-        return match db
+        match db
             .rebind_verified_dns_record(
                 binding.id,
                 record_id,
@@ -1376,31 +1462,132 @@ async fn persist_verified_binding(
             )
             .await
         {
-            Ok(1) => Ok(()),
-            _ => Err(()),
+            Ok(1) => return verify_persisted_binding(db, input, fqdn, zone, line, record_id).await,
+            Ok(_) | Err(crate::db::error::DbError::UniqueViolation) => {
+                return Err(PersistVerifiedBindingError::OwnershipUnverified)
+            }
+            Err(_) => return Err(PersistVerifiedBindingError::Database),
+        }
+    }
+    if let Some(existing) = existing_provider_binding {
+        if existing.rule_id.is_some()
+            || existing.fqdn != fqdn.as_str()
+            || existing.zone_id != zone_id
+            || existing.zone_name != zone.zone_name
+            || existing.host != zone.host
+            || existing.record_type != input.record_type.as_str()
+            || existing.line != line.raw_id
+            || existing.line_key != line.key
+            || existing.record_id != record_id
+        {
+            return Err(PersistVerifiedBindingError::OwnershipUnverified);
+        }
+        let adoption = DetachedDnsRecordBindingAdoption {
+            binding_id: existing.id,
+            rule_id: input.rule_id,
+            fqdn: fqdn.as_str().to_string(),
+            zone_id,
+            zone_name: zone.zone_name.clone(),
+            host: zone.host.clone(),
+            record_type: input.record_type.as_str().to_string(),
+            line: line.raw_id.clone(),
+            line_key: line.key.clone(),
+            record_id: record_id.to_string(),
+            previous_desired_value: existing.desired_value,
+            desired_value: input.expected_value.clone(),
+            observed_at: now.clone(),
+            updated_at: now,
+        };
+        return match db.adopt_detached_dns_record_binding(&adoption).await {
+            Ok(1) => verify_persisted_binding(db, input, fqdn, zone, line, record_id).await,
+            Ok(_) | Err(crate::db::error::DbError::UniqueViolation) => {
+                Err(PersistVerifiedBindingError::OwnershipUnverified)
+            }
+            Err(_) => Err(PersistVerifiedBindingError::Database),
         };
     }
-    if existing_provider_binding.is_some() {
-        return Ok(());
+    if !allow_insert {
+        return Err(PersistVerifiedBindingError::OwnershipUnverified);
     }
-    db.insert_dns_record_binding(&NewDnsRecordBinding {
-        rule_id: Some(input.rule_id),
-        fqdn: fqdn.as_str().to_string(),
-        zone_id,
-        zone_name: zone.zone_name.clone(),
-        host: zone.host.clone(),
-        record_type: input.record_type.as_str().to_string(),
-        line: line.raw_id.clone(),
-        line_key: line.key.clone(),
-        record_id: record_id.to_string(),
-        desired_value: input.expected_value.clone(),
-        state: "BOUND".into(),
-        last_observed_at: Some(now.clone()),
-        created_at: now,
-    })
-    .await
-    .map(|_| ())
-    .map_err(|_| ())
+    match db
+        .insert_dns_record_binding(&NewDnsRecordBinding {
+            rule_id: Some(input.rule_id),
+            fqdn: fqdn.as_str().to_string(),
+            zone_id,
+            zone_name: zone.zone_name.clone(),
+            host: zone.host.clone(),
+            record_type: input.record_type.as_str().to_string(),
+            line: line.raw_id.clone(),
+            line_key: line.key.clone(),
+            record_id: record_id.to_string(),
+            desired_value: input.expected_value.clone(),
+            state: "BOUND".into(),
+            last_observed_at: Some(now.clone()),
+            created_at: now,
+        })
+        .await
+    {
+        Ok(_) => verify_persisted_binding(db, input, fqdn, zone, line, record_id).await,
+        Err(crate::db::error::DbError::UniqueViolation) => {
+            Err(PersistVerifiedBindingError::OwnershipUnverified)
+        }
+        Err(_) => Err(PersistVerifiedBindingError::Database),
+    }
+}
+
+async fn verify_persisted_binding(
+    db: &dyn Repository,
+    input: &EnsureRecordInput,
+    fqdn: &NormalizedFqdn,
+    zone: &ResolvedZone,
+    line: &ProviderLine,
+    record_id: &str,
+) -> Result<(), PersistVerifiedBindingError> {
+    let zone_id =
+        i64::try_from(zone.domain_id).map_err(|_| PersistVerifiedBindingError::Database)?;
+    let binding = db
+        .find_dns_record_binding_for_rule(
+            input.rule_id,
+            fqdn.as_str(),
+            input.record_type.as_str(),
+            &line.key,
+        )
+        .await
+        .map_err(|_| PersistVerifiedBindingError::Database)?;
+    if binding.is_some_and(|binding| {
+        binding.rule_id == Some(input.rule_id)
+            && binding.fqdn == fqdn.as_str()
+            && binding.zone_id == zone_id
+            && binding.zone_name == zone.zone_name
+            && binding.host == zone.host
+            && binding.record_type == input.record_type.as_str()
+            && binding.line == line.raw_id
+            && binding.line_key == line.key
+            && binding.record_id == record_id
+            && binding.desired_value == input.expected_value
+            && binding.state == "BOUND"
+            && binding.last_observed_at.is_some()
+            && binding.last_error_category.is_none()
+    }) {
+        Ok(())
+    } else {
+        Err(PersistVerifiedBindingError::OwnershipUnverified)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistVerifiedBindingError {
+    Database,
+    OwnershipUnverified,
+}
+
+impl PersistVerifiedBindingError {
+    fn as_ensure_failure(self) -> EnsureRecordFailure {
+        match self {
+            Self::Database => EnsureRecordFailure::Database,
+            Self::OwnershipUnverified => EnsureRecordFailure::OwnershipUnverified,
+        }
+    }
 }
 
 fn mutation_request(
@@ -3170,6 +3357,66 @@ mod tests {
             DnsRecordType::A,
             &discovered
         ));
+
+        let line = ProviderLine::default();
+        let mut detached = exact_binding;
+        detached.rule_id = None;
+        detached.line = line.raw_id.clone();
+        detached.line_key = line.key.clone();
+        detached.state = "BOUND".into();
+        detached.last_error_category = None;
+        assert!(detached_binding_matches_record(
+            &detached,
+            &fqdn,
+            &zone,
+            DnsRecordType::A,
+            &line,
+            &discovered,
+        ));
+
+        let rejects = |binding: &DnsRecordBinding| {
+            assert!(!detached_binding_matches_record(
+                binding,
+                &fqdn,
+                &zone,
+                DnsRecordType::A,
+                &line,
+                &discovered,
+            ));
+        };
+        let mut mismatch = detached.clone();
+        mismatch.rule_id = Some(100);
+        rejects(&mismatch);
+        mismatch = detached.clone();
+        mismatch.fqdn = "other.example.com".into();
+        rejects(&mismatch);
+        mismatch = detached.clone();
+        mismatch.zone_id = 8;
+        rejects(&mismatch);
+        mismatch = detached.clone();
+        mismatch.zone_name = "other.example.com".into();
+        rejects(&mismatch);
+        mismatch = detached.clone();
+        mismatch.host = "other".into();
+        rejects(&mismatch);
+        mismatch = detached.clone();
+        mismatch.record_type = "AAAA".into();
+        rejects(&mismatch);
+        mismatch = detached.clone();
+        mismatch.line = "other-line".into();
+        rejects(&mismatch);
+        mismatch = detached.clone();
+        mismatch.line_key = "dnsmgr:other-line".into();
+        rejects(&mismatch);
+        mismatch = detached.clone();
+        mismatch.record_id = "other-record".into();
+        rejects(&mismatch);
+        mismatch = detached.clone();
+        mismatch.state = "ERROR".into();
+        rejects(&mismatch);
+        mismatch = detached;
+        mismatch.last_error_category = Some("STALE".into());
+        rejects(&mismatch);
     }
 
     #[tokio::test]
@@ -4662,7 +4909,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eligible_rule_manages_existing_records_without_an_ownership_gate() {
+    async fn eligible_rule_refuses_existing_records_without_panel_provenance() {
         let correct_db = ensure_db().await;
         let correct = spawn_ensure_mock(
             vec![record("external", "A", "192.0.2.10", "0")],
@@ -4677,15 +4924,13 @@ mod tests {
                 &ensure_input(DnsRecordType::A, "192.0.2.10"),
             )
             .await,
-            EnsureRecordResult::AlreadyCorrect {
-                record_id: "external".into()
-            }
+            EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
         );
         assert!(correct_db
             .find_dns_record_binding_by_record(7, "external")
             .await
             .unwrap()
-            .is_some());
+            .is_none());
         assert_eq!(correct.state.total_mutations(), 0);
 
         let wrong_db = ensure_db().await;
@@ -4702,58 +4947,18 @@ mod tests {
                 &ensure_input(DnsRecordType::A, "192.0.2.10"),
             )
             .await,
-            EnsureRecordResult::Updated {
-                record_id: "external".into()
-            }
+            EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
         );
-        assert_eq!(wrong.state.update_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(wrong.state.update_attempts.load(Ordering::SeqCst), 0);
         assert_eq!(
             wrong.state.records.lock().unwrap()[0].values,
-            ["192.0.2.10"]
+            ["192.0.2.99"]
         );
         assert!(wrong_db
             .find_dns_record_binding_by_record(7, "external")
             .await
             .unwrap()
-            .is_some());
-
-        let historical_db = ensure_db().await;
-        historical_db
-            .insert_dns_record_binding(&NewDnsRecordBinding {
-                rule_id: None,
-                fqdn: "op1.example.com".into(),
-                zone_id: 7,
-                zone_name: "example.com".into(),
-                host: "op1".into(),
-                record_type: "A".into(),
-                line: "0".into(),
-                line_key: "default".into(),
-                record_id: "historical".into(),
-                desired_value: "192.0.2.99".into(),
-                state: "BOUND".into(),
-                last_observed_at: None,
-                created_at: utc_now(),
-            })
-            .await
-            .unwrap();
-        let historical = spawn_ensure_mock(
-            vec![record("historical", "A", "192.0.2.99", "0")],
-            MutationBehavior::Apply,
-            MutationBehavior::Apply,
-        )
-        .await;
-        assert_eq!(
-            ensure_record(
-                &historical_db,
-                &historical.client,
-                &ensure_input(DnsRecordType::A, "192.0.2.10"),
-            )
-            .await,
-            EnsureRecordResult::Updated {
-                record_id: "historical".into()
-            }
-        );
-        assert_eq!(historical.state.update_attempts.load(Ordering::SeqCst), 1);
+            .is_none());
 
         let multiple_db = ensure_db().await;
         let multiple = spawn_ensure_mock(
@@ -4772,24 +4977,23 @@ mod tests {
                 &ensure_input(DnsRecordType::A, "192.0.2.10"),
             )
             .await,
-            EnsureRecordResult::Updated {
-                record_id: "external-1".into()
-            }
+            EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
         );
-        assert_eq!(multiple.state.update_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(multiple.state.update_attempts.load(Ordering::SeqCst), 0);
         assert!(multiple
             .state
             .records
             .lock()
             .unwrap()
             .iter()
-            .all(|record| record.values == ["192.0.2.10"]));
+            .any(|record| record.values == ["192.0.2.99"]));
     }
 
     #[tokio::test]
     async fn ensure_treats_singleton_array_as_correct_and_converges_multi_value_records() {
         let expected = "192.0.2.10";
         let correct_db = ensure_db().await;
+        insert_binding(&correct_db, "correct", expected).await;
         let correct = spawn_ensure_mock(
             vec![record("correct", "A", expected, "default_view")],
             MutationBehavior::Apply,
@@ -4810,6 +5014,7 @@ mod tests {
         assert_eq!(correct.state.total_mutations(), 0);
 
         let multi_db = ensure_db().await;
+        insert_binding(&multi_db, "multi", expected).await;
         let mut multi = record("multi", "A", "192.0.2.1", "default_view");
         multi.values.push(expected.into());
         let multi = spawn_ensure_mock(
@@ -5771,6 +5976,7 @@ mod tests {
         let scheduled = sync_row(&db).await;
         assert_eq!(scheduled.expected_value.as_deref(), Some("192.0.2.10"));
         assert_eq!(scheduled.state, "PENDING");
+        insert_binding(&db, "manual", "192.0.2.5").await;
 
         let mock = spawn_ensure_mock(
             vec![record("manual", "A", "192.0.2.5", "default_view")],
@@ -5855,7 +6061,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciliation_creates_or_manages_rule_authorized_records_without_blind_retry() {
+    async fn reconciliation_creates_records_and_refuses_unowned_records_without_blind_retry() {
         let created_db = ensure_db().await;
         configure_eligible_rule(&created_db, "op1.example.com", "192.0.2.10").await;
         insert_sync(&created_db).await;
@@ -5887,17 +6093,21 @@ mod tests {
         let external_audits =
             reconcile_one(&external_db, sync_row(&external_db).await, &external.client).await;
         let external_state = sync_row(&external_db).await;
-        assert_eq!(external_state.state, "PROPAGATED");
-        assert_eq!(external_state.ownership, "PANEL");
+        assert_eq!(external_state.state, "FAILED");
+        assert_eq!(external_state.ownership, "UNKNOWN");
+        assert_eq!(
+            external_state.last_error_category.as_deref(),
+            Some("DNS_OWNERSHIP_UNVERIFIED")
+        );
         assert!(external_db
             .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "default")
             .await
             .unwrap()
-            .is_some());
+            .is_none());
         assert_eq!(external.state.total_mutations(), 0);
         assert!(external_audits
             .iter()
-            .all(|audit| audit.action != "DNS_RECORD_CREATED"));
+            .any(|audit| audit.action == "DNS_SYNC_FAILED"));
 
         let conflict_db = ensure_db().await;
         configure_eligible_rule(&conflict_db, "op1.example.com", "192.0.2.10").await;
@@ -5924,12 +6134,16 @@ mod tests {
         let conflict_audits =
             reconcile_one(&conflict_db, sync_row(&conflict_db).await, &conflict.client).await;
         let conflict_state = sync_row(&conflict_db).await;
-        assert_eq!(conflict_state.state, "PROPAGATED");
-        assert_eq!(conflict_state.ownership, "PANEL");
-        assert_eq!(conflict.state.update_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(conflict_state.state, "FAILED");
+        assert_eq!(conflict_state.ownership, "UNKNOWN");
+        assert_eq!(
+            conflict_state.last_error_category.as_deref(),
+            Some("DNS_OWNERSHIP_UNVERIFIED")
+        );
+        assert_eq!(conflict.state.update_attempts.load(Ordering::SeqCst), 0);
         assert!(conflict_audits
             .iter()
-            .any(|audit| audit.action == "DNS_RECORD_UPDATED"));
+            .any(|audit| audit.action == "DNS_SYNC_FAILED"));
 
         let unknown_db = ensure_db().await;
         configure_eligible_rule(&unknown_db, "op1.example.com", "192.0.2.10").await;
@@ -6020,6 +6234,411 @@ mod tests {
         assert_eq!(noop_state.ownership, "PANEL");
         assert!(noop_state.mutation_verified_at.is_some());
         assert_eq!(noop.state.total_mutations(), 0);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_adopts_detached_binding_after_rule_recreation() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        db.insert_dns_record_binding(&NewDnsRecordBinding {
+            rule_id: Some(100),
+            fqdn: "op1.example.com".into(),
+            zone_id: 7,
+            zone_name: "example.com".into(),
+            host: "op1".into(),
+            record_type: "A".into(),
+            line: "default_view".into(),
+            line_key: DEFAULT_LINE_KEY.into(),
+            record_id: "historical-owned".into(),
+            desired_value: "192.0.2.99".into(),
+            state: "BOUND".into(),
+            last_observed_at: Some(utc_now()),
+            created_at: utc_now(),
+        })
+        .await
+        .unwrap();
+        RuleRepository::delete_rule(&db, 100, &ResourceScope::All)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.find_dns_record_binding_by_record(7, "historical-owned")
+                .await
+                .unwrap()
+                .unwrap()
+                .rule_id,
+            None
+        );
+        let new_rule_id = RuleRepository::create_rule_full(
+            &db,
+            "replacement-rule",
+            1,
+            21001,
+            "tcp",
+            "nginx_sni",
+            "nginx_sni",
+            "direct",
+            "raw",
+            None,
+            Some("op1.example.com"),
+            true,
+            false,
+            10,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+            &[],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        db.insert_dns_record_sync(&NewDnsRecordSync {
+            rule_id: new_rule_id,
+            fqdn: "op1.example.com".into(),
+            record_type: "A".into(),
+            expected_value: Some("192.0.2.10".into()),
+            line: "default".into(),
+            line_key: DEFAULT_LINE_KEY.into(),
+            desired_action: "UPSERT".into(),
+            state: "PENDING".into(),
+            ownership: "UNKNOWN".into(),
+            last_error_category: None,
+            next_attempt_at: Some(utc_now()),
+            created_at: utc_now(),
+            updated_at: utc_now(),
+        })
+        .await
+        .unwrap();
+        let mock = spawn_ensure_mock(
+            vec![record(
+                "historical-owned",
+                "A",
+                "192.0.2.99",
+                "default_view",
+            )],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+
+        let scheduled = db
+            .find_dns_record_sync(new_rule_id, DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_one(&db, scheduled, &mock.client).await;
+
+        assert_eq!(mock.state.update_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.state.records.lock().unwrap()[0].values, ["192.0.2.10"]);
+        let adopted = db
+            .find_dns_record_binding_for_rule(new_rule_id, "op1.example.com", "A", DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .expect("verified detached binding must belong to the replacement rule");
+        assert_eq!(adopted.record_id, "historical-owned");
+        assert_eq!(adopted.desired_value, "192.0.2.10");
+        assert_eq!(adopted.state, "BOUND");
+        assert!(adopted.last_error_category.is_none());
+        assert!(adopted.last_observed_at.is_some());
+
+        let sync = db
+            .find_dns_record_sync(new_rule_id, DEFAULT_LINE_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sync.state, "PROPAGATED");
+        assert_eq!(sync.ownership, "PANEL");
+        assert_eq!(
+            inspect_default_line_record_for_transaction(&db, &mock.client, new_rule_id)
+                .await
+                .unwrap(),
+            LineRecordSnapshot::PanelOwned {
+                value: "192.0.2.10".into(),
+                record_id: "historical-owned".into(),
+            }
+        );
+
+        db.set(
+            DNSMGR_CONFIG_KEY,
+            &serde_json::json!({
+                "enabled": true,
+                "base_url": mock.base_url.clone(),
+                "uid": 7,
+                "api_key": "key"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        db.set(
+            "node_status:10:node-a",
+            &serde_json::json!({
+                "last_seen": chrono::Utc::now().to_rfc3339(),
+                "node_id": "node-a",
+                "public_ipv4": "192.0.2.10",
+                "public_ipv4_reported": true,
+                "config_protocol_version": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+                "active_listener_rule_ids": [new_rule_id],
+                "camouflage_sites": [{
+                    "site_id": "replacement-site",
+                    "sni": "op1.example.com",
+                    "site_status": "active",
+                    "certificate_status": "active"
+                }],
+                "reconciliation": {"state": "CONVERGED", "recovery_source": "PANEL"}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        db.set(
+            "relay_preference:10",
+            &serde_json::to_string(&crate::service::relay_preference::RelayPreferenceState {
+                active_routing_mode: Some(crate::service::relay_preference::RoutingMode::Carrier),
+                normal_default_node_id: Some("node-a".into()),
+                preferred_node_id: Some("node-a".into()),
+                ..crate::service::relay_preference::RelayPreferenceState::default()
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let connections = crate::api::ws::NodeConnections::new();
+        let (_, _node_rx) = connections.register(10, Some("node-a".into())).await;
+        assert_eq!(
+            crate::service::relay_preference::start_carrier_policy_apply(
+                &db,
+                &connections,
+                10,
+                crate::service::relay_preference::CarrierPolicy {
+                    default_node_id: Some("node-a".into()),
+                    bindings: Vec::new(),
+                },
+            )
+            .await
+            .unwrap(),
+            crate::service::relay_preference::CarrierPolicyApplyOutcome::Started
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_binding_adoption_refuses_unverified_identity_and_provider_state() {
+        let external_db = ensure_db().await;
+        let external = spawn_ensure_mock(
+            vec![record("external", "A", "192.0.2.10", "default_view")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert_eq!(
+            ensure_record(
+                &external_db,
+                &external.client,
+                &ensure_input(DnsRecordType::A, "192.0.2.10"),
+            )
+            .await,
+            EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+        );
+        assert_eq!(external.state.total_mutations(), 0);
+
+        for (label, fqdn, line, binding_record_id, provider_record_id) in [
+            (
+                "record id",
+                "op1.example.com",
+                "default_view",
+                "historical",
+                "replacement",
+            ),
+            (
+                "fqdn",
+                "other.example.com",
+                "default_view",
+                "historical",
+                "historical",
+            ),
+            ("line", "op1.example.com", "0", "historical", "historical"),
+        ] {
+            let db = ensure_db().await;
+            insert_detached_binding(&db, fqdn, line, "default", binding_record_id, "192.0.2.10")
+                .await;
+            let mock = spawn_ensure_mock(
+                vec![record(
+                    provider_record_id,
+                    "A",
+                    "192.0.2.10",
+                    "default_view",
+                )],
+                MutationBehavior::Apply,
+                MutationBehavior::Apply,
+            )
+            .await;
+            assert_eq!(
+                ensure_record(
+                    &db,
+                    &mock.client,
+                    &ensure_input(DnsRecordType::A, "192.0.2.10"),
+                )
+                .await,
+                EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified),
+                "{label} mismatch must fail closed"
+            );
+            assert_eq!(
+                mock.state.total_mutations(),
+                0,
+                "{label} mismatch wrote DNS"
+            );
+            assert!(db
+                .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "default")
+                .await
+                .unwrap()
+                .is_none());
+        }
+
+        let multiple_db = ensure_db().await;
+        insert_detached_binding(
+            &multiple_db,
+            "op1.example.com",
+            "default_view",
+            "default",
+            "historical",
+            "192.0.2.10",
+        )
+        .await;
+        let multiple = spawn_ensure_mock(
+            vec![
+                record("historical", "A", "192.0.2.10", "default_view"),
+                record("duplicate", "A", "192.0.2.10", "default_view"),
+            ],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert_eq!(
+            ensure_record(
+                &multiple_db,
+                &multiple.client,
+                &ensure_input(DnsRecordType::A, "192.0.2.10"),
+            )
+            .await,
+            EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+        );
+        assert_eq!(multiple.state.total_mutations(), 0);
+
+        let other_owner_db = ensure_db().await;
+        insert_binding(&other_owner_db, "owned-by-rule-100", "192.0.2.10").await;
+        let replacement_rule_id = RuleRepository::create_rule_full(
+            &other_owner_db,
+            "replacement-rule",
+            1,
+            21001,
+            "tcp",
+            "nginx_sni",
+            "nginx_sni",
+            "direct",
+            "raw",
+            None,
+            Some("op1.example.com"),
+            true,
+            false,
+            10,
+            None,
+            "direct",
+            "127.0.0.1",
+            80,
+            &[],
+            "first",
+            0,
+            0,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let other_owner = spawn_ensure_mock(
+            vec![record(
+                "owned-by-rule-100",
+                "A",
+                "192.0.2.10",
+                "default_view",
+            )],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert_eq!(
+            ensure_record(
+                &other_owner_db,
+                &other_owner.client,
+                &EnsureRecordInput {
+                    rule_id: replacement_rule_id,
+                    fqdn: "op1.example.com".into(),
+                    record_type: DnsRecordType::A,
+                    expected_value: "192.0.2.10".into(),
+                    line: ProviderLine::default(),
+                },
+            )
+            .await,
+            EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+        );
+        assert_eq!(other_owner.state.total_mutations(), 0);
+
+        let readback_db = ensure_db().await;
+        insert_detached_binding(
+            &readback_db,
+            "op1.example.com",
+            "default_view",
+            "default",
+            "historical",
+            "192.0.2.99",
+        )
+        .await;
+        let readback = spawn_ensure_mock(
+            vec![record("historical", "A", "192.0.2.99", "default_view")],
+            MutationBehavior::Apply,
+            MutationBehavior::AcceptWithoutApply,
+        )
+        .await;
+        assert_eq!(
+            ensure_record(
+                &readback_db,
+                &readback.client,
+                &ensure_input(DnsRecordType::A, "192.0.2.10"),
+            )
+            .await,
+            EnsureRecordResult::Failed(EnsureRecordFailure::PostWriteNotVerified)
+        );
+        assert_eq!(readback.state.update_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            readback_db
+                .find_dns_record_binding_by_record(7, "historical")
+                .await
+                .unwrap()
+                .unwrap()
+                .rule_id,
+            None
+        );
+
+        let sync_db = ensure_db().await;
+        insert_sync(&sync_db).await;
+        let sync_provider = spawn_ensure_mock(
+            vec![record("external", "A", "192.0.2.10", "default_view")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        reconcile_one(&sync_db, sync_row(&sync_db).await, &sync_provider.client).await;
+        let failed_sync = sync_row(&sync_db).await;
+        assert_eq!(failed_sync.state, "FAILED");
+        assert_eq!(failed_sync.ownership, "UNKNOWN");
+        assert_eq!(
+            failed_sync.last_error_category.as_deref(),
+            Some("DNS_OWNERSHIP_UNVERIFIED")
+        );
+        assert_eq!(sync_provider.state.total_mutations(), 0);
     }
 
     #[tokio::test]
@@ -6329,6 +6948,33 @@ mod tests {
             state: "BOUND".into(),
             last_observed_at: None,
             created_at: "2026-08-26 00:00:00".into(),
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn insert_detached_binding(
+        db: &SqliteRepository,
+        fqdn: &str,
+        line: &str,
+        line_key: &str,
+        record_id: &str,
+        desired_value: &str,
+    ) {
+        db.insert_dns_record_binding(&NewDnsRecordBinding {
+            rule_id: None,
+            fqdn: fqdn.into(),
+            zone_id: 7,
+            zone_name: "example.com".into(),
+            host: "op1".into(),
+            record_type: "A".into(),
+            line: line.into(),
+            line_key: line_key.into(),
+            record_id: record_id.into(),
+            desired_value: desired_value.into(),
+            state: "BOUND".into(),
+            last_observed_at: Some(utc_now()),
+            created_at: utc_now(),
         })
         .await
         .unwrap();

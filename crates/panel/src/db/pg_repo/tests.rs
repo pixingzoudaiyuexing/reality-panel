@@ -6012,6 +6012,29 @@ async fn pg_dns_record_bindings_preserve_exact_ownership_and_enforce_uniqueness(
     assert_eq!(rebound.line, "0");
     assert_eq!(rebound.desired_value, "192.0.2.11");
 
+    let mut adoption = DetachedDnsRecordBindingAdoption {
+        binding_id: id,
+        rule_id: 101,
+        fqdn: "op1.example.com".into(),
+        zone_id: 7,
+        zone_name: "example.com".into(),
+        host: "op1".into(),
+        record_type: "A".into(),
+        line: "0".into(),
+        line_key: "default".into(),
+        record_id: "record-verified".into(),
+        previous_desired_value: "192.0.2.11".into(),
+        desired_value: "192.0.2.12".into(),
+        observed_at: "2026-08-26 00:03:00".into(),
+        updated_at: "2026-08-26 00:03:00".into(),
+    };
+    assert_eq!(
+        db.adopt_detached_dns_record_binding(&adoption)
+            .await
+            .unwrap(),
+        0
+    );
+
     sqlx::query("DELETE FROM forward_rules WHERE id = 100")
         .execute(&db.pool)
         .await
@@ -6022,6 +6045,39 @@ async fn pg_dns_record_bindings_preserve_exact_ownership_and_enforce_uniqueness(
         .unwrap()
         .unwrap();
     assert_eq!(preserved.rule_id, None);
+    adoption.line_key = "wrong-line".into();
+    assert_eq!(
+        db.adopt_detached_dns_record_binding(&adoption)
+            .await
+            .unwrap(),
+        0
+    );
+    adoption.line_key = "default".into();
+    assert_eq!(
+        db.adopt_detached_dns_record_binding(&adoption)
+            .await
+            .unwrap(),
+        1
+    );
+    let adopted = db
+        .find_dns_record_binding_for_rule(101, "op1.example.com", "A", "default")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(adopted.id, id);
+    assert_eq!(adopted.desired_value, "192.0.2.12");
+    assert_eq!(adopted.state, "BOUND");
+    assert_eq!(
+        adopted.last_observed_at.as_deref(),
+        Some("2026-08-26 00:03:00")
+    );
+    assert_eq!(adopted.last_error_category, None);
+    assert_eq!(
+        db.adopt_detached_dns_record_binding(&adoption)
+            .await
+            .unwrap(),
+        0
+    );
     cleanup(&db).await;
 }
 
