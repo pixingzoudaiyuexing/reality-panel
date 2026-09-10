@@ -1125,7 +1125,7 @@ async fn legacy_conflict_modes(
     if legacy_enabled_failover(db, group_id).await? {
         modes.push(RoutingMode::Failover);
     }
-    Ok((modes.len() > 1).then_some(modes).unwrap_or_default())
+    Ok(if modes.len() > 1 { modes } else { Vec::new() })
 }
 
 fn source_authorized(mode: RoutingMode, source: RelaySwitchSource) -> bool {
@@ -2019,6 +2019,7 @@ async fn mode_default_target(
     Ok((node_id.into(), value))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_mode_transition_records(
     db: &dyn Repository,
     client: &crate::integrations::dnsmgr::DnsMgrClient,
