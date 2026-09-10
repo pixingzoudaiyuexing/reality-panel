@@ -1054,6 +1054,7 @@ pub fn lifecycle_artifact_architecture(value: &str) -> Option<&'static str> {
 }
 
 impl DiagnoseRuleMessage {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         request_id: String,
         rule_id: i64,

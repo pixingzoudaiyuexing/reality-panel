@@ -403,7 +403,7 @@ mod tests {
         // forwards bytes correctly under the new buffer/nodelay code.
         let first_payload = b"ping-through-relay";
         client.write_all(first_payload).await.unwrap();
-        let mut got = vec![0u8; 64];
+        let mut got = [0u8; 64];
         client
             .read_exact(&mut got[..first_payload.len()])
             .await
