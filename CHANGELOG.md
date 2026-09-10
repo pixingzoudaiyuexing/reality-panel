@@ -7,6 +7,24 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.21] - 2026-09-10
+
+### 修复
+
+- 长连接 Raw TCP、TLS、WebSocket 转发流量改为实时累计；Linux splice 仅在目标 socket 成功接收后计数。
+- UDP 新会话目标连接失败时，按既有 selector 顺序继续尝试后续候选目标。
+- 新建规则省略 `forward_mode` 时默认使用 `direct`。
+- 运营商分流页面可定位规则或 DNS Zone 的线路目录不兼容，并保留歧义提示。
+
+### 改进
+
+- 节点状态页收敛为紧凑桌面表格，并在移动端使用节点卡片展示状态、资源、流量和操作。
+
+### 兼容性
+
+- 无数据库 migration，Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.20 可直接升级到 v1.1.21。
+
 ## [1.1.20] - 2026-09-09
 
 ### 改进

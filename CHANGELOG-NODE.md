@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.21] - 2026-09-10
+
+### 修复
+
+- 长连接 Raw TCP、TLS、WebSocket 转发流量在连接存活期间实时累计；Linux splice 仅在目标 socket 成功接收后计数。
+- UDP 新会话保持既有 selector 顺序，并在目标 connect 失败时继续尝试后续候选目标。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.20 relay-node 可直接升级到 v1.1.21。
+
 ## [1.1.20] - 2026-09-09
 
 ### 改进
