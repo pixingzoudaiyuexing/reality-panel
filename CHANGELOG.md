@@ -7,6 +7,19 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.22] - 2026-09-10
+
+### 修复
+
+- 修复删除旧规则并重建新规则后 detached DNS binding 未重新归属的问题。
+- 严格验证 Provider record identity 后再原子恢复 Panel ownership，避免同步状态显示成功但当前规则没有有效 ownership binding。
+- 修复 Carrier Apply 因 detached binding 生命周期不完整导致的 `DNS_OWNERSHIP_UNVERIFIED` 错误。
+
+### 兼容性
+
+- 无数据库 migration，Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.21 可直接升级到 v1.1.22。
+
 ## [1.1.21] - 2026-09-10
 
 ### 修复

@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.22] - 2026-09-10
+
+### 兼容性
+
+- relay-node 无功能代码变化；本版本与 Panel 一起发布以保持统一版本号。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.21 relay-node 可直接升级到 v1.1.22。
+
 ## [1.1.21] - 2026-09-10
 
 ### 修复
