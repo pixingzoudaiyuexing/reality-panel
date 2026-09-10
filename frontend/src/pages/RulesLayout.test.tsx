@@ -421,6 +421,7 @@ describe('Rules grouped compact layout', () => {
       auto_restart_minutes: 120,
     })]);
     const dialog = await openRuleEditor();
+    await waitFor(() => expect(within(dialog).getByLabelText('sni')).toHaveValue('q1.example.com'));
     fireEvent.click(within(dialog).getByRole('tab', { name: 'tabForward' }));
     expect(await within(dialog).findByText('lbFailover')).toBeInTheDocument();
     expect(await within(dialog).findByText('ruleForwardAdvancedSettings · ruleAdvancedConfiguredCount')).toBeInTheDocument();
