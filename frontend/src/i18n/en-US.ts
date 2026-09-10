@@ -79,6 +79,8 @@ export const enUS: Dict = {
   protocol: 'Protocol',
   port: 'Port',
   traffic: 'Traffic',
+  nodeResources: 'Resources',
+  nodeInformation: 'Node info',
   role: 'Role',
   balance: 'Balance',
   joined: 'Joined',

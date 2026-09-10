@@ -1,15 +1,17 @@
 
-import { Typography, Button, Space, Tag, Tooltip } from 'antd';
-import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined, FileTextOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons';
+import { Space } from 'antd';
 import type { NodeLifecycleHandler, Tfn } from './types';
 import type { NodeDisplayRow, RelayReadyNode } from '../../api/types';
-import { NodeResourceBar } from './NodeResourceBar';
-import { connectionTelemetry, NetworkCell, RelayReadyStatus, statusTag } from './shared';
-import { formatBps, formatUptime } from '../../utils/format';
-import { versionRelation, versionTagColor } from '../../utils/version';
-import { resolveNodeUpgrade, type NodeUpgradeState } from './upgrade';
-
-const { Text } = Typography;
+import { NetworkCell } from './shared';
+import {
+  NodeActionControls,
+  NodeConnectionsCell,
+  NodeMetadataCell,
+  NodeResourcesCell,
+  NodeStatusCell,
+  NodeTrafficCell,
+  NodeUptimeCell,
+} from './NodeStatusCells';
 
 interface Props {
   rows: NodeDisplayRow[];
@@ -27,202 +29,60 @@ interface Props {
   onUpgrade?: (row: NodeDisplayRow) => void;
   onLifecycle?: NodeLifecycleHandler;
   artifactVersions?: Record<string, string>;
+  onDelete?: (row: NodeDisplayRow) => void;
   relayNodes?: RelayReadyNode[];
   showRelayReady?: boolean;
 }
 
-/** Mobile-friendly compact list — one card per node. No wide table, no
- *  horizontal scroll. Shows: status + version + upgrade + network + speed +
- *  resource bars + uptime + a details button. */
-export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {}, relayNodes = [], showRelayReady = false }: Props) {
-  const labels = { d: t('uptimeDay'), h: t('uptimeHour'), m: t('uptimeMinute'), s: t('uptimeSecond') };
+/** Mobile node cards reuse the same data presentation and actions as the
+ * desktop table, but reorder them for status-first scanning without a table. */
+export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {}, onDelete, relayNodes = [], showRelayReady = false }: Props) {
   const relayById = new Map(relayNodes.map((node) => [node.node_id, node]));
 
   return (
     <Space orientation="vertical" style={{ width: '100%' }} size={8}>
       {rows.map((r) => {
-        const isPlaceholder = !r.node_id;
-        // v1.2 (PR4+PR5): the upgrade affordance mirrors the desktop ladder
-        // (PR4) and compares against the latest NODE release (PR5), via the
-        // shared resolveNodeUpgrade helper.
-        const { state: upgradeState } = onUpgrade
-          ? resolveNodeUpgrade(r, latestNodeVersion, panelProtocol, nodeVersionCheckFailed)
-          : { state: 'none' as NodeUpgradeState };
         return (
           <div
             key={`${r.group_id}:${r.node_id || 'none'}`}
             // v1.2.5: offline cards are greyed, same signal as the desktop
             // table's offline rows — every figure on the card is the node's
             // last report rather than a live reading.
-            className={r.online ? undefined : 'rp-node-offline-card'}
-            style={{ border: '1px solid #f0f0f0', borderRadius: 8, padding: 10 }}
+            className={`rp-node-mobile-card ${r.online ? '' : 'rp-node-offline-card'}`}
+            data-testid="node-mobile-card"
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6, flexWrap: 'wrap', gap: 4 }}>
-              <Space size={6} wrap>
-                {statusTag(r, t, panelProtocol)}
-                {showRelayReady ? <RelayReadyStatus node={r.node_id ? relayById.get(r.node_id) : undefined} t={t} /> : null}
-              </Space>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                {/* node version tag (only when the admin upgrade view is on).
-                    When the node-version check failed, render the bare version
-                    with no behind-arrow (we can't vouch for any colouring). */}
-                {(onUpgrade || onLifecycle) && r.node_version ? (
-                  <Tag color={nodeVersionCheckFailed ? undefined : versionTagColor(versionRelation(r.node_version, latestNodeVersion))} className="rp-mono">
-                    {`v${r.node_version}`}
-                  </Tag>
-                ) : null}
-                {onLifecycle && r.architecture ? <Tag className="rp-mono">{r.architecture}</Tag> : null}
-                {/* upgrade affordance — same ladder as desktop */}
-                {onUpgrade ? (
-                  <MobileUpgradeAffordance
-                    state={upgradeState}
-                    latestNodeVersion={latestNodeVersion}
-                    t={t}
-                    onUpgrade={() => onUpgrade(r)}
-                  />
-                ) : null}
-                {onLifecycle ? (() => {
-                  const arch = r.architecture === 'x86_64' ? 'amd64' : r.architecture === 'aarch64' ? 'arm64' : (r.architecture || '');
-                  const target = artifactVersions[arch];
-                  const protocolCompatible = r.config_protocol_version == null || panelProtocol <= 0 || r.config_protocol_version === panelProtocol;
-                  const normalReady = !!r.node_id && !!r.online && r.install_method === 'systemd' && protocolCompatible;
-                  const lifecycleOnline = r.lifecycle_online ?? r.online;
-                  const upgradeReady = !!r.node_id && !!lifecycleOnline && r.install_method === 'systemd';
-                  return (
-                    <Space size={2}>
-                      <Button size="small" type="text" icon={<FileTextOutlined />} disabled={!normalReady} aria-label={t('nodeLogs')} onClick={() => onLifecycle(r, 'logs')} />
-                      <Button size="small" type="text" icon={<ReloadOutlined />} disabled={!normalReady} aria-label={t('nodeRestart')} onClick={() => onLifecycle(r, 'restart')} />
-                      <Button size="small" type="text" icon={<CloudDownloadOutlined />} disabled={!upgradeReady || !target || target === r.node_version} aria-label={t('nodeUpgrade')} onClick={() => onLifecycle(r, 'upgrade')} />
-                      <Button size="small" type="text" danger icon={<StopOutlined />} disabled={!normalReady} aria-label={t('nodeUninstall')} onClick={() => onLifecycle(r, 'uninstall')} />
-                    </Space>
-                  );
-                })() : null}
-                <Button
-                  size="small"
-                  type="link"
-                  disabled={isPlaceholder}
-                  onClick={() => openDetail(r)}
-                  aria-label={t('resourceDetails')}
-                >
-                  {t('resourceDetails')}
-                </Button>
-              </span>
+            <div className="rp-node-mobile-topline">
+              <NodeStatusCell
+                row={r}
+                panelProtocol={panelProtocol}
+                relayNode={r.node_id ? relayById.get(r.node_id) : undefined}
+                showRelayReady={showRelayReady}
+                t={t}
+              />
+              <NodeActionControls
+                row={r}
+                panelProtocol={panelProtocol}
+                latestNodeVersion={latestNodeVersion}
+                nodeVersionCheckFailed={nodeVersionCheckFailed}
+                artifactVersions={artifactVersions}
+                t={t}
+                openDetail={openDetail}
+                onLifecycle={onLifecycle}
+                onUpgrade={onUpgrade}
+                onDelete={onDelete}
+              />
             </div>
             <NetworkCell row={r} t={t} />
-            {/* The rate/uptime line used a hardcoded #888 (3.5:1 on white,
-                under AA) and could not be greyed further on an offline card.
-                Both now come from the theme. */}
-            <div className="rp-node-meta" style={{ fontSize: 12, marginTop: 4 }}>
-              ↑ {formatBps(r.upload_bps)} ↓ {formatBps(r.download_bps)}
-              {' · '}TCP / UDP: {connectionTelemetry(r)}
-              {' · '}{t('systemUptime')}: {formatUptime(r.uptime, labels)}
-            </div>
-            <div style={{ display: 'flex', gap: 12, marginTop: 6 }}>
-              <div style={{ flex: 1 }}>
-                <Text type="secondary" style={{ fontSize: 11 }}>CPU</Text>
-                <NodeResourceBar value={r.cpu} tooltip={`CPU: ${r.cpu ?? '-'}%`} />
-              </div>
-              <div style={{ flex: 1 }}>
-                <Text type="secondary" style={{ fontSize: 11 }}>{t('mem')}</Text>
-                <NodeResourceBar value={r.mem} tooltip={`${t('mem')}: ${r.mem ?? '-'}%`} />
-              </div>
-              <div style={{ flex: 1 }}>
-                <Text type="secondary" style={{ fontSize: 11 }}>{t('disk')}</Text>
-                <NodeResourceBar value={r.disk_usage_percent} tooltip={`${t('disk')}: ${r.disk_usage_percent ?? '-'}%`} />
-              </div>
+            <div className="rp-node-mobile-connections"><NodeConnectionsCell row={r} /></div>
+            <NodeResourcesCell row={r} t={t} />
+            <NodeTrafficCell row={r} />
+            <div className="rp-node-mobile-footer">
+              <NodeUptimeCell row={r} t={t} />
+              <NodeMetadataCell row={r} latestNodeVersion={latestNodeVersion} nodeVersionCheckFailed={nodeVersionCheckFailed} />
             </div>
           </div>
         );
       })}
     </Space>
   );
-}
-
-/** The mobile upgrade affordance for one node — mirrors the desktop upgrade
- *  column's icon/tooltip ladder, but as a tappable 32×32 target (mobile tap
- *  sizing). */
-function MobileUpgradeAffordance({
-  state,
-  latestNodeVersion,
-  t,
-  onUpgrade,
-}: {
-  state: NodeUpgradeState;
-  latestNodeVersion: string;
-  t: Tfn;
-  onUpgrade: () => void;
-}) {
-  // 32×32 minimum tap target (WCAG / mobile guidance).
-  const tapStyle: React.CSSProperties = { minWidth: 32, minHeight: 32, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', padding: 0 };
-  switch (state) {
-    case 'none':
-    case 'checkFailed':
-      // checkFailed → neutral "-" (a failed lookup must not show a green check
-      // or an upgrade button). Use the dedicated message when available.
-      return (
-        <Tooltip title={state === 'checkFailed' ? t('nodeVersionCheckFailed') : undefined}>
-          <Typography.Text type="secondary" aria-label={t('nodeUpgrade')}>-</Typography.Text>
-        </Tooltip>
-      );
-    case 'unknown':
-      return <Typography.Text type="secondary" aria-label={t('nodeUpgrade')}>-</Typography.Text>;
-    case 'latest':
-      return (
-        <Tooltip title={t('nodeUpgradeLatest')}>
-          <span style={tapStyle} aria-label={t('nodeUpgradeLatest')} role="img">
-            <CheckCircleOutlined style={{ color: '#52c41a' }} />
-          </span>
-        </Tooltip>
-      );
-    case 'ahead':
-      // leading build (node newer than the latest node release): green check
-      // with a "leading build" tooltip, never an upgrade/downgrade offer.
-      return (
-        <Tooltip title={t('nodeVersionAhead')}>
-          <span style={tapStyle} aria-label={t('nodeVersionAhead')} role="img">
-            <CheckCircleOutlined style={{ color: '#52c41a' }} />
-          </span>
-        </Tooltip>
-      );
-    case 'docker':
-      return (
-        <Tooltip title={t('nodeUpgradeDocker')}>
-          <span style={tapStyle} aria-label={t('nodeUpgradeDocker')} role="img">
-            <CloudServerOutlined style={{ color: '#faad14' }} />
-          </span>
-        </Tooltip>
-      );
-    case 'manual':
-      return (
-        <Tooltip title={t('nodeUpgradeManual')}>
-          <span style={tapStyle} aria-label={t('nodeUpgradeManual')} role="img">
-            <CloudDownloadOutlined style={{ color: '#bfbfbf' }} />
-          </span>
-        </Tooltip>
-      );
-    case 'protocolIncompatible':
-      return <Tag color="red" aria-label={t('protocolIncompatible')}>{t('protocolIncompatible')}</Tag>;
-    case 'upgradeable':
-      return (
-        <Tooltip title={t('nodeUpgradeTip').replace('{v}', latestNodeVersion)}>
-          <Button
-            size="small"
-            type="link"
-            icon={<CloudDownloadOutlined />}
-            aria-label={t('nodeUpgrade')}
-            style={tapStyle}
-            onClick={onUpgrade}
-          />
-        </Tooltip>
-      );
-    case 'offline':
-    default:
-      return (
-        <Tooltip title={t('offline')}>
-          <span style={tapStyle} aria-label={t('offline')} role="img">
-            <CloudDownloadOutlined style={{ color: '#bfbfbf' }} />
-          </span>
-        </Tooltip>
-      );
-  }
 }

@@ -9,21 +9,23 @@ const { Text } = Typography;
 /** Dual-stack network cell — IPv4 line + IPv6 line. Each line shows the
  *  CountryFlag pill (SVG, no Emoji) followed by the IP. No country name and
  *  no regionUnknown text: unknown regions render "--". */
-export function NetworkCell({ row }: { row: NodeDisplayRow; t: Tfn }) {
+export function NetworkCell({ row, compact = false }: { row: NodeDisplayRow; t: Tfn; compact?: boolean }) {
   const v4 = row.public_ipv4 ?? row.public_ip;
   const v6 = row.public_ipv6;
   if (!v4 && !v6) return <Text type="secondary">-</Text>;
   const line = (ip: string, code: string | null | undefined) => (
-    <div key={ip} style={{ fontSize: 12, lineHeight: '18px', display: 'flex', alignItems: 'center', gap: 6 }}>
+    <div key={ip} className="rp-node-network-line">
       <CountryFlag code={code} />
-      <span className="rp-mono" style={{ whiteSpace: 'nowrap' }}>{ip}</span>
+      <Tooltip title={ip}>
+        <span className={`rp-mono ${compact ? 'rp-node-network-ellipsis' : ''}`} title={ip}>{ip}</span>
+      </Tooltip>
     </div>
   );
   return (
-    <>
+    <div className="rp-node-network" data-testid="node-network-cell">
       {v4 ? line(v4, row.ipv4_country_code) : null}
       {v6 ? line(v6, row.ipv6_country_code) : null}
-    </>
+    </div>
   );
 }
 

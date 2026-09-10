@@ -1,14 +1,16 @@
- 
-import { Table, Tag, Typography, Button, Tooltip, Popconfirm } from 'antd';
-import { CloudDownloadOutlined, CheckCircleOutlined, CloudServerOutlined, DeleteOutlined, FileTextOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons';
+import { Table, Tooltip } from 'antd';
 import type { NodeLifecycleHandler, Tfn } from './types';
 import type { NodeDisplayRow, RelayReadyNode } from '../../api/types';
-import { NodeResourceBar, NodeDiskBar } from './NodeResourceBar';
-import { formatBps, formatBytes, formatUptime, formatPercent } from '../../utils/format';
-import { versionRelation, versionTagColor } from '../../utils/version';
-import { connectionTelemetry, NetworkCell, RelayReadyStatus } from './shared';
-import { resolveNodeUpgrade } from './upgrade';
-import { nodeDesktopColumnWidths } from './tableLayout';
+import { NetworkCell } from './shared';
+import {
+  NodeActionControls,
+  NodeConnectionsCell,
+  NodeMetadataCell,
+  NodeResourcesCell,
+  NodeStatusCell,
+  NodeTrafficCell,
+  NodeUptimeCell,
+} from './NodeStatusCells';
 
 interface Props {
   rows: NodeDisplayRow[];
@@ -38,178 +40,66 @@ interface Props {
  *  columns — the permission difference is in the data source (admin reads
  *  /nodes, user reads /nodes/shared) and the detail drawer. */
 export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {}, onDelete, relayNodes = [], showRelayReady = false }: Props) {
-  const labels = { d: t('uptimeDay'), h: t('uptimeHour'), m: t('uptimeMinute'), s: t('uptimeSecond') };
   const relayById = new Map(relayNodes.map((node) => [node.node_id, node]));
 
   const columns = [
     {
-      title: t('status'), key: 'status', width: nodeDesktopColumnWidths.status, fixed: 'left' as const,
-      render: (_: unknown, r: NodeDisplayRow) => {
-        const v = r.config_protocol_version;
-        if (v != null && panelProtocol > 0 && v !== panelProtocol) {
-          return <Tag color="red">{t('protocolIncompatible')}</Tag>;
-        }
-        return r.online ? <Tag color="green">{t('online')}</Tag> : <Tag>{t('offline')}</Tag>;
-      },
-    },
-    ...(showRelayReady ? [{
-      title: t('relayReady'), key: 'relay_ready', width: nodeDesktopColumnWidths.relayReady,
+      title: t('status'), key: 'status', width: 116, fixed: 'left' as const,
       render: (_: unknown, r: NodeDisplayRow) => (
-        <RelayReadyStatus node={r.node_id ? relayById.get(r.node_id) : undefined} t={t} />
+        <NodeStatusCell
+          row={r}
+          panelProtocol={panelProtocol}
+          relayNode={r.node_id ? relayById.get(r.node_id) : undefined}
+          showRelayReady={showRelayReady}
+          t={t}
+        />
       ),
-    }] : []),
-    // v1.0.10: node version moved forward, with the upgrade action right after it.
-    // v1.2: compared against the latest NODE release (latestNodeVersion), not
-    // the panel version.
-    {
-      title: t('nodeVersion'), dataIndex: 'node_version', key: 'node_version', width: nodeDesktopColumnWidths.nodeVersion,
-      render: (v: string | null) => {
-        if (!v) return <Typography.Text type="secondary">-</Typography.Text>;
-        // v1.2: if the node-version check failed, we can't vouch for any
-        // "behind/latest" colouring — show the bare version with no arrow.
-        if (nodeVersionCheckFailed) return <Tag>{`v${v}`}</Tag>;
-        const rel = versionRelation(v, latestNodeVersion);
-        const label = rel === 'behind' ? `v${v} ↑` : `v${v}`;
-        return <Tag color={versionTagColor(rel)}>{label}</Tag>;
-      },
     },
-    ...(onLifecycle ? [{
-      title: t('nodeArchitecture'), dataIndex: 'architecture', key: 'architecture', width: 92,
-      render: (value: string | null) => value || '-',
-    }] : []),
-    // v1.0.10: admin-only per-node upgrade icon. v1.2 (PR4+PR5 reconciled): the
-    // eligibility ladder is shared with the mobile list via resolveNodeUpgrade
-    // (PR4) AND compared against the latest NODE release with a failed-check
-    // neutral state (PR5). Protocol-incompatible and a failed lookup both take
-    // priority over version status.
-    ...(!onLifecycle && onUpgrade ? [{
-      title: t('nodeUpgrade'), key: 'upgrade', width: nodeDesktopColumnWidths.nodeUpgrade,
-      render: (_: unknown, r: NodeDisplayRow) => {
-        const { state } = resolveNodeUpgrade(r, latestNodeVersion, panelProtocol, nodeVersionCheckFailed);
-        switch (state) {
-          case 'none':
-          case 'checkFailed':
-          case 'unknown':
-            return <Typography.Text type="secondary">-</Typography.Text>;
-          case 'latest':
-            return <Tooltip title={t('nodeUpgradeLatest')}><CheckCircleOutlined style={{ color: '#52c41a' }} /></Tooltip>;
-          case 'ahead':
-            return <Tooltip title={t('nodeVersionAhead')}><CheckCircleOutlined style={{ color: '#52c41a' }} /></Tooltip>;
-          case 'docker':
-            return <Tooltip title={t('nodeUpgradeDocker')}><CloudServerOutlined style={{ color: '#faad14' }} /></Tooltip>;
-          case 'manual':
-            return <Tooltip title={t('nodeUpgradeManual')}><CloudDownloadOutlined style={{ color: '#bfbfbf' }} /></Tooltip>;
-          case 'protocolIncompatible':
-            return <Tag color="red">{t('protocolIncompatible')}</Tag>;
-          case 'upgradeable':
-            return (
-              <Tooltip title={t('nodeUpgradeTip').replace('{v}', latestNodeVersion)}>
-                <Button
-                  size="small"
-                  type="link"
-                  icon={<CloudDownloadOutlined />}
-                  aria-label={t('nodeUpgrade')}
-                  onClick={() => onUpgrade(r)}
-                />
-              </Tooltip>
-            );
-          case 'offline':
-          default:
-            return <Tooltip title={t('offline')}><CloudDownloadOutlined style={{ color: '#bfbfbf' }} /></Tooltip>;
-        }
-      },
-    }] : []),
-    ...(onLifecycle ? [{
-      title: t('nodeOperations'), key: 'lifecycle', width: 176, fixed: 'right' as const,
-      render: (_: unknown, r: NodeDisplayRow) => {
-        const arch = r.architecture === 'x86_64' ? 'amd64' : r.architecture === 'aarch64' ? 'arm64' : (r.architecture || '');
-        const target = artifactVersions[arch];
-        const lifecycleOnline = r.lifecycle_online ?? r.online;
-        const lifecycleReady = !!r.node_id && !!lifecycleOnline && r.install_method === 'systemd';
-        const protocolCompatible = r.config_protocol_version == null || panelProtocol <= 0 || r.config_protocol_version === panelProtocol;
-        // Config protocol skew deliberately leaves Upgrade enabled. All other
-        // lifecycle controls remain disabled until the Node reconnects on the
-        // current config protocol.
-        const normalLifecycleReady = !!r.node_id && !!r.online && r.install_method === 'systemd' && protocolCompatible;
-        const canUpgrade = lifecycleReady && !!target && target !== r.node_version;
-        return (
-          <span style={{ display: 'inline-flex', gap: 2 }}>
-            <Tooltip title={t('nodeLogs')}><Button size="small" type="text" icon={<FileTextOutlined />} disabled={!normalLifecycleReady} aria-label={t('nodeLogs')} onClick={() => onLifecycle(r, 'logs')} /></Tooltip>
-            <Tooltip title={t('nodeRestart')}><Button size="small" type="text" icon={<ReloadOutlined />} disabled={!normalLifecycleReady} aria-label={t('nodeRestart')} onClick={() => onLifecycle(r, 'restart')} /></Tooltip>
-            <Tooltip title={target ? t('nodeUpgradeTip').replace('{v}', target) : t('nodeArtifactMissing')}><Button size="small" type="text" icon={<CloudDownloadOutlined />} disabled={!canUpgrade} aria-label={t('nodeUpgrade')} onClick={() => onLifecycle(r, 'upgrade')} /></Tooltip>
-            <Tooltip title={t('nodeUninstall')}><Button size="small" type="text" danger icon={<StopOutlined />} disabled={!normalLifecycleReady} aria-label={t('nodeUninstall')} onClick={() => onLifecycle(r, 'uninstall')} /></Tooltip>
-          </span>
-        );
-      },
-    }] : []),
     {
-      title: t('network'), key: 'network', width: 300,
-      render: (_: unknown, r: NodeDisplayRow) => <NetworkCell row={r} t={t} />,
+      title: t('network'), key: 'network', width: 228,
+      render: (_: unknown, r: NodeDisplayRow) => <NetworkCell row={r} t={t} compact />,
     },
     {
       title: <Tooltip title={`${t('tcpActiveConnections')} / ${t('udpActiveSessions')}`}>TCP / UDP</Tooltip>,
-      key: 'connections', width: 92,
-      render: (_: unknown, r: NodeDisplayRow) => <span className="rp-mono">{connectionTelemetry(r)}</span>,
+      key: 'connections', width: 82,
+      render: (_: unknown, r: NodeDisplayRow) => <NodeConnectionsCell row={r} />,
     },
     {
-      title: 'CPU', key: 'cpu', width: nodeDesktopColumnWidths.cpu,
-      render: (_: unknown, r: NodeDisplayRow) => <NodeResourceBar value={r.cpu} tooltip={`CPU: ${formatPercent(r.cpu)}`} />,
+      title: t('nodeResources'), key: 'resources', width: 180,
+      render: (_: unknown, r: NodeDisplayRow) => <NodeResourcesCell row={r} t={t} />,
     },
     {
-      title: t('mem'), key: 'mem', width: nodeDesktopColumnWidths.mem,
-      render: (_: unknown, r: NodeDisplayRow) => <NodeResourceBar value={r.mem} tooltip={`${t('mem')}: ${formatPercent(r.mem)}`} />,
-    },
-    {
-      title: t('disk'), key: 'disk', width: nodeDesktopColumnWidths.disk,
-      render: (_: unknown, r: NodeDisplayRow) => <NodeDiskBar usagePercent={r.disk_usage_percent} used={r.disk_used} total={r.disk_total} mount={r.disk_mount} t={t} />,
-    },
-    {
-      title: `${t('uploadRate')}/${t('downloadRate')}`, key: 'rate', width: nodeDesktopColumnWidths.rate,
-      render: (_: unknown, r: NodeDisplayRow) => (
-        <span className="rp-mono rp-node-throughput">{formatBps(r.upload_bps)} / {formatBps(r.download_bps)}</span>
-      ),
-    },
-    {
-      title: `${t('totalUpload')}/${t('totalDownload')}`, key: 'traffic', width: nodeDesktopColumnWidths.traffic,
-      render: (_: unknown, r: NodeDisplayRow) => (
-        <span className="rp-mono rp-node-throughput">{formatBytes(r.boot_upload_bytes)} / {formatBytes(r.boot_download_bytes)}</span>
-      ),
+      title: t('traffic'), key: 'traffic', width: 184,
+      render: (_: unknown, r: NodeDisplayRow) => <NodeTrafficCell row={r} />,
     },
     {
       title: t('systemUptime'), key: 'uptime', width: 90,
-      render: (_: unknown, r: NodeDisplayRow) => <span className="rp-mono">{formatUptime(r.uptime, labels)}</span>,
+      render: (_: unknown, r: NodeDisplayRow) => <NodeUptimeCell row={r} t={t} />,
     },
     {
-      title: t('resourceDetails'), key: 'detail', width: 70, fixed: 'right' as const,
+      title: t('nodeInformation'), key: 'metadata', width: 120,
       render: (_: unknown, r: NodeDisplayRow) => (
-        <Button size="small" type="link" onClick={() => openDetail(r)}>{t('resourceDetails')}</Button>
+        <NodeMetadataCell row={r} latestNodeVersion={latestNodeVersion} nodeVersionCheckFailed={nodeVersionCheckFailed} />
+      ),
+    },
+    {
+      title: t('nodeOperations'), key: 'actions', width: 166, fixed: 'right' as const,
+      render: (_: unknown, r: NodeDisplayRow) => (
+        <NodeActionControls
+          row={r}
+          panelProtocol={panelProtocol}
+          latestNodeVersion={latestNodeVersion}
+          nodeVersionCheckFailed={nodeVersionCheckFailed}
+          artifactVersions={artifactVersions}
+          t={t}
+          openDetail={openDetail}
+          onLifecycle={onLifecycle}
+          onUpgrade={onUpgrade}
+          onDelete={onDelete}
+        />
       ),
     },
   ];
-
-  const removeNode = onDelete;
-  const hasRemovableOfflineNode = !!removeNode && rows.some((row) => !row.online);
-  if (hasRemovableOfflineNode && removeNode) {
-    columns.push({
-      title: t('actions'), key: 'remove', width: 72, fixed: 'right' as const,
-      render: (_: unknown, r: NodeDisplayRow) =>
-        // Online rows get nothing rather than a disabled button: there is no
-        // sensible action here, and a greyed-out control invites a hunt for the
-        // condition that would enable it.
-        r.online ? null : (
-          <Popconfirm
-            title={t('removeNodeTitle')}
-            description={t('removeNodeHint')}
-            okText={t('confirmRemoveNode')}
-            cancelText={t('cancel')}
-            okButtonProps={{ danger: true }}
-            onConfirm={() => removeNode(r)}
-          >
-            <Button size="small" type="text" danger icon={<DeleteOutlined />} />
-          </Popconfirm>
-        ),
-    });
-  }
 
   return (
     <Table
@@ -223,7 +113,7 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
       rowClassName={(r) => (r.online ? '' : 'rp-node-offline')}
       pagination={false}
       size="small"
-      scroll={{ x: 'max-content' }}
+      scroll={{ x: 1080 }}
     />
   );
 }

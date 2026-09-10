@@ -809,3 +809,75 @@ describe('NodeStatus rendered group order is stable across refreshes', () => {
     expect(isBefore(docOrderIdx('shared-one'), docOrderIdx('shared-two'))).toBe(true);
   });
 });
+
+describe('NodeStatus responsive node layout', () => {
+  const responsiveNode = {
+    ...adminNode,
+    public_ipv4: '104.105.136.129',
+    public_ipv6: '2600:1901:0:1234:5678:90ab:cdef:1234',
+    tcp_connections: 174,
+    udp_sessions: 0,
+    cpu: 9,
+    mem: 43,
+    disk_usage_percent: 15,
+    disk_used: 15 * 1024 * 1024 * 1024,
+    disk_total: 100 * 1024 * 1024 * 1024,
+    upload_bps: 527 * 1024,
+    download_bps: 613 * 1024,
+    boot_upload_bytes: 15 * 1024 * 1024 * 1024,
+    boot_download_bytes: 16 * 1024 * 1024 * 1024,
+    uptime: 26 * 3600,
+    node_version: '1.1.20',
+    architecture: 'x86_64',
+  };
+
+  function setupResponsivePage() {
+    mockUseAuth.mockReturnValue({ isAdmin: true });
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/nodes') return Promise.resolve(ok([responsiveNode]));
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+    rememberGroup(1);
+  }
+
+  it('renders the compact desktop columns with node information after uptime', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1440 });
+    setupResponsivePage();
+    renderPage();
+    await flush();
+
+    expect(screen.getAllByRole('columnheader').map((header) => header.textContent?.trim())).toEqual([
+      'status', 'network', 'TCP / UDP', 'nodeResources', 'traffic', 'systemUptime', 'nodeInformation', 'nodeOperations',
+    ]);
+    expect(screen.getByTestId('node-resources-cell')).toHaveTextContent('CPU');
+    expect(screen.getByTestId('node-traffic-cell')).toHaveTextContent('527.00 KB/s');
+  });
+
+  it('uses responsive cards on a mobile viewport and opens the existing detail drawer', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    setupResponsivePage();
+    const page = renderPage();
+    await flush();
+
+    expect(document.querySelector('.ant-table')).toBeNull();
+    const card = screen.getByTestId('node-mobile-card');
+    expect(card).toHaveTextContent('online');
+    expect(card).toHaveTextContent('104.105.136.129');
+    expect(card).toHaveTextContent('2600:1901:0:1234:5678:90ab:cdef:1234');
+    expect(card).toHaveTextContent('TCP174UDP0');
+    expect(card).toHaveTextContent('CPU');
+    expect(card).toHaveTextContent('mem');
+    expect(card).toHaveTextContent('disk');
+    expect(card).toHaveTextContent('527.00 KB/s');
+    expect(card).toHaveTextContent('15.00 GB');
+    expect(card).toHaveTextContent('1uptimeDay 2uptimeHour');
+    expect(card).toHaveTextContent('v1.1.20');
+    expect(card).toHaveTextContent('x86_64');
+
+    fireEvent.click(screen.getByRole('button', { name: 'nodeDetailsTitle' }));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    page.unmount();
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
+  });
+});

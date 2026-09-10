@@ -132,6 +132,160 @@ html, body, #root {
   color: var(--rp-node-offline-text);
 }
 
+/* Node status is a compact operational surface. The table keeps each metric
+   visible without spending one full column per fact; mobile uses the same cells
+   in a status-first card instead of mechanically shrinking the table. */
+.rp-node-status-cell {
+  align-items: flex-start;
+}
+
+.rp-node-network {
+  min-width: 0;
+}
+
+.rp-node-network-line {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.rp-node-network-ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rp-node-connections {
+  display: grid;
+  gap: 2px;
+  font-size: 12px;
+}
+
+.rp-node-connections > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.rp-node-resources {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.rp-node-resource-metric {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.rp-node-resource-metric .ant-progress {
+  min-width: 0 !important;
+}
+
+.rp-node-resource-metric .ant-progress-text {
+  min-width: 33px;
+  font-size: 12px;
+}
+
+.rp-node-traffic {
+  display: grid;
+  gap: 3px;
+  font-size: 12px;
+}
+
+.rp-node-traffic-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.rp-node-traffic-row .anticon-arrow-up {
+  color: var(--rp-success);
+}
+
+.rp-node-traffic-row .anticon-arrow-down {
+  color: var(--rp-primary);
+  margin-left: 6px;
+}
+
+.rp-node-traffic-total {
+  color: var(--rp-text-secondary);
+}
+
+.rp-node-metadata {
+  align-items: flex-start;
+}
+
+.rp-node-actions {
+  flex-wrap: nowrap;
+}
+
+.rp-node-mobile-card {
+  display: grid;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  border: 1px solid var(--rp-border);
+  border-radius: var(--rp-radius-sm);
+  padding: 12px;
+  background: var(--rp-card-bg);
+}
+
+.rp-node-mobile-topline,
+.rp-node-mobile-footer {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.rp-node-mobile-topline .rp-node-actions {
+  flex: 0 0 auto;
+}
+
+.rp-node-mobile-card .rp-node-actions .ant-btn {
+  min-width: 32px;
+  min-height: 32px;
+}
+
+.rp-node-mobile-connections .rp-node-connections {
+  display: flex;
+  gap: 24px;
+}
+
+.rp-node-mobile-connections .rp-node-connections > div {
+  min-width: 72px;
+}
+
+.rp-node-mobile-card .rp-node-resources {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.rp-node-mobile-card .rp-node-resource-metric {
+  grid-template-columns: 1fr;
+  gap: 2px;
+}
+
+.rp-node-mobile-card .rp-node-metadata {
+  align-items: flex-end;
+}
+
+@media (max-width: 1199px) {
+  .rp-node-actions .ant-btn {
+    padding-inline: 4px;
+  }
+}
+
 /* Cards: clean, minimal shadow */
 .ant-card {
   border-radius: var(--rp-radius);

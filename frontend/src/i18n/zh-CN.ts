@@ -78,6 +78,8 @@ export const zhCN = {
   protocol: '协议',
   port: '端口',
   traffic: '流量',
+  nodeResources: '资源',
+  nodeInformation: '节点信息',
   role: '角色',
   balance: '余额',
   joined: '注册时间',

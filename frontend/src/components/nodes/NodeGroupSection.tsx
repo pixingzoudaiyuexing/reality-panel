@@ -98,6 +98,7 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
         onUpgrade={onUpgrade}
         onLifecycle={onLifecycle}
         artifactVersions={artifactVersions}
+        onDelete={onDelete}
         relayNodes={relayPreference?.nodes}
         showRelayReady={showRelayPreference}
       />

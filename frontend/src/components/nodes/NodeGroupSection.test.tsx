@@ -1,12 +1,11 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { Tfn } from './types';
 import type { NodeDisplayRow, RelayReadyNode } from '../../api/types';
 import { connectionTelemetry, statusTag } from './shared';
 import { NodeGroupSection } from './NodeGroupSection';
 import { NodeDesktopTable } from './NodeDesktopTable';
 import { NodeMobileList } from './NodeMobileList';
-import { nodeDesktopColumnWidths } from './tableLayout';
 
 // A fake t() that echoes the key — assertions match on the i18n KEY, not on a
 // translated string, so the tests don't break when wording changes.
@@ -75,11 +74,11 @@ describe('Node connection telemetry', () => {
       <NodeDesktopTable rows={[telemetryRow]} panelProtocol={0} latestNodeVersion="" nodeVersionCheckFailed={false} t={t} openDetail={vi.fn()} />,
     );
     expect(screen.getByRole('columnheader', { name: 'TCP / UDP' })).toBeInTheDocument();
-    expect(screen.getByText('27 / 3')).toBeInTheDocument();
+    expect(screen.getByTestId('node-connections-cell')).toHaveTextContent('TCP27UDP3');
     desktop.unmount();
 
     render(<NodeMobileList rows={[telemetryRow]} panelProtocol={0} t={t} openDetail={vi.fn()} />);
-    expect(screen.getByText(/TCP \/ UDP: 27 \/ 3/)).toBeInTheDocument();
+    expect(screen.getByTestId('node-connections-cell')).toHaveTextContent('TCP27UDP3');
   });
 });
 
@@ -93,10 +92,10 @@ describe('Relay Ready in node status', () => {
     row({ node_id: 'blocked', online: true }),
   ];
 
-  it('shows Ready, Not Ready, and a visible primary reason in the desktop table', () => {
+  it('merges online state and Ready state into the desktop status column', () => {
     render(<NodeDesktopTable rows={readyRows} relayNodes={relayNodes} showRelayReady panelProtocol={0} latestNodeVersion="" nodeVersionCheckFailed={false} t={t} openDetail={vi.fn()} />);
-    expect(screen.getByRole('columnheader', { name: 'relayReady' })).toBeInTheDocument();
-    expect(screen.getAllByText('relayReady').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByRole('columnheader', { name: 'status' })).toBeInTheDocument();
+    expect(screen.getAllByText('relayReady').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('relayNotReady')).toBeInTheDocument();
     expect(screen.getByText('relayReadyCertificateInactive · relayReadyMoreReasons')).toBeInTheDocument();
   });
@@ -109,15 +108,18 @@ describe('Relay Ready in node status', () => {
   });
 });
 
-describe('Node desktop table throughput layout', () => {
-  it('prioritizes the upload/download rate column without widening the short status columns', () => {
-    expect(nodeDesktopColumnWidths.rate).toBeGreaterThanOrEqual(192);
-    expect(nodeDesktopColumnWidths.status).toBeLessThan(84);
-    expect(nodeDesktopColumnWidths.nodeVersion).toBeLessThan(100);
-    expect(nodeDesktopColumnWidths.nodeUpgrade).toBeLessThan(72);
+describe('Node desktop table responsive information layout', () => {
+  it('uses the final eight logical columns and does not retain a detail column', () => {
+    render(
+      <NodeDesktopTable rows={[row({ online: true })]} panelProtocol={0} latestNodeVersion="" nodeVersionCheckFailed={false} t={t} openDetail={vi.fn()} />,
+    );
+    expect(screen.getAllByRole('columnheader').map((header) => header.textContent?.trim())).toEqual([
+      'status', 'network', 'TCP / UDP', 'nodeResources', 'traffic', 'systemUptime', 'nodeInformation', 'nodeOperations',
+    ]);
+    expect(screen.queryByRole('columnheader', { name: 'resourceDetails' })).toBeNull();
   });
 
-  it('keeps transfer values on one line', () => {
+  it('groups CPU, memory and disk, plus realtime and cumulative traffic', () => {
     const { container } = render(
       <NodeGroupSection
         rows={[row({ online: true, upload_bps: 1018430, download_bps: 60110, boot_upload_bytes: 123456789, boot_download_bytes: 987654321 })]}
@@ -130,12 +132,16 @@ describe('Node desktop table throughput layout', () => {
       />,
     );
 
-    expect(container.querySelectorAll('.rp-node-throughput')).toHaveLength(2);
+    expect(container.querySelectorAll('[data-testid="node-resources-cell"]')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-testid="node-traffic-cell"]')).toHaveLength(1);
+    expect(screen.getByTestId('node-resources-cell')).toHaveTextContent('CPU');
+    expect(screen.getByTestId('node-resources-cell')).toHaveTextContent('mem');
+    expect(screen.getByTestId('node-resources-cell')).toHaveTextContent('disk');
   });
 });
 
-describe('Node desktop remove-status column', () => {
-  it('hides the actions column when every node is online', () => {
+describe('Node unified actions', () => {
+  it('keeps one operations column for every node state', () => {
     render(
       <NodeGroupSection
         rows={[row({ node_id: 'up-a', online: true }), row({ node_id: 'up-b', online: true })]}
@@ -148,10 +154,11 @@ describe('Node desktop remove-status column', () => {
         onDelete={vi.fn()}
       />,
     );
-    expect(screen.queryByText('actions')).toBeNull();
+    expect(screen.getByRole('columnheader', { name: 'nodeOperations' })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'nodeDetailsTitle' })).toHaveLength(2);
   });
 
-  it('shows the actions column and preserves offline-row deletion', () => {
+  it('keeps offline deletion under the unified more menu with confirmation', async () => {
     const offline = row({ node_id: 'down', online: false });
     const onDelete = vi.fn();
     render(
@@ -167,15 +174,43 @@ describe('Node desktop remove-status column', () => {
       />,
     );
 
-    expect(screen.getByRole('columnheader', { name: 'actions' })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'delete' }));
-    fireEvent.click(screen.getByRole('button', { name: 'confirmRemoveNode' }));
-    expect(onDelete).toHaveBeenCalledWith(offline);
+    fireEvent.click(screen.getByRole('button', { name: 'actions' }));
+    fireEvent.click(screen.getByRole('menuitem', { name: /removeNodeTitle/ }));
+    const confirm = await screen.findByRole('button', { name: 'confirmRemoveNode' });
+    fireEvent.click(confirm);
+    await waitFor(() => expect(onDelete).toHaveBeenCalledWith(offline));
+  });
+
+  it('keeps offline deletion reachable from the mobile more menu', () => {
+    const offline = row({ node_id: 'down', online: false });
+    render(
+      <NodeGroupSection
+        rows={[offline]}
+        panelProtocol={0}
+        latestNodeVersion=""
+        nodeVersionCheckFailed={false}
+        isMobile
+        t={t}
+        openDetail={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'actions' }));
+    expect(screen.getByRole('menuitem', { name: /removeNodeTitle/ })).toBeInTheDocument();
+  });
+
+  it('opens the existing detail callback from the Info action', () => {
+    const openDetail = vi.fn();
+    render(
+      <NodeDesktopTable rows={[row({ online: true })]} panelProtocol={0} latestNodeVersion="" nodeVersionCheckFailed={false} t={t} openDetail={openDetail} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'nodeDetailsTitle' }));
+    expect(openDetail).toHaveBeenCalledWith(expect.objectContaining({ node_id: 'n1' }));
   });
 });
 
 describe('Stage 2 lifecycle controls', () => {
-  it('renders the four admin actions and routes each explicit action', () => {
+  it('keeps common lifecycle actions direct and uninstall in More', () => {
     const onLifecycle = vi.fn();
     render(
       <NodeGroupSection
@@ -190,9 +225,11 @@ describe('Stage 2 lifecycle controls', () => {
         artifactVersions={{ amd64: '1.2.3' }}
       />,
     );
-    for (const action of ['nodeLogs', 'nodeRestart', 'nodeUpgrade', 'nodeUninstall']) {
+    for (const action of ['nodeLogs', 'nodeRestart', 'nodeUpgrade']) {
       fireEvent.click(screen.getByRole('button', { name: action }));
     }
+    fireEvent.click(screen.getByRole('button', { name: 'actions' }));
+    fireEvent.click(screen.getByText('nodeUninstall'));
     expect(onLifecycle.mock.calls.map((call) => call[1])).toEqual([
       'logs', 'restart', 'upgrade', 'uninstall',
     ]);
@@ -212,7 +249,7 @@ describe('Stage 2 lifecycle controls', () => {
         artifactVersions={{ amd64: '1.2.3' }}
       />,
     );
-    for (const action of ['nodeLogs', 'nodeRestart', 'nodeUpgrade', 'nodeUninstall']) {
+    for (const action of ['nodeLogs', 'nodeRestart', 'nodeUpgrade']) {
       expect(screen.getByRole('button', { name: action })).toBeDisabled();
     }
   });
@@ -232,7 +269,7 @@ describe('Stage 2 lifecycle controls', () => {
       />,
     );
     expect(screen.getByRole('button', { name: 'nodeUpgrade' })).toBeEnabled();
-    for (const action of ['nodeLogs', 'nodeRestart', 'nodeUninstall']) {
+    for (const action of ['nodeLogs', 'nodeRestart']) {
       expect(screen.getByRole('button', { name: action })).toBeDisabled();
     }
   });
@@ -252,7 +289,7 @@ describe('Stage 2 lifecycle controls', () => {
       />,
     );
     expect(screen.getByRole('button', { name: 'nodeUpgrade' })).toBeEnabled();
-    for (const action of ['nodeLogs', 'nodeRestart', 'nodeUninstall']) {
+    for (const action of ['nodeLogs', 'nodeRestart']) {
       expect(screen.getByRole('button', { name: action })).toBeDisabled();
     }
   });
