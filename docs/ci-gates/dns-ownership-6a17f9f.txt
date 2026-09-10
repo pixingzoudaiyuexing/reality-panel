@@ -1,0 +1,7 @@
+Temporary CI gate for commit:
+6a17f9f9cfa9df2514a73b493df8b42207503d0b
+
+Purpose:
+Trigger the existing pull_request CI, including PostgreSQL repository tests.
+
+This branch must not be merged.
