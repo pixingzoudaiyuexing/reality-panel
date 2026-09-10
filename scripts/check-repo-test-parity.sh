@@ -25,7 +25,8 @@ fi
 
 # ── Parse test function names from a Rust test file ──
 # Matches lines like: async fn test_name() {  or  async fn test_name(suffix: ...) {
-# Excludes helper functions (repo, cleanup, seed_*, pg_url, replace_db_in_url).
+# Excludes helper functions (repo, cleanup, seed_*, fresh_pool, pg_url,
+# replace_db_in_url).
 #
 # NOTE: exclusion runs BEFORE the pg_ prefix is stripped (see pg_names below),
 # so a PG-side helper has to be listed under its REAL name (pg_seed_code), not
@@ -34,15 +35,15 @@ fi
 # helper this list already removed — reported as bogus drift.
 extract_tests() {
   local file="$1"
-  grep -oP '^\s*async fn\s+\K[a-z_][a-z0-9_]*(?=\s*\()' "$file" \
-	    | grep -vE '^(repo|cleanup|seed_group|seed_group_typed|seed_user|pg_seed_user|seed_code|pg_seed_code|balance_of|pg_balance_of|pg_url|replace_db_in_url|placeholders|_placeholders_unused)$' \
+  perl -ne 'print "$1\n" if /^\s*async fn\s+([a-z_][a-z0-9_]*)(?=\s*\()/' "$file" \
+	    | grep -vE '^(repo|cleanup|fresh_pool|seed_group|seed_group_typed|seed_user|pg_seed_user|seed_code|pg_seed_code|balance_of|pg_balance_of|pg_url|replace_db_in_url|placeholders|_placeholders_unused)$' \
     || true
 }
 
 # ── Load allowlist ──
 load_allowlist() {
   if [[ -f "$ALLOWLIST_FILE" ]]; then
-    grep -oP '^[a-z_][a-z0-9_]*' "$ALLOWLIST_FILE" | grep -v '^#' || true
+    perl -ne 'print "$1\n" if /^([a-z_][a-z0-9_]*)/' "$ALLOWLIST_FILE" || true
   fi
 }
 
