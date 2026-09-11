@@ -1,4 +1,4 @@
-import { Alert, Button, Descriptions, Input, InputNumber, Select, Space, Tabs, Tag, Typography, message } from 'antd';
+import { Alert, Button, Descriptions, Input, InputNumber, Segmented, Select, Space, Tabs, Tag, Typography, message } from 'antd';
 import { CloudUploadOutlined, CopyOutlined, DeleteOutlined, PlusOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
 import { useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
@@ -12,7 +12,7 @@ const { Text } = Typography;
 type Values = { group_id?: number; host: string; port: number; username: string; password: string };
 type SshProbe = { fingerprint: string; os: string; architecture: string };
 type DeployLog = { stage: string; message: string; at: string };
-type Deployment = { id: string; group_id: number; host: string; stage: string; status: string; message: string; node_id?: string | null; profile: 'reality_camouflage'; capabilities?: ProvisioningCapabilities | null };
+type Deployment = { id: string; group_id: number; host: string; stage: string; status: string; message: string; node_id?: string | null; profile: 'reality_camouflage'; lite_mode: boolean; capabilities?: ProvisioningCapabilities | null };
 type RowState = 'WAITING' | 'TESTING' | 'PASSED' | 'FAILED' | 'DEPLOYING' | 'SUCCESS';
 type SshRow = { id: number; values: Values; state: RowState; probe: SshProbe | null; deployment: Deployment | null; logs: DeployLog[]; error: string | null };
 type EnrollmentState = 'PENDING' | 'CLAIMED' | 'VERIFYING' | 'LOCAL_COMMITTED' | 'SUCCESS' | 'FAILED' | 'EXPIRED';
@@ -41,6 +41,7 @@ export default function NodeBootstrap() {
   const [manualResult, setManualResult] = useState<CreatedEnrollment | null>(null);
   const [secretVisible, setSecretVisible] = useState(false);
   const [mode, setMode] = useState('ssh');
+  const [liteMode, setLiteMode] = useState(false);
 
   useEffect(() => {
     api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups').then((response) => {
@@ -116,7 +117,7 @@ export default function NodeBootstrap() {
     setRows((current) => current.map((row) => ({ ...row, state: 'DEPLOYING', error: null })));
     const results = await Promise.all(rows.map(async (row) => {
       try {
-        const response = await api.post<unknown, ApiEnvelope<Deployment>>('/admin/node-deployments', { ...row.values, confirmed_fingerprint: row.probe!.fingerprint, profile: 'reality_camouflage' });
+        const response = await api.post<unknown, ApiEnvelope<Deployment>>('/admin/node-deployments', { ...row.values, confirmed_fingerprint: row.probe!.fingerprint, profile: 'reality_camouflage', lite_mode: liteMode });
         if (!response.data) throw new Error(response.message);
         return { id: row.id, deployment: response.data, error: null };
       } catch (error) { return { id: row.id, deployment: null, error: errorText(error, t('nodeBootstrapStartFailed')) }; }
@@ -147,6 +148,20 @@ export default function NodeBootstrap() {
 
   const sshContent = <>
     <Alert type="info" showIcon message={t('nodeBootstrapSshRecommended')} style={{ marginBottom: 16 }} />
+    <Space orientation="vertical" size={4} style={{ marginBottom: 16 }}>
+      <Text strong>{t('nodeBootstrapInstallMode')}</Text>
+      <Segmented
+        aria-label={t('nodeBootstrapInstallMode')}
+        disabled={rowsLocked}
+        value={liteMode ? 'lite' : 'standard'}
+        options={[
+          { value: 'standard', label: t('nodeBootstrapInstallStandard') },
+          { value: 'lite', label: t('nodeBootstrapInstallLite') },
+        ]}
+        onChange={(value) => setLiteMode(value === 'lite')}
+      />
+      <Text type="secondary">{t(liteMode ? 'nodeBootstrapInstallLiteHint' : 'nodeBootstrapInstallStandardHint')}</Text>
+    </Space>
     <div className="rp-ssh-batch" data-testid="ssh-batch">
       {rows.map((row, index) => <div className="rp-ssh-row" data-testid={`ssh-row-${row.id}`} key={row.id}>
         <Text type="secondary">#{index + 1}</Text>

@@ -61,8 +61,13 @@ pub(crate) struct ProvisioningBundle {
 }
 
 impl ProvisioningBundle {
-    pub(crate) fn new(panel_url: &str, node_token: &str, artifact: ProvisioningArtifact) -> Self {
-        let config = render_bootstrap_config(panel_url, node_token, &artifact);
+    pub(crate) fn new(
+        panel_url: &str,
+        node_token: &str,
+        artifact: ProvisioningArtifact,
+        lite_mode: bool,
+    ) -> Self {
+        let config = render_bootstrap_config(panel_url, node_token, &artifact, lite_mode);
         Self {
             install_script: INSTALL_SCRIPT,
             artifact,
@@ -235,13 +240,15 @@ fn render_bootstrap_config(
     panel_url: &str,
     node_token: &str,
     artifact: &ProvisioningArtifact,
+    lite_mode: bool,
 ) -> String {
     format!(
-        "PANEL_URL={}\nNODE_TOKEN={}\nRELAY_NODE_ARCH={}\nRELAY_NODE_SHA256={}\n",
+        "PANEL_URL={}\nNODE_TOKEN={}\nRELAY_NODE_ARCH={}\nRELAY_NODE_SHA256={}\nLITE_MODE={}\n",
         shell_quote(panel_url),
         shell_quote(node_token),
         artifact.architecture,
-        artifact.sha256
+        artifact.sha256,
+        u8::from(lite_mode),
     )
 }
 
@@ -261,8 +268,12 @@ mod tests {
             sha256: "abc123".into(),
         };
 
-        let bundle =
-            ProvisioningBundle::new("https://panel.test/api", "token with ' quote", artifact);
+        let bundle = ProvisioningBundle::new(
+            "https://panel.test/api",
+            "token with ' quote",
+            artifact,
+            false,
+        );
 
         assert_eq!(bundle.install_script, INSTALL_SCRIPT);
         assert_eq!(bundle.artifact.architecture, "amd64");
@@ -270,8 +281,19 @@ mod tests {
         assert_eq!(bundle.artifact.sha256, "abc123");
         assert_eq!(
             bundle.config.as_bytes(),
-            b"PANEL_URL='https://panel.test/api'\nNODE_TOKEN='token with '\\'' quote'\nRELAY_NODE_ARCH=amd64\nRELAY_NODE_SHA256=abc123\n"
+            b"PANEL_URL='https://panel.test/api'\nNODE_TOKEN='token with '\\'' quote'\nRELAY_NODE_ARCH=amd64\nRELAY_NODE_SHA256=abc123\nLITE_MODE=0\n"
         );
+    }
+
+    #[test]
+    fn lite_bundle_sets_only_the_bootstrap_boolean() {
+        let artifact = ProvisioningArtifact {
+            architecture: "amd64".into(),
+            bytes: vec![],
+            sha256: "abc123".into(),
+        };
+        let bundle = ProvisioningBundle::new("https://panel.test", "token", artifact, true);
+        assert!(bundle.config.ends_with("LITE_MODE=1\n"));
     }
 
     #[test]

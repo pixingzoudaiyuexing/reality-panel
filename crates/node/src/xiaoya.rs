@@ -319,6 +319,10 @@ pub async fn reconcile(node_version: &str) -> Result<XiaoyaReady, String> {
     Ok(XiaoyaReady { _private: () })
 }
 
+pub async fn verify_lite_fallback() -> Result<(), String> {
+    wait_until_healthy().await
+}
+
 async fn rollback_update_if_needed(image: Option<String>) {
     let Some(image) = image else {
         return;

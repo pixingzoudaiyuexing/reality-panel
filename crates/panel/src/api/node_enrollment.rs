@@ -324,7 +324,7 @@ pub async fn enrollment_bundle(
             "请先在站点设置中配置有效的面板公网地址，或设置 PUBLIC_PANEL_URL",
         );
     };
-    let bundle = ProvisioningBundle::new(&panel_url, &group.token, artifact);
+    let bundle = ProvisioningBundle::new(&panel_url, &group.token, artifact, false);
     match render_bundle(
         &id,
         enrollment.group_id,
@@ -2230,7 +2230,8 @@ mod tests {
             bytes: b"ELF fixture".to_vec(),
             sha256: sha256_hex(b"ELF fixture"),
         };
-        let bundle = ProvisioningBundle::new("https://panel.test", "group-token-secret", artifact);
+        let bundle =
+            ProvisioningBundle::new("https://panel.test", "group-token-secret", artifact, false);
         let bytes = render_bundle(
             "11111111-1111-1111-1111-111111111111",
             7,

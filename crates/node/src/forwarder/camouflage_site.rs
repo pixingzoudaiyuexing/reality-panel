@@ -2204,6 +2204,14 @@ pub async fn cutover_to_xiaoya_shared(
     shared: &Arc<AsyncMutex<CamouflageSiteManager>>,
     _ready: &crate::xiaoya::XiaoyaReady,
 ) -> bool {
+    cutover_to_5245_shared(shared).await
+}
+
+pub async fn cutover_to_lite_shared(shared: &Arc<AsyncMutex<CamouflageSiteManager>>) -> bool {
+    cutover_to_5245_shared(shared).await
+}
+
+async fn cutover_to_5245_shared(shared: &Arc<AsyncMutex<CamouflageSiteManager>>) -> bool {
     let _apply_lease = runtime_apply_guard(shared).await;
     let (config, active, runtime_revision, candidate) = {
         let mut current = shared.lock().await;

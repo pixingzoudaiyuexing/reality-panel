@@ -59,6 +59,29 @@ describe('Node Bootstrap deployment modes', () => {
     expect(screen.getByLabelText('nodeBootstrapHost 1')).toBeDisabled();
     expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ host: 'node-a', confirmed_fingerprint: 'SHA256:node-a' }));
     expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ host: 'node-b', confirmed_fingerprint: 'SHA256:node-b' }));
+    expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ lite_mode: false }));
+  });
+
+  it('sends lite_mode only for SSH deployments selected as Lite', async () => {
+    const user = userEvent.setup();
+    mockPost.mockImplementation((url: string, body: { host: string }) => {
+      if (url.endsWith('/fingerprint')) return Promise.resolve(ok({ fingerprint: `SHA256:${body.host}`, os: 'Debian', architecture: 'x86_64' }));
+      if (url === '/admin/node-deployments') return Promise.resolve(ok({ id: 'task-lite', group_id: 7, host: body.host, stage: 'PENDING', status: 'PENDING', message: 'queued', profile: 'reality_camouflage', lite_mode: true }));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getAllByText('relay-group').length).toBeGreaterThan(0));
+    await user.click(screen.getByText('nodeBootstrapInstallLite'));
+    await user.type(screen.getByLabelText('nodeBootstrapHost 1'), 'node-lite');
+    await user.type(screen.getByLabelText('nodeBootstrapPassword 1'), 'secret');
+    await user.click(screen.getByRole('button', { name: /nodeBootstrapTestConnection/ }));
+    await screen.findByText('nodeBootstrapRowPASSED');
+    await user.click(screen.getByRole('button', { name: /nodeBootstrapDeploy/ }));
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({
+      host: 'node-lite',
+      lite_mode: true,
+      profile: 'reality_camouflage',
+    })));
   });
 
   it('creates a Manual Bootstrap enrollment without putting the secret in its launcher command', async () => {

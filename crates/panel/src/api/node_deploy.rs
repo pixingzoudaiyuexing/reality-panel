@@ -35,6 +35,7 @@ const ONLINE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_LOGS: usize = 100;
 const MAX_CONCURRENT_DEPLOYMENTS: usize = 4;
 const XIAOYA_VERIFY_COMMAND: &str = "test \"$(docker inspect -f '{{index .Config.Labels \"io.reality-panel.managed\"}}|{{.State.Running}}|{{.HostConfig.RestartPolicy.Name}}|{{range .Mounts}}{{if eq .Destination \"/opt/alist/data\"}}{{.Source}}{{end}}{{end}}' relay-panel-xiaoya-byoa)\" = 'xiaoya-byoa|true|unless-stopped|/var/lib/relay-panel/xiaoya-byoa'; docker port relay-panel-xiaoya-byoa 5244/tcp | grep -Fx '127.0.0.1:5245' >/dev/null; test \"$(curl -fsS --max-time 10 http://127.0.0.1:5245/ping)\" = pong; grep -Fq 'proxy_pass http://127.0.0.1:5245;' /etc/nginx/conf.d/relay-panel-fallback.conf";
+const LITE_VERIFY_COMMAND: &str = "test -f /etc/relay-panel/lite-mode; test -f /var/www/fallback/index.html; test -f /etc/nginx/conf.d/relay-panel-lite-fallback.conf; test \"$(curl -fsS --max-time 10 http://127.0.0.1:5245/ping)\" = pong; grep -Fq 'proxy_pass http://127.0.0.1:5245;' /etc/nginx/conf.d/relay-panel-fallback.conf";
 #[derive(Deserialize)]
 pub struct TestSshRequest {
     pub host: String,
@@ -57,6 +58,8 @@ pub struct StartDeploymentRequest {
     pub confirmed_fingerprint: String,
     #[serde(default)]
     pub profile: ProvisioningProfile,
+    #[serde(default)]
+    pub lite_mode: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -96,6 +99,7 @@ pub struct DeploymentStatus {
     pub message: String,
     pub node_id: Option<String>,
     pub profile: ProvisioningProfile,
+    pub lite_mode: bool,
     pub capabilities: Option<ProvisioningCapabilities>,
     pub updated_at: String,
 }
@@ -132,6 +136,7 @@ impl DeploymentRegistry {
         group_id: i64,
         host: String,
         profile: ProvisioningProfile,
+        lite_mode: bool,
     ) -> DeploymentStatus {
         let id = uuid::Uuid::new_v4().to_string();
         let now = now();
@@ -144,6 +149,7 @@ impl DeploymentRegistry {
             message: "deployment task queued".into(),
             node_id: None,
             profile,
+            lite_mode,
             capabilities: None,
             updated_at: now.clone(),
         };
@@ -209,10 +215,12 @@ impl DeploymentRegistry {
         id: &str,
         node_id: String,
         capabilities: ProvisioningCapabilities,
+        lite_mode: bool,
     ) {
         if let Some(task) = self.tasks.lock().await.get_mut(id) {
             task.status.node_id = Some(node_id);
             task.status.capabilities = Some(capabilities);
+            task.status.lite_mode = lite_mode;
         }
     }
 }
@@ -232,6 +240,7 @@ struct Secrets {
 struct VerifiedNode {
     node_id: String,
     capabilities: ProvisioningCapabilities,
+    lite_mode: bool,
 }
 
 struct Preflight {
@@ -248,6 +257,7 @@ trait DeploymentRunner: Send + Sync {
     async fn probe(&self, ssh: &SshInput) -> Result<SshProbe, DeployError>;
     async fn preflight(&self, ssh: &SshInput, fingerprint: &str) -> Result<Preflight, DeployError>;
     async fn artifact(&self, architecture: &str) -> Result<ProvisioningArtifact, DeployError>;
+    #[allow(clippy::too_many_arguments)]
     async fn install(
         &self,
         task_id: &str,
@@ -256,8 +266,14 @@ trait DeploymentRunner: Send + Sync {
         artifact: &ProvisioningArtifact,
         panel_url: &str,
         token: &str,
+        lite_mode: bool,
     ) -> Result<(), DeployError>;
-    async fn verify(&self, ssh: &SshInput, fingerprint: &str) -> Result<VerifiedNode, DeployError>;
+    async fn verify(
+        &self,
+        ssh: &SshInput,
+        fingerprint: &str,
+        lite_mode: bool,
+    ) -> Result<VerifiedNode, DeployError>;
     async fn commit(
         &self,
         task_id: &str,
@@ -332,11 +348,12 @@ impl DeploymentRunner for SystemSshRunner {
         artifact: &ProvisioningArtifact,
         panel_url: &str,
         token: &str,
+        lite_mode: bool,
     ) -> Result<(), DeployError> {
         let input = ssh.clone_without_secret_debug();
         let fingerprint = fingerprint.to_string();
         let task_id = task_id.to_string();
-        let bundle = ProvisioningBundle::new(panel_url, token, artifact.clone());
+        let bundle = ProvisioningBundle::new(panel_url, token, artifact.clone(), lite_mode);
         tokio::task::spawn_blocking(move || {
             let mut session = connect(&input, Some(&fingerprint))?;
             authenticate(&mut session, &input)?;
@@ -383,7 +400,12 @@ impl DeploymentRunner for SystemSshRunner {
         .map_err(|_| DeployError::new("INSTALL_FAILED", "installer worker terminated"))?
     }
 
-    async fn verify(&self, ssh: &SshInput, fingerprint: &str) -> Result<VerifiedNode, DeployError> {
+    async fn verify(
+        &self,
+        ssh: &SshInput,
+        fingerprint: &str,
+        lite_mode: bool,
+    ) -> Result<VerifiedNode, DeployError> {
         let input = ssh.clone_without_secret_debug();
         let fingerprint = fingerprint.to_string();
         tokio::task::spawn_blocking(move || {
@@ -394,12 +416,23 @@ impl DeploymentRunner for SystemSshRunner {
                 "RELAY_NODE_FAILED",
                 "test -x /opt/relay-node/relay-node; /opt/relay-node/relay-node --version >/dev/null; systemctl is-enabled --quiet relay-node; systemctl is-active --quiet relay-node",
             )?;
-            verify_command(&mut session, "DOCKER_FAILED", "systemctl is-active --quiet docker")?;
-            verify_command(
+            let detected_mode = exec(
                 &mut session,
-                "XIAOYA_FAILED",
-                XIAOYA_VERIFY_COMMAND,
+                "if test -f /etc/relay-panel/lite-mode && test \"$(cat /etc/relay-panel/lite-mode)\" = lite; then printf lite; else printf standard; fi",
             )?;
+            let effective_lite_mode = detected_mode.trim() == "lite";
+            if lite_mode && !effective_lite_mode {
+                return Err(DeployError::new(
+                    "LITE_MODE_FAILED",
+                    "remote deployment did not retain Lite mode",
+                ));
+            }
+            if effective_lite_mode {
+                verify_command(&mut session, "LITE_FALLBACK_FAILED", LITE_VERIFY_COMMAND)?;
+            } else {
+                verify_command(&mut session, "DOCKER_FAILED", "systemctl is-active --quiet docker")?;
+                verify_command(&mut session, "XIAOYA_FAILED", XIAOYA_VERIFY_COMMAND)?;
+            }
             verify_command(&mut session, "NGINX_FAILED", "nginx -t")?;
             verify_command(
                 &mut session,
@@ -420,6 +453,7 @@ impl DeploymentRunner for SystemSshRunner {
                 Ok(VerifiedNode {
                     node_id: node_id.to_string(),
                     capabilities: ProvisioningCapabilities::reality_camouflage(),
+                    lite_mode: effective_lite_mode,
                 })
             }
         }).await.map_err(|_| DeployError::new("VERIFY_FAILED", "verification worker terminated"))?
@@ -575,7 +609,7 @@ pub async fn start_deployment(
     };
     let status = state
         .deployments
-        .insert(group.id, ssh.host.clone(), req.profile)
+        .insert(group.id, ssh.host.clone(), req.profile, req.lite_mode)
         .await;
     crate::service::audit::record(
         &state,
@@ -651,6 +685,11 @@ async fn run_task(
         .await
         .map(|task| task.group_id)
         .unwrap_or_default();
+    let lite_mode = state
+        .deployments
+        .status(&id)
+        .await
+        .is_some_and(|task| task.lite_mode);
     let mutation_started = Arc::new(AtomicBool::new(false));
     let transaction_committed = Arc::new(AtomicBool::new(false));
     let work_mutation_started = mutation_started.clone();
@@ -704,7 +743,15 @@ async fn run_task(
         state
             .deployments
             .runner
-            .install(&id, &ssh, &fingerprint, &artifact, &panel_url, &token)
+            .install(
+                &id,
+                &ssh,
+                &fingerprint,
+                &artifact,
+                &panel_url,
+                &token,
+                lite_mode,
+            )
             .await?;
         state
             .deployments
@@ -712,7 +759,11 @@ async fn run_task(
                 &id,
                 DeploymentStage::Configuring,
                 "RUNNING",
-                "relay-node, Docker, Nginx Stream, Xiaoya, fallback, and Certbot base configured",
+                if lite_mode {
+                    "relay-node, Nginx Stream, and Lite fallback configured"
+                } else {
+                    "relay-node, Docker, Nginx Stream, Xiaoya, fallback, and Certbot base configured"
+                },
                 &secrets,
             )
             .await;
@@ -726,7 +777,11 @@ async fn run_task(
                 &secrets,
             )
             .await;
-        let verified = state.deployments.runner.verify(&ssh, &fingerprint).await?;
+        let verified = state
+            .deployments
+            .runner
+            .verify(&ssh, &fingerprint, lite_mode)
+            .await?;
         let profile = state
             .deployments
             .status(&id)
@@ -756,7 +811,7 @@ async fn run_task(
         work_transaction_committed.store(true, AtomicOrdering::SeqCst);
         state
             .deployments
-            .set_verified(&id, verified.node_id, confirmed)
+            .set_verified(&id, verified.node_id, confirmed, verified.lite_mode)
             .await;
         Ok::<(), DeployError>(())
     };
@@ -1284,6 +1339,7 @@ mod tests {
             _artifact: &ProvisioningArtifact,
             _panel_url: &str,
             _token: &str,
+            _lite_mode: bool,
         ) -> Result<(), DeployError> {
             self.install_calls.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
@@ -1306,6 +1362,7 @@ mod tests {
             &self,
             _ssh: &SshInput,
             _fingerprint: &str,
+            _lite_mode: bool,
         ) -> Result<VerifiedNode, DeployError> {
             match self.behavior {
                 FakeBehavior::VerifyFailure(category) => {
@@ -1314,6 +1371,7 @@ mod tests {
                 _ => Ok(VerifiedNode {
                     node_id: "node-test-1".into(),
                     capabilities: ProvisioningCapabilities::reality_camouflage(),
+                    lite_mode: _lite_mode,
                 }),
             }
         }
@@ -1862,6 +1920,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
                 7,
                 "node.example".into(),
                 ProvisioningProfile::RealityCamouflage,
+                false,
             )
             .await;
         run_task(
@@ -1907,8 +1966,12 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             bytes: vec![],
             sha256: "abc123".into(),
         };
-        let bundle =
-            ProvisioningBundle::new("https://panel.test/api", "token with ' quote", artifact);
+        let bundle = ProvisioningBundle::new(
+            "https://panel.test/api",
+            "token with ' quote",
+            artifact,
+            false,
+        );
         assert_eq!(
             bundle.config.lines().collect::<Vec<_>>(),
             vec![
@@ -1916,6 +1979,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
                 "NODE_TOKEN='token with '\\'' quote'",
                 "RELAY_NODE_ARCH=amd64",
                 "RELAY_NODE_SHA256=abc123",
+                "LITE_MODE=0",
             ]
         );
     }
@@ -1977,6 +2041,30 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             .status()
             .unwrap()
             .success());
+        assert!(!LITE_VERIFY_COMMAND.contains("docker"));
+        assert!(LITE_VERIFY_COMMAND.contains("/etc/relay-panel/lite-mode"));
+        assert!(LITE_VERIFY_COMMAND.contains("127.0.0.1:5245/ping"));
+        assert!(Command::new("bash")
+            .args(["-n", "-c", LITE_VERIFY_COMMAND])
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn deployment_request_defaults_to_standard_and_accepts_lite() {
+        let base = serde_json::json!({
+            "group_id": 7,
+            "host": "node.example",
+            "password": "secret",
+            "confirmed_fingerprint": "SHA256:confirmed"
+        });
+        let standard: StartDeploymentRequest = serde_json::from_value(base.clone()).unwrap();
+        assert!(!standard.lite_mode);
+        let mut lite = base;
+        lite["lite_mode"] = serde_json::Value::Bool(true);
+        let lite: StartDeploymentRequest = serde_json::from_value(lite).unwrap();
+        assert!(lite.lite_mode);
     }
 
     #[tokio::test]
@@ -1987,6 +2075,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
                 9,
                 "node.example".into(),
                 ProvisioningProfile::RealityCamouflage,
+                false,
             )
             .await;
         registry
@@ -2033,6 +2122,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
                 1,
                 "one.example".into(),
                 ProvisioningProfile::RealityCamouflage,
+                false,
             )
             .await;
         let second = registry
@@ -2040,6 +2130,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
                 2,
                 "two.example".into(),
                 ProvisioningProfile::RealityCamouflage,
+                false,
             )
             .await;
         registry
@@ -2608,6 +2699,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
                 7,
                 "node.example".into(),
                 ProvisioningProfile::RealityCamouflage,
+                false,
             )
             .await;
         let (_connection_id, _receiver) = state

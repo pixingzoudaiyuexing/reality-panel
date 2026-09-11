@@ -45,7 +45,11 @@ async fn prepare_host_runtime() -> Result<(), String> {
     } else {
         eprintln!("INFO: {}", bbr.message());
     }
-    xiaoya::reconcile(VERSION).await.map(|_| ())
+    if updater::lite_mode() {
+        xiaoya::verify_lite_fallback().await
+    } else {
+        xiaoya::reconcile(VERSION).await.map(|_| ())
+    }
 }
 
 async fn run_local_recovery_tick(
@@ -444,24 +448,38 @@ async fn run() {
             } else {
                 tracing::info!("{}", bbr.message());
             }
-            match xiaoya::reconcile(VERSION).await {
-                Ok(ready) => {
-                    if forwarder::camouflage_site::cutover_to_xiaoya_shared(
-                        &camouflage_sites,
-                        &ready,
-                    )
-                    .await
-                    {
-                        tracing::info!("managed camouflage backend converged to Xiaoya");
-                    } else {
-                        tracing::warn!(
-                            "Xiaoya is healthy but camouflage cutover failed; retained prior state"
-                        );
+            if updater::lite_mode() {
+                match xiaoya::verify_lite_fallback().await {
+                    Ok(()) if forwarder::camouflage_site::cutover_to_lite_shared(&camouflage_sites).await => {
+                        tracing::info!("managed camouflage backend converged to Lite fallback");
                     }
+                    Ok(()) => tracing::warn!(
+                        "Lite fallback is healthy but camouflage cutover failed; retained prior state"
+                    ),
+                    Err(error) => tracing::warn!(
+                        "Lite fallback verification failed; retained prior camouflage state: {error}"
+                    ),
                 }
-                Err(error) => tracing::warn!(
-                    "Xiaoya reconcile did not complete; retained prior camouflage state: {error}"
-                ),
+            } else {
+                match xiaoya::reconcile(VERSION).await {
+                    Ok(ready) => {
+                        if forwarder::camouflage_site::cutover_to_xiaoya_shared(
+                            &camouflage_sites,
+                            &ready,
+                        )
+                        .await
+                        {
+                            tracing::info!("managed camouflage backend converged to Xiaoya");
+                        } else {
+                            tracing::warn!(
+                                "Xiaoya is healthy but camouflage cutover failed; retained prior state"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        "Xiaoya reconcile did not complete; retained prior camouflage state: {error}"
+                    ),
+                }
             }
         });
     }
