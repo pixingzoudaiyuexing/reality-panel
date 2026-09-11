@@ -427,7 +427,7 @@ pub async fn run_hook(args: &[String]) -> Result<(), String> {
     );
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(150))
+        .timeout(Duration::from_secs(720))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "hook HTTP client is unavailable")?;

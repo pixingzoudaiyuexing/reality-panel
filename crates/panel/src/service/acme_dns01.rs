@@ -22,7 +22,7 @@ use std::time::Duration;
 
 const STATE_PREFIX: &str = "acme:dns01:";
 const CHALLENGE_TTL_SECS: i64 = 900;
-const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(120);
+const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(600);
 const PROPAGATION_INTERVAL: Duration = Duration::from_secs(5);
 const PAGE_LIMIT: u16 = 100;
 
