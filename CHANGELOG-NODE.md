@@ -7,6 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.23] - 2026-09-11
+
+### 新增
+
+- 新增 Lite 节点部署模式，使用 Nginx 静态 fallback，跳过 Docker 和 Xiaoya。
+- Lite marker 在 relay-node 重启和升级时保持运行模式不变。
+
+### 兼容性
+
+- Standard 节点和 legacy 节点继续保持原有 Docker/Xiaoya 行为。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.22 relay-node 可直接升级到 v1.1.23。
+
 ## [1.1.22] - 2026-09-10
 
 ### 兼容性

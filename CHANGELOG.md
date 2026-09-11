@@ -7,6 +7,19 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.23] - 2026-09-11
+
+### 新增
+
+- 新增 Lite 节点部署模式，仅安装 relay-node、Nginx 和静态 fallback 页面，不安装 Docker 或 Xiaoya。
+- Lite 节点通过 `/etc/relay-panel/lite-mode` marker 保持重启和升级时的运行模式。
+
+### 兼容性
+
+- Standard 节点和 legacy 节点继续保持 Docker/Xiaoya 流程。
+- 无数据库 migration，Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.22 可直接升级到 v1.1.23。
+
 ## [1.1.22] - 2026-09-10
 
 ### 修复
