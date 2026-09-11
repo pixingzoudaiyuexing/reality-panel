@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.24] - 2026-09-11
+
+统一版本发布。本次 ACME DNS-01 timeout 修复仅位于 Panel；relay-node 无功能代码变化。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.23 relay-node 与 v1.1.24 Panel 功能兼容；v1.1.24 Node artifact 仅同步发布版本号。
+
 ## [1.1.23] - 2026-09-11
 
 ### 新增
@@ -396,131 +405,73 @@ unless the node sits somewhere `api.ipify.org` cannot be reached.
 ### Added
 
 - **`restart_rule` control message.** The panel can ask the node to drop one
-  rule's connections and rebuild its listeners. The node re-creates listeners
-  from its OWN cached config (`ForwarderManager::last_config`), never from
-  anything in the message, so a restart cannot be used to inject listener
-  config. `node_id` is re-checked on arrival as defence in depth even though
-  `send_node` already routed it.
+  rule's connections and rebuild its listeners on each node of its inbound group. Owner-scoped (a user may restart only their own
+  rules); batch restart is the frontend calling it per rule, matching batch
+  pause/resume, so there is deliberately no bulk endpoint. The rule's `paused`
+  flag is never read or written — a restart is not a state transition. A paused
+  rule is rejected rather than reported as a hollow success: it has no listener
+  to restart, and the user's actual intent there is "resume".
 
-  The WS dispatch arm for this MUST stay above the diagnose arm and MUST check
-  `type`: `DiagnoseRuleMessage` defaults its `challenge` field and ignores
-  unknown fields, so a `restart_rule` payload deserializes into it cleanly
-  (`rule_id` + `request_id` are both present). Ordered after diagnose, every
-  restart would silently become a target probe instead. A test in
-  `relay-shared` pins the ambiguity.
+  This is deliberately NOT implemented as pause+resume. That pair leaves the
+  rule PAUSED if the resume half fails (node offline, authorization revoked
+  between the two calls, panel restarted mid-way) — an outage caused by the
+  button whose whole job is to end one. It also frees the listen port for
+  auto-assignment during the gap, and writing `paused` resets `auto_paused`
+  (v1.0.8), corrupting the system-paused vs. human-paused distinction.
 
-- **Per-rule concurrent TCP connection cap** (`ListenerConfig.max_connections`,
-  None = unlimited). Admission happens in the accept loop, not in the spawned
-  connection task: the accept loop is sequential, so check-then-increment there
-  is exact, whereas incrementing inside the task would let an unbounded number
-  of accepts through before the first increment landed — precisely the
-  connection-flood case the cap exists for. Over the cap, the socket is dropped
-  immediately (the "at cap" warning is rate-limited to once per 60s per
-  listener; a rule sitting at its cap rejects on every accept, and an
-  unthrottled warn would itself become the outage).
+  The response's `restarted` field counts nodes ACTUALLY reached and can be 0
+  on an otherwise successful request (every node too old or offline), so the UI
+  keys its message off that rather than the envelope code — a restart that
+  silently did nothing would otherwise be undetectable.
 
-  The counter lives per RULE, not per listener: a dual-stack rule runs two
-  accept loops (IPv4 + IPv6), and a per-listener counter would silently grant
-  double the configured cap.
+- **Scheduled rule restart.** A rule with `auto_restart_minutes > 0` has its
+  connections dropped on that interval. The `max_connections` cap is the actual
+  fix for connection accumulation; this is the valve for when you'd rather shed
+  than refuse.
 
-### Fixed
+  The schedule lives in MEMORY, not the database. Persisting `last_restart_at`
+  would mean every rule whose interval elapsed while the panel was down comes
+  due at once on boot — a panel upgrade would begin by dropping every
+  auto-restart rule's connections simultaneously. In-memory re-bases each timer
+  to "now" on restart; the cost is at most one skipped cycle, which is invisible
+  next to an unscheduled mass disconnect. A rule seen for the first time is
+  baselined, never restarted on the spot.
 
-- **Aborting a listener no longer leaves its connections forwarding.**
-  Connections run on detached `tokio::spawn` tasks, so an aborted accept loop
-  stopped new accepts while every established connection kept relaying —
-  verified: a post-abort read/write round-trips fine. Connections now select on
-  a per-rule cancellation channel (`forwarder::gate`). Consequences:
-  - an explicit `restart_rule` genuinely sheds connections rather than just
-    re-binding the port;
-  - a rule removed from the node's config now stops forwarding, instead of
-    relaying bytes for a rule whose traffic counters `apply_config` already
-    pruned.
+- **Rule connection controls, storage + API** (no enforcement yet — the node
+  half lands separately). Two new per-rule settings, both `0` = off/unlimited so
+  an upgrade changes nothing until a rule is explicitly opted in:
+  - `max_connections` — cap on concurrent TCP connections, scoped PER NODE.
+    Nodes share no state and a group-wide total would need a central allocator
+    on the forwarding hot path, so a rule served by 3 nodes admits up to 3x this
+    number. The panel ships it to nodes in `ListenerConfig`; a node that doesn't
+    understand it ignores it (`#[serde(default)]`).
+  - `auto_restart_minutes` — interval for scheduled restarts. A non-zero value
+    below `MIN_AUTO_RESTART_MINUTES` (5) is rejected: a shorter loop would drop
+    connections faster than clients can reconnect, turning the safety valve into
+    the outage.
 
-  `apply_config`'s fingerprint-driven restart (changed targets / rate caps) does
-  NOT cancel: editing a rule must not kick everyone off, which has been the
-  behaviour since v0.3.6.
-
-- **A UDP-only rule's restart is no longer a silent no-op.** `restart_rule`
-  returned early when the rule had no `RuleRuntime` — but only the TCP arm of
-  `apply_config` creates one (UDP has no `accept()` and no cancellable
-  per-connection tasks), so a UDP-only rule has no runtime while very much
-  having a listener. It was never torn down or rebuilt, and its sessions never
-  dropped. The panel reports success as soon as the command reaches the node, so
-  the operator was told the rule had restarted while nothing happened at all.
-  "No runtime" now means only "no connections to cancel"; whether there are
-  listeners to rebuild is decided separately.
+  Both are edit-only. The atomic create path (`create_rule_with_guard`) doesn't
+  carry them, so offering them at create would silently discard the value.
+  `PUT /rules/{id}` defaults an omitted one to the rule's CURRENT value rather
+  than to 0 — otherwise setting only `max_connections` would silently switch off
+  that rule's scheduled restart.
 
 ### Compatibility
 
-- Requires panel **1.2.0+** to be sent `restart_rule` or a connection cap. Both
-  additions are backward compatible on the wire (`#[serde(default)]`), so a
-  1.2.0 node runs against an older panel unchanged — it simply never receives
-  either.
+- Nodes below **1.2.0** silently ignore the unknown `restart_rule` message. The
+  panel gates on `node_supports_restart_rule` and surfaces those nodes as
+  "upgrade required" rather than counting them as restarted — a restart that
+  quietly did nothing would be undetectable to the operator. Node Status already
+  offers one-click upgrade.
 
-## [1.1.2] - 2026-07-12
+### Schema
 
-### Fixed
-
-- **UDP forwarding now follows DDNS target IP changes.** A UDP rule's domain
-  target was resolved ONCE when the listener started (rule push / node boot) and
-  the resolved IP was reused forever — so a DDNS target (WireGuard, game relay,
-  DNS forwarding) that changed IP kept getting blackholed to the stale address
-  until the rule or node was manually restarted. New UDP sessions now resolve
-  through the shared 30s DNS cache (same as TCP), so an IP change is picked up
-  within the cache TTL; established sessions age out on the 60s idle timeout and
-  the next datagram opens a fresh session against the current IP. This also
-  removes the old "unresolvable-at-boot kills the listener → restart loop"
-  behavior — a transient DNS failure no longer tears down the UDP listener.
-
-## [1.1.1] - 2026-07-08
-
-### Fixed
-
-- **File-descriptor exhaustion under connection churn.** Forwarded TCP sockets
-  (both the accepted client side and the dialed target side) now enable TCP
-  keepalive (idle 60s, 15s probes, 4 retries). Previously a peer that vanished
-  without a FIN/RST — NAT rebind, mobile handoff, cable pull, a firewall that
-  drops instead of resets — left the bidirectional copy blocked on `read()`
-  forever, holding two fds; under churn these dead half-open connections
-  accumulated until the node hit `EMFILE` ("Too many open files", os error 24),
-  even at `LimitNOFILE=65536`. Keepalive lets the kernel reap dead peers so the
-  copy task ends and releases its fds.
-- **Low fd limit on non-systemd launches.** The node now raises its own
-  `RLIMIT_NOFILE` soft limit toward the hard limit at startup, so a docker or
-  manual (bash/nohup) launch — which inherits the 1024 default instead of the
-  systemd unit's `LimitNOFILE=65536` — no longer exhausts descriptors under
-  moderate load. The node Docker Compose service also sets `ulimits.nofile` to
-  65536 to match.
-
----
-
-## [1.1.0] - 2026-07-02
-
-The node half of the **one-click remote upgrade** release. (Panel-side changes
-for the same feature are in `CHANGELOG.md` under [1.1.0].)
-
-### Added
-
-- **Self-upgrade.** On receiving a directed `upgrade_node` command over the WS
-  control channel, a systemd node downloads the official `relay-node` release
-  for its architecture from the GitHub release, **verifies the published
-  sha256**, backs up its current binary, atomically swaps, and exits so systemd
-  restarts it. Safety:
-  - **Upgrade-only:** the target must be a valid semver strictly newer than the
-    running version, so a compromised panel can't force a downgrade.
-  - **Install-aware:** only systemd nodes self-upgrade; docker nodes are told to
-    update the image, and manual runs are disabled (nothing would restart them).
-  - **Single-flight + mandatory backup:** repeated commands can't corrupt the
-    binary, and a failed backup aborts the swap.
-- Binaries continue to ship for both **amd64 and arm64** (static musl + rustls).
-
-### Notes
-
-- Assets for 1.1.0 and earlier were published under the joint `v*` tag (panel
-  and node shared a release). From 1.1.1 onward, node binaries publish under the
-  dedicated `node-v*` tag. The node's self-upgrade download logic falls back to
-  the `v*` URL for versions ≤ 1.1.0 so existing 1.1.0 nodes can still reach the
-  historical asset; newer versions use `node-v*` exclusively.
+- SQLite Migration **38**, PG revision **21** (`PG_SCHEMA_VERSION` 20 → 21):
+  `forward_rules.max_connections` and `forward_rules.auto_restart_minutes`, both
+  `NOT NULL DEFAULT 0`. 0 = unlimited/off. A pre-v1.2 rule must come out
+  UNCAPPED — if 0 reached a node as a real cap, upgrading would throttle every
+  existing rule to zero connections; `max_connections_zero_means_unlimited_on_the_wire`
+  pins that.
 
 ---
 
