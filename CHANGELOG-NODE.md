@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.24] - 2026-09-11
+
+统一版本发布。本次 ACME DNS-01 timeout 修复仅位于 Panel；relay-node 无功能代码变化。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.23 relay-node 与 v1.1.24 Panel 功能兼容；v1.1.24 Node artifact 仅同步发布版本号。
+
 ## [1.1.23] - 2026-09-11
 
 ### 新增

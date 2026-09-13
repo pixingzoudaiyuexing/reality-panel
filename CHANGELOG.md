@@ -7,6 +7,20 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.24] - 2026-09-11
+
+### 修复
+
+- 延长 ACME DNS-01 权威传播等待时间，避免部分 DNS Provider 正常但传播较慢时过早判定证书签发失败。
+- 同步延长 Panel certificate hook HTTP 请求超时，使其覆盖完整 DNS-01 propagation 等待窗口。
+
+### 兼容性
+
+- 无数据库 migration。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.23 可直接升级到 v1.1.24。
+- 本次运行时修复仅位于 Panel；relay-node 无功能代码变化。
+
 ## [1.1.23] - 2026-09-11
 
 ### 新增
