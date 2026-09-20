@@ -6351,6 +6351,208 @@ async fn pg_dns_record_sync_composite_identity_isolates_update_delete_cas_and_du
     cleanup(&db).await;
 }
 
+async fn seed_group(db: &PgRepository, gid: i64) {
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES ($1, 'gin', 'in', $2, 1)",
+    )
+    .bind(gid)
+    .bind(format!("tok-{gid}"))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn pg_node_reuse_binding_repository_contract() {
+    let Some(db) = repo("node_reuse_contract").await else {
+        return;
+    };
+    for gid in [10, 20, 30, 40] {
+        seed_group(&db, gid).await;
+    }
+
+    db.insert_node_reuse_binding(20, 10, "node-a")
+        .await
+        .unwrap();
+    db.insert_node_reuse_binding(30, 10, "node-a")
+        .await
+        .unwrap();
+    db.insert_node_reuse_binding(20, 10, "node-b")
+        .await
+        .unwrap();
+    db.insert_node_reuse_binding(20, 40, "offline-node")
+        .await
+        .unwrap();
+
+    let binding = db
+        .find_node_reuse_binding(20, 10, "node-a")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.reusing_group_id, 20);
+    assert_eq!(binding.home_group_id, 10);
+    assert_eq!(binding.node_id, "node-a");
+    assert!(!binding.created_at.is_empty());
+    assert_eq!(
+        db.list_reusing_group_ids_for_node(10, "node-a")
+            .await
+            .unwrap(),
+        vec![20, 30]
+    );
+    assert_eq!(
+        crate::service::node_reuse::effective_source_groups(&db, 10, "node-a")
+            .await
+            .unwrap(),
+        vec![10, 20, 30]
+    );
+
+    let expected = vec![
+        ConcreteNodeIdentity {
+            home_group_id: 10,
+            node_id: "node-a".into(),
+        },
+        ConcreteNodeIdentity {
+            home_group_id: 10,
+            node_id: "node-b".into(),
+        },
+        ConcreteNodeIdentity {
+            home_group_id: 40,
+            node_id: "offline-node".into(),
+        },
+    ];
+    assert_eq!(
+        db.list_reused_concrete_nodes_for_group(20)
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        crate::service::node_reuse::reused_concrete_nodes_for_group(&db, 20)
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        db.count_node_reuse_bindings_for_home_group(10)
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        db.delete_node_reuse_binding(20, 10, "node-a")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.delete_node_reuse_binding(20, 10, "node-a")
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(db
+        .find_node_reuse_binding(30, 10, "node-a")
+        .await
+        .unwrap()
+        .is_some());
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_node_reuse_schema_constraints_and_fk_restrict() {
+    let Some(db) = repo("node_reuse_constraints").await else {
+        return;
+    };
+    seed_group(&db, 10).await;
+    seed_group(&db, 20).await;
+
+    db.insert_node_reuse_binding(20, 10, "node-a")
+        .await
+        .unwrap();
+    assert!(db
+        .insert_node_reuse_binding(20, 10, "node-a")
+        .await
+        .is_err());
+    assert!(db
+        .insert_node_reuse_binding(10, 10, "node-self")
+        .await
+        .is_err());
+    assert!(db.insert_node_reuse_binding(20, 10, "   ").await.is_err());
+    assert!(matches!(
+        db.insert_node_reuse_binding(999, 10, "node-x").await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+    assert!(matches!(
+        db.insert_node_reuse_binding(20, 999, "node-x").await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+    assert!(matches!(
+        db.delete_group(10, &ResourceScope::All).await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+    assert!(matches!(
+        db.delete_group(20, &ResourceScope::All).await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+    assert_eq!(
+        crate::service::node_reuse::validate_binding_identity(10, 10, "node-a"),
+        Err(crate::service::node_reuse::NodeReuseIdentityError::SelfReuse)
+    );
+    assert_eq!(
+        crate::service::node_reuse::validate_binding_identity(20, 10, " \t "),
+        Err(crate::service::node_reuse::NodeReuseIdentityError::BlankNodeId)
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_node_reuse_schema_upgrade_is_idempotent() {
+    let Some(pool) = fresh_pool("node_reuse_upgrade").await else {
+        return;
+    };
+    sqlx::query("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (34)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE device_groups (id BIGINT PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    run_pg_migrations(&pool).await.unwrap();
+    run_pg_migrations(&pool).await.unwrap();
+
+    let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'node_reuse_bindings'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes \
+         WHERE schemaname = 'public' AND indexname = 'idx_node_reuse_bindings_home_node'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(version, 35);
+    assert_eq!(table_count, 1);
+    assert_eq!(index_count, 1);
+
+    let db = PgRepository::new(pool);
+    cleanup(&db).await;
+}
+
 fn pg_new_dns_binding(rule_id: i64, record_id: &str) -> NewDnsRecordBinding {
     NewDnsRecordBinding {
         rule_id: Some(rule_id),

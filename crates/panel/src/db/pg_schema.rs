@@ -94,6 +94,20 @@ CREATE TABLE IF NOT EXISTS device_groups (
     created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))
 );
 
+-- Node Reuse V1 Slice 1: inert runtime-reuse authorization. Concrete node
+-- identity is (home_group_id, node_id); no node FK is created because there is no
+-- persistent node master table in the current architecture.
+CREATE TABLE IF NOT EXISTS node_reuse_bindings (
+    reusing_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
+    home_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
+    node_id TEXT NOT NULL CHECK (char_length(btrim(node_id)) > 0),
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    PRIMARY KEY (reusing_group_id, home_group_id, node_id),
+    CHECK (reusing_group_id <> home_group_id)
+);
+CREATE INDEX IF NOT EXISTS idx_node_reuse_bindings_home_node
+    ON node_reuse_bindings(home_group_id, node_id);
+
 CREATE TABLE IF NOT EXISTS tunnel_profiles (
     id              BIGSERIAL PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
@@ -471,7 +485,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 34;
+pub const PG_SCHEMA_VERSION: i32 = 35;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1780,6 +1794,35 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 34: dns_record_syncs uses composite line identity");
     }
 
+    if current < 35 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS node_reuse_bindings (\
+                 reusing_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,\
+                 home_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,\
+                 node_id TEXT NOT NULL CHECK (char_length(btrim(node_id)) > 0),\
+                 created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),\
+                 PRIMARY KEY (reusing_group_id, home_group_id, node_id),\
+                 CHECK (reusing_group_id <> home_group_id)\
+             )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_node_reuse_bindings_home_node \
+             ON node_reuse_bindings(home_group_id, node_id)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (35) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 35: node_reuse_bindings foundation present");
+    }
+
     Ok(())
 }
 
@@ -1840,7 +1883,7 @@ mod tests {
 
     #[test]
     fn pg_schema_version_matches_latest_migration() {
-        assert_eq!(PG_SCHEMA_VERSION, 34);
+        assert_eq!(PG_SCHEMA_VERSION, 35);
     }
 
     #[test]
@@ -1869,6 +1912,15 @@ mod tests {
         assert!(PG_SCHEMA_SQL.contains("PRIMARY KEY (rule_id, line_key)"));
         assert!(PG_SCHEMA_SQL.contains("desired_action TEXT NOT NULL DEFAULT 'UPSERT'"));
         assert!(PG_SCHEMA_SQL.contains("desired_action = 'DELETE' OR expected_value IS NOT NULL"));
+    }
+
+    #[test]
+    fn pg_schema_contains_node_reuse_binding_foundation() {
+        assert!(PG_SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS node_reuse_bindings"));
+        assert!(PG_SCHEMA_SQL.contains("PRIMARY KEY (reusing_group_id, home_group_id, node_id)"));
+        assert!(PG_SCHEMA_SQL.contains("CHECK (reusing_group_id <> home_group_id)"));
+        assert!(PG_SCHEMA_SQL.contains("ON DELETE RESTRICT"));
+        assert!(PG_SCHEMA_SQL.contains("idx_node_reuse_bindings_home_node"));
     }
 
     #[test]

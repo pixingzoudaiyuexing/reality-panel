@@ -16,6 +16,7 @@ mod dns_record_syncs;
 mod enrollments;
 mod groups;
 mod kvs;
+mod node_reuse;
 mod orders;
 mod profiles;
 mod redeem;

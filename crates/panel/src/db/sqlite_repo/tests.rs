@@ -6169,6 +6169,187 @@ async fn dns_record_sync_composite_identity_isolates_update_delete_cas_and_due_r
         .is_some());
 }
 
+#[tokio::test]
+async fn node_reuse_binding_repository_contract() {
+    let db = repo().await;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for gid in [10, 20, 30, 40] {
+        seed_group(&db, gid).await;
+    }
+
+    // One concrete node may be reused by multiple Groups, and one Reusing Group
+    // may bind multiple concrete nodes without widening to sibling nodes.
+    db.insert_node_reuse_binding(20, 10, "node-a")
+        .await
+        .unwrap();
+    db.insert_node_reuse_binding(30, 10, "node-a")
+        .await
+        .unwrap();
+    db.insert_node_reuse_binding(20, 10, "node-b")
+        .await
+        .unwrap();
+    db.insert_node_reuse_binding(20, 40, "offline-node")
+        .await
+        .unwrap();
+
+    let binding = db
+        .find_node_reuse_binding(20, 10, "node-a")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.reusing_group_id, 20);
+    assert_eq!(binding.home_group_id, 10);
+    assert_eq!(binding.node_id, "node-a");
+    assert!(!binding.created_at.is_empty());
+
+    assert_eq!(
+        db.list_reusing_group_ids_for_node(10, "node-a")
+            .await
+            .unwrap(),
+        vec![20, 30]
+    );
+    assert_eq!(
+        crate::service::node_reuse::effective_source_groups(&db, 10, "node-a")
+            .await
+            .unwrap(),
+        vec![10, 20, 30]
+    );
+
+    let expected = vec![
+        ConcreteNodeIdentity {
+            home_group_id: 10,
+            node_id: "node-a".into(),
+        },
+        ConcreteNodeIdentity {
+            home_group_id: 10,
+            node_id: "node-b".into(),
+        },
+        ConcreteNodeIdentity {
+            home_group_id: 40,
+            node_id: "offline-node".into(),
+        },
+    ];
+    assert_eq!(
+        db.list_reused_concrete_nodes_for_group(20)
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        crate::service::node_reuse::reused_concrete_nodes_for_group(&db, 20)
+            .await
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        db.count_node_reuse_bindings_for_home_group(10)
+            .await
+            .unwrap(),
+        3
+    );
+
+    assert_eq!(
+        db.delete_node_reuse_binding(20, 10, "node-a")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.delete_node_reuse_binding(20, 10, "node-a")
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(db
+        .find_node_reuse_binding(30, 10, "node-a")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn node_reuse_schema_constraints_and_fk_restrict() {
+    let db = repo().await;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    seed_group(&db, 10).await;
+    seed_group(&db, 20).await;
+
+    db.insert_node_reuse_binding(20, 10, "node-a")
+        .await
+        .unwrap();
+    assert!(db
+        .insert_node_reuse_binding(20, 10, "node-a")
+        .await
+        .is_err());
+    assert!(db
+        .insert_node_reuse_binding(10, 10, "node-self")
+        .await
+        .is_err());
+    assert!(db.insert_node_reuse_binding(20, 10, "   ").await.is_err());
+    assert!(matches!(
+        db.insert_node_reuse_binding(999, 10, "node-x").await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+    assert!(matches!(
+        db.insert_node_reuse_binding(20, 999, "node-x").await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+
+    // Conservative RESTRICT semantics keep both Home and Reusing Groups from
+    // being silently deleted while a binding exists. Service orchestration is a
+    // later slice; Slice 1 only proves the storage backstop.
+    assert!(matches!(
+        db.delete_group(10, &ResourceScope::All).await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+    assert!(matches!(
+        db.delete_group(20, &ResourceScope::All).await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+
+    assert_eq!(
+        crate::service::node_reuse::validate_binding_identity(10, 10, "node-a"),
+        Err(crate::service::node_reuse::NodeReuseIdentityError::SelfReuse)
+    );
+    assert_eq!(
+        crate::service::node_reuse::validate_binding_identity(20, 10, " \t "),
+        Err(crate::service::node_reuse::NodeReuseIdentityError::BlankNodeId)
+    );
+}
+
+#[tokio::test]
+async fn node_reuse_schema_upgrade_is_idempotent() {
+    let db = repo().await;
+    sqlx::query("DROP TABLE node_reuse_bindings")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    crate::db::schema::run_migrations(&db.pool).await.unwrap();
+    crate::db::schema::run_migrations(&db.pool).await.unwrap();
+
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_reuse_bindings'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_node_reuse_bindings_home_node'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(table_count, 1);
+    assert_eq!(index_count, 1);
+}
+
 fn new_dns_binding(rule_id: i64, record_id: &str) -> NewDnsRecordBinding {
     NewDnsRecordBinding {
         rule_id: Some(rule_id),

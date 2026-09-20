@@ -1,23 +1,15 @@
 # Reality Panel — Roadmap
 
-## Current stage: Workflow Adoption
+## Current stage: Node Reuse V1 — phased implementation
 
-Goal:
-- adopt AI Development Workflow v1 at pinned revision `ac2cdce29c7593f0e0c193a042d9854aaeb79b7d`;
-- establish minimal Tier 3 project documentation;
-- record verified current architecture and safety boundaries;
-- repair current-stable-version README drift;
-- return evidence to the Primary for Adoption Acceptance.
+Workflow Adoption is complete. The project is now implementing Node Reuse V1 in independently reviewable slices under the approved boundary in `docs/adr/0001-node-reuse-v1.md`.
 
-This stage does not implement Node Reuse.
+Current Slice 1 scope is intentionally inert:
+- persist explicit `(reusing_group_id, home_group_id, node_id)` reuse bindings;
+- provide dual-backend Repository queries and deterministic resolver helpers;
+- do not connect those bindings to config generation, traffic, certificates, routing, lifecycle, public APIs, frontend, release, or production runtime.
 
-## Next target: Node Reuse V1
-
-Status: approved architecture direction, not yet implemented.
-
-The next implementation phase may begin only after the Primary completes Adoption Acceptance and explicitly declares the project ready.
-
-See `docs/adr/0001-node-reuse-v1.md`.
+Later Node Reuse slices remain not implemented until separately authorized and reviewed.
 
 ## Explicitly deferred / excluded from Node Reuse V1
 

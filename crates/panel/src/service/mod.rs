@@ -7,6 +7,7 @@ pub mod dnsmgr;
 pub mod groups;
 pub mod history_prune;
 pub mod node_config;
+pub mod node_reuse;
 pub mod node_watch;
 pub mod notify;
 pub mod panel_certificate;

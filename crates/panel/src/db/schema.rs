@@ -97,6 +97,20 @@ CREATE TABLE IF NOT EXISTS device_groups (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Node Reuse V1 Slice 1: inert runtime-reuse authorization. A concrete node is
+-- identified by its Home Group plus persistent node_id; there is intentionally no
+-- node FK because the current architecture has no persistent node master table.
+CREATE TABLE IF NOT EXISTS node_reuse_bindings (
+    reusing_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
+    home_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
+    node_id TEXT NOT NULL CHECK (length(trim(node_id)) > 0),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (reusing_group_id, home_group_id, node_id),
+    CHECK (reusing_group_id <> home_group_id)
+);
+CREATE INDEX IF NOT EXISTS idx_node_reuse_bindings_home_node
+    ON node_reuse_bindings(home_group_id, node_id);
+
 -- v0.3.0: reusable tunnel profiles describing how traffic flows between an
 -- inbound node and an outbound node (NOT the user-facing entry protocol, which
 -- lives on forward_rules.entry_transport). Seed rows are is_builtin=1.
@@ -2181,6 +2195,29 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         tx.commit().await?;
     }
     tracing::info!("Migration 50: dns_record_syncs uses (rule_id, line_key) identity");
+
+    // ── Migration 51: Node Reuse V1 inert binding foundation ──
+    // No node FK exists by design: concrete node identity is (home_group_id, node_id),
+    // while both group references remain protected by RESTRICT semantics.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS node_reuse_bindings (\
+             reusing_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,\
+             home_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,\
+             node_id TEXT NOT NULL CHECK (length(trim(node_id)) > 0),\
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),\
+             PRIMARY KEY (reusing_group_id, home_group_id, node_id),\
+             CHECK (reusing_group_id <> home_group_id)\
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_node_reuse_bindings_home_node \
+         ON node_reuse_bindings(home_group_id, node_id)",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 51: node_reuse_bindings foundation present");
 
     Ok(())
 }
