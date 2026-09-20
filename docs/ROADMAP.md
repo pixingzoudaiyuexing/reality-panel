@@ -3,7 +3,7 @@
 ## Current stage: Workflow Adoption
 
 Goal:
-- adopt AI Development Workflow v1 at pinned revision `cae0265daade205928db534d8cb0516a1f1b5ea1`;
+- adopt AI Development Workflow v1 at pinned revision `ac2cdce29c7593f0e0c193a042d9854aaeb79b7d`;
 - establish minimal Tier 3 project documentation;
 - record verified current architecture and safety boundaries;
 - repair current-stable-version README drift;
