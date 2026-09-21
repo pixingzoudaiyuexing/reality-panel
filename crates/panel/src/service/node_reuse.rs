@@ -7,6 +7,10 @@
 use crate::db::error::DbError;
 use crate::db::repo::{ConcreteNodeIdentity, Repository};
 
+#[allow(
+    dead_code,
+    reason = "Node Reuse V1 Slice 1 inert foundation; reserved for a later reviewed activation slice"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeReuseIdentityError {
     SelfReuse,
@@ -15,6 +19,10 @@ pub enum NodeReuseIdentityError {
 
 /// Pure validation suitable for a future management/API activation layer. Group
 /// existence/type and concrete-node existence cannot be proven by this helper.
+#[allow(
+    dead_code,
+    reason = "Node Reuse V1 Slice 1 inert foundation; reserved for a later reviewed activation slice"
+)]
 pub fn validate_binding_identity(
     reusing_group_id: i64,
     home_group_id: i64,
@@ -33,6 +41,10 @@ pub fn validate_binding_identity(
 /// ascending order. Stored bindings are unique, but sorting/deduping here keeps
 /// the resolver contract deterministic even if a future repository changes its
 /// physical query plan.
+#[allow(
+    dead_code,
+    reason = "Node Reuse V1 Slice 1 inert foundation; reserved for a later reviewed activation slice"
+)]
 pub async fn effective_source_groups(
     db: &dyn Repository,
     home_group_id: i64,
@@ -53,6 +65,10 @@ pub async fn effective_source_groups(
 
 /// Stable reverse resolver for the concrete nodes explicitly authorized for one
 /// reusing/source Group. Each item retains its Home Group namespace.
+#[allow(
+    dead_code,
+    reason = "Node Reuse V1 Slice 1 inert foundation; reserved for a later reviewed activation slice"
+)]
 pub async fn reused_concrete_nodes_for_group(
     db: &dyn Repository,
     reusing_group_id: i64,
