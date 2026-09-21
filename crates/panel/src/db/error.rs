@@ -21,7 +21,8 @@ pub enum DbError {
     /// Detected by the in-transaction conflict pre-check; the partial unique
     /// indexes on forward_rules are the DB-layer backstop.
     PortConflict,
-    /// FOREIGN KEY constraint violation. SQLite code "787", PostgreSQL "23503".
+    /// FOREIGN KEY constraint violation. SQLite code "787" (and "1811" for
+    /// RESTRICT surfaced as SQLITE_CONSTRAINT_TRIGGER), PostgreSQL "23503".
     ForeignKeyViolation,
     /// A required row was not found (for fetch_one-or-None patterns that are
     /// expected to succeed).
@@ -61,8 +62,14 @@ impl From<sqlx::Error> for DbError {
                 Some("2067") => return DbError::UniqueViolation,
                 // PostgreSQL SQLSTATE 23505 (unique_violation)
                 Some("23505") => return DbError::UniqueViolation,
-                // SQLite SQLITE_CONSTRAINT_FOREIGNKEY
+                // SQLite SQLITE_CONSTRAINT_FOREIGNKEY.
                 Some("787") => return DbError::ForeignKeyViolation,
+                // SQLite ON DELETE/UPDATE RESTRICT can be surfaced by SQLite as
+                // SQLITE_CONSTRAINT_TRIGGER (1811). Keep the mapping narrow so
+                // unrelated trigger failures remain DbError::Other.
+                Some("1811") if db_err.message() == "FOREIGN KEY constraint failed" => {
+                    return DbError::ForeignKeyViolation;
+                }
                 // PostgreSQL SQLSTATE 23503 (foreign_key_violation)
                 Some("23503") => return DbError::ForeignKeyViolation,
                 _ => {}

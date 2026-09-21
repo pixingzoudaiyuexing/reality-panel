@@ -450,13 +450,26 @@ async fn pg_migration_34_preserves_rc8_sync_and_enables_composite_identity() {
     }
 
     run_pg_migrations(&pool).await.unwrap();
+    let migration_versions: Vec<i32> = sqlx::query_scalar(
+        "SELECT version FROM schema_version WHERE version IN (34, 35) ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(migration_versions, vec![34, 35]);
     assert_eq!(
         sqlx::query_scalar::<_, i32>("SELECT MAX(version) FROM schema_version")
             .fetch_one(&pool)
             .await
             .unwrap(),
-        34
+        crate::db::pg_schema::PG_SCHEMA_VERSION
     );
+    let node_reuse_table_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('node_reuse_bindings') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(node_reuse_table_exists);
     let preserved: DnsRecordSync = sqlx::query_as(
         "SELECT * FROM dns_record_syncs WHERE rule_id = 100 AND line_key = 'default'",
     )
@@ -6493,6 +6506,38 @@ async fn pg_node_reuse_schema_constraints_and_fk_restrict() {
         db.delete_group(20, &ResourceScope::All).await,
         Err(DbError::ForeignKeyViolation)
     ));
+    let remaining_groups: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM device_groups WHERE id IN (10, 20)")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let remaining_bindings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_reuse_bindings")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining_groups, 2);
+    assert_eq!(remaining_bindings, 1);
+
+    assert_eq!(
+        db.delete_node_reuse_binding(20, 10, "node-a")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(db.delete_group(10, &ResourceScope::All).await.unwrap(), 1);
+    assert_eq!(db.delete_group(20, &ResourceScope::All).await.unwrap(), 1);
+    let final_groups: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM device_groups WHERE id IN (10, 20)")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let final_bindings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_reuse_bindings")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(final_groups, 0);
+    assert_eq!(final_bindings, 0);
+
     assert_eq!(
         crate::service::node_reuse::validate_binding_identity(10, 10, "node-a"),
         Err(crate::service::node_reuse::NodeReuseIdentityError::SelfReuse)

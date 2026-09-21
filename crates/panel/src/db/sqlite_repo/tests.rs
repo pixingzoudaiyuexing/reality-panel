@@ -6299,9 +6299,40 @@ async fn node_reuse_schema_constraints_and_fk_restrict() {
         Err(DbError::ForeignKeyViolation)
     ));
 
-    // Conservative RESTRICT semantics keep both Home and Reusing Groups from
-    // being silently deleted while a binding exists. Service orchestration is a
-    // later slice; Slice 1 only proves the storage backstop.
+    // The contract test pool has one connection, so this verifies the exact
+    // connection later used by delete_group. Production init_db separately turns
+    // foreign_keys on for every serving-pool connection.
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys, 1);
+
+    let mut fk_contract: Vec<(String, String, String)> = sqlx::query_as(
+        r#"SELECT "from", "table", on_delete
+           FROM pragma_foreign_key_list('node_reuse_bindings')"#,
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    fk_contract.sort();
+    assert_eq!(
+        fk_contract,
+        vec![
+            (
+                "home_group_id".to_string(),
+                "device_groups".to_string(),
+                "RESTRICT".to_string()
+            ),
+            (
+                "reusing_group_id".to_string(),
+                "device_groups".to_string(),
+                "RESTRICT".to_string()
+            ),
+        ]
+    );
+
+    // Conservative RESTRICT semantics protect both sides of the binding.
     assert!(matches!(
         db.delete_group(10, &ResourceScope::All).await,
         Err(DbError::ForeignKeyViolation)
@@ -6310,6 +6341,48 @@ async fn node_reuse_schema_constraints_and_fk_restrict() {
         db.delete_group(20, &ResourceScope::All).await,
         Err(DbError::ForeignKeyViolation)
     ));
+
+    // Failed deletes must preserve both Groups and the binding, without leaving
+    // any latent FK corruption.
+    let remaining_groups: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM device_groups WHERE id IN (10, 20)")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let remaining_bindings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_reuse_bindings")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let fk_check_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check('node_reuse_bindings')")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining_groups, 2);
+    assert_eq!(remaining_bindings, 1);
+    assert_eq!(fk_check_count, 0);
+
+    // Once the explicit authorization is removed, ordinary Group deletion is no
+    // longer blocked by Node Reuse storage.
+    assert_eq!(
+        db.delete_node_reuse_binding(20, 10, "node-a")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(db.delete_group(10, &ResourceScope::All).await.unwrap(), 1);
+    assert_eq!(db.delete_group(20, &ResourceScope::All).await.unwrap(), 1);
+    let final_groups: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM device_groups WHERE id IN (10, 20)")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let final_bindings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_reuse_bindings")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(final_groups, 0);
+    assert_eq!(final_bindings, 0);
 
     assert_eq!(
         crate::service::node_reuse::validate_binding_identity(10, 10, "node-a"),
