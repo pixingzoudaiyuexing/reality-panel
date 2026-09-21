@@ -75,12 +75,12 @@ impl NodeReuseRepository for SqliteRepository {
         &self,
         home_group_id: i64,
     ) -> Result<i64, DbError> {
-        Ok(sqlx::query_scalar(
-            "SELECT COUNT(*) FROM node_reuse_bindings WHERE home_group_id = ?",
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM node_reuse_bindings WHERE home_group_id = ?")
+                .bind(home_group_id)
+                .fetch_one(&self.pool)
+                .await?,
         )
-        .bind(home_group_id)
-        .fetch_one(&self.pool)
-        .await?)
     }
 
     async fn delete_node_reuse_binding(

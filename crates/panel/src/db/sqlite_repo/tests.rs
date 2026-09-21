@@ -6233,9 +6233,7 @@ async fn node_reuse_binding_repository_contract() {
         },
     ];
     assert_eq!(
-        db.list_reused_concrete_nodes_for_group(20)
-            .await
-            .unwrap(),
+        db.list_reused_concrete_nodes_for_group(20).await.unwrap(),
         expected
     );
     assert_eq!(
