@@ -4,7 +4,7 @@
 
 - Workflow source: https://github.com/pixingzoudaiyuexing/ai-development-workflow
 - Workflow version: `v1`
-- Workflow revision: `ac2cdce29c7593f0e0c193a042d9854aaeb79b7d`
+- Workflow revision: `69a4def98c9bf473936cdebe325dd828704d97dc`
 - Project tier: Tier 3
 - Project: Reality Panel
 
