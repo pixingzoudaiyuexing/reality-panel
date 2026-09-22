@@ -639,7 +639,7 @@ pub trait NodeReuseRepository: Send + Sync {
 ///
 /// A row is NOT proof that the Node has been claimed, authenticated, or granted
 /// Node Reuse authority. S2-A1 deliberately adds no issuance or verification path.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct NodeCredentialRecord {
     /// Public lookup identifier for the verifier record. This is not a bearer secret.
     pub credential_id: String,
@@ -662,7 +662,7 @@ pub struct NodeCredentialRecord {
 ///
 /// The strict Node Reuse identity type makes normalization impossible at this
 /// Repository boundary; legacy Home-only node-id paths remain unchanged.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NewNodeCredentialRecord {
     pub credential_id: String,
     pub home_group_id: i64,
@@ -671,6 +671,104 @@ pub struct NewNodeCredentialRecord {
     pub verifier_format: String,
     pub verifier_version: i64,
     pub verifier_data: Vec<u8>,
+}
+
+struct RedactedVerifierData;
+
+impl std::fmt::Debug for RedactedVerifierData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::fmt::Debug for NodeCredentialRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCredentialRecord")
+            .field("credential_id", &self.credential_id)
+            .field("home_group_id", &self.home_group_id)
+            .field("node_id", &self.node_id)
+            .field("generation", &self.generation)
+            .field("verifier_format", &self.verifier_format)
+            .field("verifier_version", &self.verifier_version)
+            .field("verifier_data", &RedactedVerifierData)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("revoked_at", &self.revoked_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for NewNodeCredentialRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewNodeCredentialRecord")
+            .field("credential_id", &self.credential_id)
+            .field("home_group_id", &self.home_group_id)
+            .field("node_id", &self.node_id)
+            .field("generation", &self.generation)
+            .field("verifier_format", &self.verifier_format)
+            .field("verifier_version", &self.verifier_version)
+            .field("verifier_data", &RedactedVerifierData)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod node_credential_debug_tests {
+    use super::*;
+
+    const VERIFIER_BYTES: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+
+    fn assert_verifier_is_redacted(debug: &str) {
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("[1, 35, 69, 103, 137, 171, 205, 239]"));
+        assert!(!debug.contains("0123456789abcdef"));
+        assert!(!debug.contains("ASNFZ4mrze8="));
+    }
+
+    #[test]
+    fn node_credential_record_debug_redacts_verifier_data() {
+        let record = NodeCredentialRecord {
+            credential_id: "cred-debug-record".into(),
+            home_group_id: 42,
+            node_id: "Node_A".into(),
+            generation: 7,
+            verifier_format: "test-format".into(),
+            verifier_version: 3,
+            verifier_data: VERIFIER_BYTES.to_vec(),
+            created_at: "2026-09-23 00:00:00".into(),
+            updated_at: "2026-09-23 00:01:00".into(),
+            revoked_at: None,
+        };
+
+        let debug = format!("{record:?}");
+        assert_verifier_is_redacted(&debug);
+        assert!(debug.contains("cred-debug-record"));
+        assert!(debug.contains("Node_A"));
+        assert!(debug.contains("home_group_id: 42"));
+        assert!(debug.contains("test-format"));
+        assert!(debug.contains("verifier_version: 3"));
+    }
+
+    #[test]
+    fn new_node_credential_record_debug_redacts_verifier_data() {
+        let record = NewNodeCredentialRecord {
+            credential_id: "cred-debug-new".into(),
+            home_group_id: 84,
+            node_id: ReuseEligibleNodeId::parse("Node_B").unwrap(),
+            generation: 9,
+            verifier_format: "test-format-new".into(),
+            verifier_version: 4,
+            verifier_data: VERIFIER_BYTES.to_vec(),
+        };
+
+        let debug = format!("{record:?}");
+        assert_verifier_is_redacted(&debug);
+        assert!(debug.contains("cred-debug-new"));
+        assert!(debug.contains("Node_B"));
+        assert!(debug.contains("home_group_id: 84"));
+        assert!(debug.contains("test-format-new"));
+        assert!(debug.contains("verifier_version: 4"));
+    }
 }
 
 #[async_trait]
