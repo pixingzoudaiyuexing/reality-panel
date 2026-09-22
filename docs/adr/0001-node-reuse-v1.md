@@ -1,6 +1,6 @@
 # ADR 0001 — Node Reuse V1
 
-Status: **APPROVED / NOT YET IMPLEMENTED**
+Status: **APPROVED / PHASED IMPLEMENTATION**
 
 ## Context
 
@@ -93,6 +93,8 @@ The existing relay-node persistent node ID remains the node identity mechanism.
 
 ## Implementation status
 
-No database field, API, wire protocol, migration, or runtime merge implementation is specified by this ADR.
+Slice 1 is merged as an inert foundation: explicit concrete-node reuse bindings, dual-backend Repository access, and pure resolver helpers. It does not activate runtime reuse.
 
-Those details are intentionally deferred to the later Node Reuse V1 implementation task after Adoption Acceptance.
+S2-A1 adds another inert foundation: a strict Node-Reuse-only node-id type plus an algorithm-neutral concrete-node credential verifier registry. A credential row is not proof that a Node has been claimed, authenticated, or granted Reuse authority.
+
+Credential issuance/claim/verification, management APIs, wire-protocol changes, EffectiveConfig merge, traffic/billing, certificate scope, routing, LKG/revocation behavior, and production activation remain deferred to separately authorized and reviewed tasks.

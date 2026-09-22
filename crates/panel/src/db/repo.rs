@@ -30,6 +30,8 @@ use relay_shared::models::{
 use relay_shared::protocol::{RuleTargetRequest, TrafficEntry};
 use serde::Serialize;
 
+use crate::node_identity::ReuseEligibleNodeId;
+
 use super::error::DbError;
 
 // ── Resource scoping (v0.4.10 multi-user isolation) ──
@@ -629,6 +631,65 @@ pub trait NodeReuseRepository: Send + Sync {
         home_group_id: i64,
         node_id: &str,
     ) -> Result<u64, DbError>;
+}
+
+// ── Node Reuse V1 concrete-node credential registry ──
+
+/// Inert storage record for verifier material associated with one concrete Node.
+///
+/// A row is NOT proof that the Node has been claimed, authenticated, or granted
+/// Node Reuse authority. S2-A1 deliberately adds no issuance or verification path.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct NodeCredentialRecord {
+    /// Public lookup identifier for the verifier record. This is not a bearer secret.
+    pub credential_id: String,
+    pub home_group_id: i64,
+    pub node_id: String,
+    /// Monotonic per-(Home Group, node id) slot reserved for future rotation.
+    pub generation: i64,
+    /// Scheme/encoding label only. S2-A1 does not define an authentication algorithm.
+    pub verifier_format: String,
+    pub verifier_version: i64,
+    /// Opaque verifier bytes. Callers must never pass a plaintext bearer secret here.
+    pub verifier_data: Vec<u8>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Reserved storage state for a later reviewed revocation flow.
+    pub revoked_at: Option<String>,
+}
+
+/// Write shape for the inert verifier registry.
+///
+/// The strict Node Reuse identity type makes normalization impossible at this
+/// Repository boundary; legacy Home-only node-id paths remain unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewNodeCredentialRecord {
+    pub credential_id: String,
+    pub home_group_id: i64,
+    pub node_id: ReuseEligibleNodeId,
+    pub generation: i64,
+    pub verifier_format: String,
+    pub verifier_version: i64,
+    pub verifier_data: Vec<u8>,
+}
+
+#[async_trait]
+pub trait NodeCredentialRepository: Send + Sync {
+    async fn insert_node_credential(
+        &self,
+        credential: &NewNodeCredentialRecord,
+    ) -> Result<(), DbError>;
+
+    async fn find_node_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<NodeCredentialRecord>, DbError>;
+
+    async fn list_node_credentials_for_identity(
+        &self,
+        home_group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+    ) -> Result<Vec<NodeCredentialRecord>, DbError>;
 }
 
 // ── Manual bootstrap enrollments ──
@@ -1734,6 +1795,7 @@ pub trait Repository:
     + DnsRecordBindingRepository
     + DnsRecordSyncRepository
     + NodeReuseRepository
+    + NodeCredentialRepository
     + Send
     + Sync
 {
