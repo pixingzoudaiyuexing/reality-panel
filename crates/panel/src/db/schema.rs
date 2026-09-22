@@ -111,6 +111,27 @@ CREATE TABLE IF NOT EXISTS node_reuse_bindings (
 CREATE INDEX IF NOT EXISTS idx_node_reuse_bindings_home_node
     ON node_reuse_bindings(home_group_id, node_id);
 
+-- Node Reuse V1 S2-A1: inert concrete-node credential verifier registry.
+-- credential_id is a public locator, not a bearer secret. verifier_data is opaque
+-- verifier material whose cryptographic construction is intentionally deferred.
+CREATE TABLE IF NOT EXISTS node_credentials (
+    credential_id TEXT PRIMARY KEY CHECK (length(credential_id) BETWEEN 1 AND 128),
+    home_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
+    node_id TEXT NOT NULL CHECK (
+        length(node_id) BETWEEN 1 AND 128
+        AND length(CAST(node_id AS BLOB)) = length(node_id)
+        AND node_id NOT GLOB '*[^A-Za-z0-9_-]*'
+    ),
+    generation INTEGER NOT NULL CHECK (generation >= 1),
+    verifier_format TEXT NOT NULL CHECK (length(verifier_format) BETWEEN 1 AND 128),
+    verifier_version INTEGER NOT NULL CHECK (verifier_version >= 1),
+    verifier_data BLOB NOT NULL CHECK (length(verifier_data) > 0),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    revoked_at TEXT,
+    UNIQUE (home_group_id, node_id, generation)
+);
+
 -- v0.3.0: reusable tunnel profiles describing how traffic flows between an
 -- inbound node and an outbound node (NOT the user-facing entry protocol, which
 -- lives on forward_rules.entry_transport). Seed rows are is_builtin=1.
@@ -2218,6 +2239,33 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .execute(pool)
     .await?;
     tracing::info!("Migration 51: node_reuse_bindings foundation present");
+
+    // ── Migration 52: Node Reuse V1 inert credential registry ──
+    // The verifier bytes have no authentication meaning in this slice. The
+    // strict Node Reuse id grammar is duplicated here only as a storage backstop;
+    // application writes use ReuseEligibleNodeId before reaching this table.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS node_credentials (\
+             credential_id TEXT PRIMARY KEY CHECK (length(credential_id) BETWEEN 1 AND 128),\
+             home_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,\
+             node_id TEXT NOT NULL CHECK (\
+                 length(node_id) BETWEEN 1 AND 128 \
+                 AND length(CAST(node_id AS BLOB)) = length(node_id) \
+                 AND node_id NOT GLOB '*[^A-Za-z0-9_-]*'\
+             ),\
+             generation INTEGER NOT NULL CHECK (generation >= 1),\
+             verifier_format TEXT NOT NULL CHECK (length(verifier_format) BETWEEN 1 AND 128),\
+             verifier_version INTEGER NOT NULL CHECK (verifier_version >= 1),\
+             verifier_data BLOB NOT NULL CHECK (length(verifier_data) > 0),\
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),\
+             updated_at TEXT NOT NULL DEFAULT (datetime('now')),\
+             revoked_at TEXT,\
+             UNIQUE (home_group_id, node_id, generation)\
+         )",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 52: node_credentials inert registry present");
 
     Ok(())
 }

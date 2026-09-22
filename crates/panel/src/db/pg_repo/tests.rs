@@ -6544,7 +6544,11 @@ async fn pg_node_reuse_schema_constraints_and_fk_restrict() {
     );
     assert_eq!(
         crate::service::node_reuse::validate_binding_identity(20, 10, " \t "),
-        Err(crate::service::node_reuse::NodeReuseIdentityError::BlankNodeId)
+        Err(
+            crate::service::node_reuse::NodeReuseIdentityError::InvalidNodeId(
+                crate::node_identity::ReuseEligibleNodeIdError::InvalidCharacter
+            )
+        )
     );
     cleanup(&db).await;
 }
@@ -6588,9 +6592,225 @@ async fn pg_node_reuse_schema_upgrade_is_idempotent() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(version, 35);
+    assert_eq!(version, crate::db::pg_schema::PG_SCHEMA_VERSION);
     assert_eq!(table_count, 1);
     assert_eq!(index_count, 1);
+
+    let db = PgRepository::new(pool);
+    cleanup(&db).await;
+}
+
+fn pg_test_node_credential(
+    credential_id: &str,
+    home_group_id: i64,
+    node_id: &str,
+    generation: i64,
+) -> NewNodeCredentialRecord {
+    NewNodeCredentialRecord {
+        credential_id: credential_id.into(),
+        home_group_id,
+        node_id: crate::node_identity::ReuseEligibleNodeId::parse(node_id).unwrap(),
+        generation,
+        verifier_format: "test-only-opaque".into(),
+        verifier_version: 1,
+        // Storage-only fixture bytes. They are not a generated bearer secret and
+        // this test exercises no verifier computation or authentication path.
+        verifier_data: vec![0xA5; 32],
+    }
+}
+
+#[tokio::test]
+async fn pg_node_credential_repository_contract() {
+    let Some(db) = repo("node_credential_contract").await else {
+        return;
+    };
+    seed_group(&db, 10).await;
+    seed_group(&db, 20).await;
+
+    db.insert_node_credential(&pg_test_node_credential("cred-10-1", 10, "AAA", 1))
+        .await
+        .unwrap();
+    db.insert_node_credential(&pg_test_node_credential("cred-20-1", 20, "AAA", 1))
+        .await
+        .unwrap();
+    db.insert_node_credential(&pg_test_node_credential("cred-10-2", 10, "AAA", 2))
+        .await
+        .unwrap();
+
+    let record = db.find_node_credential("cred-10-1").await.unwrap().unwrap();
+    assert_eq!(record.home_group_id, 10);
+    assert_eq!(record.node_id, "AAA");
+    assert_eq!(record.generation, 1);
+    assert_eq!(record.verifier_format, "test-only-opaque");
+    assert_eq!(record.verifier_version, 1);
+    assert_eq!(record.verifier_data, vec![0xA5; 32]);
+    assert_ne!(record.verifier_data, b"plaintext-bearer-secret");
+    assert!(record.revoked_at.is_none());
+
+    let node_id = crate::node_identity::ReuseEligibleNodeId::parse("AAA").unwrap();
+    assert_eq!(
+        db.list_node_credentials_for_identity(10, &node_id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| (row.credential_id.as_str(), row.generation))
+            .collect::<Vec<_>>(),
+        vec![("cred-10-1", 1), ("cred-10-2", 2)]
+    );
+    assert_eq!(
+        db.list_node_credentials_for_identity(20, &node_id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| (row.credential_id.as_str(), row.generation))
+            .collect::<Vec<_>>(),
+        vec![("cred-20-1", 1)]
+    );
+
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'node_credentials'",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(!columns
+        .iter()
+        .any(|name| name.contains("secret") || name.contains("token")));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_node_credential_schema_constraints_and_fk_restrict() {
+    let Some(db) = repo("node_credential_constraints").await else {
+        return;
+    };
+    seed_group(&db, 10).await;
+
+    db.insert_node_credential(&pg_test_node_credential(
+        "cred-a",
+        10,
+        "my-fixed-id-12345",
+        1,
+    ))
+    .await
+    .unwrap();
+
+    assert!(db
+        .insert_node_credential(&pg_test_node_credential(
+            "cred-b",
+            10,
+            "my-fixed-id-12345",
+            1,
+        ))
+        .await
+        .is_err());
+    assert!(db
+        .insert_node_credential(&pg_test_node_credential("cred-a", 10, "BBB", 2))
+        .await
+        .is_err());
+    assert!(matches!(
+        db.insert_node_credential(&pg_test_node_credential("cred-missing", 999, "AAA", 1))
+            .await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+    assert!(matches!(
+        db.delete_group(10, &ResourceScope::All).await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+
+    for (index, invalid) in [
+        " node",
+        "node ",
+        "my node",
+        "my\tnode",
+        "node\u{00a0}",
+        "节点",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = sqlx::query(
+            "INSERT INTO node_credentials \
+             (credential_id, home_group_id, node_id, generation, verifier_format, verifier_version, verifier_data) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(format!("invalid-{index}"))
+        .bind(10_i64)
+        .bind(invalid)
+        .bind(index as i64 + 10)
+        .bind("test-only-opaque")
+        .bind(1_i64)
+        .bind(vec![1_u8])
+        .execute(&db.pool)
+        .await;
+        assert!(result.is_err(), "DB accepted invalid node id {invalid:?}");
+    }
+
+    let overlong = "a".repeat(129);
+    assert!(sqlx::query(
+        "INSERT INTO node_credentials \
+         (credential_id, home_group_id, node_id, generation, verifier_format, verifier_version, verifier_data) \
+         VALUES ('invalid-long', $1, $2, 99, 'test-only-opaque', 1, $3)",
+    )
+    .bind(10_i64)
+    .bind(&overlong)
+    .bind(vec![1_u8])
+    .execute(&db.pool)
+    .await
+    .is_err());
+
+    let mut bad_generation = pg_test_node_credential("bad-generation", 10, "BBB", 0);
+    assert!(db.insert_node_credential(&bad_generation).await.is_err());
+    bad_generation.generation = 3;
+    bad_generation.verifier_version = 0;
+    assert!(db.insert_node_credential(&bad_generation).await.is_err());
+    bad_generation.verifier_version = 1;
+    bad_generation.verifier_data.clear();
+    assert!(db.insert_node_credential(&bad_generation).await.is_err());
+
+    sqlx::query("DELETE FROM node_credentials WHERE credential_id = 'cred-a'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(db.delete_group(10, &ResourceScope::All).await.unwrap(), 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_node_credential_schema_upgrade_is_idempotent() {
+    let Some(pool) = fresh_pool("node_credential_upgrade").await else {
+        return;
+    };
+    sqlx::query("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (35)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE device_groups (id BIGINT PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    run_pg_migrations(&pool).await.unwrap();
+    run_pg_migrations(&pool).await.unwrap();
+
+    let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'node_credentials'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(version, crate::db::pg_schema::PG_SCHEMA_VERSION);
+    assert_eq!(table_count, 1);
 
     let db = PgRepository::new(pool);
     cleanup(&db).await;

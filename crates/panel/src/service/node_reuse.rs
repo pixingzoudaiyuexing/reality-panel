@@ -6,6 +6,7 @@
 
 use crate::db::error::DbError;
 use crate::db::repo::{ConcreteNodeIdentity, Repository};
+use crate::node_identity::{ReuseEligibleNodeId, ReuseEligibleNodeIdError};
 
 #[allow(
     dead_code,
@@ -14,7 +15,7 @@ use crate::db::repo::{ConcreteNodeIdentity, Repository};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeReuseIdentityError {
     SelfReuse,
-    BlankNodeId,
+    InvalidNodeId(ReuseEligibleNodeIdError),
 }
 
 /// Pure validation suitable for a future management/API activation layer. Group
@@ -31,9 +32,7 @@ pub fn validate_binding_identity(
     if reusing_group_id == home_group_id {
         return Err(NodeReuseIdentityError::SelfReuse);
     }
-    if node_id.trim().is_empty() {
-        return Err(NodeReuseIdentityError::BlankNodeId);
-    }
+    ReuseEligibleNodeId::parse(node_id).map_err(NodeReuseIdentityError::InvalidNodeId)?;
     Ok(())
 }
 

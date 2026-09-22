@@ -108,6 +108,27 @@ CREATE TABLE IF NOT EXISTS node_reuse_bindings (
 CREATE INDEX IF NOT EXISTS idx_node_reuse_bindings_home_node
     ON node_reuse_bindings(home_group_id, node_id);
 
+-- Node Reuse V1 S2-A1: inert concrete-node credential verifier registry.
+-- credential_id is a public locator, not a bearer secret. verifier_data remains
+-- algorithm-neutral opaque bytes until a later credential protocol is reviewed.
+CREATE TABLE IF NOT EXISTS node_credentials (
+    credential_id TEXT PRIMARY KEY CHECK (char_length(credential_id) BETWEEN 1 AND 128),
+    home_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
+    node_id TEXT NOT NULL CHECK (
+        char_length(node_id) BETWEEN 1 AND 128
+        AND octet_length(node_id) = char_length(node_id)
+        AND node_id !~ '[^A-Za-z0-9_-]'
+    ),
+    generation BIGINT NOT NULL CHECK (generation >= 1),
+    verifier_format TEXT NOT NULL CHECK (char_length(verifier_format) BETWEEN 1 AND 128),
+    verifier_version BIGINT NOT NULL CHECK (verifier_version >= 1),
+    verifier_data BYTEA NOT NULL CHECK (octet_length(verifier_data) > 0),
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    revoked_at TEXT,
+    UNIQUE (home_group_id, node_id, generation)
+);
+
 CREATE TABLE IF NOT EXISTS tunnel_profiles (
     id              BIGSERIAL PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
@@ -485,7 +506,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 35;
+pub const PG_SCHEMA_VERSION: i32 = 36;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1823,6 +1844,38 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 35: node_reuse_bindings foundation present");
     }
 
+    if current < 36 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS node_credentials (\
+                 credential_id TEXT PRIMARY KEY CHECK (char_length(credential_id) BETWEEN 1 AND 128),\
+                 home_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,\
+                 node_id TEXT NOT NULL CHECK (\
+                     char_length(node_id) BETWEEN 1 AND 128 \
+                     AND octet_length(node_id) = char_length(node_id) \
+                     AND node_id !~ '[^A-Za-z0-9_-]'\
+                 ),\
+                 generation BIGINT NOT NULL CHECK (generation >= 1),\
+                 verifier_format TEXT NOT NULL CHECK (char_length(verifier_format) BETWEEN 1 AND 128),\
+                 verifier_version BIGINT NOT NULL CHECK (verifier_version >= 1),\
+                 verifier_data BYTEA NOT NULL CHECK (octet_length(verifier_data) > 0),\
+                 created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),\
+                 updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),\
+                 revoked_at TEXT,\
+                 UNIQUE (home_group_id, node_id, generation)\
+             )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (36) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 36: node_credentials inert registry present");
+    }
+
     Ok(())
 }
 
@@ -1883,7 +1936,7 @@ mod tests {
 
     #[test]
     fn pg_schema_version_matches_latest_migration() {
-        assert_eq!(PG_SCHEMA_VERSION, 35);
+        assert_eq!(PG_SCHEMA_VERSION, 36);
     }
 
     #[test]
@@ -1921,6 +1974,16 @@ mod tests {
         assert!(PG_SCHEMA_SQL.contains("CHECK (reusing_group_id <> home_group_id)"));
         assert!(PG_SCHEMA_SQL.contains("ON DELETE RESTRICT"));
         assert!(PG_SCHEMA_SQL.contains("idx_node_reuse_bindings_home_node"));
+    }
+
+    #[test]
+    fn pg_schema_contains_inert_node_credential_foundation() {
+        assert!(PG_SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS node_credentials"));
+        assert!(PG_SCHEMA_SQL.contains("UNIQUE (home_group_id, node_id, generation)"));
+        assert!(PG_SCHEMA_SQL.contains("verifier_data BYTEA NOT NULL"));
+        assert!(PG_SCHEMA_SQL.contains("revoked_at TEXT"));
+        assert!(!PG_SCHEMA_SQL.contains("node_secret"));
+        assert!(!PG_SCHEMA_SQL.contains("group_token"));
     }
 
     #[test]
