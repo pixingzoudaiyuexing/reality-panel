@@ -574,6 +574,63 @@ pub trait GroupRepository: Send + Sync {
     async fn list_group_names_by_ids(&self, ids: &[i64]) -> Result<Vec<String>, DbError>;
 }
 
+// ── Node Reuse V1 bindings ──
+
+/// Stable identity for one concrete Relay in the current data model. `node_id`
+/// alone is insufficient outside its Home Group namespace.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, sqlx::FromRow)]
+pub struct ConcreteNodeIdentity {
+    pub home_group_id: i64,
+    pub node_id: String,
+}
+
+/// One explicit authorization for `reusing_group_id` to run on exactly one
+/// concrete Home-Group node. This does not transfer node ownership.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct NodeReuseBinding {
+    pub reusing_group_id: i64,
+    pub home_group_id: i64,
+    pub node_id: String,
+    pub created_at: String,
+}
+
+#[async_trait]
+pub trait NodeReuseRepository: Send + Sync {
+    async fn insert_node_reuse_binding(
+        &self,
+        reusing_group_id: i64,
+        home_group_id: i64,
+        node_id: &str,
+    ) -> Result<(), DbError>;
+    async fn find_node_reuse_binding(
+        &self,
+        reusing_group_id: i64,
+        home_group_id: i64,
+        node_id: &str,
+    ) -> Result<Option<NodeReuseBinding>, DbError>;
+    async fn list_reusing_group_ids_for_node(
+        &self,
+        home_group_id: i64,
+        node_id: &str,
+    ) -> Result<Vec<i64>, DbError>;
+    async fn list_reused_concrete_nodes_for_group(
+        &self,
+        reusing_group_id: i64,
+    ) -> Result<Vec<ConcreteNodeIdentity>, DbError>;
+    /// Conservative primitive for future Home-Group deletion guards. Slice 1
+    /// deliberately does not wire it into current group deletion behavior.
+    async fn count_node_reuse_bindings_for_home_group(
+        &self,
+        home_group_id: i64,
+    ) -> Result<i64, DbError>;
+    async fn delete_node_reuse_binding(
+        &self,
+        reusing_group_id: i64,
+        home_group_id: i64,
+        node_id: &str,
+    ) -> Result<u64, DbError>;
+}
+
 // ── Manual bootstrap enrollments ──
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -1676,6 +1733,7 @@ pub trait Repository:
     + ManualBootstrapEnrollmentRepository
     + DnsRecordBindingRepository
     + DnsRecordSyncRepository
+    + NodeReuseRepository
     + Send
     + Sync
 {
