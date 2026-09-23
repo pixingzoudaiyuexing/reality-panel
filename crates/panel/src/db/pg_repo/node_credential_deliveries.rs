@@ -606,11 +606,11 @@ impl NodeCredentialDeliveryRepository for PgRepository {
         }
         let applied =
             expire_prepared_tx(&mut tx, claim_id, home_group_id, node_id.as_str(), &now).await?;
+        if !applied {
+            tx.rollback().await?;
+            return Ok(NodeCredentialDeliveryMutationResult::Rejected);
+        }
         tx.commit().await?;
-        Ok(if applied {
-            NodeCredentialDeliveryMutationResult::Applied
-        } else {
-            NodeCredentialDeliveryMutationResult::Rejected
-        })
+        Ok(NodeCredentialDeliveryMutationResult::Applied)
     }
 }

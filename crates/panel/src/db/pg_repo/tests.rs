@@ -7984,6 +7984,493 @@ async fn pg_node_credential_delivery_history_cancel_and_independent_expiry_contr
 }
 
 #[tokio::test]
+async fn pg_node_credential_delivery_expiry_rejects_partial_commit_and_terminal_noops() {
+    let Some(db) = repo("node_credential_delivery_expiry_atomicity").await else {
+        return;
+    };
+    for group in [68_i64, 69, 70, 71, 72] {
+        seed_group(&db, group).await;
+    }
+    let t0 = pg_claim_test_time("2026-09-23T23:00:00Z");
+
+    // Construct a schema-valid cross-table mismatch only inside this isolated test DB:
+    // Claim is terminal CANCELLED while its Delivery remains PREPARED. The production
+    // expiry method must roll back the Delivery UPDATE when the Claim UPDATE matches 0 rows.
+    let (claim, secret) = pg_test_node_claim(
+        "claim-expire-rollback",
+        68,
+        "B2A_EXPIRE_ROLLBACK",
+        0xc0,
+        1,
+        t0,
+        600,
+    );
+    db.create_node_credential_claim(&claim).await.unwrap();
+    db.claim_node_credential(&pg_test_claim_attempt(
+        "claim-expire-rollback",
+        68,
+        "B2A_EXPIRE_ROLLBACK",
+        secret.clone(),
+        0xc1,
+        t0 + chrono::Duration::seconds(1),
+    ))
+    .await
+    .unwrap();
+    let (prepare, _) = pg_test_credential_delivery_requests(
+        "claim-expire-rollback",
+        68,
+        "B2A_EXPIRE_ROLLBACK",
+        secret,
+        0xc1,
+        0xc2,
+        "expire-rollback-credential",
+        0xc3,
+        t0 + chrono::Duration::seconds(2),
+    );
+    let prepared = match db
+        .prepare_initial_node_credential_delivery(&prepare)
+        .await
+        .unwrap()
+    {
+        NodeCredentialDeliveryPrepareResult::Prepared(value) => value,
+        other => panic!("unexpected PREPARE result: {other:?}"),
+    };
+    let fixture_cancelled_at =
+        (t0 + chrono::Duration::seconds(3)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let fixture = sqlx::query(
+        "UPDATE node_credential_claims SET state='CANCELLED', cancelled_at=$1, updated_at=$1 \
+         WHERE claim_id=$2 AND state='CREDENTIAL_PENDING'",
+    )
+    .bind(&fixture_cancelled_at)
+    .bind("claim-expire-rollback")
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(fixture.rows_affected(), 1);
+    let claim_before = db
+        .find_node_credential_claim("claim-expire-rollback")
+        .await
+        .unwrap()
+        .unwrap();
+    let delivery_before = db
+        .find_node_credential_delivery("claim-expire-rollback")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim_before.state, "CANCELLED");
+    assert_eq!(delivery_before.state, "PREPARED");
+    let due = chrono::DateTime::parse_from_rfc3339(&prepared.expires_at)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert_eq!(
+        db.expire_node_credential_delivery(
+            "claim-expire-rollback",
+            68,
+            &crate::node_identity::ReuseEligibleNodeId::parse("B2A_EXPIRE_ROLLBACK").unwrap(),
+            due,
+        )
+        .await
+        .unwrap(),
+        NodeCredentialDeliveryMutationResult::Rejected
+    );
+    let claim_after = db
+        .find_node_credential_claim("claim-expire-rollback")
+        .await
+        .unwrap()
+        .unwrap();
+    let delivery_after = db
+        .find_node_credential_delivery("claim-expire-rollback")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(claim_after == claim_before);
+    assert!(delivery_after == delivery_before);
+    assert_eq!(delivery_after.state, "PREPARED");
+    assert!(delivery_after.expired_at.is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM node_credentials WHERE credential_id=$1"
+        )
+        .bind("expire-rollback-credential")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        0
+    );
+
+    // PREPARED but not yet due is a strict no-op.
+    let (claim, secret) = pg_test_node_claim(
+        "claim-expire-not-due",
+        69,
+        "B2A_EXPIRE_NOT_DUE",
+        0xc4,
+        1,
+        t0,
+        600,
+    );
+    db.create_node_credential_claim(&claim).await.unwrap();
+    db.claim_node_credential(&pg_test_claim_attempt(
+        "claim-expire-not-due",
+        69,
+        "B2A_EXPIRE_NOT_DUE",
+        secret.clone(),
+        0xc5,
+        t0 + chrono::Duration::seconds(1),
+    ))
+    .await
+    .unwrap();
+    let (prepare, _) = pg_test_credential_delivery_requests(
+        "claim-expire-not-due",
+        69,
+        "B2A_EXPIRE_NOT_DUE",
+        secret,
+        0xc5,
+        0xc6,
+        "expire-not-due-credential",
+        0xc7,
+        t0 + chrono::Duration::seconds(2),
+    );
+    db.prepare_initial_node_credential_delivery(&prepare)
+        .await
+        .unwrap();
+    let claim_before = db
+        .find_node_credential_claim("claim-expire-not-due")
+        .await
+        .unwrap()
+        .unwrap();
+    let delivery_before = db
+        .find_node_credential_delivery("claim-expire-not-due")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.expire_node_credential_delivery(
+            "claim-expire-not-due",
+            69,
+            &crate::node_identity::ReuseEligibleNodeId::parse("B2A_EXPIRE_NOT_DUE").unwrap(),
+            t0 + chrono::Duration::seconds(3),
+        )
+        .await
+        .unwrap(),
+        NodeCredentialDeliveryMutationResult::Rejected
+    );
+    assert!(
+        db.find_node_credential_claim("claim-expire-not-due")
+            .await
+            .unwrap()
+            .unwrap()
+            == claim_before
+    );
+    assert!(
+        db.find_node_credential_delivery("claim-expire-not-due")
+            .await
+            .unwrap()
+            .unwrap()
+            == delivery_before
+    );
+
+    // Unknown Claim is rejected without creating persistence.
+    assert_eq!(
+        db.expire_node_credential_delivery(
+            "claim-expire-missing",
+            68,
+            &crate::node_identity::ReuseEligibleNodeId::parse("B2A_EXPIRE_MISSING").unwrap(),
+            t0 + chrono::Duration::seconds(1000),
+        )
+        .await
+        .unwrap(),
+        NodeCredentialDeliveryMutationResult::Rejected
+    );
+    assert!(db
+        .find_node_credential_claim("claim-expire-missing")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .find_node_credential_delivery("claim-expire-missing")
+        .await
+        .unwrap()
+        .is_none());
+
+    // Due PREPARED expiry updates Claim + Delivery together; a repeat is a no-op.
+    let (claim, secret) = pg_test_node_claim(
+        "claim-expire-applied",
+        70,
+        "B2A_EXPIRE_APPLIED",
+        0xc8,
+        1,
+        t0,
+        600,
+    );
+    db.create_node_credential_claim(&claim).await.unwrap();
+    db.claim_node_credential(&pg_test_claim_attempt(
+        "claim-expire-applied",
+        70,
+        "B2A_EXPIRE_APPLIED",
+        secret.clone(),
+        0xc9,
+        t0 + chrono::Duration::seconds(1),
+    ))
+    .await
+    .unwrap();
+    let (prepare, _) = pg_test_credential_delivery_requests(
+        "claim-expire-applied",
+        70,
+        "B2A_EXPIRE_APPLIED",
+        secret,
+        0xc9,
+        0xca,
+        "expire-applied-credential",
+        0xcb,
+        t0 + chrono::Duration::seconds(2),
+    );
+    let prepared = match db
+        .prepare_initial_node_credential_delivery(&prepare)
+        .await
+        .unwrap()
+    {
+        NodeCredentialDeliveryPrepareResult::Prepared(value) => value,
+        other => panic!("unexpected PREPARE result: {other:?}"),
+    };
+    let due = chrono::DateTime::parse_from_rfc3339(&prepared.expires_at)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let applied_node =
+        crate::node_identity::ReuseEligibleNodeId::parse("B2A_EXPIRE_APPLIED").unwrap();
+    assert_eq!(
+        db.expire_node_credential_delivery("claim-expire-applied", 70, &applied_node, due)
+            .await
+            .unwrap(),
+        NodeCredentialDeliveryMutationResult::Applied
+    );
+    let claim_expired = db
+        .find_node_credential_claim("claim-expire-applied")
+        .await
+        .unwrap()
+        .unwrap();
+    let delivery_expired = db
+        .find_node_credential_delivery("claim-expire-applied")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim_expired.state, "EXPIRED");
+    assert_eq!(delivery_expired.state, "EXPIRED");
+    assert!(claim_expired.expired_at.is_some());
+    assert!(delivery_expired.expired_at.is_some());
+    assert_eq!(
+        db.expire_node_credential_delivery(
+            "claim-expire-applied",
+            70,
+            &applied_node,
+            due + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap(),
+        NodeCredentialDeliveryMutationResult::Rejected
+    );
+    assert!(
+        db.find_node_credential_claim("claim-expire-applied")
+            .await
+            .unwrap()
+            .unwrap()
+            == claim_expired
+    );
+    assert!(
+        db.find_node_credential_delivery("claim-expire-applied")
+            .await
+            .unwrap()
+            .unwrap()
+            == delivery_expired
+    );
+
+    // CANCELLED is terminal for delivery expiry.
+    let (claim, secret) = pg_test_node_claim(
+        "claim-expire-cancelled",
+        71,
+        "B2A_EXPIRE_CANCEL",
+        0xcc,
+        1,
+        t0,
+        600,
+    );
+    db.create_node_credential_claim(&claim).await.unwrap();
+    db.claim_node_credential(&pg_test_claim_attempt(
+        "claim-expire-cancelled",
+        71,
+        "B2A_EXPIRE_CANCEL",
+        secret.clone(),
+        0xcd,
+        t0 + chrono::Duration::seconds(1),
+    ))
+    .await
+    .unwrap();
+    let (prepare, _) = pg_test_credential_delivery_requests(
+        "claim-expire-cancelled",
+        71,
+        "B2A_EXPIRE_CANCEL",
+        secret,
+        0xcd,
+        0xce,
+        "expire-cancelled-credential",
+        0xcf,
+        t0 + chrono::Duration::seconds(2),
+    );
+    db.prepare_initial_node_credential_delivery(&prepare)
+        .await
+        .unwrap();
+    let cancelled_node =
+        crate::node_identity::ReuseEligibleNodeId::parse("B2A_EXPIRE_CANCEL").unwrap();
+    assert_eq!(
+        db.cancel_node_credential_claim(
+            "claim-expire-cancelled",
+            71,
+            &cancelled_node,
+            t0 + chrono::Duration::seconds(3),
+        )
+        .await
+        .unwrap(),
+        NodeCredentialClaimMutationResult::Applied
+    );
+    let claim_cancelled = db
+        .find_node_credential_claim("claim-expire-cancelled")
+        .await
+        .unwrap()
+        .unwrap();
+    let delivery_cancelled = db
+        .find_node_credential_delivery("claim-expire-cancelled")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        db.expire_node_credential_delivery(
+            "claim-expire-cancelled",
+            71,
+            &cancelled_node,
+            t0 + chrono::Duration::seconds(1000),
+        )
+        .await
+        .unwrap(),
+        NodeCredentialDeliveryMutationResult::Rejected
+    );
+    assert!(
+        db.find_node_credential_claim("claim-expire-cancelled")
+            .await
+            .unwrap()
+            .unwrap()
+            == claim_cancelled
+    );
+    assert!(
+        db.find_node_credential_delivery("claim-expire-cancelled")
+            .await
+            .unwrap()
+            .unwrap()
+            == delivery_cancelled
+    );
+
+    // COMPLETED is terminal; expiry must not revoke or otherwise mutate the active credential.
+    let (claim, secret) = pg_test_node_claim(
+        "claim-expire-completed",
+        72,
+        "B2A_EXPIRE_DONE",
+        0xd0,
+        1,
+        t0,
+        600,
+    );
+    db.create_node_credential_claim(&claim).await.unwrap();
+    db.claim_node_credential(&pg_test_claim_attempt(
+        "claim-expire-completed",
+        72,
+        "B2A_EXPIRE_DONE",
+        secret.clone(),
+        0xd1,
+        t0 + chrono::Duration::seconds(1),
+    ))
+    .await
+    .unwrap();
+    let (prepare, mut activate) = pg_test_credential_delivery_requests(
+        "claim-expire-completed",
+        72,
+        "B2A_EXPIRE_DONE",
+        secret,
+        0xd1,
+        0xd2,
+        "expire-completed-credential",
+        0xd3,
+        t0 + chrono::Duration::seconds(2),
+    );
+    let prepared = match db
+        .prepare_initial_node_credential_delivery(&prepare)
+        .await
+        .unwrap()
+    {
+        NodeCredentialDeliveryPrepareResult::Prepared(value) => value,
+        other => panic!("unexpected PREPARE result: {other:?}"),
+    };
+    activate.now = t0 + chrono::Duration::seconds(3);
+    assert!(matches!(
+        db.activate_initial_node_credential_from_delivery(&activate)
+            .await
+            .unwrap(),
+        NodeCredentialDeliveryActivateResult::Activated { .. }
+    ));
+    let completed_node =
+        crate::node_identity::ReuseEligibleNodeId::parse("B2A_EXPIRE_DONE").unwrap();
+    let claim_completed = db
+        .find_node_credential_claim("claim-expire-completed")
+        .await
+        .unwrap()
+        .unwrap();
+    let delivery_completed = db
+        .find_node_credential_delivery("claim-expire-completed")
+        .await
+        .unwrap()
+        .unwrap();
+    let credential_completed = db
+        .find_node_credential("expire-completed-credential")
+        .await
+        .unwrap()
+        .unwrap();
+    let due = chrono::DateTime::parse_from_rfc3339(&prepared.expires_at)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert_eq!(
+        db.expire_node_credential_delivery(
+            "claim-expire-completed",
+            72,
+            &completed_node,
+            due + chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap(),
+        NodeCredentialDeliveryMutationResult::Rejected
+    );
+    assert!(
+        db.find_node_credential_claim("claim-expire-completed")
+            .await
+            .unwrap()
+            .unwrap()
+            == claim_completed
+    );
+    assert!(
+        db.find_node_credential_delivery("claim-expire-completed")
+            .await
+            .unwrap()
+            .unwrap()
+            == delivery_completed
+    );
+    let credential_after = db
+        .find_node_credential("expire-completed-credential")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(credential_after == credential_completed);
+    assert!(credential_after.activated_at.is_some());
+    assert!(credential_after.revoked_at.is_none());
+    cleanup(&db).await;
+}
+
+#[tokio::test]
 async fn pg_node_credential_delivery_concurrent_prepare_and_activate_converges() {
     let Some(db) = repo("node_credential_delivery_race").await else {
         return;
