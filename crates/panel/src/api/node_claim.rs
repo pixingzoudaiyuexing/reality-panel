@@ -277,7 +277,7 @@ fn claim_transport_allowed(
         && exactly_https_forwarded_proto(headers)
 }
 
-async fn production_claim_transport_allowed(
+pub(crate) async fn production_claim_transport_allowed(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,

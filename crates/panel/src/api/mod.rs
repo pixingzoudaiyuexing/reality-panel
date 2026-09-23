@@ -16,6 +16,7 @@ pub mod middleware;
 pub mod node;
 pub mod node_batch_upgrade;
 pub mod node_claim;
+pub mod node_credential_delivery;
 pub mod node_deploy;
 pub mod node_enrollment;
 pub mod node_ops;
@@ -140,6 +141,22 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/node-credential-claims/{claim_id}/claim",
             axum::routing::post(node_claim::claim_node)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(
+                    node_claim::claim_response_headers,
+                )),
+        )
+        .route(
+            "/node-credential-claims/{claim_id}/credential/prepare",
+            axum::routing::post(node_credential_delivery::prepare_credential)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(
+                    node_claim::claim_response_headers,
+                )),
+        )
+        .route(
+            "/node-credential-claims/{claim_id}/credential/activate",
+            axum::routing::post(node_credential_delivery::activate_credential)
                 .layer(axum::extract::DefaultBodyLimit::max(4096))
                 .layer(axum::middleware::from_fn(
                     node_claim::claim_response_headers,
