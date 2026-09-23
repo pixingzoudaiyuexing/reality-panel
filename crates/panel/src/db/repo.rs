@@ -33,7 +33,10 @@ use serde::Serialize;
 use crate::node_claim::{
     NodeClaimNonceVerifier, NodeClaimSecret, NodeClaimSecretVerifier, NodeClaimantNonce,
 };
-use crate::node_credential::NodeCredentialVerifier;
+use crate::node_credential::{
+    NodeCredentialDeliveryNonce, NodeCredentialDeliveryNonceVerifier, NodeCredentialSecret,
+    NodeCredentialVerifier, PresentedNodeCredentialVerifier,
+};
 use crate::node_identity::ReuseEligibleNodeId;
 
 use super::error::DbError;
@@ -886,6 +889,8 @@ pub struct NodeCredentialClaimRecord {
     pub created_at: String,
     pub updated_at: String,
     pub claimed_at: Option<String>,
+    pub credential_pending_at: Option<String>,
+    pub completed_at: Option<String>,
     pub cancelled_at: Option<String>,
     pub expired_at: Option<String>,
 }
@@ -971,6 +976,8 @@ impl std::fmt::Debug for NodeCredentialClaimRecord {
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .field("claimed_at", &self.claimed_at)
+            .field("credential_pending_at", &self.credential_pending_at)
+            .field("completed_at", &self.completed_at)
             .field("cancelled_at", &self.cancelled_at)
             .field("expired_at", &self.expired_at)
             .finish()
@@ -1077,6 +1084,218 @@ pub trait NodeCredentialClaimRepository: Send + Sync {
         node_id: &ReuseEligibleNodeId,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<NodeCredentialClaimMutationResult, DbError>;
+}
+
+// ── Node Reuse V1 B2-02A inert credential-delivery state machine ──
+
+pub const NODE_CREDENTIAL_DELIVERY_TTL_SECS: i64 = 10 * 60;
+
+#[derive(Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct NodeCredentialDeliveryRecord {
+    pub claim_id: String,
+    pub home_group_id: i64,
+    pub node_id: String,
+    pub credential_id: String,
+    pub credential_verifier_format: String,
+    pub credential_verifier_version: i64,
+    pub credential_verifier_data: Vec<u8>,
+    pub delivery_nonce_verifier_format: String,
+    pub delivery_nonce_verifier_version: i64,
+    pub delivery_nonce_verifier_data: Vec<u8>,
+    pub state: String,
+    pub authorized_at: String,
+    pub expires_at: String,
+    pub updated_at: String,
+    pub credential_generation: Option<i64>,
+    pub proof_verified_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub cancelled_at: Option<String>,
+    pub expired_at: Option<String>,
+}
+
+impl std::fmt::Debug for NodeCredentialDeliveryRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCredentialDeliveryRecord")
+            .field("claim_id", &self.claim_id)
+            .field("home_group_id", &self.home_group_id)
+            .field("node_id", &self.node_id)
+            .field("credential_id", &self.credential_id)
+            .field(
+                "credential_verifier_format",
+                &self.credential_verifier_format,
+            )
+            .field(
+                "credential_verifier_version",
+                &self.credential_verifier_version,
+            )
+            .field("credential_verifier_data", &RedactedVerifierData)
+            .field(
+                "delivery_nonce_verifier_format",
+                &self.delivery_nonce_verifier_format,
+            )
+            .field(
+                "delivery_nonce_verifier_version",
+                &self.delivery_nonce_verifier_version,
+            )
+            .field("delivery_nonce_verifier_data", &RedactedVerifierData)
+            .field("state", &self.state)
+            .field("authorized_at", &self.authorized_at)
+            .field("expires_at", &self.expires_at)
+            .field("updated_at", &self.updated_at)
+            .field("credential_generation", &self.credential_generation)
+            .field("proof_verified_at", &self.proof_verified_at)
+            .field("completed_at", &self.completed_at)
+            .field("cancelled_at", &self.cancelled_at)
+            .field("expired_at", &self.expired_at)
+            .finish()
+    }
+}
+
+impl NodeCredentialDeliveryRecord {
+    pub fn delivery_nonce_matches(
+        &self,
+        node_id: &ReuseEligibleNodeId,
+        nonce: &NodeCredentialDeliveryNonce,
+    ) -> bool {
+        if self.node_id != node_id.as_str()
+            || self.delivery_nonce_verifier_format
+                != crate::node_credential::NODE_CREDENTIAL_DELIVERY_NONCE_VERIFIER_FORMAT
+            || self.delivery_nonce_verifier_version
+                != crate::node_credential::NODE_CREDENTIAL_DELIVERY_NONCE_VERIFIER_VERSION
+        {
+            return false;
+        }
+        NodeCredentialDeliveryNonceVerifier::derive(
+            &self.claim_id,
+            self.home_group_id,
+            node_id,
+            nonce,
+        )
+        .verify_data(&self.delivery_nonce_verifier_data)
+    }
+
+    pub fn presented_verifier_matches(&self, presented: &PresentedNodeCredentialVerifier) -> bool {
+        self.credential_verifier_format == presented.format()
+            && self.credential_verifier_version == presented.version()
+            && presented.verify_data(&self.credential_verifier_data)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PrepareInitialNodeCredentialDelivery {
+    pub claim_id: String,
+    pub home_group_id: i64,
+    pub node_id: ReuseEligibleNodeId,
+    pub claim_secret: NodeClaimSecret,
+    pub claimant_nonce: NodeClaimantNonce,
+    pub delivery_nonce: NodeCredentialDeliveryNonce,
+    pub credential_id: String,
+    pub presented_verifier: PresentedNodeCredentialVerifier,
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+impl std::fmt::Debug for PrepareInitialNodeCredentialDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrepareInitialNodeCredentialDelivery")
+            .field("claim_id", &self.claim_id)
+            .field("home_group_id", &self.home_group_id)
+            .field("node_id", &self.node_id)
+            .field("claim_secret", &self.claim_secret)
+            .field("claimant_nonce", &self.claimant_nonce)
+            .field("delivery_nonce", &self.delivery_nonce)
+            .field("credential_id", &self.credential_id)
+            .field("presented_verifier", &self.presented_verifier)
+            .field("now", &self.now)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ActivateInitialNodeCredentialFromDelivery {
+    pub claim_id: String,
+    pub home_group_id: i64,
+    pub node_id: ReuseEligibleNodeId,
+    pub credential_id: String,
+    pub delivery_nonce: NodeCredentialDeliveryNonce,
+    pub credential_secret: NodeCredentialSecret,
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+impl std::fmt::Debug for ActivateInitialNodeCredentialFromDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivateInitialNodeCredentialFromDelivery")
+            .field("claim_id", &self.claim_id)
+            .field("home_group_id", &self.home_group_id)
+            .field("node_id", &self.node_id)
+            .field("credential_id", &self.credential_id)
+            .field("delivery_nonce", &self.delivery_nonce)
+            .field("credential_secret", &self.credential_secret)
+            .field("now", &self.now)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeCredentialDeliveryPrepareResult {
+    Prepared(NodeCredentialDeliveryRecord),
+    Existing(NodeCredentialDeliveryRecord),
+    Expired,
+    Cancelled,
+    Invalid,
+    Replay,
+    AlreadyActive,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeCredentialDeliveryActivateResult {
+    Activated {
+        delivery: NodeCredentialDeliveryRecord,
+        credential: NodeCredentialRecord,
+    },
+    Existing {
+        delivery: NodeCredentialDeliveryRecord,
+        credential: NodeCredentialRecord,
+    },
+    Expired,
+    Cancelled,
+    Invalid,
+    InvalidProof,
+    AlreadyActive,
+    RecoveryRequired,
+    CredentialRevoked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeCredentialDeliveryMutationResult {
+    Applied,
+    Rejected,
+}
+
+#[async_trait]
+pub trait NodeCredentialDeliveryRepository: Send + Sync {
+    async fn find_node_credential_delivery(
+        &self,
+        claim_id: &str,
+    ) -> Result<Option<NodeCredentialDeliveryRecord>, DbError>;
+
+    async fn prepare_initial_node_credential_delivery(
+        &self,
+        request: &PrepareInitialNodeCredentialDelivery,
+    ) -> Result<NodeCredentialDeliveryPrepareResult, DbError>;
+
+    async fn activate_initial_node_credential_from_delivery(
+        &self,
+        request: &ActivateInitialNodeCredentialFromDelivery,
+    ) -> Result<NodeCredentialDeliveryActivateResult, DbError>;
+
+    async fn expire_node_credential_delivery(
+        &self,
+        claim_id: &str,
+        home_group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<NodeCredentialDeliveryMutationResult, DbError>;
 }
 
 // ── Manual bootstrap enrollments ──
@@ -2184,6 +2403,7 @@ pub trait Repository:
     + NodeReuseRepository
     + NodeCredentialRepository
     + NodeCredentialClaimRepository
+    + NodeCredentialDeliveryRepository
     + Send
     + Sync
 {

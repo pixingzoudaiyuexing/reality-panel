@@ -138,6 +138,8 @@ pub struct NodeClaimView {
     pub created_at: String,
     pub updated_at: String,
     pub claimed_at: Option<String>,
+    pub credential_pending_at: Option<String>,
+    pub completed_at: Option<String>,
     pub cancelled_at: Option<String>,
     pub expired_at: Option<String>,
 }
@@ -181,6 +183,8 @@ fn claim_view(record: &NodeCredentialClaimRecord) -> NodeClaimView {
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
         claimed_at: record.claimed_at.clone(),
+        credential_pending_at: record.credential_pending_at.clone(),
+        completed_at: record.completed_at.clone(),
         cancelled_at: record.cancelled_at.clone(),
         expired_at: record.expired_at.clone(),
     }

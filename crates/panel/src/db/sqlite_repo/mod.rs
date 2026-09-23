@@ -17,6 +17,7 @@ mod enrollments;
 mod groups;
 mod kvs;
 mod node_claims;
+mod node_credential_deliveries;
 mod node_credentials;
 mod node_reuse;
 mod orders;

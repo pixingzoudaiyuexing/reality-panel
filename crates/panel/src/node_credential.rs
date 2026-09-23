@@ -18,7 +18,18 @@ pub const NODE_CREDENTIAL_SECRET_PREFIX: &str = "rpn1_";
 pub const NODE_CREDENTIAL_SECRET_LEN: usize = 32;
 pub const NODE_CREDENTIAL_VERIFIER_FORMAT: &str = "rp-node-sha256";
 pub const NODE_CREDENTIAL_VERIFIER_VERSION: i64 = 1;
+pub const NODE_CREDENTIAL_VERIFIER_DATA_LEN: usize = 32;
+#[allow(
+    dead_code,
+    reason = "B2-02A keeps the delivery wire format inert until reviewed B2-02B API/helper"
+)]
+pub const NODE_CREDENTIAL_DELIVERY_NONCE_PREFIX: &str = "rpdn1_";
+pub const NODE_CREDENTIAL_DELIVERY_NONCE_LEN: usize = 32;
+pub const NODE_CREDENTIAL_DELIVERY_NONCE_VERIFIER_FORMAT: &str = "rp-node-delivery-nonce-sha256";
+pub const NODE_CREDENTIAL_DELIVERY_NONCE_VERIFIER_VERSION: i64 = 1;
 const NODE_CREDENTIAL_DOMAIN: &[u8] = b"relay-panel/node-credential/v1\0";
+const NODE_CREDENTIAL_DELIVERY_NONCE_DOMAIN: &[u8] =
+    b"relay-panel/node-credential-delivery-nonce/v1\0";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct NodeCredentialSecret([u8; NODE_CREDENTIAL_SECRET_LEN]);
@@ -158,6 +169,240 @@ impl NodeCredentialVerifier {
 
     pub fn data(&self) -> &[u8; 32] {
         &self.data
+    }
+
+    pub fn verify_data(&self, stored: &[u8]) -> bool {
+        stored.len() == self.data.len() && bool::from(self.data.as_slice().ct_eq(stored))
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "B2-02A validates the future PREPARE wire contract without exposing an HTTP route"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentedNodeCredentialVerifierParseError {
+    UnsupportedFormat,
+    UnsupportedVersion,
+    PaddingNotAllowed,
+    InvalidEncoding,
+    InvalidLength,
+    NonCanonicalEncoding,
+}
+
+impl std::fmt::Display for PresentedNodeCredentialVerifierParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::UnsupportedFormat => "unsupported credential verifier format",
+            Self::UnsupportedVersion => "unsupported credential verifier version",
+            Self::PaddingNotAllowed => "credential verifier padding is not allowed",
+            Self::InvalidEncoding => "invalid credential verifier encoding",
+            Self::InvalidLength => "invalid credential verifier length",
+            Self::NonCanonicalEncoding => "non-canonical credential verifier encoding",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for PresentedNodeCredentialVerifierParseError {}
+
+/// An untrusted verifier submitted by the future B2-02B target helper.
+///
+/// This validates only the wire and algorithm contract. Possession is not
+/// established until the Repository receives the raw permanent secret and
+/// recomputes NodeCredentialVerifier inside the activation transaction.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PresentedNodeCredentialVerifier([u8; NODE_CREDENTIAL_VERIFIER_DATA_LEN]);
+
+impl std::fmt::Debug for PresentedNodeCredentialVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PresentedNodeCredentialVerifier")
+            .field("format", &NODE_CREDENTIAL_VERIFIER_FORMAT)
+            .field("version", &NODE_CREDENTIAL_VERIFIER_VERSION)
+            .field("data", &"<redacted-untrusted-verifier>")
+            .finish()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "B2-02A parser/wire helpers are consumed by reviewed B2-02B, not runtime yet"
+)]
+impl PresentedNodeCredentialVerifier {
+    pub fn parse(
+        format: &str,
+        version: i64,
+        encoded_data: &str,
+    ) -> Result<Self, PresentedNodeCredentialVerifierParseError> {
+        if format != NODE_CREDENTIAL_VERIFIER_FORMAT {
+            return Err(PresentedNodeCredentialVerifierParseError::UnsupportedFormat);
+        }
+        if version != NODE_CREDENTIAL_VERIFIER_VERSION {
+            return Err(PresentedNodeCredentialVerifierParseError::UnsupportedVersion);
+        }
+        if encoded_data.contains('=') {
+            return Err(PresentedNodeCredentialVerifierParseError::PaddingNotAllowed);
+        }
+        let decoded = URL_SAFE_NO_PAD
+            .decode(encoded_data)
+            .map_err(|_| PresentedNodeCredentialVerifierParseError::InvalidEncoding)?;
+        let parsed = Self::from_data(format, version, &decoded)?;
+        if URL_SAFE_NO_PAD.encode(parsed.0) != encoded_data {
+            return Err(PresentedNodeCredentialVerifierParseError::NonCanonicalEncoding);
+        }
+        Ok(parsed)
+    }
+
+    pub fn from_data(
+        format: &str,
+        version: i64,
+        data: &[u8],
+    ) -> Result<Self, PresentedNodeCredentialVerifierParseError> {
+        if format != NODE_CREDENTIAL_VERIFIER_FORMAT {
+            return Err(PresentedNodeCredentialVerifierParseError::UnsupportedFormat);
+        }
+        if version != NODE_CREDENTIAL_VERIFIER_VERSION {
+            return Err(PresentedNodeCredentialVerifierParseError::UnsupportedVersion);
+        }
+        if data.len() != NODE_CREDENTIAL_VERIFIER_DATA_LEN {
+            return Err(PresentedNodeCredentialVerifierParseError::InvalidLength);
+        }
+        let mut bytes = [0_u8; NODE_CREDENTIAL_VERIFIER_DATA_LEN];
+        bytes.copy_from_slice(data);
+        Ok(Self(bytes))
+    }
+
+    pub fn format(&self) -> &'static str {
+        NODE_CREDENTIAL_VERIFIER_FORMAT
+    }
+
+    pub fn version(&self) -> i64 {
+        NODE_CREDENTIAL_VERIFIER_VERSION
+    }
+
+    pub fn data(&self) -> &[u8; NODE_CREDENTIAL_VERIFIER_DATA_LEN] {
+        &self.0
+    }
+
+    pub fn verify_data(&self, stored: &[u8]) -> bool {
+        stored.len() == self.0.len() && bool::from(self.0.as_slice().ct_eq(stored))
+    }
+
+    pub fn to_wire_data(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.0)
+    }
+
+    pub fn matches_derived(&self, derived: &NodeCredentialVerifier) -> bool {
+        bool::from(self.0.as_slice().ct_eq(derived.data().as_slice()))
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct NodeCredentialDeliveryNonce([u8; NODE_CREDENTIAL_DELIVERY_NONCE_LEN]);
+
+impl std::fmt::Debug for NodeCredentialDeliveryNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted-node-credential-delivery-nonce>")
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "B2-02A keeps delivery nonce generation/wire parsing inert until reviewed B2-02B"
+)]
+impl NodeCredentialDeliveryNonce {
+    pub fn generate() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0_u8; NODE_CREDENTIAL_DELIVERY_NONCE_LEN];
+        getrandom::getrandom(&mut bytes)?;
+        Ok(Self(bytes))
+    }
+
+    pub fn parse(input: &str) -> Result<Self, NodeCredentialSecretParseError> {
+        let encoded = input
+            .strip_prefix(NODE_CREDENTIAL_DELIVERY_NONCE_PREFIX)
+            .ok_or(NodeCredentialSecretParseError::InvalidPrefix)?;
+        if encoded.contains('=') {
+            return Err(NodeCredentialSecretParseError::PaddingNotAllowed);
+        }
+        let decoded = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| NodeCredentialSecretParseError::InvalidEncoding)?;
+        if decoded.len() != NODE_CREDENTIAL_DELIVERY_NONCE_LEN {
+            return Err(NodeCredentialSecretParseError::InvalidLength);
+        }
+        if URL_SAFE_NO_PAD.encode(&decoded) != encoded {
+            return Err(NodeCredentialSecretParseError::NonCanonicalEncoding);
+        }
+        let mut bytes = [0_u8; NODE_CREDENTIAL_DELIVERY_NONCE_LEN];
+        bytes.copy_from_slice(&decoded);
+        Ok(Self(bytes))
+    }
+
+    pub fn to_wire_value(&self) -> String {
+        format!(
+            "{}{}",
+            NODE_CREDENTIAL_DELIVERY_NONCE_PREFIX,
+            URL_SAFE_NO_PAD.encode(self.0)
+        )
+    }
+
+    fn as_bytes(&self) -> &[u8; NODE_CREDENTIAL_DELIVERY_NONCE_LEN] {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_bytes(bytes: [u8; NODE_CREDENTIAL_DELIVERY_NONCE_LEN]) -> Self {
+        Self(bytes)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct NodeCredentialDeliveryNonceVerifier([u8; 32]);
+
+impl std::fmt::Debug for NodeCredentialDeliveryNonceVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCredentialDeliveryNonceVerifier")
+            .field("format", &NODE_CREDENTIAL_DELIVERY_NONCE_VERIFIER_FORMAT)
+            .field("version", &NODE_CREDENTIAL_DELIVERY_NONCE_VERIFIER_VERSION)
+            .field("data", &"<redacted-verifier>")
+            .finish()
+    }
+}
+
+impl NodeCredentialDeliveryNonceVerifier {
+    pub fn derive(
+        claim_id: &str,
+        home_group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+        nonce: &NodeCredentialDeliveryNonce,
+    ) -> Self {
+        let claim_id_bytes = claim_id.as_bytes();
+        let node_id_bytes = node_id.as_str().as_bytes();
+        let mut digest = Sha256::new();
+        digest.update(NODE_CREDENTIAL_DELIVERY_NONCE_DOMAIN);
+        digest.update((claim_id_bytes.len() as u64).to_be_bytes());
+        digest.update(claim_id_bytes);
+        digest.update(home_group_id.to_be_bytes());
+        digest.update((node_id_bytes.len() as u64).to_be_bytes());
+        digest.update(node_id_bytes);
+        digest.update(nonce.as_bytes());
+        Self(digest.finalize().into())
+    }
+
+    pub fn format(&self) -> &'static str {
+        NODE_CREDENTIAL_DELIVERY_NONCE_VERIFIER_FORMAT
+    }
+
+    pub fn version(&self) -> i64 {
+        NODE_CREDENTIAL_DELIVERY_NONCE_VERIFIER_VERSION
+    }
+
+    pub fn data(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn verify_data(&self, stored: &[u8]) -> bool {
+        stored.len() == self.0.len() && bool::from(self.0.as_slice().ct_eq(stored))
     }
 }
 
@@ -308,6 +553,65 @@ mod tests {
             .data(),
             verifier.data()
         );
+    }
+
+    #[test]
+    fn delivery_nonce_wire_and_verifier_are_strict_bound_and_redacted() {
+        let nonce = NodeCredentialDeliveryNonce::from_test_bytes(SECRET_BYTES);
+        let wire = nonce.to_wire_value();
+        assert!(wire.starts_with(NODE_CREDENTIAL_DELIVERY_NONCE_PREFIX));
+        assert!(!wire.contains('='));
+        assert_eq!(NodeCredentialDeliveryNonce::parse(&wire).unwrap(), nonce);
+        assert!(NodeCredentialDeliveryNonce::parse(
+            "rpcn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        )
+        .is_err());
+        assert!(NodeCredentialDeliveryNonce::parse(&format!("{wire}=")).is_err());
+
+        let node = ReuseEligibleNodeId::parse("Node_A").unwrap();
+        let verifier = NodeCredentialDeliveryNonceVerifier::derive("claim-1", 42, &node, &nonce);
+        assert_eq!(verifier.format(), "rp-node-delivery-nonce-sha256");
+        assert_eq!(verifier.version(), 1);
+        assert!(verifier.verify_data(verifier.data()));
+        assert!(
+            !NodeCredentialDeliveryNonceVerifier::derive("claim-2", 42, &node, &nonce)
+                .verify_data(verifier.data())
+        );
+        assert!(
+            !NodeCredentialDeliveryNonceVerifier::derive("claim-1", 43, &node, &nonce)
+                .verify_data(verifier.data())
+        );
+        assert!(!NodeCredentialDeliveryNonceVerifier::derive(
+            "claim-1",
+            42,
+            &ReuseEligibleNodeId::parse("Node_B").unwrap(),
+            &nonce,
+        )
+        .verify_data(verifier.data()));
+        assert!(!format!("{nonce:?}").contains(&URL_SAFE_NO_PAD.encode(SECRET_BYTES)));
+        assert!(!format!("{verifier:?}").contains(&hex::encode(verifier.data())));
+    }
+
+    #[test]
+    fn presented_verifier_requires_exact_v1_canonical_shape_and_stays_untrusted() {
+        let secret = NodeCredentialSecret::from_test_bytes(SECRET_BYTES);
+        let node = ReuseEligibleNodeId::parse("Node_A").unwrap();
+        let derived = NodeCredentialVerifier::derive("cred-presented", 42, &node, &secret);
+        let encoded = URL_SAFE_NO_PAD.encode(derived.data());
+        let presented =
+            PresentedNodeCredentialVerifier::parse("rp-node-sha256", 1, &encoded).unwrap();
+        assert!(presented.matches_derived(&derived));
+        assert_eq!(presented.to_wire_data(), encoded);
+        assert!(PresentedNodeCredentialVerifier::parse("wrong", 1, &encoded).is_err());
+        assert!(PresentedNodeCredentialVerifier::parse("rp-node-sha256", 2, &encoded).is_err());
+        assert!(PresentedNodeCredentialVerifier::parse(
+            "rp-node-sha256",
+            1,
+            &(encoded.clone() + "="),
+        )
+        .is_err());
+        assert!(PresentedNodeCredentialVerifier::parse("rp-node-sha256", 1, "AQ").is_err());
+        assert!(!format!("{presented:?}").contains(&hex::encode(derived.data())));
     }
 
     #[test]
