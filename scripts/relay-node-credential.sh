@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # B2-02B first-time permanent Node Credential establishment helper.
 # This establishes a credential only; runtime HTTP/WS auth and Node Reuse remain disabled.
+case "$-" in
+  *x*)
+    printf '%s\n' "node credential setup failed: bash xtrace is not allowed for this sensitive helper" >&2
+    exit 1
+    ;;
+esac
 set -euo pipefail
 umask 077
 export LC_ALL=C
@@ -34,13 +40,6 @@ restore_tty_echo() {
 
 cleanup() {
   restore_tty_echo
-  if [ -n "$STATE_DIR" ] && [ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ]; then
-    rm -f -- \
-      "$STATE_DIR"/.credential-request.* \
-      "$STATE_DIR"/.credential-response.* \
-      "$STATE_DIR"/.credential-curl.* \
-      "$STATE_DIR"/.credential-http-code.* 9>&- 2>/dev/null || true
-  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -74,7 +73,7 @@ esac
 case "$CLAIM_ID" in *[!0-9a-f-]*) fail "invalid Claim id" ;; esac
 case "$HOME_GROUP_ID" in ''|0|*[!0-9]*) fail "invalid Home Group id" ;; esac
 
-for cmd in cat curl flock grep install mktemp python3 stat stty tr wc; do
+for cmd in cat curl flock grep install python3 stat stty tr wc; do
   command -v "$cmd" >/dev/null 2>&1 || fail "$cmd is required"
 done
 [ -f "$STATE_TOOL" ] && [ ! -L "$STATE_TOOL" ] || fail "Credential state helper is unavailable"
@@ -236,58 +235,50 @@ prompt_claim_secret() {
   case "$payload" in *[!A-Za-z0-9_-]*) fail "Claim Secret has invalid format" ;; esac
 }
 
-curl_config_escape() {
-  local value="$1"
-  value="${value//\\/\\\\}"
-  value="${value//\"/\\\"}"
-  printf '%s' "$value"
-}
-
 perform_request() {
-  local phase="$1" endpoint="$2" request_file="$3"
-  local response_file curl_config http_code_file curl_status http_code
-
-  response_file="$(mktemp "$STATE_DIR/.credential-response.XXXXXX" 9>&-)"
-  curl_config="$(mktemp "$STATE_DIR/.credential-curl.XXXXXX" 9>&-)"
-  http_code_file="$(mktemp "$STATE_DIR/.credential-http-code.XXXXXX" 9>&-)"
-  chmod 0600 "$response_file" "$curl_config" "$http_code_file" 9>&-
-
-  panel_cfg="$(curl_config_escape "$PANEL_URL")"
-  token_cfg="$(curl_config_escape "$NODE_TOKEN")"
-  response_cfg="$(curl_config_escape "$response_file")"
-  request_cfg="$(curl_config_escape "$request_file")"
-  {
-    printf 'url = "%s/api/v1/node-credential-claims/%s/credential/%s"\n' \
-      "$panel_cfg" "$CLAIM_ID" "$endpoint"
-    printf 'request = "POST"\n'
-    printf 'output = "%s"\n' "$response_cfg"
-    printf 'silent\nshow-error\nproto = "=https"\nproto-redir = "=https"\nmax-redirs = 0\n'
-    printf 'max-filesize = 65536\n'
-    printf 'header = "Content-Type: application/json"\n'
-    printf 'header = "Authorization: Bearer %s"\n' "$token_cfg"
-    printf 'data-binary = "@%s"\n' "$request_cfg"
-    printf 'write-out = "%%{http_code}"\n'
-  } > "$curl_config"
+  local phase="$1" endpoint="$2" request_status endpoint_url
+  endpoint_url="$PANEL_URL/api/v1/node-credential-claims/$CLAIM_ID/credential/$endpoint"
 
   set +e
-  curl --config "$curl_config" > "$http_code_file" 9>&-
-  curl_status=$?
-  set -e
-  rm -f -- "$request_file" 9>&-
-  if [ "$curl_status" -ne 0 ]; then
-    fail "HTTPS Credential request failed; durable local state retained for safe retry"
+  if [ "$phase" = PREPARE ]; then
+    REQUEST_RESULT="$(
+      {
+        printf '%s\n' "$NODE_TOKEN"
+        printf '{"home_group_id":%s,"node_id":"%s","claim_secret":"%s","claimant_nonce":"%s","delivery_nonce":"%s","credential_id":"%s","verifier_format":"rp-node-sha256","verifier_version":1,"verifier_data":"%s"}' \
+          "$HOME_GROUP_ID" "$NODE_ID" "$CLAIM_SECRET" "$CLAIMANT_NONCE" "$DELIVERY_NONCE" \
+          "$CREDENTIAL_ID" "$VERIFIER_DATA"
+      } 9>&- |
+        python3 "$STATE_TOOL" request \
+          --phase PREPARE \
+          --url "$endpoint_url" \
+          --claim-id "$CLAIM_ID" \
+          --group-id "$HOME_GROUP_ID" \
+          --node-id "$NODE_ID" \
+          --credential-id "$CREDENTIAL_ID" 9>&-
+    )"
+    request_status=$?
+  else
+    REQUEST_RESULT="$(
+      {
+        printf '%s\n' "$NODE_TOKEN"
+        printf '{"home_group_id":%s,"node_id":"%s","credential_id":"%s","delivery_nonce":"%s","credential_secret":"%s"}' \
+          "$HOME_GROUP_ID" "$NODE_ID" "$CREDENTIAL_ID" "$DELIVERY_NONCE" "$CREDENTIAL_SECRET"
+      } 9>&- |
+        python3 "$STATE_TOOL" request \
+          --phase ACTIVATE \
+          --url "$endpoint_url" \
+          --claim-id "$CLAIM_ID" \
+          --group-id "$HOME_GROUP_ID" \
+          --node-id "$NODE_ID" \
+          --credential-id "$CREDENTIAL_ID" 9>&-
+    )"
+    request_status=$?
   fi
-  http_code="$(cat "$http_code_file")"
-  REQUEST_RESULT="$(python3 "$STATE_TOOL" parse-response \
-    --phase "$phase" \
-    --http-code "$http_code" \
-    --response "$response_file" \
-    --claim-id "$CLAIM_ID" \
-    --group-id "$HOME_GROUP_ID" \
-    --node-id "$NODE_ID" \
-    --credential-id "$CREDENTIAL_ID" 9>&-)" \
-    || fail "Panel returned an invalid Credential response"
-  rm -f -- "$response_file" "$curl_config" "$http_code_file" 9>&-
+  set -e
+
+  if [ "$request_status" -ne 0 ]; then
+    fail "HTTPS Credential request failed or Panel returned an invalid Credential response; durable local state retained for safe retry"
+  fi
 }
 
 handle_error_result() {
@@ -312,12 +303,7 @@ fi
 
 if [ "$PHASE" = PREPARE_READY ]; then
   prompt_claim_secret
-  request_file="$(mktemp "$STATE_DIR/.credential-request.XXXXXX" 9>&-)"
-  chmod 0600 "$request_file" 9>&-
-  printf '{"home_group_id":%s,"node_id":"%s","claim_secret":"%s","claimant_nonce":"%s","delivery_nonce":"%s","credential_id":"%s","verifier_format":"rp-node-sha256","verifier_version":1,"verifier_data":"%s"}' \
-    "$HOME_GROUP_ID" "$NODE_ID" "$CLAIM_SECRET" "$CLAIMANT_NONCE" "$DELIVERY_NONCE" \
-    "$CREDENTIAL_ID" "$VERIFIER_DATA" > "$request_file"
-  perform_request PREPARE prepare "$request_file"
+  perform_request PREPARE prepare
   unset CLAIM_SECRET
   case "$REQUEST_RESULT" in
     SUCCESS:PREPARED|SUCCESS:EXISTING)
@@ -341,12 +327,7 @@ secret_payload="${CREDENTIAL_SECRET#rpn1_}"
   || fail "permanent Credential Secret is invalid"
 case "$secret_payload" in *[!A-Za-z0-9_-]*) fail "permanent Credential Secret is invalid" ;; esac
 
-request_file="$(mktemp "$STATE_DIR/.credential-request.XXXXXX" 9>&-)"
-chmod 0600 "$request_file" 9>&-
-printf '{"home_group_id":%s,"node_id":"%s","credential_id":"%s","delivery_nonce":"%s","credential_secret":"%s"}' \
-  "$HOME_GROUP_ID" "$NODE_ID" "$CREDENTIAL_ID" "$DELIVERY_NONCE" "$CREDENTIAL_SECRET" \
-  > "$request_file"
-perform_request ACTIVATE activate "$request_file"
+perform_request ACTIVATE activate
 unset CREDENTIAL_SECRET
 
 case "$REQUEST_RESULT" in

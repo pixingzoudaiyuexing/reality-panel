@@ -13,10 +13,14 @@ import json
 import os
 import secrets
 import stat
+import subprocess
 import sys
 import uuid
 
 MAX_RESPONSE_BYTES = 65536
+MAX_REQUEST_BYTES = 8192
+MAX_TOKEN_BYTES = 4096
+CURL_STATUS_MARKER = b"\n__RP_HTTP_STATUS__:"
 MAX_DEPTH = 16
 STATE_KEYS = {
     "version",
@@ -319,9 +323,7 @@ def walk_response(value, depth=0) -> None:
             walk_response(child, depth + 1)
 
 
-def parse_response(args) -> None:
-    with open(args.response, "rb") as handle:
-        raw = handle.read(MAX_RESPONSE_BYTES + 1)
+def classify_response(args, raw: bytes, http_code: str) -> str:
     if len(raw) > MAX_RESPONSE_BYTES:
         fail("response too large")
     try:
@@ -344,7 +346,7 @@ def parse_response(args) -> None:
         "PREPARE": {"PREPARED", "EXISTING"},
         "ACTIVATE": {"ACTIVATED", "EXISTING"},
     }
-    if args.http_code == "200" and doc["code"] == 0 and outcome in successes[args.phase]:
+    if http_code == "200" and doc["code"] == 0 and outcome in successes[args.phase]:
         expected_data = (
             {"outcome", "delivery"}
             if args.phase == "PREPARE"
@@ -384,20 +386,117 @@ def parse_response(args) -> None:
                 or credential["revoked_at"] is not None
             ):
                 fail("invalid activated Credential response")
-        print(f"SUCCESS:{outcome}")
-        return
+        return f"SUCCESS:{outcome}"
 
     if (
-        args.http_code in {"401", "409", "410", "429"}
+        http_code in {"401", "409", "410", "429"}
         and isinstance(data, dict)
         and outcome in CONTROLLED_ERRORS
     ):
-        print(f"ERROR:{outcome}")
-        return
-    if args.http_code.startswith("5"):
-        print("ERROR:SERVER")
-        return
+        return f"ERROR:{outcome}"
+    if http_code.startswith("5"):
+        return "ERROR:SERVER"
     fail("response is not an allowed Credential result")
+
+
+def curl_config_escape(value: str) -> str:
+    if "\r" in value or "\n" in value:
+        fail("invalid curl transport value")
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def request(args) -> None:
+    raw_input = sys.stdin.buffer.read(MAX_REQUEST_BYTES + MAX_TOKEN_BYTES + 2)
+    token_raw, separator, body = raw_input.partition(b"\n")
+    if (
+        not separator
+        or not token_raw
+        or len(token_raw) > MAX_TOKEN_BYTES
+        or not body
+        or len(body) > MAX_REQUEST_BYTES
+    ):
+        fail("invalid credential transport input")
+    try:
+        token = token_raw.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise StateError("invalid credential transport input") from exc
+    if any(ch.isspace() for ch in token):
+        fail("invalid credential transport input")
+    if not args.url.startswith("https://"):
+        fail("Credential transport requires HTTPS")
+
+    config_read, config_write = os.pipe()
+    body_read, body_write = os.pipe()
+    config_path = f"/dev/fd/{config_read}"
+    body_path = f"/dev/fd/{body_read}"
+    config = (
+        f'url = "{curl_config_escape(args.url)}"\n'
+        'request = "POST"\n'
+        'silent\nshow-error\nproto = "=https"\nproto-redir = "=https"\nmax-redirs = 0\n'
+        'connect-timeout = 10\nmax-time = 30\nmax-filesize = 65536\n'
+        'header = "Content-Type: application/json"\n'
+        f'header = "Authorization: Bearer {curl_config_escape(token)}"\n'
+        f'data-binary = "@{body_path}"\n'
+        'write-out = "\\n__RP_HTTP_STATUS__:%{http_code}"\n'
+    ).encode("utf-8")
+
+    curl_env = os.environ.copy()
+    for key in ("NODE_TOKEN", "CLAIM_SECRET", "CREDENTIAL_SECRET"):
+        curl_env.pop(key, None)
+
+    process = None
+    try:
+        process = subprocess.Popen(
+            ["curl", "--config", config_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            pass_fds=(config_read, body_read),
+            env=curl_env,
+        )
+        os.close(config_read)
+        config_read = -1
+        os.close(body_read)
+        body_read = -1
+        write_all(config_write, config)
+        os.close(config_write)
+        config_write = -1
+        write_all(body_write, body)
+        os.close(body_write)
+        body_write = -1
+        try:
+            stdout, _stderr = process.communicate(timeout=35)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            process.communicate()
+            raise StateError("HTTPS Credential request failed") from exc
+    finally:
+        for fd in (config_read, config_write, body_read, body_write):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    if process is None or process.returncode != 0:
+        fail("HTTPS Credential request failed")
+    marker_at = stdout.rfind(CURL_STATUS_MARKER)
+    if marker_at < 0:
+        fail("Credential response is missing HTTP status")
+    status_raw = stdout[marker_at + len(CURL_STATUS_MARKER) :]
+    response = stdout[:marker_at]
+    if len(status_raw) != 3 or not status_raw.isdigit():
+        fail("Credential response has invalid HTTP status")
+    http_code = status_raw.decode("ascii")
+    print(classify_response(args, response, http_code))
 
 
 def build_parser():
@@ -424,15 +523,14 @@ def build_parser():
     verifier_parser.add_argument("--secret-file", required=True)
     verifier_parser.set_defaults(func=verifier)
 
-    response_parser = sub.add_parser("parse-response", add_help=False)
-    response_parser.add_argument("--phase", choices=["PREPARE", "ACTIVATE"], required=True)
-    response_parser.add_argument("--http-code", required=True)
-    response_parser.add_argument("--response", required=True)
-    response_parser.add_argument("--claim-id", required=True)
-    response_parser.add_argument("--group-id", type=int, required=True)
-    response_parser.add_argument("--node-id", required=True)
-    response_parser.add_argument("--credential-id", required=True)
-    response_parser.set_defaults(func=parse_response)
+    request_parser = sub.add_parser("request", add_help=False)
+    request_parser.add_argument("--phase", choices=["PREPARE", "ACTIVATE"], required=True)
+    request_parser.add_argument("--url", required=True)
+    request_parser.add_argument("--claim-id", required=True)
+    request_parser.add_argument("--group-id", type=int, required=True)
+    request_parser.add_argument("--node-id", required=True)
+    request_parser.add_argument("--credential-id", required=True)
+    request_parser.set_defaults(func=request)
     return parser
 
 

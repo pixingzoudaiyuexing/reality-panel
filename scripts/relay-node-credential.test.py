@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import http.server
 import json
 import os
 import pathlib
@@ -7,6 +8,7 @@ import pty
 import select
 import shutil
 import signal
+import ssl
 import stat
 import subprocess
 import sys
@@ -86,6 +88,7 @@ if len(sys.argv) != 3 or sys.argv[1] != "--config":
     raise SystemExit(90)
 config = pathlib.Path(sys.argv[2])
 text = config.read_text(encoding="utf-8")
+
 def extract(pattern):
     match = re.search(pattern, text, re.MULTILINE)
     if not match:
@@ -93,8 +96,10 @@ def extract(pattern):
     return match.group(1).replace(r"\\\"", '"').replace(r"\\\\", "\\")
 
 url = extract(r'^url = "(.*)"$')
-output = pathlib.Path(extract(r'^output = "(.*)"$'))
 request_path = pathlib.Path(extract(r'^data-binary = "@(.*)"$'))
+authorization = extract(r'^header = "Authorization: (.*)"$')
+if authorization != "Bearer group-token-private-test":
+    raise SystemExit(97)
 match = re.search(r"/node-credential-claims/([^/]+)/credential/(prepare|activate)$", url)
 if not match:
     raise SystemExit(92)
@@ -102,10 +107,10 @@ claim_id, endpoint = match.groups()
 phase = "PREPARE" if endpoint == "prepare" else "ACTIVATE"
 capture = pathlib.Path(os.environ["FAKE_CAPTURE_DIR"])
 capture.mkdir(parents=True, exist_ok=True)
-shutil_path = capture / f"{endpoint}.json"
-shutil_path.write_bytes(request_path.read_bytes())
+request_bytes = request_path.read_bytes()
+(capture / f"{endpoint}.json").write_bytes(request_bytes)
 (capture / f"{endpoint}.argv").write_text(" ".join(sys.argv[1:]), encoding="utf-8")
-(capture / f"{endpoint}.config").write_text(text, encoding="utf-8")
+(capture / f"{endpoint}.started").write_text("started\n", encoding="ascii")
 
 state_dir = pathlib.Path(os.environ["CREDENTIAL_TEST_STATE_ROOT"]) / claim_id
 state_file = state_dir / "credential-pending.json"
@@ -121,7 +126,7 @@ expected_phase = "PREPARE_READY" if phase == "PREPARE" else "ACTIVATE_READY"
 if state.get("phase") != expected_phase:
     raise SystemExit(96)
 
-request = json.loads(request_path.read_text(encoding="utf-8"))
+request = json.loads(request_bytes.decode("utf-8"))
 mode_name = os.environ.get(
     "FAKE_PREPARE_MODE" if phase == "PREPARE" else "FAKE_ACTIVATE_MODE",
     "prepared" if phase == "PREPARE" else "activated",
@@ -184,26 +189,31 @@ if mode_name in errors:
 elif mode_name == "server":
     http = "500"
     body = {"code": 500, "message": "error", "data": None}
+elif mode_name == "server_echo_secret":
+    http = "500"
+    body = {
+        "code": 500,
+        "message": request.get("claim_secret") or request.get("credential_secret") or "error",
+        "data": None,
+    }
 elif mode_name == "wrong_identity":
     body["data"]["delivery"]["node_id"] = request["node_id"] + "_wrong"
 elif mode_name == "forbidden_secret":
     body["data"]["credential_secret"] = "rpn1_SHOULD_NOT_BE_ACCEPTED"
 elif mode_name == "duplicate":
     raw = '{"code":0,"code":0,"message":"ok","data":' + json.dumps(body["data"], separators=(",", ":")) + "}"
-    output.write_text(raw, encoding="utf-8")
-    print("200", end="")
+    sys.stdout.write(raw + "\n__RP_HTTP_STATUS__:200")
     raise SystemExit(0)
 elif mode_name == "malformed":
-    output.write_text('{"code":0,"data":', encoding="utf-8")
-    print("200", end="")
+    sys.stdout.write('{"code":0,"data":\n__RP_HTTP_STATUS__:200')
     raise SystemExit(0)
 elif mode_name == "oversized":
     body["padding"] = "x" * 70000
 elif mode_name == "status401_success":
     http = "401"
 
-output.write_text(json.dumps(body, separators=(",", ":")), encoding="utf-8")
-print(http, end="")
+sys.stdout.write(json.dumps(body, separators=(",", ":")))
+sys.stdout.write("\n__RP_HTTP_STATUS__:" + http)
 '''
 write_executable(FAKE_BIN / "curl", fake_curl)
 
@@ -246,16 +256,30 @@ def base_env(slot, prepare="prepared", activate="activated", delay=2):
     return env
 
 
-def run_helper(claim_id, secret=CLAIM_SECRET, group=7, slot="run", prepare="prepared",
-               activate="activated", secret_delay=0.0, never_send=False, pid_file=None):
-    env = base_env(slot, prepare, activate)
+def run_helper(
+    claim_id,
+    secret=CLAIM_SECRET,
+    group=7,
+    slot="run",
+    prepare="prepared",
+    activate="activated",
+    secret_delay=0.0,
+    never_send=False,
+    pid_file=None,
+    delay=2,
+    bash_args=None,
+    extra_env=None,
+):
+    env = base_env(slot, prepare, activate, delay)
+    if extra_env:
+        env.update(extra_env)
+    argv = ["bash"]
+    if bash_args:
+        argv.extend(bash_args)
+    argv.extend([str(HELPER), "--claim-id", claim_id, "--home-group-id", str(group)])
     pid, fd = pty.fork()
     if pid == 0:
-        os.execve(
-            "/bin/bash",
-            ["bash", str(HELPER), "--claim-id", claim_id, "--home-group-id", str(group)],
-            env,
-        )
+        os.execve("/bin/bash", argv, env)
     if pid_file:
         pathlib.Path(pid_file).write_text(str(pid), encoding="ascii")
     captured = bytearray()
@@ -334,12 +358,280 @@ def assert_no_leak(output, *values):
             fail("sensitive value leaked to helper terminal output")
 
 
+def ensure_local_state(claim_id):
+    output = subprocess.check_output(
+        [
+            "python3",
+            str(STATE_TOOL),
+            "ensure",
+            "--state-dir",
+            str(STATE_ROOT / claim_id),
+            "--claim-id",
+            claim_id,
+            "--group-id",
+            "7",
+            "--node-id",
+            NODE_ID,
+        ],
+        text=True,
+    ).strip()
+    fields = output.split("\t")
+    if len(fields) != 4:
+        fail("test setup could not initialize durable Credential state")
+    return fields
+
+
+def assert_no_sensitive_transients(claim_id, permanent_secret=None):
+    state_dir = STATE_ROOT / claim_id
+    forbidden_prefixes = (
+        ".credential-request.",
+        ".credential-response.",
+        ".credential-curl.",
+        ".credential-http-code.",
+    )
+    for path in state_dir.iterdir():
+        if path.name.startswith(forbidden_prefixes):
+            fail(f"persistent sensitive transient remains after interruption: {path.name}")
+        if not path.is_file() or path.is_symlink():
+            continue
+        data = path.read_bytes()
+        if CLAIM_SECRET.encode() in data or TOKEN.encode() in data:
+            fail(f"Claim Secret or Group Token persisted in {path.name}")
+        if (
+            permanent_secret
+            and permanent_secret.encode() in data
+            and path.name != "node-credential.secret"
+        ):
+            fail(f"duplicate permanent Credential Secret persisted in {path.name}")
+
+
+def run_real_curl_fd_test():
+    if not sys.platform.startswith("linux"):
+        print("NOT RUN: real curl FD wiring test requires Linux", file=sys.stderr)
+        return
+    real_curl = shutil.which("curl")
+    openssl = shutil.which("openssl")
+    if not real_curl or not openssl:
+        fail("Linux real curl FD wiring test requires curl and openssl")
+
+    test_dir = TMP / "real-curl"
+    test_dir.mkdir()
+    cert = test_dir / "cert.pem"
+    key = test_dir / "key.pem"
+    subprocess.check_call(
+        [
+            openssl,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-sha256",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=127.0.0.1",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    claim_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+    credential_id = "real-curl-credential"
+    captured_http = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            request = json.loads(body.decode("utf-8"))
+            captured_http["path"] = self.path
+            captured_http["authorization"] = self.headers.get("Authorization")
+            captured_http["content_type"] = self.headers.get("Content-Type")
+            captured_http["body"] = request
+            delivery = {
+                "claim_id": claim_id,
+                "home_group_id": 7,
+                "node_id": NODE_ID,
+                "credential_id": credential_id,
+                "state": "PREPARED",
+                "authorized_at": "2026-09-23T00:00:00Z",
+                "expires_at": "2026-09-23T00:10:00Z",
+                "updated_at": "2026-09-23T00:01:00Z",
+                "credential_generation": None,
+                "proof_verified_at": None,
+                "completed_at": None,
+                "cancelled_at": None,
+                "expired_at": None,
+            }
+            response = json.dumps(
+                {
+                    "code": 0,
+                    "message": "ok",
+                    "data": {"outcome": "PREPARED", "delivery": delivery},
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=cert, keyfile=key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    wrapper_dir = test_dir / "bin"
+    wrapper_dir.mkdir()
+    argv_file = test_dir / "curl.argv"
+    wrapper = f'''#!/usr/bin/env python3
+import os
+import sys
+with open(os.environ["REAL_CURL_ARGV_FILE"], "w", encoding="utf-8") as handle:
+    handle.write("\\n".join(sys.argv[1:]))
+os.execv({real_curl!r}, [{real_curl!r}] + sys.argv[1:])
+'''
+    write_executable(wrapper_dir / "curl", wrapper)
+    env = os.environ.copy()
+    env["PATH"] = str(wrapper_dir) + os.pathsep + env.get("PATH", "")
+    env["CURL_CA_BUNDLE"] = str(cert)
+    env["REAL_CURL_ARGV_FILE"] = str(argv_file)
+    env.pop("NODE_TOKEN", None)
+    env.pop("CLAIM_SECRET", None)
+    env.pop("CREDENTIAL_SECRET", None)
+
+    request = {
+        "home_group_id": 7,
+        "node_id": NODE_ID,
+        "claim_secret": CLAIM_SECRET,
+        "claimant_nonce": CLAIMANT_NONCE,
+        "delivery_nonce": "rpdn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "credential_id": credential_id,
+        "verifier_format": "rp-node-sha256",
+        "verifier_version": 1,
+        "verifier_data": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    }
+    input_text = TOKEN + "\n" + json.dumps(request, separators=(",", ":"))
+    try:
+        result = subprocess.run(
+            [
+                "python3",
+                str(STATE_TOOL),
+                "request",
+                "--phase",
+                "PREPARE",
+                "--url",
+                f"https://127.0.0.1:{server.server_port}/api/v1/node-credential-claims/{claim_id}/credential/prepare",
+                "--claim-id",
+                claim_id,
+                "--group-id",
+                "7",
+                "--node-id",
+                NODE_ID,
+                "--credential-id",
+                credential_id,
+            ],
+            input=input_text,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=20,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    if result.returncode != 0 or result.stdout.strip() != "SUCCESS:PREPARED":
+        sys.stderr.write(result.stderr)
+        fail("real curl FD wiring request failed")
+    if captured_http.get("authorization") != f"Bearer {TOKEN}":
+        fail("real curl did not receive the Bearer Token through config FD")
+    if captured_http.get("content_type") != "application/json":
+        fail("real curl did not send the expected Content-Type")
+    if captured_http.get("path") != (
+        f"/api/v1/node-credential-claims/{claim_id}/credential/prepare"
+    ):
+        fail("real curl used the wrong Credential endpoint")
+    if captured_http.get("body") != request:
+        fail("real curl did not read the independent JSON body FD exactly")
+    argv = argv_file.read_text(encoding="utf-8")
+    if "--config" not in argv or "/dev/fd/" not in argv:
+        fail("real curl was not invoked through the anonymous config FD")
+    for sensitive in (TOKEN, CLAIM_SECRET, CLAIMANT_NONCE, request["delivery_nonce"]):
+        if sensitive in argv or sensitive in result.stdout or sensitive in result.stderr:
+            fail("real curl FD test exposed sensitive material in argv/output")
+    print("REAL CURL FD TEST: PASS")
+
+
 try:
     write_env()
     write_node()
     env_before = ENV_FILE.read_bytes()
     node_before = NODE_ID_FILE.read_bytes()
     node_mode_before = mode(NODE_ID_FILE)
+
+    # xtrace must fail closed before trusted config, Claim Secret, or durable
+    # permanent Credential material is read or mutated.
+    xtrace_claim = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f"
+    write_claim_pending(xtrace_claim)
+    ensure_local_state(xtrace_claim)
+    xtrace_state_before = (STATE_ROOT / xtrace_claim / "credential-pending.json").read_bytes()
+    xtrace_secret_before = (STATE_ROOT / xtrace_claim / "node-credential.secret").read_bytes()
+    xtrace_secret_wire = xtrace_secret_before.decode("ascii")
+    status, output, _ = run_helper(
+        xtrace_claim,
+        slot="xtrace-direct",
+        never_send=True,
+        bash_args=["-x"],
+    )
+    if status == 0:
+        fail("bash -x unexpectedly entered the sensitive Credential helper")
+    assert_no_leak(output, TOKEN, CLAIM_SECRET, xtrace_secret_wire, CLAIMANT_NONCE)
+    if (CAPTURE_ROOT / "xtrace-direct").exists():
+        fail("bash -x reached the network transport")
+    if (
+        (STATE_ROOT / xtrace_claim / "credential-pending.json").read_bytes()
+        != xtrace_state_before
+        or (STATE_ROOT / xtrace_claim / "node-credential.secret").read_bytes()
+        != xtrace_secret_before
+    ):
+        fail("bash -x mutated durable Credential state before rejection")
+
+    bash_env = TMP / "enable-xtrace.bash"
+    bash_env.write_text("set -x\n", encoding="ascii")
+    status, output, _ = run_helper(
+        xtrace_claim,
+        slot="xtrace-inherited",
+        never_send=True,
+        extra_env={"BASH_ENV": str(bash_env)},
+    )
+    if status == 0:
+        fail("BASH_ENV-enabled inherited xtrace unexpectedly entered the helper")
+    assert_no_leak(output, TOKEN, CLAIM_SECRET, xtrace_secret_wire, CLAIMANT_NONCE)
+    if (CAPTURE_ROOT / "xtrace-inherited").exists():
+        fail("inherited xtrace reached the network transport")
+    if (
+        (STATE_ROOT / xtrace_claim / "credential-pending.json").read_bytes()
+        != xtrace_state_before
+        or (STATE_ROOT / xtrace_claim / "node-credential.secret").read_bytes()
+        != xtrace_secret_before
+    ):
+        fail("inherited xtrace mutated durable Credential state before rejection")
+    print("XTRACE NEGATIVE TESTS: PASS")
 
     # End-to-end success. The fake network verifies durable state+Secret exist
     # with mode 0600 before either request is accepted.
@@ -464,30 +756,122 @@ try:
     if thread.is_alive() or result["first"][0] != 0:
         fail("first same-Claim helper did not complete")
 
-    # SIGKILL releases the kernel lock and keeps stable local material.
+    # PREPARE in-flight SIGKILL: the fake transport has already read both
+    # anonymous FDs before the shell is killed. No sensitive named transient
+    # may remain, the flock must be immediately recoverable, and retry must
+    # preserve the exact durable Credential material.
     claim = "66666666-6666-4666-8666-666666666666"
     write_claim_pending(claim)
     killed = {}
-    pid_file = TMP / "killed.pid"
+    pid_file = TMP / "prepare-killed.pid"
     thread = threading.Thread(
         target=lambda: killed.setdefault(
-            "run", run_helper(claim, slot="killed-a", never_send=True, pid_file=pid_file)
+            "run",
+            run_helper(
+                claim,
+                slot="prepare-killed-a",
+                prepare="slow_prepared",
+                pid_file=pid_file,
+                delay=4,
+            ),
         )
     )
     thread.start()
-    if not wait_for(STATE_ROOT / claim / "credential-pending.json") or not wait_for(pid_file):
-        fail("SIGKILL helper did not reach durable pre-PREPARE state")
+    started = CAPTURE_ROOT / "prepare-killed-a" / "prepare.started"
+    if not wait_for(started) or not wait_for(pid_file):
+        fail("PREPARE SIGKILL test never reached the in-flight transport")
     before_state = (STATE_ROOT / claim / "credential-pending.json").read_bytes()
     before_secret = (STATE_ROOT / claim / "node-credential.secret").read_bytes()
+    before_doc = json.loads(before_state)
+    before_secret_wire = before_secret.decode("ascii")
+    first_prepare = captured("prepare-killed-a", "prepare")
+    assert_no_sensitive_transients(claim, before_secret_wire)
     os.kill(int(pid_file.read_text()), signal.SIGKILL)
     thread.join(timeout=10)
-    status, output, _ = run_helper(claim, slot="killed-b")
+    if thread.is_alive():
+        fail("PREPARE SIGKILL helper did not terminate")
+    assert_no_sensitive_transients(claim, before_secret_wire)
+    if (STATE_ROOT / claim / "credential-pending.json").read_bytes() != before_state:
+        fail("PREPARE SIGKILL changed durable pending state")
+    if (STATE_ROOT / claim / "node-credential.secret").read_bytes() != before_secret:
+        fail("PREPARE SIGKILL replaced durable permanent Secret")
+    status, output, _ = run_helper(claim, slot="prepare-killed-b")
     if status != 0:
-        fail("retry after SIGKILL did not reacquire lock")
-    if json.loads(before_state)["credential_id"] != load_state(claim)["credential_id"]:
-        fail("SIGKILL retry replaced credential_id")
-    if before_secret != (STATE_ROOT / claim / "node-credential.secret").read_bytes():
-        fail("SIGKILL retry replaced durable Secret")
+        fail("PREPARE retry after SIGKILL did not reacquire the Claim lock")
+    retry_prepare = captured("prepare-killed-b", "prepare")
+    if (
+        retry_prepare["credential_id"] != before_doc["credential_id"]
+        or retry_prepare["delivery_nonce"] != before_doc["delivery_nonce"]
+        or retry_prepare["credential_id"] != first_prepare["credential_id"]
+        or retry_prepare["delivery_nonce"] != first_prepare["delivery_nonce"]
+    ):
+        fail("PREPARE SIGKILL retry replaced stable delivery material")
+    if (STATE_ROOT / claim / "node-credential.secret").read_bytes() != before_secret:
+        fail("PREPARE SIGKILL retry generated a second permanent Secret")
+    assert_no_sensitive_transients(claim, before_secret_wire)
+    print("PREPARE IN-FLIGHT SIGKILL TEST: PASS")
+
+    # ACTIVATE in-flight SIGKILL: PREPARE has already advanced durable state
+    # to ACTIVATE_READY and the fake transport has read the activation body.
+    # Restart must skip PREPARE and reuse the exact permanent proof material.
+    claim = "67676767-6767-4767-8767-676767676767"
+    write_claim_pending(claim)
+    killed = {}
+    pid_file = TMP / "activate-killed.pid"
+    thread = threading.Thread(
+        target=lambda: killed.setdefault(
+            "run",
+            run_helper(
+                claim,
+                slot="activate-killed-a",
+                activate="slow_activated",
+                pid_file=pid_file,
+                delay=4,
+            ),
+        )
+    )
+    thread.start()
+    started = CAPTURE_ROOT / "activate-killed-a" / "activate.started"
+    if not wait_for(started) or not wait_for(pid_file):
+        fail("ACTIVATE SIGKILL test never reached the in-flight transport")
+    before_state = (STATE_ROOT / claim / "credential-pending.json").read_bytes()
+    before_secret = (STATE_ROOT / claim / "node-credential.secret").read_bytes()
+    before_doc = json.loads(before_state)
+    before_secret_wire = before_secret.decode("ascii")
+    first_activate = captured("activate-killed-a", "activate")
+    if before_doc["phase"] != "ACTIVATE_READY":
+        fail("ACTIVATE SIGKILL did not reach durable ACTIVATE_READY")
+    assert_no_sensitive_transients(claim, before_secret_wire)
+    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+    thread.join(timeout=10)
+    if thread.is_alive():
+        fail("ACTIVATE SIGKILL helper did not terminate")
+    assert_no_sensitive_transients(claim, before_secret_wire)
+    if (STATE_ROOT / claim / "credential-pending.json").read_bytes() != before_state:
+        fail("ACTIVATE SIGKILL changed durable pending state")
+    if (STATE_ROOT / claim / "node-credential.secret").read_bytes() != before_secret:
+        fail("ACTIVATE SIGKILL replaced durable permanent Secret")
+    status, output, _ = run_helper(
+        claim,
+        slot="activate-killed-b",
+        prepare="fail",
+        activate="existing",
+    )
+    if status != 0 or load_state(claim)["phase"] != "ACTIVE_CONFIRMED":
+        fail("ACTIVATE retry after SIGKILL did not recover")
+    if (CAPTURE_ROOT / "activate-killed-b" / "prepare.json").exists():
+        fail("ACTIVATE retry after SIGKILL incorrectly restarted PREPARE")
+    retry_activate = captured("activate-killed-b", "activate")
+    if retry_activate != first_activate:
+        fail("ACTIVATE retry after SIGKILL changed permanent proof material")
+    if (
+        retry_activate["credential_id"] != before_doc["credential_id"]
+        or retry_activate["delivery_nonce"] != before_doc["delivery_nonce"]
+        or retry_activate["credential_secret"] != before_secret_wire
+    ):
+        fail("ACTIVATE SIGKILL retry did not reuse stable durable material")
+    assert_no_sensitive_transients(claim, before_secret_wire)
+    print("ACTIVATE IN-FLIGHT SIGKILL TEST: PASS")
 
     # Historical 0644 node-id remains compatible and unchanged.
     write_node(file_mode=0o644)
@@ -530,10 +914,19 @@ try:
             fail(f"malicious response {attack} unexpectedly succeeded")
         local_secret = (STATE_ROOT / claim / "node-credential.secret").read_text()
         assert_no_leak(output, CLAIM_SECRET, TOKEN, local_secret)
+        assert_no_sensitive_transients(claim, local_secret)
 
     # Controlled HTTP failures also keep fixed local hints and durable material.
     for index, rejection in enumerate(
-        ["invalid", "replay", "expired", "cancelled", "rate_limited", "server"]
+        [
+            "invalid",
+            "replay",
+            "expired",
+            "cancelled",
+            "rate_limited",
+            "server",
+            "server_echo_secret",
+        ]
     ):
         claim = f"bbbbbbb{index}-bbbb-4bbb-8bbb-{index:012d}"
         write_claim_pending(claim)
@@ -542,6 +935,7 @@ try:
             fail(f"rejection {rejection} unexpectedly succeeded")
         local_secret = (STATE_ROOT / claim / "node-credential.secret").read_text()
         assert_no_leak(output, CLAIM_SECRET, TOKEN, local_secret)
+        assert_no_sensitive_transients(claim, local_secret)
         if load_state(claim)["phase"] != "PREPARE_READY":
             fail(f"rejection {rejection} corrupted retry phase")
 
@@ -578,6 +972,8 @@ try:
     status, _, _ = run_helper(state_claim, slot="state-symlink")
     if status == 0:
         fail("symlinked Credential state unexpectedly succeeded")
+
+    run_real_curl_fd_test()
 
     if ENV_FILE.read_bytes() != env_before or NODE_ID_FILE.read_bytes() != node_before:
         fail("final helper run modified existing Home-only config or node-id")
