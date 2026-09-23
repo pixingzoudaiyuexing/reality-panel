@@ -735,11 +735,6 @@ async fn claim_node_after_transport(
 }
 
 #[cfg(test)]
-fn clear_all_claim_attempt_rate_limits() {
-    CLAIM_ATTEMPT_LIMITER.lock().unwrap().clear();
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::diagnose::DiagnoseRegistry;
@@ -1246,7 +1241,6 @@ mod tests {
 
     #[tokio::test]
     async fn node_claim_requires_group_secret_exact_identity_and_pins_nonce() {
-        clear_all_claim_attempt_rate_limits();
         let (state, pool) = test_state().await;
         let (_, _, created) = create_for(&state, 1, 7, "Node_A").await;
         let (claim_id, secret) = extract_created(&created);
@@ -1365,7 +1359,6 @@ mod tests {
 
     #[tokio::test]
     async fn node_claim_cancel_and_expiry_keep_secret_non_authoritative() {
-        clear_all_claim_attempt_rate_limits();
         let (state, _pool) = test_state().await;
 
         let (_, _, created) = create_for(&state, 1, 7, "Cancel_Node").await;
@@ -1461,7 +1454,6 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_api_claimants_have_one_first_claimant_and_one_replay() {
-        clear_all_claim_attempt_rate_limits();
         let (state, _pool) = test_state().await;
         let (_, _, created) = create_for(&state, 1, 7, "Race_Node").await;
         let (claim_id, secret) = extract_created(&created);
@@ -1525,7 +1517,6 @@ mod tests {
 
     #[tokio::test]
     async fn claim_attempt_rate_limit_is_bounded_and_never_uses_secret_as_key() {
-        clear_all_claim_attempt_rate_limits();
         let (state, _pool) = test_state().await;
         let (_, _, created) = create_for(&state, 1, 7, "Rate_Node").await;
         let (claim_id, _) = extract_created(&created);
@@ -1558,6 +1549,5 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(body["data"]["outcome"], "RATE_LIMITED");
-        clear_all_claim_attempt_rate_limits();
     }
 }
