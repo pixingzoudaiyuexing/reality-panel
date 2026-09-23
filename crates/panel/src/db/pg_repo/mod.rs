@@ -32,6 +32,7 @@ mod dns_record_syncs;
 mod enrollments;
 mod groups;
 mod kvs;
+mod node_claims;
 mod node_credentials;
 mod node_reuse;
 mod orders;

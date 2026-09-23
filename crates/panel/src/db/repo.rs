@@ -30,6 +30,9 @@ use relay_shared::models::{
 use relay_shared::protocol::{RuleTargetRequest, TrafficEntry};
 use serde::Serialize;
 
+use crate::node_claim::{
+    NodeClaimNonceVerifier, NodeClaimSecret, NodeClaimSecretVerifier, NodeClaimantNonce,
+};
 use crate::node_credential::NodeCredentialVerifier;
 use crate::node_identity::ReuseEligibleNodeId;
 
@@ -858,6 +861,222 @@ pub trait NodeCredentialRepository: Send + Sync {
         node_id: &ReuseEligibleNodeId,
         generation: i64,
     ) -> Result<NodeCredentialMutationResult, DbError>;
+}
+
+// ── Node Reuse V1 one-time Concrete Node Claim registry ──
+
+/// Persisted internal Claim state. A row is authorization workflow state only:
+/// it is not proof that a physical machine has been verified and grants no
+/// runtime Node Reuse authority.
+#[derive(Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct NodeCredentialClaimRecord {
+    pub claim_id: String,
+    pub home_group_id: i64,
+    pub node_id: String,
+    pub secret_verifier_format: String,
+    pub secret_verifier_version: i64,
+    pub secret_verifier_data: Vec<u8>,
+    pub state: String,
+    pub expires_at: String,
+    pub claimant_nonce_verifier_format: Option<String>,
+    pub claimant_nonce_verifier_version: Option<i64>,
+    pub claimant_nonce_verifier_data: Option<Vec<u8>>,
+    pub approved_by: i64,
+    pub approval_ref: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub claimed_at: Option<String>,
+    pub cancelled_at: Option<String>,
+    pub expired_at: Option<String>,
+}
+
+/// Input for atomically creating an APPROVED Claim.
+///
+/// It intentionally carries only a verifier, never the raw Claim Secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewNodeCredentialClaim {
+    pub claim_id: String,
+    pub home_group_id: i64,
+    pub node_id: ReuseEligibleNodeId,
+    pub secret_verifier: NodeClaimSecretVerifier,
+    pub approved_by: i64,
+    pub approval_ref: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Presented material for one claim attempt. Raw material exists only in memory
+/// for constant-time verifier checks and is never part of a persisted DTO.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NodeCredentialClaimAttempt {
+    pub claim_id: String,
+    pub home_group_id: i64,
+    pub node_id: ReuseEligibleNodeId,
+    pub secret: NodeClaimSecret,
+    pub claimant_nonce: NodeClaimantNonce,
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeCredentialClaimCreateResult {
+    Created(NodeCredentialClaimRecord),
+    Existing(NodeCredentialClaimRecord),
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeCredentialClaimResult {
+    Claimed(NodeCredentialClaimRecord),
+    Existing(NodeCredentialClaimRecord),
+    Expired,
+    Cancelled,
+    Invalid,
+    Replay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeCredentialClaimMutationResult {
+    Applied,
+    Rejected,
+}
+
+impl std::fmt::Debug for NodeCredentialClaimRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCredentialClaimRecord")
+            .field("claim_id", &self.claim_id)
+            .field("home_group_id", &self.home_group_id)
+            .field("node_id", &self.node_id)
+            .field("secret_verifier_format", &self.secret_verifier_format)
+            .field("secret_verifier_version", &self.secret_verifier_version)
+            .field("secret_verifier_data", &RedactedVerifierData)
+            .field("state", &self.state)
+            .field("expires_at", &self.expires_at)
+            .field(
+                "claimant_nonce_verifier_format",
+                &self.claimant_nonce_verifier_format,
+            )
+            .field(
+                "claimant_nonce_verifier_version",
+                &self.claimant_nonce_verifier_version,
+            )
+            .field(
+                "claimant_nonce_verifier_data",
+                &self
+                    .claimant_nonce_verifier_data
+                    .as_ref()
+                    .map(|_| RedactedVerifierData),
+            )
+            .field("approved_by", &self.approved_by)
+            .field("approval_ref", &self.approval_ref)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("claimed_at", &self.claimed_at)
+            .field("cancelled_at", &self.cancelled_at)
+            .field("expired_at", &self.expired_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for NewNodeCredentialClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewNodeCredentialClaim")
+            .field("claim_id", &self.claim_id)
+            .field("home_group_id", &self.home_group_id)
+            .field("node_id", &self.node_id)
+            .field("secret_verifier", &self.secret_verifier)
+            .field("approved_by", &self.approved_by)
+            .field("approval_ref", &self.approval_ref)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for NodeCredentialClaimAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCredentialClaimAttempt")
+            .field("claim_id", &self.claim_id)
+            .field("home_group_id", &self.home_group_id)
+            .field("node_id", &self.node_id)
+            .field("secret", &self.secret)
+            .field("claimant_nonce", &self.claimant_nonce)
+            .field("now", &self.now)
+            .finish()
+    }
+}
+
+impl NodeCredentialClaimRecord {
+    pub fn secret_matches(&self, node_id: &ReuseEligibleNodeId, secret: &NodeClaimSecret) -> bool {
+        if self.node_id != node_id.as_str()
+            || self.secret_verifier_format != crate::node_claim::NODE_CLAIM_SECRET_VERIFIER_FORMAT
+            || self.secret_verifier_version != crate::node_claim::NODE_CLAIM_VERIFIER_VERSION
+        {
+            return false;
+        }
+        NodeClaimSecretVerifier::derive(&self.claim_id, self.home_group_id, node_id, secret)
+            .verify_data(&self.secret_verifier_data)
+    }
+
+    pub fn claimant_nonce_matches(
+        &self,
+        node_id: &ReuseEligibleNodeId,
+        nonce: &NodeClaimantNonce,
+    ) -> bool {
+        let (Some(format), Some(version), Some(data)) = (
+            self.claimant_nonce_verifier_format.as_deref(),
+            self.claimant_nonce_verifier_version,
+            self.claimant_nonce_verifier_data.as_deref(),
+        ) else {
+            return false;
+        };
+        if format != crate::node_claim::NODE_CLAIM_NONCE_VERIFIER_FORMAT
+            || version != crate::node_claim::NODE_CLAIM_VERIFIER_VERSION
+        {
+            return false;
+        }
+        NodeClaimNonceVerifier::derive(&self.claim_id, self.home_group_id, node_id, nonce)
+            .verify_data(data)
+    }
+}
+
+#[async_trait]
+pub trait NodeCredentialClaimRepository: Send + Sync {
+    async fn create_node_credential_claim(
+        &self,
+        claim: &NewNodeCredentialClaim,
+    ) -> Result<NodeCredentialClaimCreateResult, DbError>;
+
+    async fn find_node_credential_claim(
+        &self,
+        claim_id: &str,
+    ) -> Result<Option<NodeCredentialClaimRecord>, DbError>;
+
+    async fn list_node_credential_claims_for_identity(
+        &self,
+        home_group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+    ) -> Result<Vec<NodeCredentialClaimRecord>, DbError>;
+
+    async fn claim_node_credential(
+        &self,
+        attempt: &NodeCredentialClaimAttempt,
+    ) -> Result<NodeCredentialClaimResult, DbError>;
+
+    async fn cancel_node_credential_claim(
+        &self,
+        claim_id: &str,
+        home_group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<NodeCredentialClaimMutationResult, DbError>;
+
+    async fn expire_node_credential_claim(
+        &self,
+        claim_id: &str,
+        home_group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<NodeCredentialClaimMutationResult, DbError>;
 }
 
 // ── Manual bootstrap enrollments ──
@@ -1964,6 +2183,7 @@ pub trait Repository:
     + DnsRecordSyncRepository
     + NodeReuseRepository
     + NodeCredentialRepository
+    + NodeCredentialClaimRepository
     + Send
     + Sync
 {

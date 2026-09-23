@@ -133,6 +133,63 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_node_credentials_one_active
     ON node_credentials(home_group_id, node_id)
     WHERE activated_at IS NOT NULL AND revoked_at IS NULL;
 
+-- Node Reuse V1 S2-A2B1: inert one-time Concrete Node Claim registry.
+CREATE TABLE IF NOT EXISTS node_credential_claims (
+    claim_id TEXT PRIMARY KEY CHECK (char_length(claim_id) BETWEEN 1 AND 128),
+    home_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
+    node_id TEXT NOT NULL CHECK (
+        char_length(node_id) BETWEEN 1 AND 128
+        AND octet_length(node_id) = char_length(node_id)
+        AND node_id !~ '[^A-Za-z0-9_-]'
+    ),
+    secret_verifier_format TEXT NOT NULL CHECK (secret_verifier_format = 'rp-node-claim-sha256'),
+    secret_verifier_version BIGINT NOT NULL CHECK (secret_verifier_version = 1),
+    secret_verifier_data BYTEA NOT NULL CHECK (octet_length(secret_verifier_data) = 32),
+    state TEXT NOT NULL CHECK (state IN ('APPROVED','CLAIMED','CANCELLED','EXPIRED')),
+    expires_at TEXT NOT NULL CHECK (char_length(expires_at) > 0),
+    claimant_nonce_verifier_format TEXT,
+    claimant_nonce_verifier_version BIGINT,
+    claimant_nonce_verifier_data BYTEA,
+    approved_by BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    approval_ref TEXT NOT NULL CHECK (char_length(approval_ref) BETWEEN 1 AND 128),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    claimed_at TEXT,
+    cancelled_at TEXT,
+    expired_at TEXT,
+    CHECK (
+        (claimant_nonce_verifier_format IS NULL
+         AND claimant_nonce_verifier_version IS NULL
+         AND claimant_nonce_verifier_data IS NULL)
+        OR
+        (claimant_nonce_verifier_format = 'rp-node-claim-nonce-sha256'
+         AND claimant_nonce_verifier_version = 1
+         AND octet_length(claimant_nonce_verifier_data) = 32)
+    ),
+    CHECK (
+        (claimed_at IS NULL
+         AND claimant_nonce_verifier_format IS NULL
+         AND claimant_nonce_verifier_version IS NULL
+         AND claimant_nonce_verifier_data IS NULL)
+        OR
+        (claimed_at IS NOT NULL
+         AND claimant_nonce_verifier_format IS NOT NULL
+         AND claimant_nonce_verifier_version IS NOT NULL
+         AND claimant_nonce_verifier_data IS NOT NULL)
+    ),
+    CHECK (
+        (state = 'APPROVED' AND claimed_at IS NULL AND cancelled_at IS NULL
+         AND expired_at IS NULL AND claimant_nonce_verifier_data IS NULL)
+        OR (state = 'CLAIMED' AND claimed_at IS NOT NULL AND cancelled_at IS NULL
+            AND expired_at IS NULL AND claimant_nonce_verifier_data IS NOT NULL)
+        OR (state = 'CANCELLED' AND cancelled_at IS NOT NULL AND expired_at IS NULL)
+        OR (state = 'EXPIRED' AND expired_at IS NOT NULL AND cancelled_at IS NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_node_credential_claims_one_nonterminal
+    ON node_credential_claims(home_group_id, node_id)
+    WHERE state IN ('APPROVED','CLAIMED');
+
 CREATE TABLE IF NOT EXISTS tunnel_profiles (
     id              BIGSERIAL PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
@@ -510,7 +567,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 37;
+pub const PG_SCHEMA_VERSION: i32 = 38;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -1901,6 +1958,45 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tracing::info!("PG migration 37: node credential activation lifecycle present");
     }
 
+    if current < 38 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS node_credential_claims (\
+                 claim_id TEXT PRIMARY KEY CHECK (char_length(claim_id) BETWEEN 1 AND 128),\
+                 home_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,\
+                 node_id TEXT NOT NULL CHECK (char_length(node_id) BETWEEN 1 AND 128 AND octet_length(node_id) = char_length(node_id) AND node_id !~ '[^A-Za-z0-9_-]'),\
+                 secret_verifier_format TEXT NOT NULL CHECK (secret_verifier_format = 'rp-node-claim-sha256'),\
+                 secret_verifier_version BIGINT NOT NULL CHECK (secret_verifier_version = 1),\
+                 secret_verifier_data BYTEA NOT NULL CHECK (octet_length(secret_verifier_data) = 32),\
+                 state TEXT NOT NULL CHECK (state IN ('APPROVED','CLAIMED','CANCELLED','EXPIRED')),\
+                 expires_at TEXT NOT NULL CHECK (char_length(expires_at) > 0),\
+                 claimant_nonce_verifier_format TEXT, claimant_nonce_verifier_version BIGINT, claimant_nonce_verifier_data BYTEA,\
+                 approved_by BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,\
+                 approval_ref TEXT NOT NULL CHECK (char_length(approval_ref) BETWEEN 1 AND 128),\
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, claimed_at TEXT, cancelled_at TEXT, expired_at TEXT,\
+                 CHECK ((claimant_nonce_verifier_format IS NULL AND claimant_nonce_verifier_version IS NULL AND claimant_nonce_verifier_data IS NULL) OR (claimant_nonce_verifier_format = 'rp-node-claim-nonce-sha256' AND claimant_nonce_verifier_version = 1 AND octet_length(claimant_nonce_verifier_data) = 32)),\
+                 CHECK ((claimed_at IS NULL AND claimant_nonce_verifier_format IS NULL AND claimant_nonce_verifier_version IS NULL AND claimant_nonce_verifier_data IS NULL) OR (claimed_at IS NOT NULL AND claimant_nonce_verifier_format IS NOT NULL AND claimant_nonce_verifier_version IS NOT NULL AND claimant_nonce_verifier_data IS NOT NULL)),\
+                 CHECK ((state = 'APPROVED' AND claimed_at IS NULL AND cancelled_at IS NULL AND expired_at IS NULL AND claimant_nonce_verifier_data IS NULL) OR (state = 'CLAIMED' AND claimed_at IS NOT NULL AND cancelled_at IS NULL AND expired_at IS NULL AND claimant_nonce_verifier_data IS NOT NULL) OR (state = 'CANCELLED' AND cancelled_at IS NOT NULL AND expired_at IS NULL) OR (state = 'EXPIRED' AND expired_at IS NOT NULL AND cancelled_at IS NULL))\
+             )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_node_credential_claims_one_nonterminal \
+             ON node_credential_claims(home_group_id, node_id) \
+             WHERE state IN ('APPROVED','CLAIMED')",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (38) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 38: node_credential_claims state foundation present");
+    }
+
     Ok(())
 }
 
@@ -1961,7 +2057,7 @@ mod tests {
 
     #[test]
     fn pg_schema_version_matches_latest_migration() {
-        assert_eq!(PG_SCHEMA_VERSION, 37);
+        assert_eq!(PG_SCHEMA_VERSION, 38);
     }
 
     #[test]
@@ -2012,6 +2108,16 @@ mod tests {
         assert!(PG_SCHEMA_SQL.contains("WHERE activated_at IS NOT NULL AND revoked_at IS NULL"));
         assert!(!PG_SCHEMA_SQL.contains("node_secret"));
         assert!(!PG_SCHEMA_SQL.contains("group_token"));
+    }
+
+    #[test]
+    fn pg_schema_contains_node_claim_state_foundation() {
+        assert!(PG_SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS node_credential_claims"));
+        assert!(PG_SCHEMA_SQL.contains("rp-node-claim-sha256"));
+        assert!(PG_SCHEMA_SQL.contains("rp-node-claim-nonce-sha256"));
+        assert!(PG_SCHEMA_SQL.contains("uq_node_credential_claims_one_nonterminal"));
+        assert!(PG_SCHEMA_SQL.contains("state IN ('APPROVED','CLAIMED')"));
+        assert!(!PG_SCHEMA_SQL.contains("claim_secret TEXT"));
     }
 
     #[test]
