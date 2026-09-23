@@ -136,6 +136,64 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_node_credentials_one_active
     ON node_credentials(home_group_id, node_id)
     WHERE activated_at IS NOT NULL AND revoked_at IS NULL;
 
+-- Node Reuse V1 S2-A2B1: inert one-time Concrete Node Claim registry.
+-- A Claim row is internal authorization state, not proof of a physical Node.
+CREATE TABLE IF NOT EXISTS node_credential_claims (
+    claim_id TEXT PRIMARY KEY CHECK (length(claim_id) BETWEEN 1 AND 128),
+    home_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
+    node_id TEXT NOT NULL CHECK (
+        length(node_id) BETWEEN 1 AND 128
+        AND length(CAST(node_id AS BLOB)) = length(node_id)
+        AND node_id NOT GLOB '*[^A-Za-z0-9_-]*'
+    ),
+    secret_verifier_format TEXT NOT NULL CHECK (secret_verifier_format = 'rp-node-claim-sha256'),
+    secret_verifier_version INTEGER NOT NULL CHECK (secret_verifier_version = 1),
+    secret_verifier_data BLOB NOT NULL CHECK (length(secret_verifier_data) = 32),
+    state TEXT NOT NULL CHECK (state IN ('APPROVED','CLAIMED','CANCELLED','EXPIRED')),
+    expires_at TEXT NOT NULL CHECK (length(expires_at) > 0),
+    claimant_nonce_verifier_format TEXT,
+    claimant_nonce_verifier_version INTEGER,
+    claimant_nonce_verifier_data BLOB,
+    approved_by INTEGER NOT NULL,
+    approval_ref TEXT NOT NULL CHECK (length(approval_ref) BETWEEN 1 AND 128),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    claimed_at TEXT,
+    cancelled_at TEXT,
+    expired_at TEXT,
+    CHECK (
+        (claimant_nonce_verifier_format IS NULL
+         AND claimant_nonce_verifier_version IS NULL
+         AND claimant_nonce_verifier_data IS NULL)
+        OR
+        (claimant_nonce_verifier_format = 'rp-node-claim-nonce-sha256'
+         AND claimant_nonce_verifier_version = 1
+         AND length(claimant_nonce_verifier_data) = 32)
+    ),
+    CHECK (
+        (claimed_at IS NULL
+         AND claimant_nonce_verifier_format IS NULL
+         AND claimant_nonce_verifier_version IS NULL
+         AND claimant_nonce_verifier_data IS NULL)
+        OR
+        (claimed_at IS NOT NULL
+         AND claimant_nonce_verifier_format IS NOT NULL
+         AND claimant_nonce_verifier_version IS NOT NULL
+         AND claimant_nonce_verifier_data IS NOT NULL)
+    ),
+    CHECK (
+        (state = 'APPROVED' AND claimed_at IS NULL AND cancelled_at IS NULL
+         AND expired_at IS NULL AND claimant_nonce_verifier_data IS NULL)
+        OR (state = 'CLAIMED' AND claimed_at IS NOT NULL AND cancelled_at IS NULL
+            AND expired_at IS NULL AND claimant_nonce_verifier_data IS NOT NULL)
+        OR (state = 'CANCELLED' AND cancelled_at IS NOT NULL AND expired_at IS NULL)
+        OR (state = 'EXPIRED' AND expired_at IS NOT NULL AND cancelled_at IS NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_node_credential_claims_one_nonterminal
+    ON node_credential_claims(home_group_id, node_id)
+    WHERE state IN ('APPROVED','CLAIMED');
+
 -- v0.3.0: reusable tunnel profiles describing how traffic flows between an
 -- inbound node and an outbound node (NOT the user-facing entry protocol, which
 -- lives on forward_rules.entry_transport). Seed rows are is_builtin=1.
@@ -2284,6 +2342,41 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .execute(pool)
     .await?;
     tracing::info!("Migration 53: node credential activation lifecycle present");
+
+    // ── Migration 54: one-time Concrete Node Claim state foundation ──
+    // Time never participates in the unique-index predicate. Repository
+    // transactions explicitly terminalize expired rows before replacement.
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS node_credential_claims (\
+             claim_id TEXT PRIMARY KEY CHECK (length(claim_id) BETWEEN 1 AND 128),\
+             home_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,\
+             node_id TEXT NOT NULL CHECK (length(node_id) BETWEEN 1 AND 128 AND length(CAST(node_id AS BLOB)) = length(node_id) AND node_id NOT GLOB '*[^A-Za-z0-9_-]*'),\
+             secret_verifier_format TEXT NOT NULL CHECK (secret_verifier_format = 'rp-node-claim-sha256'),\
+             secret_verifier_version INTEGER NOT NULL CHECK (secret_verifier_version = 1),\
+             secret_verifier_data BLOB NOT NULL CHECK (length(secret_verifier_data) = 32),\
+             state TEXT NOT NULL CHECK (state IN ('APPROVED','CLAIMED','CANCELLED','EXPIRED')),\
+             expires_at TEXT NOT NULL CHECK (length(expires_at) > 0),\
+             claimant_nonce_verifier_format TEXT, claimant_nonce_verifier_version INTEGER, claimant_nonce_verifier_data BLOB,\
+             approved_by INTEGER NOT NULL,\
+             approval_ref TEXT NOT NULL CHECK (length(approval_ref) BETWEEN 1 AND 128),\
+             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, claimed_at TEXT, cancelled_at TEXT, expired_at TEXT,\
+             CHECK ((claimant_nonce_verifier_format IS NULL AND claimant_nonce_verifier_version IS NULL AND claimant_nonce_verifier_data IS NULL) OR (claimant_nonce_verifier_format = 'rp-node-claim-nonce-sha256' AND claimant_nonce_verifier_version = 1 AND length(claimant_nonce_verifier_data) = 32)),\
+             CHECK ((claimed_at IS NULL AND claimant_nonce_verifier_format IS NULL AND claimant_nonce_verifier_version IS NULL AND claimant_nonce_verifier_data IS NULL) OR (claimed_at IS NOT NULL AND claimant_nonce_verifier_format IS NOT NULL AND claimant_nonce_verifier_version IS NOT NULL AND claimant_nonce_verifier_data IS NOT NULL)),\
+             CHECK ((state = 'APPROVED' AND claimed_at IS NULL AND cancelled_at IS NULL AND expired_at IS NULL AND claimant_nonce_verifier_data IS NULL) OR (state = 'CLAIMED' AND claimed_at IS NOT NULL AND cancelled_at IS NULL AND expired_at IS NULL AND claimant_nonce_verifier_data IS NOT NULL) OR (state = 'CANCELLED' AND cancelled_at IS NOT NULL AND expired_at IS NULL) OR (state = 'EXPIRED' AND expired_at IS NOT NULL AND cancelled_at IS NULL))\
+         )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_node_credential_claims_one_nonterminal \
+         ON node_credential_claims(home_group_id, node_id) \
+         WHERE state IN ('APPROVED','CLAIMED')",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    tracing::info!("Migration 54: node_credential_claims state foundation present");
 
     Ok(())
 }

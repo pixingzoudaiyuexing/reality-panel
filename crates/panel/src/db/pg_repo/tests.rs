@@ -7464,6 +7464,563 @@ async fn pg_node_credential_lifecycle_upgrade_preserves_inactive_rows() {
     cleanup(&db).await;
 }
 
+fn pg_claim_test_time(value: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
+}
+
+fn pg_test_node_claim(
+    claim_id: &str,
+    home_group_id: i64,
+    node_id: &str,
+    secret_byte: u8,
+    approved_by: i64,
+    created_at: chrono::DateTime<chrono::Utc>,
+    ttl_secs: i64,
+) -> (NewNodeCredentialClaim, crate::node_claim::NodeClaimSecret) {
+    let node_id = crate::node_identity::ReuseEligibleNodeId::parse(node_id).unwrap();
+    let secret = crate::node_claim::NodeClaimSecret::from_test_bytes([secret_byte; 32]);
+    let secret_verifier = crate::node_claim::NodeClaimSecretVerifier::derive(
+        claim_id,
+        home_group_id,
+        &node_id,
+        &secret,
+    );
+    (
+        NewNodeCredentialClaim {
+            claim_id: claim_id.into(),
+            home_group_id,
+            node_id,
+            secret_verifier,
+            approved_by,
+            approval_ref: format!("approval-{claim_id}"),
+            created_at,
+            expires_at: created_at + chrono::Duration::seconds(ttl_secs),
+        },
+        secret,
+    )
+}
+
+fn pg_test_claim_attempt(
+    claim_id: &str,
+    home_group_id: i64,
+    node_id: &str,
+    secret: crate::node_claim::NodeClaimSecret,
+    nonce_byte: u8,
+    now: chrono::DateTime<chrono::Utc>,
+) -> NodeCredentialClaimAttempt {
+    NodeCredentialClaimAttempt {
+        claim_id: claim_id.into(),
+        home_group_id,
+        node_id: crate::node_identity::ReuseEligibleNodeId::parse(node_id).unwrap(),
+        secret,
+        claimant_nonce: crate::node_claim::NodeClaimantNonce::from_test_bytes([nonce_byte; 32]),
+        now,
+    }
+}
+
+#[tokio::test]
+async fn pg_node_credential_claim_repository_contract() {
+    let Some(db) = repo("node_claim_contract").await else {
+        return;
+    };
+    seed_group(&db, 10).await;
+    seed_group(&db, 20).await;
+    let now = pg_claim_test_time("2026-09-23T12:00:00Z");
+    let (claim, secret) = pg_test_node_claim("claim-a", 10, "Node_A", 0x11, 1, now, 600);
+
+    let NodeCredentialClaimCreateResult::Created(created) =
+        db.create_node_credential_claim(&claim).await.unwrap()
+    else {
+        panic!("first claim must be created");
+    };
+    assert_eq!(created.state, "APPROVED");
+    assert_ne!(created.secret_verifier_data, vec![0x11; 32]);
+    let record_debug = format!("{created:?}");
+    assert!(record_debug.contains("<redacted>"));
+    assert!(
+        !record_debug.contains(&hex::encode(&created.secret_verifier_data)),
+        "persisted Claim verifier digest must not leak through Debug"
+    );
+    assert!(matches!(
+        db.create_node_credential_claim(&claim).await.unwrap(),
+        NodeCredentialClaimCreateResult::Existing(_)
+    ));
+
+    let (other_group, _) = pg_test_node_claim("claim-other-group", 20, "Node_A", 0x12, 1, now, 600);
+    assert!(matches!(
+        db.create_node_credential_claim(&other_group).await.unwrap(),
+        NodeCredentialClaimCreateResult::Created(_)
+    ));
+
+    let wrong = crate::node_claim::NodeClaimSecret::from_test_bytes([0x55; 32]);
+    assert_eq!(
+        db.claim_node_credential(&pg_test_claim_attempt(
+            "claim-a",
+            10,
+            "Node_A",
+            wrong,
+            0x21,
+            now + chrono::Duration::seconds(1)
+        ))
+        .await
+        .unwrap(),
+        NodeCredentialClaimResult::Invalid
+    );
+    assert_eq!(
+        db.claim_node_credential(&pg_test_claim_attempt(
+            "claim-a",
+            20,
+            "Node_A",
+            secret.clone(),
+            0x21,
+            now + chrono::Duration::seconds(1)
+        ))
+        .await
+        .unwrap(),
+        NodeCredentialClaimResult::Invalid
+    );
+    assert_eq!(
+        db.claim_node_credential(&pg_test_claim_attempt(
+            "claim-a",
+            10,
+            "Node_a",
+            secret.clone(),
+            0x21,
+            now + chrono::Duration::seconds(1)
+        ))
+        .await
+        .unwrap(),
+        NodeCredentialClaimResult::Invalid
+    );
+    assert!(matches!(
+        db.claim_node_credential(&pg_test_claim_attempt(
+            "claim-a",
+            10,
+            "Node_A",
+            secret.clone(),
+            0x21,
+            now + chrono::Duration::seconds(1)
+        ))
+        .await
+        .unwrap(),
+        NodeCredentialClaimResult::Claimed(_)
+    ));
+    assert!(matches!(
+        db.claim_node_credential(&pg_test_claim_attempt(
+            "claim-a",
+            10,
+            "Node_A",
+            secret.clone(),
+            0x21,
+            now + chrono::Duration::seconds(2)
+        ))
+        .await
+        .unwrap(),
+        NodeCredentialClaimResult::Existing(_)
+    ));
+    assert_eq!(
+        db.claim_node_credential(&pg_test_claim_attempt(
+            "claim-a",
+            10,
+            "Node_A",
+            secret,
+            0x22,
+            now + chrono::Duration::seconds(2)
+        ))
+        .await
+        .unwrap(),
+        NodeCredentialClaimResult::Replay
+    );
+    let credential_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_credentials")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(credential_count, 0);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_node_credential_claim_expiry_cancel_and_recreation() {
+    let Some(db) = repo("node_claim_expiry").await else {
+        return;
+    };
+    seed_group(&db, 10).await;
+    let t0 = pg_claim_test_time("2026-09-23T13:00:00Z");
+    let node = crate::node_identity::ReuseEligibleNodeId::parse("Node_A").unwrap();
+
+    let (old, old_secret) = pg_test_node_claim("claim-old", 10, "Node_A", 0x31, 1, t0, 60);
+    assert!(matches!(
+        db.create_node_credential_claim(&old).await.unwrap(),
+        NodeCredentialClaimCreateResult::Created(_)
+    ));
+    assert_eq!(
+        db.claim_node_credential(&pg_test_claim_attempt(
+            "claim-old",
+            10,
+            "Node_A",
+            old_secret.clone(),
+            0x41,
+            t0 + chrono::Duration::seconds(61)
+        ))
+        .await
+        .unwrap(),
+        NodeCredentialClaimResult::Expired
+    );
+
+    let (new_claim, new_secret) = pg_test_node_claim(
+        "claim-new",
+        10,
+        "Node_A",
+        0x32,
+        1,
+        t0 + chrono::Duration::seconds(61),
+        60,
+    );
+    assert!(matches!(
+        db.create_node_credential_claim(&new_claim).await.unwrap(),
+        NodeCredentialClaimCreateResult::Created(_)
+    ));
+    assert_eq!(
+        db.claim_node_credential(&pg_test_claim_attempt(
+            "claim-old",
+            10,
+            "Node_A",
+            old_secret,
+            0x41,
+            t0 + chrono::Duration::seconds(62)
+        ))
+        .await
+        .unwrap(),
+        NodeCredentialClaimResult::Expired
+    );
+    assert_eq!(
+        db.cancel_node_credential_claim("claim-new", 10, &node, t0 + chrono::Duration::seconds(62))
+            .await
+            .unwrap(),
+        NodeCredentialClaimMutationResult::Applied
+    );
+    assert_eq!(
+        db.claim_node_credential(&pg_test_claim_attempt(
+            "claim-new",
+            10,
+            "Node_A",
+            new_secret,
+            0x42,
+            t0 + chrono::Duration::seconds(63)
+        ))
+        .await
+        .unwrap(),
+        NodeCredentialClaimResult::Cancelled
+    );
+
+    let (third, _) = pg_test_node_claim(
+        "claim-third",
+        10,
+        "Node_A",
+        0x33,
+        1,
+        t0 + chrono::Duration::seconds(63),
+        60,
+    );
+    assert!(matches!(
+        db.create_node_credential_claim(&third).await.unwrap(),
+        NodeCredentialClaimCreateResult::Created(_)
+    ));
+    assert_eq!(
+        db.expire_node_credential_claim(
+            "claim-third",
+            10,
+            &node,
+            t0 + chrono::Duration::seconds(100)
+        )
+        .await
+        .unwrap(),
+        NodeCredentialClaimMutationResult::Rejected
+    );
+    assert_eq!(
+        db.expire_node_credential_claim(
+            "claim-third",
+            10,
+            &node,
+            t0 + chrono::Duration::seconds(124)
+        )
+        .await
+        .unwrap(),
+        NodeCredentialClaimMutationResult::Applied
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_node_credential_claim_concurrent_create_and_claim() {
+    let Some(db) = repo("node_claim_concurrency").await else {
+        return;
+    };
+    pg_seed_user(&db, 2).await;
+    seed_group(&db, 10).await;
+    let now = pg_claim_test_time("2026-09-23T14:00:00Z");
+    let (a, secret_a) = pg_test_node_claim("claim-race-a", 10, "Node_A", 0x51, 1, now, 600);
+    let (b, secret_b) = pg_test_node_claim("claim-race-b", 10, "Node_A", 0x52, 2, now, 600);
+    let db_a = PgRepository::new(db.pool.clone());
+    let db_b = PgRepository::new(db.pool.clone());
+    let (ra, rb) = tokio::join!(
+        db_a.create_node_credential_claim(&a),
+        db_b.create_node_credential_claim(&b)
+    );
+    let ra = ra.unwrap();
+    let rb = rb.unwrap();
+    assert!(
+        (matches!(&ra, NodeCredentialClaimCreateResult::Created(_))
+            && matches!(&rb, NodeCredentialClaimCreateResult::Existing(_)))
+            || (matches!(&rb, NodeCredentialClaimCreateResult::Created(_))
+                && matches!(&ra, NodeCredentialClaimCreateResult::Existing(_)))
+    );
+
+    let node = crate::node_identity::ReuseEligibleNodeId::parse("Node_A").unwrap();
+    let rows = db
+        .list_node_credential_claims_for_identity(10, &node)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(row.state.as_str(), "APPROVED" | "CLAIMED"))
+            .count(),
+        1
+    );
+    let winner = rows
+        .iter()
+        .find(|row| row.state == "APPROVED")
+        .unwrap()
+        .claim_id
+        .clone();
+    let secret = if winner == "claim-race-a" {
+        secret_a
+    } else {
+        secret_b
+    };
+    let aa = pg_test_claim_attempt(
+        &winner,
+        10,
+        "Node_A",
+        secret.clone(),
+        0x61,
+        now + chrono::Duration::seconds(1),
+    );
+    let ab = pg_test_claim_attempt(
+        &winner,
+        10,
+        "Node_A",
+        secret,
+        0x62,
+        now + chrono::Duration::seconds(1),
+    );
+    let db_a = PgRepository::new(db.pool.clone());
+    let db_b = PgRepository::new(db.pool.clone());
+    let (ca, cb) = tokio::join!(
+        db_a.claim_node_credential(&aa),
+        db_b.claim_node_credential(&ab)
+    );
+    let ca = ca.unwrap();
+    let cb = cb.unwrap();
+    assert!(
+        (matches!(&ca, NodeCredentialClaimResult::Claimed(_))
+            && matches!(&cb, NodeCredentialClaimResult::Replay))
+            || (matches!(&cb, NodeCredentialClaimResult::Claimed(_))
+                && matches!(&ca, NodeCredentialClaimResult::Replay))
+    );
+    let rows = db
+        .list_node_credential_claims_for_identity(10, &node)
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().filter(|row| row.state == "CLAIMED").count(), 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_node_credential_claim_schema_constraints_and_fk_restrict() {
+    let Some(db) = repo("node_claim_constraints").await else {
+        return;
+    };
+    seed_group(&db, 10).await;
+    let now = pg_claim_test_time("2026-09-23T15:00:00Z");
+    let (claim, _) =
+        pg_test_node_claim("claim-constraints", 10, "Case_Sensitive", 0x71, 1, now, 600);
+    assert!(matches!(
+        db.create_node_credential_claim(&claim).await.unwrap(),
+        NodeCredentialClaimCreateResult::Created(_)
+    ));
+    assert!(matches!(
+        db.delete_group(10, &ResourceScope::All).await,
+        Err(DbError::ForeignKeyViolation)
+    ));
+
+    for (index, invalid) in [" node", "node ", "my node", "node\t", "节点"]
+        .into_iter()
+        .enumerate()
+    {
+        let result = sqlx::query(
+            "INSERT INTO node_credential_claims \
+             (claim_id,home_group_id,node_id,secret_verifier_format,secret_verifier_version,secret_verifier_data,state,expires_at,approved_by,approval_ref,created_at,updated_at) \
+             VALUES ($1,10,$2,'rp-node-claim-sha256',1,$3,'APPROVED',$4,1,'approval-x',$5,$5)",
+        )
+        .bind(format!("invalid-{index}"))
+        .bind(invalid)
+        .bind(vec![0x77_u8; 32])
+        .bind("2026-09-23T15:10:00Z")
+        .bind("2026-09-23T15:00:00Z")
+        .execute(&db.pool)
+        .await;
+        assert!(result.is_err(), "DB accepted invalid node id {invalid:?}");
+    }
+    let duplicate = sqlx::query(
+        "INSERT INTO node_credential_claims \
+         (claim_id,home_group_id,node_id,secret_verifier_format,secret_verifier_version,secret_verifier_data,state,expires_at,approved_by,approval_ref,created_at,updated_at) \
+         VALUES ('claim-duplicate',10,'Case_Sensitive','rp-node-claim-sha256',1,$1,'APPROVED','2026-09-23T15:10:00Z',1,'approval-y','2026-09-23T15:00:00Z','2026-09-23T15:00:00Z')",
+    ).bind(vec![0x78_u8; 32]).execute(&db.pool).await;
+    assert!(duplicate.is_err());
+    let malformed = sqlx::query(
+        "UPDATE node_credential_claims SET state='CLAIMED' WHERE claim_id='claim-constraints'",
+    )
+    .execute(&db.pool)
+    .await;
+    assert!(malformed.is_err());
+    let malformed_terminal = sqlx::query(
+        "UPDATE node_credential_claims
+         SET state='CANCELLED', cancelled_at='2026-09-23T15:01:00Z',
+             claimed_at='2026-09-23T15:00:30Z'
+         WHERE claim_id='claim-constraints'",
+    )
+    .execute(&db.pool)
+    .await;
+    assert!(malformed_terminal.is_err());
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_node_credential_claim_schema_upgrade_is_idempotent() {
+    let Some(pool) = fresh_pool("node_claim_upgrade").await else {
+        return;
+    };
+    sqlx::query("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO schema_version (version) VALUES (37)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE users (id BIGINT PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO users (id) VALUES (1)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE device_groups (id BIGINT PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE node_credentials (credential_id TEXT PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO node_credentials (credential_id) VALUES ('preserved-credential')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    run_pg_migrations(&pool).await.unwrap();
+    run_pg_migrations(&pool).await.unwrap();
+
+    let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='node_credential_claims'",
+    ).fetch_one(&pool).await.unwrap();
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes WHERE schemaname='public' AND indexname='uq_node_credential_claims_one_nonterminal'",
+    ).fetch_one(&pool).await.unwrap();
+    let credential_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM node_credentials WHERE credential_id='preserved-credential'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(version, crate::db::pg_schema::PG_SCHEMA_VERSION);
+    assert_eq!(table_count, 1);
+    assert_eq!(index_count, 1);
+    assert_eq!(credential_count, 1);
+
+    let db = PgRepository::new(pool);
+    let too_long = pg_test_node_claim(
+        "claim-too-long",
+        1,
+        "AAA",
+        0x92,
+        1,
+        pg_claim_test_time("2026-09-23T16:00:00Z"),
+        crate::node_claim::NODE_CLAIM_MAX_TTL_SECS + 1,
+    )
+    .0;
+    assert_eq!(
+        db.create_node_credential_claim(&too_long).await.unwrap(),
+        NodeCredentialClaimCreateResult::Rejected
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_node_credential_claim_migration_failure_recovery() {
+    let Some(db) = repo("node_claim_migration_recovery").await else {
+        return;
+    };
+    seed_group(&db, 10).await;
+    sqlx::query("DROP INDEX uq_node_credential_claims_one_nonterminal")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM schema_version WHERE version = 38")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for id in ["migration-race-a", "migration-race-b"] {
+        sqlx::query(
+            "INSERT INTO node_credential_claims \
+             (claim_id,home_group_id,node_id,secret_verifier_format,secret_verifier_version,secret_verifier_data,state,expires_at,approved_by,approval_ref,created_at,updated_at) \
+             VALUES ($1,10,'Node_A','rp-node-claim-sha256',1,$2,'APPROVED','2026-09-23T18:00:00Z',1,'approval-migration','2026-09-23T17:00:00Z','2026-09-23T17:00:00Z')",
+        ).bind(id).bind(vec![0xA1_u8;32]).execute(&db.pool).await.unwrap();
+    }
+    assert!(run_pg_migrations(&db.pool).await.is_err());
+    let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        version, 37,
+        "failed PG migration must not advance schema_version"
+    );
+
+    sqlx::query(
+        "UPDATE node_credential_claims SET state='CANCELLED', cancelled_at='2026-09-23T17:01:00Z', updated_at='2026-09-23T17:01:00Z' WHERE claim_id='migration-race-b'",
+    ).execute(&db.pool).await.unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+    let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes WHERE schemaname='public' AND indexname='uq_node_credential_claims_one_nonterminal'",
+    ).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(version, 38);
+    assert_eq!(index_count, 1);
+    cleanup(&db).await;
+}
+
 fn pg_new_dns_binding(rule_id: i64, record_id: &str) -> NewDnsRecordBinding {
     NewDnsRecordBinding {
         rule_id: Some(rule_id),
