@@ -154,7 +154,7 @@ CREATE TABLE IF NOT EXISTS node_credential_claims (
     claimant_nonce_verifier_format TEXT,
     claimant_nonce_verifier_version INTEGER,
     claimant_nonce_verifier_data BLOB,
-    approved_by INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    approved_by INTEGER NOT NULL,
     approval_ref TEXT NOT NULL CHECK (length(approval_ref) BETWEEN 1 AND 128),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -2358,7 +2358,7 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
              state TEXT NOT NULL CHECK (state IN ('APPROVED','CLAIMED','CANCELLED','EXPIRED')),\
              expires_at TEXT NOT NULL CHECK (length(expires_at) > 0),\
              claimant_nonce_verifier_format TEXT, claimant_nonce_verifier_version INTEGER, claimant_nonce_verifier_data BLOB,\
-             approved_by INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,\
+             approved_by INTEGER NOT NULL,\
              approval_ref TEXT NOT NULL CHECK (length(approval_ref) BETWEEN 1 AND 128),\
              created_at TEXT NOT NULL, updated_at TEXT NOT NULL, claimed_at TEXT, cancelled_at TEXT, expired_at TEXT,\
              CHECK ((claimant_nonce_verifier_format IS NULL AND claimant_nonce_verifier_version IS NULL AND claimant_nonce_verifier_data IS NULL) OR (claimant_nonce_verifier_format = 'rp-node-claim-nonce-sha256' AND claimant_nonce_verifier_version = 1 AND length(claimant_nonce_verifier_data) = 32)),\

@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS node_credential_claims (
     claimant_nonce_verifier_format TEXT,
     claimant_nonce_verifier_version BIGINT,
     claimant_nonce_verifier_data BYTEA,
-    approved_by BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    approved_by BIGINT NOT NULL,
     approval_ref TEXT NOT NULL CHECK (char_length(approval_ref) BETWEEN 1 AND 128),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -1971,7 +1971,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
                  state TEXT NOT NULL CHECK (state IN ('APPROVED','CLAIMED','CANCELLED','EXPIRED')),\
                  expires_at TEXT NOT NULL CHECK (char_length(expires_at) > 0),\
                  claimant_nonce_verifier_format TEXT, claimant_nonce_verifier_version BIGINT, claimant_nonce_verifier_data BYTEA,\
-                 approved_by BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,\
+                 approved_by BIGINT NOT NULL,\
                  approval_ref TEXT NOT NULL CHECK (char_length(approval_ref) BETWEEN 1 AND 128),\
                  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, claimed_at TEXT, cancelled_at TEXT, expired_at TEXT,\
                  CHECK ((claimant_nonce_verifier_format IS NULL AND claimant_nonce_verifier_version IS NULL AND claimant_nonce_verifier_data IS NULL) OR (claimant_nonce_verifier_format = 'rp-node-claim-nonce-sha256' AND claimant_nonce_verifier_version = 1 AND octet_length(claimant_nonce_verifier_data) = 32)),\
