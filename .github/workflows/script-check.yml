@@ -46,3 +46,6 @@ jobs:
 
       - name: Node Claim helper security tests
         run: bash scripts/relay-node-claim.test.sh
+
+      - name: Node Credential helper security and recovery tests
+        run: bash scripts/relay-node-credential.test.sh
