@@ -12,7 +12,7 @@ const CLAIM_COLUMNS: &str = "claim_id, home_group_id, node_id, secret_verifier_f
     secret_verifier_version, secret_verifier_data, state, expires_at, \
     claimant_nonce_verifier_format, claimant_nonce_verifier_version, \
     claimant_nonce_verifier_data, approved_by, approval_ref, created_at, updated_at, \
-    claimed_at, cancelled_at, expired_at";
+    claimed_at, credential_pending_at, completed_at, cancelled_at, expired_at";
 
 fn canonical_time(value: chrono::DateTime<chrono::Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -49,6 +49,30 @@ async fn expire_identity_if_due(
     node_id: &str,
     now: &str,
 ) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE node_credential_deliveries d \
+         SET state='EXPIRED', expired_at=$1, updated_at=$1 \
+         WHERE home_group_id=$2 AND node_id=$3 AND state='PREPARED' AND expires_at <= $1 \
+           AND EXISTS (SELECT 1 FROM node_credential_claims c \
+                       WHERE c.claim_id=d.claim_id AND c.state='CREDENTIAL_PENDING')",
+    )
+    .bind(now)
+    .bind(home_group_id)
+    .bind(node_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE node_credential_claims c \
+         SET state='EXPIRED', expired_at=$1, updated_at=$1 \
+         WHERE home_group_id=$2 AND node_id=$3 AND state='CREDENTIAL_PENDING' \
+           AND EXISTS (SELECT 1 FROM node_credential_deliveries d \
+                       WHERE d.claim_id=c.claim_id AND d.state='EXPIRED')",
+    )
+    .bind(now)
+    .bind(home_group_id)
+    .bind(node_id)
+    .execute(&mut **tx)
+    .await?;
     sqlx::query(
         "UPDATE node_credential_claims \
          SET state = 'EXPIRED', expired_at = $1, updated_at = $1 \
@@ -274,6 +298,38 @@ impl NodeCredentialClaimRepository for PgRepository {
             return Ok(NodeCredentialClaimMutationResult::Rejected);
         }
         expire_identity_if_due(&mut tx, home_group_id, node_id.as_str(), &now).await?;
+
+        let delivery = sqlx::query(
+            "UPDATE node_credential_deliveries d SET state='CANCELLED', cancelled_at=$1, updated_at=$1 \
+             WHERE claim_id=$2 AND home_group_id=$3 AND node_id=$4 AND state='PREPARED' \
+               AND EXISTS (SELECT 1 FROM node_credential_claims c \
+                           WHERE c.claim_id=d.claim_id AND c.state='CREDENTIAL_PENDING')",
+        )
+        .bind(&now)
+        .bind(claim_id)
+        .bind(home_group_id)
+        .bind(node_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        if delivery.rows_affected() == 1 {
+            let claim = sqlx::query(
+                "UPDATE node_credential_claims SET state='CANCELLED', cancelled_at=$1, updated_at=$1 \
+                 WHERE claim_id=$2 AND home_group_id=$3 AND node_id=$4 AND state='CREDENTIAL_PENDING'",
+            )
+            .bind(&now)
+            .bind(claim_id)
+            .bind(home_group_id)
+            .bind(node_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+            if claim.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(NodeCredentialClaimMutationResult::Rejected);
+            }
+            tx.commit().await?;
+            return Ok(NodeCredentialClaimMutationResult::Applied);
+        }
+
         let updated = sqlx::query(
             "UPDATE node_credential_claims SET state='CANCELLED', cancelled_at=$1, updated_at=$1 \
              WHERE claim_id=$2 AND home_group_id=$3 AND node_id=$4 \
@@ -306,6 +362,37 @@ impl NodeCredentialClaimRepository for PgRepository {
             tx.rollback().await?;
             return Ok(NodeCredentialClaimMutationResult::Rejected);
         }
+
+        let delivery = sqlx::query(
+            "UPDATE node_credential_deliveries SET state='EXPIRED', expired_at=$1, updated_at=$1 \
+             WHERE claim_id=$2 AND home_group_id=$3 AND node_id=$4 \
+               AND state='PREPARED' AND expires_at <= $1",
+        )
+        .bind(&now)
+        .bind(claim_id)
+        .bind(home_group_id)
+        .bind(node_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        if delivery.rows_affected() == 1 {
+            let claim = sqlx::query(
+                "UPDATE node_credential_claims SET state='EXPIRED', expired_at=$1, updated_at=$1 \
+                 WHERE claim_id=$2 AND home_group_id=$3 AND node_id=$4 AND state='CREDENTIAL_PENDING'",
+            )
+            .bind(&now)
+            .bind(claim_id)
+            .bind(home_group_id)
+            .bind(node_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+            if claim.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(NodeCredentialClaimMutationResult::Rejected);
+            }
+            tx.commit().await?;
+            return Ok(NodeCredentialClaimMutationResult::Applied);
+        }
+
         let updated = sqlx::query(
             "UPDATE node_credential_claims SET state='EXPIRED', expired_at=$1, updated_at=$1 \
              WHERE claim_id=$2 AND home_group_id=$3 AND node_id=$4 \
