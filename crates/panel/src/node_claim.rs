@@ -1,13 +1,8 @@
-//! Node Reuse V1 S2-A2B1 one-time Concrete Node Claim primitives.
+//! Node Reuse V1 one-time Concrete Node Claim cryptographic primitives.
 //!
-//! This module is intentionally inert. It defines cryptographic material used by
-//! the internal claim registry, but no HTTP, WebSocket, bootstrap, helper, or
-//! runtime path issues or consumes a real Claim Secret in S2-A2B1.
-
-#![allow(
-    dead_code,
-    reason = "S2-A2B1 is an intentionally inert reviewed claim foundation"
-)]
+//! S2-A2B1 introduced the reviewed inert secret/verifier foundation. S2-A2B2
+//! consumes these types only for the separately-approved one-time Claim flow;
+//! they still do not represent a permanent Node Credential or runtime authority.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
@@ -143,6 +138,10 @@ impl std::fmt::Debug for NodeClaimantNonce {
 }
 
 impl NodeClaimantNonce {
+    #[allow(
+        dead_code,
+        reason = "production nonce generation is performed by the S2-A2B2 target helper outside the Panel process"
+    )]
     pub fn generate() -> Result<Self, getrandom::Error> {
         let mut bytes = [0_u8; NODE_CLAIM_NONCE_LEN];
         getrandom::getrandom(&mut bytes)?;
@@ -153,6 +152,10 @@ impl NodeClaimantNonce {
         Ok(Self(parse_wire(input, NODE_CLAIM_NONCE_PREFIX)?))
     }
 
+    #[allow(
+        dead_code,
+        reason = "production nonce encoding is performed by the S2-A2B2 target helper outside the Panel process"
+    )]
     pub fn to_wire_value(&self) -> String {
         wire_value(NODE_CLAIM_NONCE_PREFIX, &self.0)
     }
