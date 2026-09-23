@@ -7,6 +7,7 @@ case "$-" in
     exit 1
     ;;
 esac
+unset NODE_TOKEN CLAIM_SECRET CREDENTIAL_SECRET
 set -euo pipefail
 umask 077
 export LC_ALL=C

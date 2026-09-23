@@ -413,6 +413,9 @@ def write_all(fd: int, data: bytes) -> None:
 
 
 def request(args) -> None:
+    for key in ("NODE_TOKEN", "CLAIM_SECRET", "CREDENTIAL_SECRET"):
+        if key in os.environ:
+            fail("sensitive credential material must not be inherited through environment")
     raw_input = sys.stdin.buffer.read(MAX_REQUEST_BYTES + MAX_TOKEN_BYTES + 2)
     token_raw, separator, body = raw_input.partition(b"\n")
     if (

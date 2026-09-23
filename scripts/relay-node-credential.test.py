@@ -251,6 +251,9 @@ def base_env(slot, prepare="prepared", activate="activated", delay=2):
             "FAKE_PREPARE_MODE": prepare,
             "FAKE_ACTIVATE_MODE": activate,
             "FAKE_DELAY": str(delay),
+            "NODE_TOKEN": "ENV_NODE_TOKEN_SHOULD_NOT_REACH_CHILD",
+            "CLAIM_SECRET": "ENV_CLAIM_SECRET_SHOULD_NOT_REACH_CHILD",
+            "CREDENTIAL_SECRET": "ENV_CREDENTIAL_SECRET_SHOULD_NOT_REACH_CHILD",
         }
     )
     return env
@@ -610,6 +613,25 @@ try:
         != xtrace_secret_before
     ):
         fail("bash -x mutated durable Credential state before rejection")
+
+    status, output, _ = run_helper(
+        xtrace_claim,
+        slot="xtrace-option",
+        never_send=True,
+        bash_args=["-o", "xtrace"],
+    )
+    if status == 0:
+        fail("bash -o xtrace unexpectedly entered the sensitive Credential helper")
+    assert_no_leak(output, TOKEN, CLAIM_SECRET, xtrace_secret_wire, CLAIMANT_NONCE)
+    if (CAPTURE_ROOT / "xtrace-option").exists():
+        fail("bash -o xtrace reached the network transport")
+    if (
+        (STATE_ROOT / xtrace_claim / "credential-pending.json").read_bytes()
+        != xtrace_state_before
+        or (STATE_ROOT / xtrace_claim / "node-credential.secret").read_bytes()
+        != xtrace_secret_before
+    ):
+        fail("bash -o xtrace mutated durable Credential state before rejection")
 
     bash_env = TMP / "enable-xtrace.bash"
     bash_env.write_text("set -x\n", encoding="ascii")
