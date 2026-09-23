@@ -46,6 +46,7 @@ const CLAIM_TRUSTED_PROXY_IPS_ENV: &str = "NODE_CLAIM_TRUSTED_PROXY_IPS";
 const CLAIM_ATTEMPT_LIMIT: u32 = 10;
 const CLAIM_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
 const CLAIM_ATTEMPT_LIMITER_CAP: usize = 10_000;
+const CLAIM_ATTEMPT_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct ClaimAttemptWindow {
@@ -53,8 +54,70 @@ struct ClaimAttemptWindow {
     window_start: Instant,
 }
 
-static CLAIM_ATTEMPT_LIMITER: Lazy<Mutex<HashMap<String, ClaimAttemptWindow>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+#[derive(Debug)]
+struct ClaimAttemptLimiter {
+    entries: HashMap<String, ClaimAttemptWindow>,
+    last_cleanup: Instant,
+    #[cfg(test)]
+    cleanup_runs: usize,
+}
+
+impl ClaimAttemptLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            entries: HashMap::new(),
+            last_cleanup: now,
+            #[cfg(test)]
+            cleanup_runs: 0,
+        }
+    }
+
+    fn check(
+        &mut self,
+        key: &str,
+        now: Instant,
+        cap: usize,
+        window: Duration,
+        cleanup_interval: Duration,
+    ) -> bool {
+        if let Some(entry) = self.entries.get_mut(key) {
+            if now.saturating_duration_since(entry.window_start) < window {
+                entry.count = entry.count.saturating_add(1);
+                return entry.count > CLAIM_ATTEMPT_LIMIT;
+            }
+            entry.count = 1;
+            entry.window_start = now;
+            return false;
+        }
+
+        if self.entries.len() >= cap {
+            if now.saturating_duration_since(self.last_cleanup) >= cleanup_interval {
+                self.entries
+                    .retain(|_, entry| now.saturating_duration_since(entry.window_start) < window);
+                self.last_cleanup = now;
+                #[cfg(test)]
+                {
+                    self.cleanup_runs += 1;
+                }
+            }
+            if self.entries.len() >= cap {
+                return true;
+            }
+        }
+
+        self.entries.insert(
+            key.to_string(),
+            ClaimAttemptWindow {
+                count: 1,
+                window_start: now,
+            },
+        );
+        false
+    }
+}
+
+static CLAIM_ATTEMPT_LIMITER: Lazy<Mutex<ClaimAttemptLimiter>> =
+    Lazy::new(|| Mutex::new(ClaimAttemptLimiter::new(Instant::now())));
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -236,31 +299,13 @@ fn rate_limit_key(home_group_id: i64, claim_id: &str) -> String {
 
 fn claim_attempt_rate_limited(key: &str) -> bool {
     let now = Instant::now();
-    let mut map = CLAIM_ATTEMPT_LIMITER.lock().unwrap();
-    let blocked = match map.get_mut(key) {
-        Some(entry) if now.duration_since(entry.window_start) < CLAIM_ATTEMPT_WINDOW => {
-            entry.count += 1;
-            entry.count > CLAIM_ATTEMPT_LIMIT
-        }
-        _ => {
-            map.insert(
-                key.to_string(),
-                ClaimAttemptWindow {
-                    count: 1,
-                    window_start: now,
-                },
-            );
-            false
-        }
-    };
-    if map.len() > CLAIM_ATTEMPT_LIMITER_CAP {
-        map.retain(|_, entry| now.duration_since(entry.window_start) < CLAIM_ATTEMPT_WINDOW);
-    }
-    blocked
-}
-
-fn clear_claim_attempt_rate_limit(key: &str) {
-    CLAIM_ATTEMPT_LIMITER.lock().unwrap().remove(key);
+    CLAIM_ATTEMPT_LIMITER.lock().unwrap().check(
+        key,
+        now,
+        CLAIM_ATTEMPT_LIMITER_CAP,
+        CLAIM_ATTEMPT_WINDOW,
+        CLAIM_ATTEMPT_CLEANUP_INTERVAL,
+    )
 }
 
 pub async fn create_claim(
@@ -652,7 +697,6 @@ async fn claim_node_after_transport(
 
     match state.db.claim_node_credential(&attempt).await {
         Ok(NodeCredentialClaimResult::Claimed(record)) => {
-            clear_claim_attempt_rate_limit(&limiter_key);
             crate::service::audit::record(
                 &state,
                 None,
@@ -673,16 +717,13 @@ async fn claim_node_after_transport(
                 }),
             )
         }
-        Ok(NodeCredentialClaimResult::Existing(record)) => {
-            clear_claim_attempt_rate_limit(&limiter_key);
-            sensitive_json(
-                StatusCode::OK,
-                ApiResponse::success(ClaimNodeResult {
-                    outcome: "EXISTING",
-                    claim: Some(claim_view(&record)),
-                }),
-            )
-        }
+        Ok(NodeCredentialClaimResult::Existing(record)) => sensitive_json(
+            StatusCode::OK,
+            ApiResponse::success(ClaimNodeResult {
+                outcome: "EXISTING",
+                claim: Some(claim_view(&record)),
+            }),
+        ),
         Ok(NodeCredentialClaimResult::Replay) => sensitive_json(
             StatusCode::CONFLICT,
             ApiResponse {
@@ -1513,6 +1554,154 @@ mod tests {
         let conflict = if sa == StatusCode::CONFLICT { va } else { vb };
         assert_eq!(conflict["code"], 409);
         assert!(conflict["data"].get("claim_secret").is_none());
+    }
+
+    #[test]
+    fn claim_attempt_limiter_enforces_window_and_hard_capacity() {
+        let start = Instant::now();
+        let mut limiter = ClaimAttemptLimiter::new(start);
+
+        for _ in 0..CLAIM_ATTEMPT_LIMIT {
+            assert!(!limiter.check(
+                "7:known",
+                start,
+                3,
+                CLAIM_ATTEMPT_WINDOW,
+                CLAIM_ATTEMPT_CLEANUP_INTERVAL,
+            ));
+        }
+        assert!(limiter.check(
+            "7:known",
+            start,
+            3,
+            CLAIM_ATTEMPT_WINDOW,
+            CLAIM_ATTEMPT_CLEANUP_INTERVAL,
+        ));
+
+        assert!(!limiter.check(
+            "7:second",
+            start,
+            3,
+            CLAIM_ATTEMPT_WINDOW,
+            CLAIM_ATTEMPT_CLEANUP_INTERVAL,
+        ));
+        assert!(!limiter.check(
+            "7:third",
+            start,
+            3,
+            CLAIM_ATTEMPT_WINDOW,
+            CLAIM_ATTEMPT_CLEANUP_INTERVAL,
+        ));
+        assert_eq!(limiter.entries.len(), 3);
+
+        assert!(
+            limiter.check(
+                "7:unknown",
+                start,
+                3,
+                CLAIM_ATTEMPT_WINDOW,
+                CLAIM_ATTEMPT_CLEANUP_INTERVAL,
+            ),
+            "unknown keys must fail closed when the hard cap is full"
+        );
+        assert_eq!(limiter.entries.len(), 3);
+        assert!(
+            limiter.check(
+                "7:known",
+                start,
+                3,
+                CLAIM_ATTEMPT_WINDOW,
+                CLAIM_ATTEMPT_CLEANUP_INTERVAL,
+            ),
+            "full-cap rejection must not reset an existing key's window"
+        );
+
+        let key = rate_limit_key(7, "claim-public-id");
+        assert_eq!(key, "7:claim-public-id");
+        assert!(!key.contains("rpc1_"));
+        assert!(!key.contains("rpcn1_"));
+        assert!(!key.contains("group-token"));
+    }
+
+    #[test]
+    fn claim_attempt_limiter_reclaims_expired_entries_without_scan_per_request() {
+        let start = Instant::now();
+        let mut limiter = ClaimAttemptLimiter::new(start);
+        for key in ["7:a", "7:b", "7:c"] {
+            assert!(!limiter.check(
+                key,
+                start,
+                3,
+                CLAIM_ATTEMPT_WINDOW,
+                CLAIM_ATTEMPT_CLEANUP_INTERVAL,
+            ));
+        }
+
+        let first_cleanup = start + CLAIM_ATTEMPT_CLEANUP_INTERVAL;
+        assert!(limiter.check(
+            "7:blocked-0",
+            first_cleanup,
+            3,
+            CLAIM_ATTEMPT_WINDOW,
+            CLAIM_ATTEMPT_CLEANUP_INTERVAL,
+        ));
+        assert_eq!(limiter.cleanup_runs, 1);
+
+        for i in 1..=256 {
+            assert!(limiter.check(
+                &format!("7:blocked-{i}"),
+                first_cleanup + Duration::from_millis(1),
+                3,
+                CLAIM_ATTEMPT_WINDOW,
+                CLAIM_ATTEMPT_CLEANUP_INTERVAL,
+            ));
+        }
+        assert_eq!(
+            limiter.cleanup_runs, 1,
+            "a full active map must not trigger an O(N) retain on every new key"
+        );
+        assert_eq!(limiter.entries.len(), 3);
+
+        let after_expiry = start + CLAIM_ATTEMPT_WINDOW + CLAIM_ATTEMPT_CLEANUP_INTERVAL;
+        assert!(!limiter.check(
+            "7:after-expiry",
+            after_expiry,
+            3,
+            CLAIM_ATTEMPT_WINDOW,
+            CLAIM_ATTEMPT_CLEANUP_INTERVAL,
+        ));
+        assert_eq!(limiter.cleanup_runs, 2);
+        assert_eq!(limiter.entries.len(), 1);
+        assert!(limiter.entries.contains_key("7:after-expiry"));
+    }
+
+    #[test]
+    fn claim_attempt_limiter_concurrency_never_exceeds_capacity() {
+        const CAP: usize = 32;
+        const ATTEMPTS: usize = 128;
+        let start = Instant::now();
+        let limiter = Arc::new(Mutex::new(ClaimAttemptLimiter::new(start)));
+        let mut workers = Vec::new();
+
+        for i in 0..ATTEMPTS {
+            let limiter = Arc::clone(&limiter);
+            workers.push(std::thread::spawn(move || {
+                !limiter.lock().unwrap().check(
+                    &format!("7:concurrent-{i}"),
+                    start,
+                    CAP,
+                    CLAIM_ATTEMPT_WINDOW,
+                    CLAIM_ATTEMPT_CLEANUP_INTERVAL,
+                )
+            }));
+        }
+
+        let admitted = workers.into_iter().fold(0_usize, |count, worker| {
+            count + usize::from(worker.join().unwrap())
+        });
+        let limiter = limiter.lock().unwrap();
+        assert_eq!(admitted, CAP);
+        assert_eq!(limiter.entries.len(), CAP);
     }
 
     #[tokio::test]

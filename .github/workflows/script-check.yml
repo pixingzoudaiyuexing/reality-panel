@@ -43,3 +43,6 @@ jobs:
             exit 0
           fi
           shellcheck --severity=error "${scripts[@]}"
+
+      - name: Node Claim helper security tests
+        run: bash scripts/relay-node-claim.test.sh
