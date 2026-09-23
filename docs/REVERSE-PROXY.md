@@ -34,6 +34,46 @@ admin's localhost address).
 
 ---
 
+
+
+## Concrete Node Claim trusted HTTPS ingress
+
+The one-time Concrete Node Claim endpoints are stricter than the legacy
+Home-only HTTP/WS paths. They are **disabled by default** and fail closed unless
+the Panel can establish a trusted TLS-termination boundary for the current
+request.
+
+To enable these endpoints, all of the following must be true:
+
+1. `PUBLIC_PANEL_URL` (or the effective site public URL) is a credential-free
+   `https://` origin.
+2. `NODE_CLAIM_TRUSTED_PROXY_IPS` is set to the exact socket-peer IP address
+   or comma-separated addresses of the TLS-terminating reverse proxy that talks
+   directly to the Panel, for example `127.0.0.1,::1` for a same-host proxy.
+3. That trusted proxy strips or overwrites any client-supplied
+   `X-Forwarded-Proto` header and sends exactly `X-Forwarded-Proto: https`
+   for the HTTPS request.
+4. The Panel's plain HTTP listener is not publicly bypassable. Bind it to
+   loopback where possible, or firewall it so only the trusted proxy peer can
+   connect.
+
+The Claim handlers verify the **actual socket peer** before accepting
+`X-Forwarded-Proto`. Merely setting `PUBLIC_PANEL_URL=https://...`, or sending
+a forged forwarding header from an arbitrary client, does not enable the Claim
+flow.
+
+Do not put an Internet-facing CDN address or a broad public address range into
+`NODE_CLAIM_TRUSTED_PROXY_IPS`. The value is the immediate, controlled proxy
+peer that connects to the Panel. If a Compose/CDN layout does not provide a
+stable and firewall-restricted immediate peer address, leave the Claim flow
+disabled until that ingress boundary can be established safely.
+
+This setting protects only the new Concrete Node Claim endpoints. It does not
+retroactively change the transport policy of existing Manual Bootstrap,
+Home-only HTTP polling, or the existing WebSocket control channel.
+
+---
+
 ## Nginx
 
 ```nginx

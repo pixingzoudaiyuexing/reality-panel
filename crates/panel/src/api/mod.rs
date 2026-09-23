@@ -15,6 +15,7 @@ pub mod groups;
 pub mod middleware;
 pub mod node;
 pub mod node_batch_upgrade;
+pub mod node_claim;
 pub mod node_deploy;
 pub mod node_enrollment;
 pub mod node_ops;
@@ -119,6 +120,30 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/admin/node-deployments/{id}/logs",
             axum::routing::get(node_deploy::deployment_logs),
+        )
+        .route(
+            "/admin/node-credential-claims",
+            axum::routing::post(node_claim::create_claim)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(
+                    node_claim::claim_response_headers,
+                )),
+        )
+        .route(
+            "/admin/node-credential-claims/{claim_id}",
+            axum::routing::get(node_claim::claim_status)
+                .delete(node_claim::cancel_claim)
+                .layer(axum::middleware::from_fn(
+                    node_claim::claim_response_headers,
+                )),
+        )
+        .route(
+            "/node-credential-claims/{claim_id}/claim",
+            axum::routing::post(node_claim::claim_node)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(
+                    node_claim::claim_response_headers,
+                )),
         )
         .route(
             "/admin/node-enrollments",

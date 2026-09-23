@@ -181,7 +181,12 @@ async fn main() {
         config.public_dir
     );
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 /// Open the configured backend, run migrations, and return the repository.
