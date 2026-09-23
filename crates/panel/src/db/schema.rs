@@ -111,9 +111,9 @@ CREATE TABLE IF NOT EXISTS node_reuse_bindings (
 CREATE INDEX IF NOT EXISTS idx_node_reuse_bindings_home_node
     ON node_reuse_bindings(home_group_id, node_id);
 
--- Node Reuse V1 S2-A1: inert concrete-node credential verifier registry.
--- credential_id is a public locator, not a bearer secret. verifier_data is opaque
--- verifier material whose cryptographic construction is intentionally deferred.
+-- Node Reuse V1 S2-A2A: inert concrete-node credential lifecycle foundation.
+-- credential_id is a public locator, not a bearer secret. Runtime issuance,
+-- claim, authentication, and Node Reuse authority remain disabled.
 CREATE TABLE IF NOT EXISTS node_credentials (
     credential_id TEXT PRIMARY KEY CHECK (length(credential_id) BETWEEN 1 AND 128),
     home_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
@@ -128,9 +128,13 @@ CREATE TABLE IF NOT EXISTS node_credentials (
     verifier_data BLOB NOT NULL CHECK (length(verifier_data) > 0),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    activated_at TEXT,
     revoked_at TEXT,
     UNIQUE (home_group_id, node_id, generation)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_node_credentials_one_active
+    ON node_credentials(home_group_id, node_id)
+    WHERE activated_at IS NOT NULL AND revoked_at IS NULL;
 
 -- v0.3.0: reusable tunnel profiles describing how traffic flows between an
 -- inbound node and an outbound node (NOT the user-facing entry protocol, which
@@ -2266,6 +2270,20 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .execute(pool)
     .await?;
     tracing::info!("Migration 52: node_credentials inert registry present");
+
+    // ── Migration 53: credential activation lifecycle ──
+    // Existing S2-A1 rows become inactive candidates because activated_at is NULL.
+    // The partial unique index is the DB backstop for at most one server-active
+    // credential per exact concrete identity.
+    add_column_if_missing(pool, "node_credentials", "activated_at", "TEXT").await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_node_credentials_one_active \
+         ON node_credentials(home_group_id, node_id) \
+         WHERE activated_at IS NOT NULL AND revoked_at IS NULL",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 53: node credential activation lifecycle present");
 
     Ok(())
 }

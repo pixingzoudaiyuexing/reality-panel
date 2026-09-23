@@ -30,6 +30,7 @@ use relay_shared::models::{
 use relay_shared::protocol::{RuleTargetRequest, TrafficEntry};
 use serde::Serialize;
 
+use crate::node_credential::NodeCredentialVerifier;
 use crate::node_identity::ReuseEligibleNodeId;
 
 use super::error::DbError;
@@ -635,33 +636,36 @@ pub trait NodeReuseRepository: Send + Sync {
 
 // ── Node Reuse V1 concrete-node credential registry ──
 
-/// Inert storage record for verifier material associated with one concrete Node.
+/// Persisted verifier material for one concrete Node credential generation.
 ///
-/// A row is NOT proof that the Node has been claimed, authenticated, or granted
-/// Node Reuse authority. S2-A1 deliberately adds no issuance or verification path.
+/// A row is still NOT proof of a claimed Node or Node Reuse authority. S2-A2A
+/// adds only internal cryptographic/lifecycle primitives; no runtime path calls them.
 #[derive(Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct NodeCredentialRecord {
     /// Public lookup identifier for the verifier record. This is not a bearer secret.
     pub credential_id: String,
     pub home_group_id: i64,
     pub node_id: String,
-    /// Monotonic per-(Home Group, node id) slot reserved for future rotation.
+    /// Monotonic per-(Home Group, node id) generation.
     pub generation: i64,
-    /// Scheme/encoding label only. S2-A1 does not define an authentication algorithm.
     pub verifier_format: String,
     pub verifier_version: i64,
-    /// Opaque verifier bytes. Callers must never pass a plaintext bearer secret here.
+    /// Verifier bytes are deliberately redacted from Debug output.
     pub verifier_data: Vec<u8>,
     pub created_at: String,
     pub updated_at: String,
-    /// Reserved storage state for a later reviewed revocation flow.
+    /// Inactive candidates keep this NULL. A non-NULL value means server-active
+    /// only; it does not grant Node Reuse authority.
+    pub activated_at: Option<String>,
+    /// Once set, revocation is irreversible through the Repository contract.
     pub revoked_at: Option<String>,
 }
 
-/// Write shape for the inert verifier registry.
+/// S2-A1 storage-shape DTO retained for compatibility/debug regression coverage.
 ///
-/// The strict Node Reuse identity type makes normalization impossible at this
-/// Repository boundary; legacy Home-only node-id paths remain unchanged.
+/// S2-A2A deliberately removes the Repository write method that accepted this
+/// caller-selected generation. New writes must use NewNodeCredentialCandidate
+/// so the database layer allocates generations atomically.
 #[derive(Clone, PartialEq, Eq)]
 pub struct NewNodeCredentialRecord {
     pub credential_id: String,
@@ -671,6 +675,22 @@ pub struct NewNodeCredentialRecord {
     pub verifier_format: String,
     pub verifier_version: i64,
     pub verifier_data: Vec<u8>,
+}
+
+/// Candidate input for atomic generation allocation. It structurally carries the
+/// reviewed V1 verifier rather than arbitrary format/version/data fields.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewNodeCredentialCandidate {
+    pub credential_id: String,
+    pub home_group_id: i64,
+    pub node_id: ReuseEligibleNodeId,
+    pub verifier: NodeCredentialVerifier,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeCredentialMutationResult {
+    Applied,
+    Rejected,
 }
 
 struct RedactedVerifierData;
@@ -693,6 +713,7 @@ impl std::fmt::Debug for NodeCredentialRecord {
             .field("verifier_data", &RedactedVerifierData)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
+            .field("activated_at", &self.activated_at)
             .field("revoked_at", &self.revoked_at)
             .finish()
     }
@@ -708,6 +729,17 @@ impl std::fmt::Debug for NewNodeCredentialRecord {
             .field("verifier_format", &self.verifier_format)
             .field("verifier_version", &self.verifier_version)
             .field("verifier_data", &RedactedVerifierData)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for NewNodeCredentialCandidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewNodeCredentialCandidate")
+            .field("credential_id", &self.credential_id)
+            .field("home_group_id", &self.home_group_id)
+            .field("node_id", &self.node_id)
+            .field("verifier", &self.verifier)
             .finish()
     }
 }
@@ -737,6 +769,7 @@ mod node_credential_debug_tests {
             verifier_data: VERIFIER_BYTES.to_vec(),
             created_at: "2026-09-23 00:00:00".into(),
             updated_at: "2026-09-23 00:01:00".into(),
+            activated_at: None,
             revoked_at: None,
         };
 
@@ -773,10 +806,12 @@ mod node_credential_debug_tests {
 
 #[async_trait]
 pub trait NodeCredentialRepository: Send + Sync {
-    async fn insert_node_credential(
+    /// Atomically assigns the next generation for this exact concrete identity
+    /// and persists an inactive candidate. Callers cannot supply a generation.
+    async fn allocate_node_credential_candidate(
         &self,
-        credential: &NewNodeCredentialRecord,
-    ) -> Result<(), DbError>;
+        candidate: &NewNodeCredentialCandidate,
+    ) -> Result<NodeCredentialRecord, DbError>;
 
     async fn find_node_credential(
         &self,
@@ -788,6 +823,39 @@ pub trait NodeCredentialRepository: Send + Sync {
         home_group_id: i64,
         node_id: &ReuseEligibleNodeId,
     ) -> Result<Vec<NodeCredentialRecord>, DbError>;
+
+    /// Activates an inactive, non-revoked candidate only when the identity has
+    /// no other active credential.
+    async fn activate_node_credential(
+        &self,
+        credential_id: &str,
+        home_group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+        generation: i64,
+    ) -> Result<NodeCredentialMutationResult, DbError>;
+
+    /// Atomically revokes the expected current active generation and activates
+    /// the expected strictly newer inactive candidate. Any mismatch or generation
+    /// rollback leaves the old active row unchanged.
+    async fn replace_active_node_credential(
+        &self,
+        home_group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+        expected_active_credential_id: &str,
+        expected_active_generation: i64,
+        candidate_credential_id: &str,
+        candidate_generation: i64,
+    ) -> Result<NodeCredentialMutationResult, DbError>;
+
+    /// Irreversible through this contract: there is intentionally no method that
+    /// clears revoked_at or reactivates a revoked generation.
+    async fn revoke_node_credential(
+        &self,
+        credential_id: &str,
+        home_group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+        generation: i64,
+    ) -> Result<NodeCredentialMutationResult, DbError>;
 }
 
 // ── Manual bootstrap enrollments ──

@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod dto;
 mod integrations;
+mod node_credential;
 mod node_identity;
 mod service;
 
