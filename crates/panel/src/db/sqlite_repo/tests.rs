@@ -6792,7 +6792,7 @@ async fn node_credential_lifecycle_contract() {
         db.activate_node_credential("cred-life-3", 10, &node_id, 3)
             .await
             .unwrap(),
-        NodeCredentialMutationResult::Applied
+        NodeCredentialMutationResult::Rejected
     );
 
     let other = db
@@ -6871,6 +6871,297 @@ async fn node_credential_replacement_rejects_generation_rollback() {
         .unwrap();
     assert!(stale.activated_at.is_none() && stale.revoked_at.is_none());
     assert!(current.activated_at.is_some() && current.revoked_at.is_none());
+}
+
+#[tokio::test]
+async fn node_credential_activation_history_blocks_ordinary_recovery_and_is_group_scoped() {
+    let db = repo().await;
+    seed_group(&db, 10).await;
+    seed_group(&db, 20).await;
+    let node_id = crate::node_identity::ReuseEligibleNodeId::parse("HIST").unwrap();
+
+    let first = db
+        .allocate_node_credential_candidate(&test_node_credential_candidate(
+            "cred-history-1",
+            10,
+            "HIST",
+            0x81,
+        ))
+        .await
+        .unwrap();
+    let second = db
+        .allocate_node_credential_candidate(&test_node_credential_candidate(
+            "cred-history-2",
+            10,
+            "HIST",
+            0x82,
+        ))
+        .await
+        .unwrap();
+    let third = db
+        .allocate_node_credential_candidate(&test_node_credential_candidate(
+            "cred-history-3",
+            10,
+            "HIST",
+            0x83,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        (first.generation, second.generation, third.generation),
+        (1, 2, 3)
+    );
+
+    // Initial activation need not be generation 1; it is allowed exactly once
+    // for an identity that has no activation history.
+    assert_eq!(
+        db.activate_node_credential("cred-history-3", 10, &node_id, 3)
+            .await
+            .unwrap(),
+        NodeCredentialMutationResult::Applied
+    );
+    assert_eq!(
+        db.revoke_node_credential("cred-history-3", 10, &node_id, 3)
+            .await
+            .unwrap(),
+        NodeCredentialMutationResult::Applied
+    );
+
+    assert_eq!(
+        db.activate_node_credential("cred-history-2", 10, &node_id, 2)
+            .await
+            .unwrap(),
+        NodeCredentialMutationResult::Rejected
+    );
+    assert_eq!(
+        db.activate_node_credential("cred-history-3", 10, &node_id, 3)
+            .await
+            .unwrap(),
+        NodeCredentialMutationResult::Rejected
+    );
+
+    let fourth = db
+        .allocate_node_credential_candidate(&test_node_credential_candidate(
+            "cred-history-4",
+            10,
+            "HIST",
+            0x84,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(fourth.generation, 4);
+    assert_eq!(
+        db.activate_node_credential("cred-history-4", 10, &node_id, 4)
+            .await
+            .unwrap(),
+        NodeCredentialMutationResult::Rejected
+    );
+
+    let other_first = db
+        .allocate_node_credential_candidate(&test_node_credential_candidate(
+            "cred-history-other-1",
+            20,
+            "HIST",
+            0x85,
+        ))
+        .await
+        .unwrap();
+    let other_second = db
+        .allocate_node_credential_candidate(&test_node_credential_candidate(
+            "cred-history-other-2",
+            20,
+            "HIST",
+            0x86,
+        ))
+        .await
+        .unwrap();
+    assert_eq!((other_first.generation, other_second.generation), (1, 2));
+    assert_eq!(
+        db.activate_node_credential("cred-history-other-2", 20, &node_id, 2)
+            .await
+            .unwrap(),
+        NodeCredentialMutationResult::Applied
+    );
+}
+
+#[tokio::test]
+async fn node_credential_replacement_rejects_below_historical_high() {
+    let db = repo().await;
+    seed_group(&db, 10).await;
+    let node_id = crate::node_identity::ReuseEligibleNodeId::parse("LEGACY").unwrap();
+
+    for (credential_id, secret_byte) in [
+        ("cred-legacy-current", 0x91),
+        ("cred-legacy-candidate", 0x92),
+        ("cred-legacy-history", 0x93),
+    ] {
+        db.allocate_node_credential_candidate(&test_node_credential_candidate(
+            credential_id,
+            10,
+            "LEGACY",
+            secret_byte,
+        ))
+        .await
+        .unwrap();
+    }
+
+    // Simulate a historical/pre-fix state where generation 3 was activated and
+    // revoked, while generation 1 is currently active.
+    sqlx::query(
+        "UPDATE node_credentials          SET activated_at = datetime('now'), revoked_at = datetime('now')          WHERE credential_id = 'cred-legacy-history'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE node_credentials SET activated_at = datetime('now')          WHERE credential_id = 'cred-legacy-current'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db.replace_active_node_credential(
+            10,
+            &node_id,
+            "cred-legacy-current",
+            1,
+            "cred-legacy-candidate",
+            2,
+        )
+        .await
+        .unwrap(),
+        NodeCredentialMutationResult::Rejected
+    );
+
+    let current = db
+        .find_node_credential("cred-legacy-current")
+        .await
+        .unwrap()
+        .unwrap();
+    let candidate = db
+        .find_node_credential("cred-legacy-candidate")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(current.activated_at.is_some() && current.revoked_at.is_none());
+    assert!(candidate.activated_at.is_none() && candidate.revoked_at.is_none());
+
+    let newer = db
+        .allocate_node_credential_candidate(&test_node_credential_candidate(
+            "cred-legacy-newer",
+            10,
+            "LEGACY",
+            0x94,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(newer.generation, 4);
+    assert_eq!(
+        db.replace_active_node_credential(
+            10,
+            &node_id,
+            "cred-legacy-current",
+            1,
+            "cred-legacy-newer",
+            4,
+        )
+        .await
+        .unwrap(),
+        NodeCredentialMutationResult::Applied
+    );
+}
+
+#[tokio::test]
+async fn node_credential_concurrent_replacement_keeps_single_active() {
+    let path = std::env::temp_dir().join(format!(
+        "reality-panel-credential-replacement-race-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let url = format!("sqlite://{}", path.display());
+    let pool = crate::db::init::init_db(&url).await.unwrap();
+    let db = SqliteRepository::new(pool.clone());
+    seed_group(&db, 10).await;
+    let node_id = crate::node_identity::ReuseEligibleNodeId::parse("RACE").unwrap();
+
+    for (credential_id, secret_byte) in [
+        ("cred-replace-race-1", 0xa1),
+        ("cred-replace-race-2", 0xa2),
+        ("cred-replace-race-3", 0xa3),
+    ] {
+        db.allocate_node_credential_candidate(&test_node_credential_candidate(
+            credential_id,
+            10,
+            "RACE",
+            secret_byte,
+        ))
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        db.activate_node_credential("cred-replace-race-1", 10, &node_id, 1)
+            .await
+            .unwrap(),
+        NodeCredentialMutationResult::Applied
+    );
+
+    let db_a = SqliteRepository::new(pool.clone());
+    let db_b = SqliteRepository::new(pool.clone());
+    let node_a = crate::node_identity::ReuseEligibleNodeId::parse("RACE").unwrap();
+    let node_b = crate::node_identity::ReuseEligibleNodeId::parse("RACE").unwrap();
+    let (a, b) = tokio::join!(
+        db_a.replace_active_node_credential(
+            10,
+            &node_a,
+            "cred-replace-race-1",
+            1,
+            "cred-replace-race-2",
+            2,
+        ),
+        db_b.replace_active_node_credential(
+            10,
+            &node_b,
+            "cred-replace-race-1",
+            1,
+            "cred-replace-race-3",
+            3,
+        )
+    );
+    let results = [a.unwrap(), b.unwrap()];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == NodeCredentialMutationResult::Applied)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == NodeCredentialMutationResult::Rejected)
+            .count(),
+        1
+    );
+
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM node_credentials          WHERE home_group_id = 10 AND node_id = 'RACE'            AND activated_at IS NOT NULL AND revoked_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let active_generation: i64 = sqlx::query_scalar(
+        "SELECT generation FROM node_credentials          WHERE home_group_id = 10 AND node_id = 'RACE'            AND activated_at IS NOT NULL AND revoked_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active_count, 1);
+    assert!([2_i64, 3_i64].contains(&active_generation));
+
+    pool.close().await;
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
 }
 
 #[tokio::test]

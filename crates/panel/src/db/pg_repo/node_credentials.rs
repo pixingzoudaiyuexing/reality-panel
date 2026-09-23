@@ -108,11 +108,10 @@ impl NodeCredentialRepository for PgRepository {
              WHERE credential_id = $1 AND home_group_id = $2 AND node_id = $3 AND generation = $4 \
                AND activated_at IS NULL AND revoked_at IS NULL \
                AND NOT EXISTS ( \
-                   SELECT 1 FROM node_credentials AS active \
-                   WHERE active.home_group_id = candidate.home_group_id \
-                     AND active.node_id = candidate.node_id \
-                     AND active.activated_at IS NOT NULL \
-                     AND active.revoked_at IS NULL \
+                   SELECT 1 FROM node_credentials AS history \
+                   WHERE history.home_group_id = candidate.home_group_id \
+                     AND history.node_id = candidate.node_id \
+                     AND history.activated_at IS NOT NULL \
                )",
         )
         .bind(credential_id)
@@ -172,11 +171,17 @@ impl NodeCredentialRepository for PgRepository {
         }
 
         let activated = sqlx::query(
-            "UPDATE node_credentials \
+            "UPDATE node_credentials AS candidate \
              SET activated_at = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'), \
                  updated_at = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') \
              WHERE credential_id = $1 AND home_group_id = $2 AND node_id = $3 AND generation = $4 \
-               AND activated_at IS NULL AND revoked_at IS NULL",
+               AND activated_at IS NULL AND revoked_at IS NULL \
+               AND candidate.generation > COALESCE(( \
+                   SELECT MAX(history.generation) FROM node_credentials AS history \
+                   WHERE history.home_group_id = candidate.home_group_id \
+                     AND history.node_id = candidate.node_id \
+                     AND history.activated_at IS NOT NULL \
+               ), 0)",
         )
         .bind(candidate_credential_id)
         .bind(home_group_id)

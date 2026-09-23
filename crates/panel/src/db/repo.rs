@@ -824,8 +824,9 @@ pub trait NodeCredentialRepository: Send + Sync {
         node_id: &ReuseEligibleNodeId,
     ) -> Result<Vec<NodeCredentialRecord>, DbError>;
 
-    /// Activates an inactive, non-revoked candidate only when the identity has
-    /// no other active credential.
+    /// Performs the one-time initial activation of an inactive, non-revoked
+    /// candidate. Once this exact identity has any activation history, later
+    /// activation must use a separately approved recovery flow, not this method.
     async fn activate_node_credential(
         &self,
         credential_id: &str,
@@ -835,8 +836,9 @@ pub trait NodeCredentialRepository: Send + Sync {
     ) -> Result<NodeCredentialMutationResult, DbError>;
 
     /// Atomically revokes the expected current active generation and activates
-    /// the expected strictly newer inactive candidate. Any mismatch or generation
-    /// rollback leaves the old active row unchanged.
+    /// an inactive candidate whose generation is strictly newer than both the
+    /// current generation and every historically activated generation. Any
+    /// mismatch or rollback attempt leaves the old active row unchanged.
     async fn replace_active_node_credential(
         &self,
         home_group_id: i64,
