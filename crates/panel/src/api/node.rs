@@ -82,17 +82,20 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     };
     let group_id = identity.group_id();
     let node_id = identity.node_id().map(str::to_string);
+    let verified_concrete_node = identity.verified().is_some();
 
     // v0.3.6: delegate to the shared `build_node_config`. This path and the WS
     // push path (ws.rs) now use the SAME function.
     //
     // Only an inbound group with genuinely no active rules yields Ok(empty).
     let certificate_state_dir = std::path::PathBuf::from(state.config.certificate_state_dir());
-    match crate::service::node_config::build_node_config_snapshot_for_node_with_certificate_inventory(
+    match crate::service::node_config::build_guarded_node_config_snapshot_for_delivery(
         state.db.as_ref(),
         &certificate_state_dir,
         group_id,
         node_id.as_deref(),
+        verified_concrete_node,
+        crate::service::node_config::NodeReuseRuntimeDeliveryMode::HomeOnly,
     )
     .await
     {
@@ -1393,6 +1396,7 @@ mod tests {
             &certificate_state_dir,
             10,
             Some("node-a"),
+            false,
         )
         .await
         .expect("WS snapshot");
@@ -1467,6 +1471,7 @@ mod tests {
             &certificate_state_dir,
             10,
             Some("node-a"),
+            false,
         )
         .await
         .expect("WS snapshot");
@@ -1479,6 +1484,78 @@ mod tests {
         assert_eq!(ws_rule_ids, vec![100]);
         assert!(!http_rule_ids.contains(&200));
         assert!(!ws_rule_ids.contains(&200));
+
+        // Even a fully VerifiedConcreteNode with a current ACTIVE Credential
+        // remains Home-only on the live HTTP/WS delivery mode.
+        let secret =
+            install_active_runtime_credential(&pool, "cred-reuse", 10, "node-a", 0x62).await;
+        let verified_http = get_config(
+            State(state.clone()),
+            credential_config_headers("cred-reuse", &secret, "node-a"),
+        )
+        .await;
+        assert_eq!(verified_http.status(), axum::http::StatusCode::OK);
+        let verified_body = axum::body::to_bytes(verified_http.into_body(), 65536)
+            .await
+            .unwrap();
+        let verified_snapshot: NodeConfigSnapshot = serde_json::from_slice(&verified_body).unwrap();
+        assert_eq!(
+            verified_snapshot
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![100]
+        );
+
+        let verified_ws = crate::api::ws::build_config_snapshot_for_node(
+            state.db.as_ref(),
+            &certificate_state_dir,
+            10,
+            Some("node-a"),
+            true,
+        )
+        .await
+        .expect("verified WS snapshot");
+        assert_eq!(
+            verified_ws
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![100]
+        );
+
+        // The isolated test-only mode proves the exact same snapshot machinery
+        // can compose the guarded candidate without making that mode available
+        // to production callers.
+        let guarded_candidate =
+            crate::service::node_config::build_guarded_node_config_snapshot_for_delivery(
+                state.db.as_ref(),
+                &certificate_state_dir,
+                10,
+                Some("node-a"),
+                true,
+                crate::service::node_config::NodeReuseRuntimeDeliveryMode::GuardedCandidate,
+            )
+            .await
+            .expect("test-only guarded candidate snapshot");
+        assert_eq!(
+            guarded_candidate
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![100, 200]
+        );
+        assert!(guarded_candidate.config_revision > 0);
+        assert_eq!(
+            guarded_candidate.config_fingerprint,
+            relay_shared::reconciliation::config_fingerprint(&guarded_candidate.config).as_str()
+        );
     }
 
     /// WebSocket upgrade with NO Authorization header → real HTTP 401 (the one
