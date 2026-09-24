@@ -1419,6 +1419,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn node_reuse_binding_does_not_change_http_or_ws_home_only_config() {
+        let (state, pool) = seeded_state().await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid)
+             VALUES (20, 'reuse-source', 'in', 'tok-B', 2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port)
+             VALUES (200, 'reuse-rule', 2, 21000, 20, '127.0.0.1', 81)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO node_reuse_bindings (reusing_group_id, home_group_id, node_id)
+             VALUES (20, 10, 'node-a')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let http = get_config(
+            State(state.clone()),
+            config_headers_for_node("tok-A", "node-a"),
+        )
+        .await;
+        assert_eq!(http.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(http.into_body(), 65536).await.unwrap();
+        let http_snapshot: NodeConfigSnapshot = serde_json::from_slice(&body).unwrap();
+        let http_rule_ids = http_snapshot
+            .config
+            .listeners
+            .iter()
+            .map(|listener| listener.rule_id)
+            .collect::<Vec<_>>();
+        assert_eq!(http_rule_ids, vec![100]);
+
+        let certificate_state_dir = std::path::PathBuf::from(state.config.certificate_state_dir());
+        let ws_snapshot = crate::api::ws::build_config_snapshot_for_node(
+            state.db.as_ref(),
+            &certificate_state_dir,
+            10,
+            Some("node-a"),
+        )
+        .await
+        .expect("WS snapshot");
+        let ws_rule_ids = ws_snapshot
+            .config
+            .listeners
+            .iter()
+            .map(|listener| listener.rule_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ws_rule_ids, vec![100]);
+        assert!(!http_rule_ids.contains(&200));
+        assert!(!ws_rule_ids.contains(&200));
+    }
+
     /// WebSocket upgrade with NO Authorization header → real HTTP 401 (the one
     /// exception to the "business code in JSON" rule — WS upgrades must fail at
     /// the HTTP layer). We assert via node_ws_handler's IntoResponse output,

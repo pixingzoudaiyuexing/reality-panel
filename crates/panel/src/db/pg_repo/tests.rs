@@ -6471,6 +6471,358 @@ async fn pg_node_reuse_binding_repository_contract() {
 }
 
 #[tokio::test]
+async fn pg_node_reuse_atomic_active_credential_admission_contract() {
+    let Some(db) = repo("s4a_node_reuse_admission").await else {
+        return;
+    };
+    for gid in [10, 20, 30, 40, 50] {
+        seed_group(&db, gid).await;
+    }
+
+    let node = crate::node_identity::ReuseEligibleNodeId::parse("NODE_A").unwrap();
+    let candidate = db
+        .allocate_node_credential_candidate(&pg_test_node_credential_candidate(
+            "s4a-active-1",
+            10,
+            "NODE_A",
+            0xa1,
+        ))
+        .await
+        .unwrap();
+    assert!(db
+        .find_current_active_node_credential_for_identity(10, &node)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        db.create_node_reuse_binding_if_active(20, 10, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Rejected(
+            NodeReuseBindingCreateRejection::ActiveCredentialMissing
+        )
+    );
+
+    assert_eq!(
+        db.activate_node_credential(&candidate.credential_id, 10, &node, candidate.generation)
+            .await
+            .unwrap(),
+        NodeCredentialMutationResult::Applied
+    );
+    assert_eq!(
+        db.find_current_active_node_credential_for_identity(10, &node)
+            .await
+            .unwrap()
+            .unwrap()
+            .credential_id,
+        "s4a-active-1"
+    );
+
+    assert!(matches!(
+        db.create_node_reuse_binding_if_active(20, 10, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Created(_)
+    ));
+    assert!(matches!(
+        db.create_node_reuse_binding_if_active(20, 10, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Existing(_)
+    ));
+    assert_eq!(
+        db.create_node_reuse_binding_if_active(20, 30, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Rejected(
+            NodeReuseBindingCreateRejection::ActiveCredentialMissing
+        )
+    );
+
+    let (a, b) = tokio::join!(
+        db.create_node_reuse_binding_if_active(40, 10, &node),
+        db.create_node_reuse_binding_if_active(40, 10, &node)
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, NodeReuseBindingCreateResult::Created(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, NodeReuseBindingCreateResult::Existing(_)))
+            .count(),
+        1
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM node_reuse_bindings
+         WHERE reusing_group_id = 40 AND home_group_id = 10 AND node_id = 'NODE_A'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+
+    sqlx::query("UPDATE device_groups SET group_type = 'out' WHERE id = 50")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.create_node_reuse_binding_if_active(50, 10, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Rejected(
+            NodeReuseBindingCreateRejection::ReusingGroupNotInbound
+        )
+    );
+
+    assert_eq!(
+        db.revoke_node_credential(&candidate.credential_id, 10, &node, candidate.generation)
+            .await
+            .unwrap(),
+        NodeCredentialMutationResult::Applied
+    );
+    assert!(db
+        .find_current_active_node_credential_for_identity(10, &node)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        db.create_node_reuse_binding_if_active(20, 10, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Existing(_)
+    ));
+    assert_eq!(
+        db.create_node_reuse_binding_if_active(30, 10, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Rejected(
+            NodeReuseBindingCreateRejection::ActiveCredentialMissing
+        )
+    );
+    assert_eq!(db.count_node_reuse_bindings_for_group(10).await.unwrap(), 2);
+    assert_eq!(db.count_node_reuse_bindings_for_group(20).await.unwrap(), 1);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_node_reuse_concurrent_mutation_contract() {
+    let Some(db) = repo("s4a_node_reuse_concurrency").await else {
+        return;
+    };
+    for gid in [10, 20, 30, 40] {
+        seed_group(&db, gid).await;
+    }
+    for (credential_id, node_id, marker) in [
+        ("race-revoke", "NODE_REVOKE", 0xb1_u8),
+        ("race-group", "NODE_GROUP", 0xb2),
+        ("race-delete", "NODE_DELETE", 0xb3),
+    ] {
+        sqlx::query(
+            "INSERT INTO node_credentials
+             (credential_id, home_group_id, node_id, generation, verifier_format,
+              verifier_version, verifier_data, activated_at)
+             VALUES ($1, 10, $2, 1, 'rp-node-sha256', 1, $3,
+                     to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))",
+        )
+        .bind(credential_id)
+        .bind(node_id)
+        .bind(vec![marker; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    let create_db = PgRepository::new(db.pool.clone());
+    let revoke_db = PgRepository::new(db.pool.clone());
+    let create_node = crate::node_identity::ReuseEligibleNodeId::parse("NODE_REVOKE").unwrap();
+    let revoke_node = crate::node_identity::ReuseEligibleNodeId::parse("NODE_REVOKE").unwrap();
+    let (created, revoked) = tokio::join!(
+        create_db.create_node_reuse_binding_if_active(20, 10, &create_node),
+        revoke_db.revoke_node_credential("race-revoke", 10, &revoke_node, 1),
+    );
+    assert_eq!(revoked.unwrap(), NodeCredentialMutationResult::Applied);
+    assert!(matches!(
+        created.unwrap(),
+        NodeReuseBindingCreateResult::Created(_)
+            | NodeReuseBindingCreateResult::Rejected(
+                NodeReuseBindingCreateRejection::ActiveCredentialMissing
+            )
+    ));
+    assert!(db
+        .find_current_active_node_credential_for_identity(10, &revoke_node)
+        .await
+        .unwrap()
+        .is_none());
+
+    let create_db = PgRepository::new(db.pool.clone());
+    let delete_db = PgRepository::new(db.pool.clone());
+    let node = crate::node_identity::ReuseEligibleNodeId::parse("NODE_GROUP").unwrap();
+    let (created, deleted) = tokio::join!(
+        create_db.create_node_reuse_binding_if_active(30, 10, &node),
+        delete_db.delete_group(30, &ResourceScope::All),
+    );
+    match (created.unwrap(), deleted) {
+        (NodeReuseBindingCreateResult::Created(_), Err(DbError::ForeignKeyViolation)) => {}
+        (
+            NodeReuseBindingCreateResult::Rejected(
+                NodeReuseBindingCreateRejection::ReusingGroupMissing,
+            ),
+            Ok(1),
+        ) => {}
+        other => panic!("unexpected create-vs-group-delete result: {other:?}"),
+    }
+    let orphan_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM node_reuse_bindings b
+         LEFT JOIN device_groups r ON r.id = b.reusing_group_id
+         LEFT JOIN device_groups h ON h.id = b.home_group_id
+         WHERE r.id IS NULL OR h.id IS NULL",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(orphan_count, 0);
+
+    let create_db = PgRepository::new(db.pool.clone());
+    let delete_db = PgRepository::new(db.pool.clone());
+    let node = crate::node_identity::ReuseEligibleNodeId::parse("NODE_DELETE").unwrap();
+    let (created, deleted) = tokio::join!(
+        create_db.create_node_reuse_binding_if_active(40, 10, &node),
+        delete_db.delete_node_reuse_binding(40, 10, "NODE_DELETE"),
+    );
+    assert!(matches!(
+        created.unwrap(),
+        NodeReuseBindingCreateResult::Created(_)
+    ));
+    let deleted = deleted.unwrap();
+    assert!(deleted <= 1);
+    assert_eq!(
+        db.find_node_reuse_binding(40, 10, "NODE_DELETE")
+            .await
+            .unwrap()
+            .is_some(),
+        deleted == 0
+    );
+    cleanup(&db).await;
+}
+
+#[tokio::test]
+async fn pg_node_reuse_preview_business_contract() {
+    let Some(db) = repo("s4a_node_reuse_preview").await else {
+        return;
+    };
+    for gid in [10, 20, 30] {
+        seed_group(&db, gid).await;
+    }
+    for (id, group_id, port, paused) in [
+        (9100_i64, 10_i64, 19100_i64, false),
+        (9200, 20, 19200, false),
+        (9201, 20, 19201, true),
+        (9300, 30, 19300, false),
+    ] {
+        sqlx::query(
+            "INSERT INTO forward_rules
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port, paused)
+             VALUES ($1, $2, 1, $3, $4, '127.0.0.1', 80, $5)",
+        )
+        .bind(id)
+        .bind(format!("preview-{id}"))
+        .bind(port)
+        .bind(group_id)
+        .bind(paused)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    for (credential_id, home_group_id) in [("preview-home", 10_i64), ("preview-same-id", 30)] {
+        sqlx::query(
+            "INSERT INTO node_credentials
+             (credential_id, home_group_id, node_id, generation, verifier_format,
+              verifier_version, verifier_data, activated_at)
+             VALUES ($1, $2, 'NODE_PREVIEW', 1, 'rp-node-sha256', 1, $3,
+                     to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))",
+        )
+        .bind(credential_id)
+        .bind(home_group_id)
+        .bind(vec![home_group_id as u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    db.insert_node_reuse_binding(20, 10, "NODE_PREVIEW")
+        .await
+        .unwrap();
+    db.insert_node_reuse_binding(30, 10, "NODE_PREVIEW")
+        .await
+        .unwrap();
+
+    assert!(db
+        .get("node_config_revision:10:NODE_PREVIEW")
+        .await
+        .unwrap()
+        .is_none());
+    let preview =
+        crate::service::node_reuse::preview_effective_config_for_node(&db, 10, "NODE_PREVIEW")
+            .await
+            .unwrap();
+    assert_eq!(preview.source_group_ids, vec![10, 20, 30]);
+    assert_eq!(
+        preview
+            .listeners
+            .iter()
+            .map(|listener| (listener.source_group_id, listener.rule_id))
+            .collect::<Vec<_>>(),
+        vec![(10, 9100), (20, 9200), (30, 9300)]
+    );
+    assert!(db
+        .get("node_config_revision:10:NODE_PREVIEW")
+        .await
+        .unwrap()
+        .is_none());
+
+    let other =
+        crate::service::node_reuse::preview_effective_config_for_node(&db, 30, "NODE_PREVIEW")
+            .await
+            .unwrap();
+    assert_eq!(other.source_group_ids, vec![30]);
+    assert_eq!(
+        db.delete_node_reuse_binding(20, 10, "NODE_PREVIEW")
+            .await
+            .unwrap(),
+        1
+    );
+    let after =
+        crate::service::node_reuse::preview_effective_config_for_node(&db, 10, "NODE_PREVIEW")
+            .await
+            .unwrap();
+    assert_eq!(after.source_group_ids, vec![10, 30]);
+
+    sqlx::query(
+        "UPDATE node_credentials
+         SET revoked_at = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
+         WHERE credential_id = 'preview-home'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        crate::service::node_reuse::preview_effective_config_for_node(&db, 10, "NODE_PREVIEW")
+            .await,
+        Err(
+            crate::service::node_reuse::NodeReuseServiceError::AdmissionRejected(
+                NodeReuseBindingCreateRejection::ActiveCredentialMissing
+            )
+        )
+    ));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
 async fn pg_node_reuse_schema_constraints_and_fk_restrict() {
     let Some(db) = repo("node_reuse_constraints").await else {
         return;

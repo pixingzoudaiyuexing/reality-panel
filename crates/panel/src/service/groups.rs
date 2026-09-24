@@ -161,6 +161,24 @@ impl std::fmt::Display for GroupInUseError {
 
 impl std::error::Error for GroupInUseError {}
 
+#[derive(Debug)]
+pub struct GroupReuseBindingInUseError {
+    pub group_id: i64,
+    pub binding_count: i64,
+}
+
+impl std::fmt::Display for GroupReuseBindingInUseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "group {} still referenced by {} node reuse binding(s)",
+            self.group_id, self.binding_count
+        )
+    }
+}
+
+impl std::error::Error for GroupReuseBindingInUseError {}
+
 /// Delete an admin-owned device group. Before deleting, checks that no
 /// forward_rules reference this group via device_group_in, device_group_out,
 /// or fallback_group. Returns `GroupInUseError` with the rule count if any
@@ -176,7 +194,33 @@ pub async fn delete_group(
             rule_count: count,
         }));
     }
-    Ok(db.delete_group(id, &ResourceScope::All).await? > 0)
+
+    let binding_count = db.count_node_reuse_bindings_for_group(id).await?;
+    if binding_count > 0 {
+        return Err(Box::new(GroupReuseBindingInUseError {
+            group_id: id,
+            binding_count,
+        }));
+    }
+
+    match db.delete_group(id, &ResourceScope::All).await {
+        Ok(rows) => Ok(rows > 0),
+        Err(DbError::ForeignKeyViolation) => {
+            // Atomic Binding admission locks/rechecks the Group. If a Binding
+            // won the race after the pre-check, surface the same controlled 409
+            // rather than degrading the FK backstop into a generic 500.
+            let binding_count = db.count_node_reuse_bindings_for_group(id).await?;
+            if binding_count > 0 {
+                Err(Box::new(GroupReuseBindingInUseError {
+                    group_id: id,
+                    binding_count,
+                }))
+            } else {
+                Err(Box::new(DbError::ForeignKeyViolation))
+            }
+        }
+        Err(error) => Err(Box::new(error)),
+    }
 }
 
 /// Delete a rule within `scope` (owner-scoped for regular users, All for
