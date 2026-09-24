@@ -9959,7 +9959,7 @@ async fn pg_node_credential_delivery_migration_preserves_previous_claim_history(
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(version, 39);
+    assert_eq!(version, crate::db::pg_schema::PG_SCHEMA_VERSION);
     let db = PgRepository::new(pool);
     let claim = db
         .find_node_credential_claim("v38-claimed")
@@ -10010,7 +10010,7 @@ async fn pg_node_credential_claim_migration_failure_recovery() {
         .execute(&db.pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM schema_version WHERE version IN (38,39)")
+    sqlx::query("DELETE FROM schema_version WHERE version >= 38")
         .execute(&db.pool)
         .await
         .unwrap();
@@ -10042,7 +10042,7 @@ async fn pg_node_credential_claim_migration_failure_recovery() {
     let index_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pg_indexes WHERE schemaname='public' AND indexname='uq_node_credential_claims_one_nonterminal'",
     ).fetch_one(&db.pool).await.unwrap();
-    assert_eq!(version, 39);
+    assert_eq!(version, crate::db::pg_schema::PG_SCHEMA_VERSION);
     assert_eq!(index_count, 1);
     cleanup(&db).await;
 }

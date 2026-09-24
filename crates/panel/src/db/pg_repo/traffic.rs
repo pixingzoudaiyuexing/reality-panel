@@ -260,7 +260,7 @@ impl TrafficRepository for PgRepository {
         // FOR SHARE prevents a concurrent revoke/replace UPDATE from crossing
         // the first-application authorization check.
         let active: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM node_credentials
+            "SELECT 1::BIGINT FROM node_credentials
              WHERE credential_id = $1 AND home_group_id = $2 AND node_id = $3
                AND generation = $4 AND activated_at IS NOT NULL AND revoked_at IS NULL
              FOR SHARE",
