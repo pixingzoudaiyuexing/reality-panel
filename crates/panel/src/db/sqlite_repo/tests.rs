@@ -2052,13 +2052,16 @@ async fn traffic_batch_idempotency_contract() {
             download: 3,
         },
     ];
-    let mut deleted_mixed_scope =
-        scope(10, "cred-a", 1, "batch-deleted-mixed", &deleted_mixed_entries);
+    let mut deleted_mixed_scope = scope(
+        10,
+        "cred-a",
+        1,
+        "batch-deleted-mixed",
+        &deleted_mixed_entries,
+    );
     deleted_mixed_scope.config_revision = Some(78);
-    deleted_mixed_scope.rule_source_groups =
-        [(100_i64, 10_i64), (200, 20)].into_iter().collect();
-    deleted_mixed_scope.rule_owner_uids =
-        [(100_i64, 1_i64), (200, 1)].into_iter().collect();
+    deleted_mixed_scope.rule_source_groups = [(100_i64, 10_i64), (200, 20)].into_iter().collect();
+    deleted_mixed_scope.rule_owner_uids = [(100_i64, 1_i64), (200, 1)].into_iter().collect();
     assert_eq!(
         reopened
             .apply_idempotent_traffic_batch(&deleted_mixed_scope, &deleted_mixed_entries)
@@ -2073,12 +2076,11 @@ async fn traffic_batch_idempotency_contract() {
             .unwrap(),
         IdempotentTrafficBatchResult::AlreadyApplied
     );
-    let user_after_deleted: i64 =
-        sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=?")
-            .bind(1_i64)
-            .fetch_one(&reopened_pool)
-            .await
-            .unwrap();
+    let user_after_deleted: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=?")
+        .bind(1_i64)
+        .fetch_one(&reopened_pool)
+        .await
+        .unwrap();
     assert_eq!(user_after_deleted, 114);
     let rule100_after_deleted: i64 =
         sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id=100")
@@ -2086,13 +2088,12 @@ async fn traffic_batch_idempotency_contract() {
             .await
             .unwrap();
     assert_eq!(rule100_after_deleted, 59);
-    let deleted_history: (i64, i64, i64) = sqlx::query_as(
-        "SELECT uid, group_id, billed_total FROM traffic_history WHERE rule_id=?",
-    )
-    .bind(200_i64)
-    .fetch_one(&reopened_pool)
-    .await
-    .unwrap();
+    let deleted_history: (i64, i64, i64) =
+        sqlx::query_as("SELECT uid, group_id, billed_total FROM traffic_history WHERE rule_id=?")
+            .bind(200_i64)
+            .fetch_one(&reopened_pool)
+            .await
+            .unwrap();
     assert_eq!(deleted_history.0, 1);
     assert_eq!(deleted_history.1, 20);
     assert_eq!(
@@ -2130,12 +2131,11 @@ async fn traffic_batch_idempotency_contract() {
             .unwrap(),
         IdempotentTrafficBatchResult::AlreadyApplied
     );
-    let user_after_moved: i64 =
-        sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=?")
-            .bind(1_i64)
-            .fetch_one(&reopened_pool)
-            .await
-            .unwrap();
+    let user_after_moved: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=?")
+        .bind(1_i64)
+        .fetch_one(&reopened_pool)
+        .await
+        .unwrap();
     assert_eq!(user_after_moved, 114);
     let moved_rule_traffic: i64 =
         sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id=100")
@@ -2161,8 +2161,7 @@ async fn traffic_batch_idempotency_contract() {
         upload: 6,
         download: 4,
     }];
-    let mut pre_fix_scope =
-        scope(10, "cred-a", 1, "batch-prefixed-deleted", &pre_fix_entries);
+    let mut pre_fix_scope = scope(10, "cred-a", 1, "batch-prefixed-deleted", &pre_fix_entries);
     pre_fix_scope.config_revision = Some(80);
     pre_fix_scope.rule_source_groups = [(200_i64, 20_i64)].into_iter().collect();
     pre_fix_scope.rule_owner_uids.clear();
@@ -2180,12 +2179,11 @@ async fn traffic_batch_idempotency_contract() {
             .unwrap(),
         IdempotentTrafficBatchResult::AlreadyApplied
     );
-    let user_after_prefixed: i64 =
-        sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=?")
-            .bind(1_i64)
-            .fetch_one(&reopened_pool)
-            .await
-            .unwrap();
+    let user_after_prefixed: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=?")
+        .bind(1_i64)
+        .fetch_one(&reopened_pool)
+        .await
+        .unwrap();
     assert_eq!(user_after_prefixed, 114);
     let deleted_dispositions: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM audit_log

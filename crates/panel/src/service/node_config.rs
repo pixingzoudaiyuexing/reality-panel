@@ -533,17 +533,14 @@ async fn finish_snapshot_locked(
     }
     let mut rule_owner_uids = BTreeMap::new();
     for (rule_id, source_group_id) in &rule_sources {
-        let rule = crate::db::repo::RuleRepository::find_rule_by_id(
-            db,
-            *rule_id,
-            &ResourceScope::All,
-        )
-        .await?
-        .ok_or_else(|| {
-            NodeConfigBuildError::InvalidConfig(format!(
-                "rule {rule_id} disappeared while config attribution was being recorded"
-            ))
-        })?;
+        let rule =
+            crate::db::repo::RuleRepository::find_rule_by_id(db, *rule_id, &ResourceScope::All)
+                .await?
+                .ok_or_else(|| {
+                    NodeConfigBuildError::InvalidConfig(format!(
+                        "rule {rule_id} disappeared while config attribution was being recorded"
+                    ))
+                })?;
         if rule.device_group_in != *source_group_id {
             return Err(NodeConfigBuildError::InvalidConfig(format!(
                 "rule {rule_id} changed source group while config attribution was being recorded"

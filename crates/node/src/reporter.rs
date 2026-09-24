@@ -2061,14 +2061,8 @@ mod tests {
         server.await.unwrap();
         let requests = captured.lock().await;
         assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[0].batch.as_ref().unwrap().config_revision,
-            Some(42)
-        );
-        assert_eq!(
-            requests[1].batch.as_ref().unwrap().config_revision,
-            Some(43)
-        );
+        assert_eq!(requests[0].batch.as_ref().unwrap().config_revision, Some(42));
+        assert_eq!(requests[1].batch.as_ref().unwrap().config_revision, Some(43));
         assert_ne!(
             requests[0].batch.as_ref().unwrap().batch_id,
             requests[1].batch.as_ref().unwrap().batch_id

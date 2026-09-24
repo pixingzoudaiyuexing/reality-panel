@@ -378,90 +378,84 @@ pub async fn report_traffic(
             return traffic_business_error(409, "traffic batch identity or payload conflict");
         }
 
-        let (rule_source_groups, rule_owner_uids) =
-            if let Some(revision) = batch.config_revision {
-                let key = format!(
-                    "node_config_rule_sources:{}:{}:{}",
-                    verified.home_group_id,
-                    verified.node_id.as_str(),
-                    revision
+        let (rule_source_groups, rule_owner_uids) = if let Some(revision) = batch.config_revision {
+            let key = format!(
+                "node_config_rule_sources:{}:{}:{}",
+                verified.home_group_id,
+                verified.node_id.as_str(),
+                revision
+            );
+            let raw = match state.db.get(&key).await {
+                Ok(Some(raw)) => raw,
+                Ok(None) => {
+                    return traffic_business_error(
+                        403,
+                        "traffic batch config revision is unavailable for this node",
+                    )
+                }
+                Err(error) => {
+                    tracing::error!("report_traffic: config attribution lookup failed: {error}");
+                    return traffic_business_error(500, "database error");
+                }
+            };
+            let mapping = match serde_json::from_str::<std::collections::BTreeMap<i64, i64>>(&raw) {
+                Ok(mapping) => mapping,
+                Err(error) => {
+                    tracing::error!("report_traffic: config attribution state is invalid: {error}");
+                    return traffic_business_error(500, "database error");
+                }
+            };
+            if req
+                .reports
+                .iter()
+                .any(|entry| !mapping.contains_key(&entry.rule_id))
+            {
+                return traffic_business_error(
+                    403,
+                    "one or more rules are unavailable for this node config",
                 );
-                let raw = match state.db.get(&key).await {
-                    Ok(Some(raw)) => raw,
-                    Ok(None) => {
-                        return traffic_business_error(
-                            403,
-                            "traffic batch config revision is unavailable for this node",
-                        )
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            "report_traffic: config attribution lookup failed: {error}"
-                        );
-                        return traffic_business_error(500, "database error");
-                    }
-                };
-                let mapping =
+            }
+
+            let owner_key = format!(
+                "node_config_rule_owners:{}:{}:{}",
+                verified.home_group_id,
+                verified.node_id.as_str(),
+                revision
+            );
+            let owners = match state.db.get(&owner_key).await {
+                Ok(Some(raw)) => {
                     match serde_json::from_str::<std::collections::BTreeMap<i64, i64>>(&raw) {
-                        Ok(mapping) => mapping,
+                        Ok(owners) => owners,
                         Err(error) => {
                             tracing::error!(
-                                "report_traffic: config attribution state is invalid: {error}"
+                                "report_traffic: config owner attribution state is invalid: {error}"
                             );
                             return traffic_business_error(500, "database error");
                         }
-                    };
-                if req
-                    .reports
-                    .iter()
-                    .any(|entry| !mapping.contains_key(&entry.rule_id))
-                {
-                    return traffic_business_error(
-                        403,
-                        "one or more rules are unavailable for this node config",
-                    );
+                    }
                 }
-
-                let owner_key = format!(
-                    "node_config_rule_owners:{}:{}:{}",
-                    verified.home_group_id,
-                    verified.node_id.as_str(),
-                    revision
-                );
-                let owners = match state.db.get(&owner_key).await {
-                    Ok(Some(raw)) => {
-                        match serde_json::from_str::<std::collections::BTreeMap<i64, i64>>(&raw) {
-                            Ok(owners) => owners,
-                            Err(error) => {
-                                tracing::error!(
-                                    "report_traffic: config owner attribution state is invalid: {error}"
-                                );
-                                return traffic_business_error(500, "database error");
-                            }
-                        }
-                    }
-                    // A pre-fix delivered revision legitimately has no owner
-                    // snapshot. It can still settle a rule that remains in the
-                    // historical source Group; deleted/moved entries are handled
-                    // as explicit terminal unbillable dispositions below.
-                    Ok(None) => std::collections::BTreeMap::new(),
-                    Err(error) => {
-                        tracing::error!(
-                            "report_traffic: config owner attribution lookup failed: {error}"
-                        );
-                        return traffic_business_error(500, "database error");
-                    }
-                };
-                (mapping, owners)
-            } else {
-                (
-                    req.reports
-                        .iter()
-                        .map(|entry| (entry.rule_id, verified.home_group_id))
-                        .collect(),
-                    std::collections::BTreeMap::new(),
-                )
+                // A pre-fix delivered revision legitimately has no owner
+                // snapshot. It can still settle a rule that remains in the
+                // historical source Group; deleted/moved entries are handled
+                // as explicit terminal unbillable dispositions below.
+                Ok(None) => std::collections::BTreeMap::new(),
+                Err(error) => {
+                    tracing::error!(
+                        "report_traffic: config owner attribution lookup failed: {error}"
+                    );
+                    return traffic_business_error(500, "database error");
+                }
             };
+            (mapping, owners)
+        } else {
+            (
+                req.reports
+                    .iter()
+                    .map(|entry| (entry.rule_id, verified.home_group_id))
+                    .collect(),
+                std::collections::BTreeMap::new(),
+            )
+        };
         let scope = crate::db::repo::TrafficBatchScope {
             home_group_id: verified.home_group_id,
             node_id: verified.node_id.as_str().to_string(),

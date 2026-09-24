@@ -336,8 +336,7 @@ impl TrafficRepository for PgRepository {
 
         let mut resolved: Vec<Resolved> = Vec::with_capacity(rule_delta.len());
         let mut dispositions: Vec<Disposition> = Vec::new();
-        let mut user_delta: std::collections::HashMap<i64, i64> =
-            std::collections::HashMap::new();
+        let mut user_delta: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
 
         for (rule_id, (dup, ddown)) in &rule_delta {
             let rule_delta_sum = match dup.checked_add(*ddown) {
@@ -352,123 +351,126 @@ impl TrafficRepository for PgRepository {
                 return Ok(IdempotentTrafficBatchResult::Unavailable);
             };
             let historical_uid = scope.rule_owner_uids.get(rule_id).copied();
-            let current_rule: Option<(i64, i64, i64, i64)> =
-                sqlx::query_as("SELECT id, uid, device_group_in, traffic_used FROM forward_rules WHERE id = $1")
-                    .bind(rule_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
+            let current_rule: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+                "SELECT id, uid, device_group_in, traffic_used FROM forward_rules WHERE id = $1",
+            )
+            .bind(rule_id)
+            .fetch_optional(&mut *tx)
+            .await?;
 
-            let (uid, user_used, rule_used, update_rule, rate) =
-                if scope.config_revision.is_some() {
-                    let (uid, rule_used, update_rule) = match current_rule {
-                        Some((_rid, _current_uid, current_group_id, _current_used))
-                            if current_group_id != source_group_id =>
-                        {
-                            dispositions.push(Disposition {
-                                rule_id: *rule_id,
-                                source_group_id,
-                                historical_uid,
-                                delta_up: *dup,
-                                delta_down: *ddown,
-                                reason: "rule_moved_from_historical_group",
-                            });
-                            continue;
-                        }
-                        Some((_rid, current_uid, _current_group_id, _current_used))
-                            if historical_uid.is_some() && historical_uid != Some(current_uid) =>
-                        {
-                            dispositions.push(Disposition {
-                                rule_id: *rule_id,
-                                source_group_id,
-                                historical_uid,
-                                delta_up: *dup,
-                                delta_down: *ddown,
-                                reason: "rule_owner_changed_since_historical_config",
-                            });
-                            continue;
-                        }
-                        Some((_rid, current_uid, _current_group_id, current_used)) => {
-                            (historical_uid.unwrap_or(current_uid), Some(current_used), true)
-                        }
-                        None => match historical_uid {
-                            Some(uid) => (uid, None, false),
-                            None => {
-                                dispositions.push(Disposition {
-                                    rule_id: *rule_id,
-                                    source_group_id,
-                                    historical_uid: None,
-                                    delta_up: *dup,
-                                    delta_down: *ddown,
-                                    reason: "rule_deleted_without_historical_owner",
-                                });
-                                continue;
-                            }
-                        },
-                    };
-
-                    let rate = match sqlx::query_scalar::<_, f64>("SELECT rate FROM device_groups WHERE id = $1")
-                        .bind(source_group_id)
-                        .fetch_optional(&mut *tx)
-                        .await?
-                        .flatten()
+            let (uid, user_used, rule_used, update_rule, rate) = if scope.config_revision.is_some()
+            {
+                let (uid, rule_used, update_rule) = match current_rule {
+                    Some((_rid, _current_uid, current_group_id, _current_used))
+                        if current_group_id != source_group_id =>
                     {
-                        Some(rate) => rate,
-                        None => {
-                            dispositions.push(Disposition {
-                                rule_id: *rule_id,
-                                source_group_id,
-                                historical_uid: Some(uid),
-                                delta_up: *dup,
-                                delta_down: *ddown,
-                                reason: "historical_source_group_missing",
-                            });
-                            continue;
-                        }
-                    };
-                    let user_used = match sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM users WHERE id = $1")
-                        .bind(uid)
-                        .fetch_optional(&mut *tx)
-                        .await?
-                    {
-                        Some(value) => value,
-                        None => {
-                            dispositions.push(Disposition {
-                                rule_id: *rule_id,
-                                source_group_id,
-                                historical_uid: Some(uid),
-                                delta_up: *dup,
-                                delta_down: *ddown,
-                                reason: "historical_user_missing",
-                            });
-                            continue;
-                        }
-                    };
-                    (uid, user_used, rule_used, update_rule, rate)
-                } else {
-                    let Some((_rid, uid, current_group_id, rule_used)) = current_rule else {
-                        let _ = tx.rollback().await;
-                        return Ok(IdempotentTrafficBatchResult::Unavailable);
-                    };
-                    if current_group_id != source_group_id {
-                        let _ = tx.rollback().await;
-                        return Ok(IdempotentTrafficBatchResult::Unavailable);
+                        dispositions.push(Disposition {
+                            rule_id: *rule_id,
+                            source_group_id,
+                            historical_uid,
+                            delta_up: *dup,
+                            delta_down: *ddown,
+                            reason: "rule_moved_from_historical_group",
+                        });
+                        continue;
                     }
-                    let rate = sqlx::query_scalar::<_, f64>("SELECT rate FROM device_groups WHERE id = $1")
-                        .bind(source_group_id)
-                        .fetch_optional(&mut *tx)
-                        .await?
-                        .flatten()
-                        .unwrap_or(1.0);
-                    let Some(user_used) = sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM users WHERE id = $1")
-                        .bind(uid)
-                        .fetch_optional(&mut *tx)
-                        .await?
-                    else {
-                        let _ = tx.rollback().await;
-                        return Ok(IdempotentTrafficBatchResult::Unavailable);
-                    };
-                    (uid, user_used, Some(rule_used), true, rate)
+                    Some((_rid, current_uid, _current_group_id, _current_used))
+                        if historical_uid.is_some() && historical_uid != Some(current_uid) =>
+                    {
+                        dispositions.push(Disposition {
+                            rule_id: *rule_id,
+                            source_group_id,
+                            historical_uid,
+                            delta_up: *dup,
+                            delta_down: *ddown,
+                            reason: "rule_owner_changed_since_historical_config",
+                        });
+                        continue;
+                    }
+                    Some((_rid, current_uid, _current_group_id, current_used)) => (
+                        historical_uid.unwrap_or(current_uid),
+                        Some(current_used),
+                        true,
+                    ),
+                    None => match historical_uid {
+                        Some(uid) => (uid, None, false),
+                        None => {
+                            dispositions.push(Disposition {
+                                rule_id: *rule_id,
+                                source_group_id,
+                                historical_uid: None,
+                                delta_up: *dup,
+                                delta_down: *ddown,
+                                reason: "rule_deleted_without_historical_owner",
+                            });
+                            continue;
+                        }
+                    },
                 };
+
+                let rate = match sqlx::query_scalar::<_, f64>("SELECT rate FROM device_groups WHERE id = $1")
+                    .bind(source_group_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .flatten()
+                {
+                    Some(rate) => rate,
+                    None => {
+                        dispositions.push(Disposition {
+                            rule_id: *rule_id,
+                            source_group_id,
+                            historical_uid: Some(uid),
+                            delta_up: *dup,
+                            delta_down: *ddown,
+                            reason: "historical_source_group_missing",
+                        });
+                        continue;
+                    }
+                };
+                let user_used = match sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM users WHERE id = $1")
+                    .bind(uid)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                {
+                    Some(value) => value,
+                    None => {
+                        dispositions.push(Disposition {
+                            rule_id: *rule_id,
+                            source_group_id,
+                            historical_uid: Some(uid),
+                            delta_up: *dup,
+                            delta_down: *ddown,
+                            reason: "historical_user_missing",
+                        });
+                        continue;
+                    }
+                };
+                (uid, user_used, rule_used, update_rule, rate)
+            } else {
+                let Some((_rid, uid, current_group_id, rule_used)) = current_rule else {
+                    let _ = tx.rollback().await;
+                    return Ok(IdempotentTrafficBatchResult::Unavailable);
+                };
+                if current_group_id != source_group_id {
+                    let _ = tx.rollback().await;
+                    return Ok(IdempotentTrafficBatchResult::Unavailable);
+                }
+                let rate = sqlx::query_scalar::<_, f64>("SELECT rate FROM device_groups WHERE id = $1")
+                    .bind(source_group_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .flatten()
+                    .unwrap_or(1.0);
+                let Some(user_used) = sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM users WHERE id = $1")
+                    .bind(uid)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                else {
+                    let _ = tx.rollback().await;
+                    return Ok(IdempotentTrafficBatchResult::Unavailable);
+                };
+                (uid, user_used, Some(rule_used), true, rate)
+            };
 
             if !(0.1..=100.0).contains(&rate) {
                 let _ = tx.rollback().await;
