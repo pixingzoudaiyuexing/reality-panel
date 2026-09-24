@@ -496,7 +496,7 @@ impl Drop for TcpConnectionGuard {
     }
 }
 
-pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter) {
+pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter, node_id: &str) {
     // Snapshot (non-destructive) first: the snapshotted bytes are only deducted
     // from the counters after the panel ACKs the upload (see TrafficSnapshot).
     // A failed/lost upload drops the guard without commit, so those bytes stay
@@ -516,9 +516,10 @@ pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter) {
 
     let url = format!("{}/api/v1/node/report_traffic", config.panel_url);
     let client = reqwest::Client::new();
-    match client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", config.token))
+    match config
+        .auth
+        .apply_reqwest(client.post(&url))
+        .header("X-Node-ID", node_id)
         .json(&report)
         .send()
         .await
@@ -1081,9 +1082,10 @@ pub async fn report_status(
     // report_traffic there's nothing to retry here (status is ephemeral), but
     // a persistent rejection (e.g. rotated token) now shows up in the log
     // rather than the node believing everything is fine.
-    match client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", config.token))
+    match config
+        .auth
+        .apply_reqwest(client.post(&url))
+        .header("X-Node-ID", node_id)
         .json(&report)
         .send()
         .await

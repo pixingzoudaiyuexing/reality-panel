@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use crate::api::middleware::AuthUser;
-use crate::api::node::extract_node_token;
+use crate::api::node_auth::{authenticate_node, AuthenticatedNodeIdentity, NodeAuthError};
 use crate::api::AppState;
 use crate::db::repo::ResourceScope;
 use axum::extract::{Path, Query, State};
@@ -1216,32 +1216,34 @@ pub async fn receive_diagnose_result(
     headers: HeaderMap,
     Json(req): Json<DiagnoseResult>,
 ) -> Json<ApiResponse<()>> {
-    let Some(token) = extract_node_token(&headers) else {
-        return Json(ApiResponse {
-            code: 401,
-            message: "Invalid token".into(),
-            data: None,
-        });
-    };
-    // Resolve the group this token belongs to.
-    let group = match state.db.find_by_token(&token).await {
-        Ok(Some(g)) => g,
-        Ok(None) => {
-            return Json(ApiResponse {
-                code: 401,
-                message: "Invalid token".into(),
-                data: None,
-            })
-        }
-        Err(e) => {
-            tracing::error!("diagnose_result: find_by_token failed: {}", e);
+    let identity = match authenticate_node(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(NodeAuthError::Unavailable) => {
+            tracing::error!("diagnose_result: node authentication database lookup failed");
             return Json(ApiResponse {
                 code: 500,
                 message: "database error".into(),
                 data: None,
             });
         }
+        Err(_) => {
+            return Json(ApiResponse {
+                code: 401,
+                message: "Invalid token".into(),
+                data: None,
+            })
+        }
     };
+    if let AuthenticatedNodeIdentity::VerifiedConcreteNode { verified, .. } = &identity {
+        if req.node_id.trim() != verified.node_id.as_str() {
+            return Json(ApiResponse {
+                code: 403,
+                message: "node identity mismatch".into(),
+                data: None,
+            });
+        }
+    }
+    let group_id = identity.group_id();
     // The rule must belong to THIS group's inbound set. This is the node-auth
     // path (group token verified above), not a user request — use an unscoped
     // lookup; the device_group_in check below is the real authorization.
@@ -1267,7 +1269,7 @@ pub async fn receive_diagnose_result(
             });
         }
     };
-    if rule.device_group_in != group.id {
+    if rule.device_group_in != group_id {
         return Json(ApiResponse {
             code: 403,
             message: "rule does not belong to this node's group".into(),

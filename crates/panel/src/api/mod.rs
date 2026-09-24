@@ -14,6 +14,7 @@ pub mod geoip;
 pub mod groups;
 pub mod middleware;
 pub mod node;
+pub mod node_auth;
 pub mod node_batch_upgrade;
 pub mod node_claim;
 pub mod node_credential_delivery;

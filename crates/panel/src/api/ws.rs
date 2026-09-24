@@ -1,4 +1,6 @@
-use crate::api::node::extract_node_token;
+use crate::api::node_auth::{
+    authenticate_node, verified_credential_still_active, VerifiedConcreteNode,
+};
 use crate::api::AppState;
 use axum::{
     extract::{
@@ -333,33 +335,13 @@ pub async fn node_ws_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let token = match extract_node_token(&headers) {
-        Some(t) => t,
-        None => return axum::http::StatusCode::UNAUTHORIZED.into_response(),
+    let identity = match authenticate_node(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(error) => return error.status().into_response(),
     };
-
-    use relay_shared::models::DeviceGroup;
-    let group: DeviceGroup = match state.db.find_by_token(&token).await {
-        Ok(Some(g)) => g,
-        Ok(None) => return axum::http::StatusCode::UNAUTHORIZED.into_response(),
-        Err(e) => {
-            tracing::error!("node_ws_handler: find_by_token failed: {}", e);
-            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    };
-    if group.group_type != "in" {
-        return axum::http::StatusCode::FORBIDDEN.into_response();
-    }
-
-    let group_id = group.id;
-    // v0.4.14: optional per-node identity. None for an older node that didn't
-    // send X-Node-ID — it still connects and gets config_changed, it just can't
-    // be targeted by directed diagnosis.
-    let node_id = headers
-        .get("X-Node-ID")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let group_id = identity.group_id();
+    let node_id = identity.node_id().map(str::to_string);
+    let verified_credential = identity.verified().cloned();
     let node_version = headers
         .get("X-Node-Version")
         .and_then(|value| value.to_str().ok())
@@ -425,6 +407,7 @@ pub async fn node_ws_handler(
             node_architecture,
             config_compatible,
             lifecycle_capable,
+            verified_credential,
             state,
             db,
             node_connections,
@@ -444,6 +427,7 @@ async fn handle_node_ws(
     node_architecture: Option<String>,
     config_compatible: bool,
     lifecycle_capable: bool,
+    verified_credential: Option<VerifiedConcreteNode>,
     state: AppState,
     db: std::sync::Arc<dyn crate::db::Repository>,
     node_connections: NodeConnections,
@@ -504,6 +488,9 @@ async fn handle_node_ws(
     // half-open TCP) is eventually cleaned up. The node's heartbeat is
     // expected well within this window.
     const READ_TIMEOUT: Duration = Duration::from_secs(120);
+    const CREDENTIAL_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+    let mut credential_recheck = tokio::time::interval(CREDENTIAL_RECHECK_INTERVAL);
+    credential_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Drive both halves. `receiver.recv()` (wrapped in a timeout) and
     // `push_rx.recv()` borrow different variables, so select! can hold both
@@ -560,6 +547,29 @@ async fn handle_node_ws(
                 }
                 Ok(Some(Ok(_))) => {
                     // ignore other message types
+                }
+            },
+            _ = credential_recheck.tick(), if verified_credential.is_some() => {
+                let verified = verified_credential.as_ref().expect("guarded by select condition");
+                match verified_credential_still_active(&state, verified).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(
+                            group_id,
+                            node_id = %verified.node_id.as_str(),
+                            credential_id = %verified.credential_id,
+                            "websocket credential is no longer active; closing connection"
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            group_id,
+                            node_id = %verified.node_id.as_str(),
+                            "websocket credential revalidation unavailable; failing closed"
+                        );
+                        break;
+                    }
                 }
             },
             pushed = push_rx.recv() => match pushed {
@@ -625,6 +635,151 @@ pub(crate) async fn build_config_snapshot_for_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::system::ReleaseCache;
+    use crate::config::Config;
+    use crate::db::schema::SCHEMA_SQL;
+    use crate::db::sqlite_repo::SqliteRepository;
+    use crate::node_credential::{NodeCredentialSecret, NodeCredentialVerifier};
+    use crate::node_identity::ReuseEligibleNodeId;
+    use futures_util::StreamExt;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::sync::Arc;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    async fn ws_credential_state() -> (AppState, NodeCredentialSecret, sqlx::SqlitePool) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) \
+             VALUES (10, 'home', 'in', 'legacy-token', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let node_id = ReuseEligibleNodeId::parse("Node_A").unwrap();
+        let secret = NodeCredentialSecret::from_test_bytes([0x42; 32]);
+        let verifier = NodeCredentialVerifier::derive("cred-ws", 10, &node_id, &secret);
+        sqlx::query(
+            "INSERT INTO node_credentials \
+             (credential_id, home_group_id, node_id, generation, verifier_format, verifier_version, verifier_data, activated_at) \
+             VALUES ('cred-ws', 10, 'Node_A', 1, 'rp-node-sha256', 1, ?, datetime('now'))",
+        )
+        .bind(verifier.data().as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState {
+            db: Arc::new(SqliteRepository::new(pool.clone())),
+            config: Config {
+                database_path: "sqlite::memory:".into(),
+                listen: "127.0.0.1:0".into(),
+                key: "test-key".into(),
+                jwt_secret: "test-secret".into(),
+                public_dir: "public".into(),
+                public_panel_url: String::new(),
+                registration_enabled: false,
+                cors_origins: vec![],
+                geoip_enabled: false,
+                geoip_cache_ttl: 604_800,
+            },
+            release_cache: ReleaseCache::new(),
+            node_connections: NodeConnections::new(),
+            node_operations: crate::api::node_ops::NodeOperationRegistry::new(),
+            deployments: crate::api::node_deploy::DeploymentRegistry::default(),
+            diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
+            geoip_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+        (state, secret, pool)
+    }
+
+    fn credential_ws_request(
+        addr: std::net::SocketAddr,
+        secret: &NodeCredentialSecret,
+    ) -> axum::http::Request<()> {
+        let mut request = format!("ws://{addr}/node/ws")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            format!("RelayNodeCredential {}", secret.to_wire_value())
+                .parse()
+                .unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("X-Node-Credential-ID", "cred-ws".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("X-Node-ID", "Node_A".parse().unwrap());
+        request.headers_mut().insert(
+            "X-Config-Protocol-Version",
+            relay_shared::protocol::CONFIG_PROTOCOL_VERSION
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        request
+    }
+
+    #[tokio::test]
+    async fn verified_websocket_is_closed_after_credential_revocation_and_reconnect_is_rejected() {
+        let (state, secret, pool) = ws_credential_state().await;
+        let app = axum::Router::new()
+            .route("/node/ws", axum::routing::get(node_ws_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (mut socket, response) =
+            tokio_tungstenite::connect_async(credential_ws_request(addr, &secret))
+                .await
+                .expect("active permanent Credential must complete a real WS handshake");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SWITCHING_PROTOCOLS
+        );
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("server must send initial config snapshot");
+        assert!(first.is_some());
+
+        sqlx::query(
+            "UPDATE node_credentials SET revoked_at = datetime('now') WHERE credential_id = 'cred-ws'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let disconnected = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                match socket.next().await {
+                    None | Some(Err(_)) => return true,
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) => return true,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await
+        .expect("revoked Verified WebSocket retained control authority past recheck bound");
+        assert!(disconnected);
+
+        let reconnect =
+            tokio_tungstenite::connect_async(credential_ws_request(addr, &secret)).await;
+        match reconnect {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+            }
+            other => panic!("revoked Credential reconnect must return HTTP 401, got {other:?}"),
+        }
+        server.abort();
+    }
 
     /// register() must hand back a receiver that actually receives what
     /// broadcast_all sends. This is the contract every admin mutation

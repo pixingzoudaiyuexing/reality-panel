@@ -824,6 +824,14 @@ pub trait NodeCredentialRepository: Send + Sync {
         credential_id: &str,
     ) -> Result<Option<NodeCredentialRecord>, DbError>;
 
+    /// Runtime-authentication lookup. Returns only the exact credential when it
+    /// is the current ACTIVE generation for its concrete Home Group + Node
+    /// identity. Historical/revoked/inactive rows are deliberately invisible.
+    async fn find_active_node_credential_for_runtime(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<NodeCredentialRecord>, DbError>;
+
     async fn list_node_credentials_for_identity(
         &self,
         home_group_id: i64,

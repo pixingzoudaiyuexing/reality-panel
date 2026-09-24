@@ -4,7 +4,7 @@
 
 use crate::api::diagnose::{group_node_statuses, NodeStatusRow, DIAGNOSE_TIMEOUT};
 use crate::api::middleware::AuthUser;
-use crate::api::node::extract_node_token;
+use crate::api::node_auth::{authenticate_node, AuthenticatedNodeIdentity, NodeAuthError};
 use crate::api::AppState;
 use crate::db::repo::ResourceScope;
 use axum::extract::{Path, State};
@@ -274,30 +274,34 @@ pub async fn receive_reapply_result(
     headers: HeaderMap,
     Json(result): Json<ReapplyNginxSniResult>,
 ) -> Json<ApiResponse<()>> {
-    let Some(token) = extract_node_token(&headers) else {
-        return Json(ApiResponse {
-            code: 401,
-            message: "Invalid token".into(),
-            data: None,
-        });
-    };
-    let Some(group) = (match state.db.find_by_token(&token).await {
-        Ok(group) => group,
-        Err(error) => {
-            tracing::error!("reapply result group lookup failed: {}", error);
+    let identity = match authenticate_node(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(NodeAuthError::Unavailable) => {
+            tracing::error!("reapply result node authentication database lookup failed");
             return Json(ApiResponse {
                 code: 500,
                 message: "database error".into(),
                 data: None,
             });
         }
-    }) else {
-        return Json(ApiResponse {
-            code: 401,
-            message: "Invalid token".into(),
-            data: None,
-        });
+        Err(_) => {
+            return Json(ApiResponse {
+                code: 401,
+                message: "Invalid token".into(),
+                data: None,
+            })
+        }
     };
+    if let AuthenticatedNodeIdentity::VerifiedConcreteNode { verified, .. } = &identity {
+        if result.node_id.trim() != verified.node_id.as_str() {
+            return Json(ApiResponse {
+                code: 403,
+                message: "node identity mismatch".into(),
+                data: None,
+            });
+        }
+    }
+    let group_id = identity.group_id();
     let Some(rule) = (match state
         .db
         .find_rule_by_id(result.rule_id, &ResourceScope::All)
@@ -319,7 +323,7 @@ pub async fn receive_reapply_result(
             data: None,
         });
     };
-    if rule.device_group_in != group.id
+    if rule.device_group_in != group_id
         || (rule.public_transport != "nginx_sni" && rule.node_transport != "nginx_sni")
     {
         return Json(ApiResponse {

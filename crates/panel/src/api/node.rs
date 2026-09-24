@@ -1,7 +1,7 @@
+use crate::api::node_auth::{authenticate_node, AuthenticatedNodeIdentity, NodeAuthError};
 use crate::api::AppState;
 use axum::response::{IntoResponse, Response};
 use axum::{extract::State, http::HeaderMap, http::StatusCode, Json};
-use relay_shared::models::*;
 use relay_shared::protocol::*;
 
 /// Extract the node token from the `Authorization: Bearer <NODE_TOKEN>` header.
@@ -16,6 +16,7 @@ pub(crate) fn extract_node_token(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+#[allow(dead_code)] // Retained for the legacy token-extraction compatibility pin tests.
 pub(crate) fn extract_node_id(headers: &HeaderMap) -> Option<String> {
     headers
         .get("X-Node-ID")
@@ -68,28 +69,19 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
             .into_response();
     }
 
-    // An absent token is not an authoritative empty plan. Returning 200 with
-    // listeners=[] here would make a node delete its last known good config.
-    let Some(token) = extract_node_token(&headers) else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-
-    // Find device group by token.
-    let group: Option<DeviceGroup> = match state.db.find_by_token(&token).await {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::error!("get_config: find_by_token failed: {}", e);
+    let identity = match authenticate_node(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(NodeAuthError::Unavailable) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "config unavailable: transient database error",
             )
-                .into_response();
+                .into_response()
         }
+        Err(error) => return error.status().into_response(),
     };
-
-    let Some(group) = group else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
+    let group_id = identity.group_id();
+    let node_id = identity.node_id().map(str::to_string);
 
     // v0.3.6: delegate to the shared `build_node_config`. This path and the WS
     // push path (ws.rs) now use the SAME function.
@@ -99,8 +91,8 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     match crate::service::node_config::build_node_config_snapshot_for_node_with_certificate_inventory(
         state.db.as_ref(),
         &certificate_state_dir,
-        group.id,
-        extract_node_id(&headers).as_deref(),
+        group_id,
+        node_id.as_deref(),
     )
     .await
     {
@@ -114,7 +106,7 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
         Err(e) => {
             tracing::error!(
                 "get_config: build_node_config failed for group {}: {}",
-                group.id,
+                group_id,
                 e
             );
             (
@@ -127,20 +119,14 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
 }
 
 pub async fn get_certificates(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(token) = extract_node_token(&headers) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let identity = match authenticate_node(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(error) => return error.status().into_response(),
     };
-    if extract_node_id(&headers).is_none() {
+    if identity.node_id().is_none() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let group = match state.db.find_by_token(&token).await {
-        Ok(Some(group)) if group.group_type == "in" => group,
-        Ok(_) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(error) => {
-            tracing::warn!("get_certificates: group lookup failed: {error}");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    };
+    let group_id = identity.group_id();
     let manager = match crate::service::panel_certificate::PanelCertificateManager::new(
         state.db.clone(),
         &state.config,
@@ -151,10 +137,10 @@ pub async fn get_certificates(State(state): State<AppState>, headers: HeaderMap)
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    let manifest = match manager.group_manifest(group.id).await {
+    let manifest = match manager.group_manifest(group_id).await {
         Ok(manifest) => manifest,
         Err(error) => {
-            tracing::warn!(group_id = group.id, "get_certificates failed: {error}");
+            tracing::warn!(group_id, "get_certificates failed: {error}");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
@@ -207,25 +193,30 @@ async fn acme_dns01_operation(
     request: crate::service::acme_dns01::AcmeDns01Request,
     present: bool,
 ) -> Response {
-    let Some(token) = extract_node_token(&headers) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let identity = match authenticate_node(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(error) => return error.status().into_response(),
     };
-    let group = match state.db.find_by_token(&token).await {
-        Ok(Some(group)) if group.group_type == "in" => group,
-        Ok(_) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+    let group_id = identity.group_id();
     let node_id = request.node_id.trim();
-    if node_id.is_empty()
-        || extract_node_id(&headers).is_some_and(|header_node_id| header_node_id != node_id)
-    {
+    let node_mismatch = match &identity {
+        AuthenticatedNodeIdentity::LegacyHomeGroup {
+            reported_node_id, ..
+        } => reported_node_id
+            .as_deref()
+            .is_some_and(|reported| reported != node_id),
+        AuthenticatedNodeIdentity::VerifiedConcreteNode { verified, .. } => {
+            verified.node_id.as_str() != node_id
+        }
+    };
+    if node_id.is_empty() || node_mismatch {
         return StatusCode::FORBIDDEN.into_response();
     }
     if present {
         let scopes =
             match crate::service::node_config::issuance_authorized_certificate_scopes_for_group(
                 state.db.as_ref(),
-                group.id,
+                group_id,
             )
             .await
             {
@@ -250,9 +241,9 @@ async fn acme_dns01_operation(
     }
 
     let result = if present {
-        crate::service::acme_dns01::present(state.db.as_ref(), group.id, &request).await
+        crate::service::acme_dns01::present(state.db.as_ref(), group_id, &request).await
     } else {
-        crate::service::acme_dns01::cleanup(state.db.as_ref(), group.id, &request).await
+        crate::service::acme_dns01::cleanup(state.db.as_ref(), group_id, &request).await
     };
     match result {
         Ok(response) => Json(response).into_response(),
@@ -301,29 +292,17 @@ pub async fn report_traffic(
     // never gets to read a JSON body on a failed upgrade). Do NOT "normalize"
     // these without a coordinated node upgrade; see the test module's
     // `node_http_status_compat_*` tests that pin the current behavior.
-    let Some(token) = extract_node_token(&headers) else {
-        return Json(ApiResponse {
-            code: 401,
-            message: "Invalid token".into(),
-            data: None,
-        });
-    };
-
-    let group: Option<DeviceGroup> = match state.db.find_by_token(&token).await {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::error!("report_traffic: find_by_token failed: {}", e);
+    let identity = match authenticate_node(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(NodeAuthError::Unavailable) => {
+            tracing::error!("report_traffic: node authentication database lookup failed");
             return Json(ApiResponse {
                 code: 500,
                 message: "database error".into(),
                 data: None,
             });
         }
-    };
-
-    let group = match group {
-        Some(g) => g,
-        None => {
+        Err(_) => {
             return Json(ApiResponse {
                 code: 401,
                 message: "Invalid token".into(),
@@ -331,6 +310,7 @@ pub async fn report_traffic(
             })
         }
     };
+    let group_id = identity.group_id();
 
     // v0.4.9 SECURITY: the whole batch is one atomic transaction, and rule-id
     // existence is NO LONGER distinguishable from cross-group reporting. Both
@@ -342,7 +322,7 @@ pub async fn report_traffic(
     // HTTP-status note (preserved): a rejection returns HTTP 200 with a business
     // `code` (403/400/500) INSIDE the JSON body — NOT a real HTTP error. Nodes
     // read the JSON `code` and ignore the HTTP status on these endpoints.
-    match crate::service::traffic::apply_traffic_report(state.db.as_ref(), group.id, &req.reports)
+    match crate::service::traffic::apply_traffic_report(state.db.as_ref(), group_id, &req.reports)
         .await
     {
         Ok(()) => Json(ApiResponse::success(())),
@@ -399,28 +379,32 @@ pub async fn report_status(
     headers: HeaderMap,
     Json(req): Json<StatusReport>,
 ) -> Json<ApiResponse<()>> {
-    // Token comes ONLY from the Authorization header (v0.3.9: body token
-    // fallback removed).
-    let Some(token) = extract_node_token(&headers) else {
-        return Json(ApiResponse {
-            code: 401,
-            message: "Invalid token".into(),
-            data: None,
-        });
-    };
-
-    // Verify token and update node status in kvs
-    let group: Option<DeviceGroup> = match state.db.find_by_token(&token).await {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::error!("report_status: find_by_token failed: {}", e);
-            // Match the original swallow-and-empty behavior: a transient DB
-            // failure shouldn't make the node think its report was rejected.
+    let identity = match authenticate_node(&state, &headers).await {
+        Ok(identity) => Some(identity),
+        Err(NodeAuthError::Unavailable) => {
+            tracing::error!("report_status: node authentication database lookup failed");
             None
+        }
+        Err(_) => {
+            return Json(ApiResponse {
+                code: 401,
+                message: "Invalid token".into(),
+                data: None,
+            })
         }
     };
 
-    if let Some(g) = group {
+    if let Some(identity) = identity {
+        if let AuthenticatedNodeIdentity::VerifiedConcreteNode { verified, .. } = &identity {
+            if req.node_id.as_deref().map(str::trim) != Some(verified.node_id.as_str()) {
+                return Json(ApiResponse {
+                    code: 403,
+                    message: "node identity mismatch".into(),
+                    data: None,
+                });
+            }
+        }
+        let g = identity.group();
         // v0.3.0: key node status by (group_id, node_id) so multiple nodes
         // sharing one group token no longer overwrite each other. The node_id
         // is a stable per-node identity generated on first start (see
@@ -765,6 +749,54 @@ mod tests {
 
     fn config_headers_for_node(token: &str, node_id: &str) -> HeaderMap {
         let mut headers = config_headers(Some(token));
+        headers.insert("X-Node-ID", node_id.parse().unwrap());
+        headers
+    }
+
+    async fn install_active_runtime_credential(
+        pool: &SqlitePool,
+        credential_id: &str,
+        group_id: i64,
+        node_id: &str,
+        secret_byte: u8,
+    ) -> crate::node_credential::NodeCredentialSecret {
+        let node = crate::node_identity::ReuseEligibleNodeId::parse(node_id).unwrap();
+        let secret =
+            crate::node_credential::NodeCredentialSecret::from_test_bytes([secret_byte; 32]);
+        let verifier = crate::node_credential::NodeCredentialVerifier::derive(
+            credential_id,
+            group_id,
+            &node,
+            &secret,
+        );
+        sqlx::query(
+            "INSERT INTO node_credentials \
+             (credential_id, home_group_id, node_id, generation, verifier_format, verifier_version, verifier_data, activated_at) \
+             VALUES (?, ?, ?, 1, 'rp-node-sha256', 1, ?, datetime('now'))",
+        )
+        .bind(credential_id)
+        .bind(group_id)
+        .bind(node_id)
+        .bind(verifier.data().as_slice())
+        .execute(pool)
+        .await
+        .unwrap();
+        secret
+    }
+
+    fn credential_config_headers(
+        credential_id: &str,
+        secret: &crate::node_credential::NodeCredentialSecret,
+        node_id: &str,
+    ) -> HeaderMap {
+        let mut headers = config_headers(None);
+        headers.insert(
+            "Authorization",
+            format!("RelayNodeCredential {}", secret.to_wire_value())
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("X-Node-Credential-ID", credential_id.parse().unwrap());
         headers.insert("X-Node-ID", node_id.parse().unwrap());
         headers
     }
@@ -1215,6 +1247,47 @@ mod tests {
         let (state, _pool) = seeded_state().await;
         let resp = get_config(State(state.clone()), config_headers(Some("invalid"))).await;
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_config_accepts_verified_credential_but_rejects_wrong_secret_and_forged_node() {
+        let (state, pool) = seeded_state().await;
+        let secret =
+            install_active_runtime_credential(&pool, "cred-http", 10, "Node_A", 0x42).await;
+
+        let ok = get_config(
+            State(state.clone()),
+            credential_config_headers("cred-http", &secret, "Node_A"),
+        )
+        .await;
+        assert_eq!(ok.status(), axum::http::StatusCode::OK);
+
+        let wrong_secret =
+            crate::node_credential::NodeCredentialSecret::from_test_bytes([0x55; 32]);
+        let rejected = get_config(
+            State(state.clone()),
+            credential_config_headers("cred-http", &wrong_secret, "Node_A"),
+        )
+        .await;
+        assert_eq!(rejected.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let forged_node = get_config(
+            State(state.clone()),
+            credential_config_headers("cred-http", &secret, "Other_Node"),
+        )
+        .await;
+        assert_eq!(forged_node.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let legacy = get_config(
+            State(state),
+            config_headers_for_node("tok-A", "self-reported-legacy"),
+        )
+        .await;
+        assert_eq!(
+            legacy.status(),
+            axum::http::StatusCode::OK,
+            "legacy Group Token path must remain compatible"
+        );
     }
 
     #[tokio::test]

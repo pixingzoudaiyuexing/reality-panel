@@ -121,6 +121,29 @@ impl NodeCredentialRepository for SqliteRepository {
         .await?)
     }
 
+    async fn find_active_node_credential_for_runtime(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<NodeCredentialRecord>, DbError> {
+        Ok(sqlx::query_as::<_, NodeCredentialRecord>(
+            "SELECT credential_id, home_group_id, node_id, generation, verifier_format, \
+                    verifier_version, verifier_data, created_at, updated_at, activated_at, revoked_at \
+             FROM node_credentials AS current \
+             WHERE current.credential_id = ? \
+               AND current.activated_at IS NOT NULL \
+               AND current.revoked_at IS NULL \
+               AND current.generation = ( \
+                   SELECT MAX(history.generation) FROM node_credentials AS history \
+                   WHERE history.home_group_id = current.home_group_id \
+                     AND history.node_id = current.node_id \
+                     AND history.activated_at IS NOT NULL \
+               )",
+        )
+        .bind(credential_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     async fn list_node_credentials_for_identity(
         &self,
         home_group_id: i64,
