@@ -278,78 +278,125 @@ async fn acme_dns01_operation(
     }
 }
 
+fn traffic_business_error(code: i32, message: &str) -> Json<ApiResponse<TrafficBatchAck>> {
+    Json(ApiResponse::<TrafficBatchAck> {
+        code,
+        message: message.into(),
+        data: None,
+    })
+}
+
 pub async fn report_traffic(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<TrafficReport>,
-) -> Json<ApiResponse<()>> {
-    // Token comes ONLY from the Authorization header (v0.3.9: the body token
-    // fallback was removed — nodes send the header and an empty body token).
-    //
-    // HTTP-status note: a missing/invalid token here returns HTTP 200 with a
-    // business `code: 401` INSIDE the JSON body — NOT a real HTTP 401. This is
-    // deliberate backward-compat: all shipped nodes read the JSON `code` field
-    // and ignore the HTTP status on these node-facing endpoints. The WebSocket
-    // upgrade path (ws.rs::node_ws_handler) is the ONE exception — it returns a
-    // real HTTP 401 because WS upgrades must fail at the HTTP layer (the client
-    // never gets to read a JSON body on a failed upgrade). Do NOT "normalize"
-    // these without a coordinated node upgrade; see the test module's
-    // `node_http_status_compat_*` tests that pin the current behavior.
+) -> Json<ApiResponse<TrafficBatchAck>> {
+    // Keep the node-facing HTTP-200/business-code compatibility contract.
     let identity = match authenticate_node(&state, &headers).await {
         Ok(identity) => identity,
         Err(NodeAuthError::Unavailable) => {
             tracing::error!("report_traffic: node authentication database lookup failed");
-            return Json(ApiResponse {
-                code: 500,
-                message: "database error".into(),
-                data: None,
-            });
+            return traffic_business_error(500, "database error");
         }
-        Err(_) => {
-            return Json(ApiResponse {
-                code: 401,
-                message: "Invalid token".into(),
-                data: None,
-            })
-        }
+        Err(_) => return traffic_business_error(401, "Invalid token"),
     };
-    let group_id = identity.group_id();
 
-    // v0.4.9 SECURITY: the whole batch is one atomic transaction, and rule-id
-    // existence is NO LONGER distinguishable from cross-group reporting. Both
-    // "rule missing" and "rule belongs to another group" produce the SAME
-    // external response (403 + a single generic message). The batch logic lives
-    // in `service::traffic::apply_traffic_report` (overflow pre-check + atomic
-    // apply + result interpretation) so it can be unit-tested without HTTP.
-    //
-    // HTTP-status note (preserved): a rejection returns HTTP 200 with a business
-    // `code` (403/400/500) INSIDE the JSON body — NOT a real HTTP error. Nodes
-    // read the JSON `code` and ignore the HTTP status on these endpoints.
-    match crate::service::traffic::apply_traffic_report(state.db.as_ref(), group_id, &req.reports)
-        .await
-    {
-        Ok(()) => Json(ApiResponse::success(())),
-        Err(crate::service::traffic::TrafficReportError::Unavailable) => {
-            // Uniform 403 — identical for "missing" and "foreign". Do NOT echo
-            // which rule_id or why.
-            Json(ApiResponse {
-                code: 403,
-                message: "one or more rules are unavailable for this node".into(),
-                data: None,
-            })
+    if let Some(batch) = req.batch.as_ref() {
+        // Strict idempotency is intentionally available only to a cryptographically
+        // authenticated concrete Node. A legacy Bearer token's X-Node-ID remains
+        // self-reported and never becomes a dedupe identity.
+        let Some(verified) = identity.verified() else {
+            return traffic_business_error(
+                403,
+                "strict traffic batches require verified concrete-node authentication",
+            );
+        };
+        let computed = traffic_batch_payload_sha256(&req.reports);
+        if batch.version != TRAFFIC_BATCH_PROTOCOL_VERSION
+            || !valid_traffic_batch_id(&batch.batch_id)
+            || !valid_traffic_payload_sha256(&batch.payload_sha256)
+            || computed != batch.payload_sha256
+        {
+            return traffic_business_error(409, "traffic batch identity or payload conflict");
         }
-        Err(crate::service::traffic::TrafficReportError::Overflow) => Json(ApiResponse {
-            code: 400,
-            message: "one or more traffic entries are out of range".into(),
+
+        let scope = crate::db::repo::TrafficBatchScope {
+            home_group_id: verified.home_group_id,
+            node_id: verified.node_id.as_str().to_string(),
+            credential_id: verified.credential_id.clone(),
+            credential_generation: verified.generation,
+            batch_id: batch.batch_id.clone(),
+            payload_sha256: batch.payload_sha256.clone(),
+        };
+        return match crate::service::traffic::apply_idempotent_traffic_report(
+            state.db.as_ref(),
+            &scope,
+            &req.reports,
+        )
+        .await
+        {
+            Ok(status) => {
+                let status = match status {
+                    crate::service::traffic::StrictTrafficReportStatus::Applied => {
+                        TrafficBatchAckStatus::Applied
+                    }
+                    crate::service::traffic::StrictTrafficReportStatus::AlreadyApplied => {
+                        TrafficBatchAckStatus::AlreadyApplied
+                    }
+                };
+                Json(ApiResponse::success(TrafficBatchAck {
+                    version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                    batch_id: batch.batch_id.clone(),
+                    payload_sha256: batch.payload_sha256.clone(),
+                    status,
+                }))
+            }
+            Err(crate::service::traffic::TrafficReportError::Unavailable) => {
+                traffic_business_error(403, "one or more rules are unavailable for this node")
+            }
+            Err(crate::service::traffic::TrafficReportError::Overflow) => {
+                traffic_business_error(400, "one or more traffic entries are out of range")
+            }
+            Err(crate::service::traffic::TrafficReportError::PayloadConflict) => {
+                traffic_business_error(409, "traffic batch identity or payload conflict")
+            }
+            Err(crate::service::traffic::TrafficReportError::IdentityUnavailable) => {
+                traffic_business_error(401, "verified node credential is no longer active")
+            }
+            Err(crate::service::traffic::TrafficReportError::Database(error)) => {
+                tracing::error!("report_traffic: idempotent settlement failed: {}", error);
+                traffic_business_error(500, "database error")
+            }
+        };
+    }
+
+    // Legacy clients deliberately retain the pre-T1 at-least-once behavior.
+    // Missing/foreign rule IDs remain uniformly indistinguishable.
+    match crate::service::traffic::apply_traffic_report(
+        state.db.as_ref(),
+        identity.group_id(),
+        &req.reports,
+    )
+    .await
+    {
+        Ok(()) => Json(ApiResponse {
+            code: 0,
+            message: "ok".into(),
             data: None,
         }),
-        Err(crate::service::traffic::TrafficReportError::Database(e)) => {
-            tracing::error!("report_traffic: apply_traffic_batch failed: {}", e);
-            Json(ApiResponse {
-                code: 500,
-                message: "database error".into(),
-                data: None,
-            })
+        Err(crate::service::traffic::TrafficReportError::Unavailable) => {
+            traffic_business_error(403, "one or more rules are unavailable for this node")
+        }
+        Err(crate::service::traffic::TrafficReportError::Overflow) => {
+            traffic_business_error(400, "one or more traffic entries are out of range")
+        }
+        Err(crate::service::traffic::TrafficReportError::Database(error)) => {
+            tracing::error!("report_traffic: apply_traffic_batch failed: {}", error);
+            traffic_business_error(500, "database error")
+        }
+        Err(crate::service::traffic::TrafficReportError::PayloadConflict)
+        | Err(crate::service::traffic::TrafficReportError::IdentityUnavailable) => {
+            traffic_business_error(500, "database error")
         }
     }
 }
@@ -604,7 +651,10 @@ mod tests {
     use crate::api::AppState;
     use crate::config::Config;
     use crate::db::schema::SCHEMA_SQL;
-    use relay_shared::protocol::{TrafficEntry, TrafficReport};
+    use relay_shared::protocol::{
+        traffic_batch_payload_sha256, ApiResponse, TrafficBatchAck, TrafficBatchAckStatus,
+        TrafficBatchMetadata, TrafficEntry, TrafficReport, TRAFFIC_BATCH_PROTOCOL_VERSION,
+    };
     use std::sync::Arc;
 
     async fn full_state() -> (AppState, SqlitePool) {
@@ -670,6 +720,7 @@ mod tests {
 
     fn report(_token: &str, entries: &[TrafficEntry]) -> TrafficReport {
         TrafficReport {
+            batch: None,
             reports: entries.to_vec(),
         }
     }
@@ -832,6 +883,142 @@ mod tests {
             .await
             .unwrap();
         v
+    }
+
+    async fn router_post_traffic(
+        app: axum::Router,
+        headers: HeaderMap,
+        report: &TrafficReport,
+    ) -> ApiResponse<TrafficBatchAck> {
+        use tower::ServiceExt as _;
+
+        let mut request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/node/report_traffic")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(report).unwrap()))
+            .unwrap();
+        for (name, value) in headers.iter() {
+            request.headers_mut().insert(name, value.clone());
+        }
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn traffic_report_router_strict_idempotency_and_legacy_compat() {
+        let (state, pool) = seeded_state().await;
+        let secret =
+            install_active_runtime_credential(&pool, "cred-t1-router", 10, "NODE_T1", 0xa1).await;
+        let app = crate::api::routes().with_state(state);
+
+        let entries = vec![TrafficEntry {
+            rule_id: 100,
+            upload: 11,
+            download: 19,
+        }];
+        let payload_sha256 = traffic_batch_payload_sha256(&entries);
+        let strict_report = TrafficReport {
+            batch: Some(TrafficBatchMetadata {
+                version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                batch_id: "router-batch-1".into(),
+                payload_sha256: payload_sha256.clone(),
+            }),
+            reports: entries.clone(),
+        };
+        let headers = credential_config_headers("cred-t1-router", &secret, "NODE_T1");
+
+        let first = router_post_traffic(app.clone(), headers.clone(), &strict_report).await;
+        assert_eq!(first.code, 0);
+        let first_ack = first.data.expect("strict Applied ACK");
+        assert_eq!(first_ack.status, TrafficBatchAckStatus::Applied);
+        assert_eq!(first_ack.batch_id, "router-batch-1");
+        assert_eq!(first_ack.payload_sha256, payload_sha256);
+
+        let replay = router_post_traffic(app.clone(), headers.clone(), &strict_report).await;
+        assert_eq!(replay.code, 0);
+        assert_eq!(
+            replay.data.expect("strict AlreadyApplied ACK").status,
+            TrafficBatchAckStatus::AlreadyApplied
+        );
+        assert_eq!(rule_traffic(&pool, 100).await, 30);
+        assert_eq!(user_traffic(&pool, 2).await, 30);
+
+        // Model "server commit succeeded, ACK was lost": deliberately discard
+        // the first response after the real Router/Repository path returns.
+        // Retrying the same immutable batch must only acknowledge the committed
+        // ledger row, never charge the bytes again.
+        let lost_ack_entries = vec![TrafficEntry {
+            rule_id: 100,
+            upload: 4,
+            download: 6,
+        }];
+        let lost_ack_report = TrafficReport {
+            batch: Some(TrafficBatchMetadata {
+                version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                batch_id: "router-batch-lost-ack".into(),
+                payload_sha256: traffic_batch_payload_sha256(&lost_ack_entries),
+            }),
+            reports: lost_ack_entries,
+        };
+        let _discarded = router_post_traffic(app.clone(), headers.clone(), &lost_ack_report).await;
+        let recovered = router_post_traffic(app.clone(), headers.clone(), &lost_ack_report).await;
+        assert_eq!(recovered.code, 0);
+        assert_eq!(
+            recovered
+                .data
+                .expect("lost-ACK retry must be confirmable")
+                .status,
+            TrafficBatchAckStatus::AlreadyApplied
+        );
+        assert_eq!(rule_traffic(&pool, 100).await, 40);
+        assert_eq!(user_traffic(&pool, 2).await, 40);
+
+        let changed_entries = vec![TrafficEntry {
+            rule_id: 100,
+            upload: 99,
+            download: 1,
+        }];
+        let changed = TrafficReport {
+            batch: Some(TrafficBatchMetadata {
+                version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                batch_id: "router-batch-1".into(),
+                payload_sha256: traffic_batch_payload_sha256(&changed_entries),
+            }),
+            reports: changed_entries,
+        };
+        let conflict = router_post_traffic(app.clone(), headers, &changed).await;
+        assert_eq!(conflict.code, 409);
+        assert!(conflict.data.is_none());
+        assert_eq!(rule_traffic(&pool, 100).await, 40);
+
+        // A legacy Group Token's X-Node-ID remains self-reported; attaching
+        // strict metadata cannot upgrade it to a verified concrete identity.
+        let mut legacy_headers = auth_headers("tok-A");
+        legacy_headers.insert("X-Node-ID", "NODE_T1".parse().unwrap());
+        let legacy_strict = router_post_traffic(app.clone(), legacy_headers, &strict_report).await;
+        assert_eq!(legacy_strict.code, 403);
+        assert_eq!(rule_traffic(&pool, 100).await, 40);
+
+        // Old clients that omit batch metadata retain the original settlement
+        // contract and wire shape (code=0, data=null).
+        let legacy_report = TrafficReport {
+            batch: None,
+            reports: vec![TrafficEntry {
+                rule_id: 100,
+                upload: 2,
+                download: 3,
+            }],
+        };
+        let legacy = router_post_traffic(app, auth_headers("tok-A"), &legacy_report).await;
+        assert_eq!(legacy.code, 0);
+        assert!(legacy.data.is_none());
+        assert_eq!(rule_traffic(&pool, 100).await, 45);
+        assert_eq!(user_traffic(&pool, 2).await, 45);
     }
 
     /// Normal batch: rule and user totals both move, atomically.

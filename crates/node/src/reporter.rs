@@ -1,17 +1,20 @@
-use crate::config::NodeConfig;
+use crate::config::{NodeConfig, NodeRuntimeAuth};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use relay_shared::protocol::{
+    traffic_batch_payload_sha256, valid_traffic_batch_id, valid_traffic_payload_sha256,
     ApiResponse, CamouflageSiteStatus, ListenerError, ReconciliationStatus, StatusReport,
-    TrafficEntry, TrafficReport,
+    TrafficBatchAck, TrafficBatchAckStatus, TrafficBatchMetadata, TrafficEntry, TrafficReport,
+    TRAFFIC_BATCH_PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 #[cfg(any(target_os = "linux", test))]
 use std::collections::HashSet;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
-#[cfg(any(target_os = "linux", test))]
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, System};
@@ -76,6 +79,14 @@ pub struct TrafficCounter {
     // TrafficSnapshot, so failed uploads release it simply by dropping the
     // snapshot while successful uploads release it after commit.
     snapshot_gate: Mutex<()>,
+    // Serializes the whole report operation. Strict mode releases
+    // snapshot_gate after durable sealing, so this second gate prevents another
+    // caller from sealing a second batch before the pending one is resolved.
+    report_gate: Mutex<()>,
+    // Set only when a post-rename durability failure leaves it uncertain whether
+    // the durable pending file exists. The live process then stops reporting
+    // rather than risk sending disk and memory copies of the same bytes.
+    strict_seal_poisoned: AtomicBool,
 }
 
 impl TrafficCounter {
@@ -83,6 +94,8 @@ impl TrafficCounter {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
             snapshot_gate: Mutex::new(()),
+            report_gate: Mutex::new(()),
+            strict_seal_poisoned: AtomicBool::new(false),
         }
     }
 
@@ -496,24 +509,276 @@ impl Drop for TcpConnectionGuard {
     }
 }
 
-pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter, node_id: &str) {
-    // Snapshot (non-destructive) first: the snapshotted bytes are only deducted
-    // from the counters after the panel ACKs the upload (see TrafficSnapshot).
-    // A failed/lost upload drops the guard without commit, so those bytes stay
-    // and are retried on the next cycle instead of being permanently dropped.
+const TRAFFIC_PENDING_FILENAME: &str = "traffic-report-pending.json";
+const MAX_PENDING_TRAFFIC_BYTES: u64 = 1_048_576;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PendingTrafficBatch {
+    version: u32,
+    batch_id: String,
+    payload_sha256: String,
+    node_id: String,
+    credential_id: String,
+    reports: Vec<TrafficEntry>,
+}
+
+fn pending_traffic_path(auth: &NodeRuntimeAuth, node_id: &str) -> Result<Option<PathBuf>, String> {
+    match auth {
+        NodeRuntimeAuth::LegacyGroupToken { .. } => Ok(None),
+        NodeRuntimeAuth::PermanentCredential {
+            secret_file,
+            state_node_id,
+            ..
+        } => {
+            if state_node_id != node_id {
+                return Err("traffic batch node identity does not match Credential state".into());
+            }
+            let parent = secret_file
+                .parent()
+                .ok_or_else(|| "Credential Secret has no private parent directory".to_string())?;
+            Ok(Some(parent.join(TRAFFIC_PENDING_FILENAME)))
+        }
+    }
+}
+
+fn validate_private_pending_parent(parent: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(parent)
+        .map_err(|_| "traffic pending directory is unavailable".to_string())?;
+    let euid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != euid
+        || (metadata.mode() & 0o777) != 0o700
+    {
+        return Err(
+            "traffic pending directory must be owner-only mode 0700 and must not be a symlink"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_pending_batch(
+    pending: &PendingTrafficBatch,
+    node_id: &str,
+    credential_id: &str,
+) -> Result<(), String> {
+    if pending.version != TRAFFIC_BATCH_PROTOCOL_VERSION
+        || pending.node_id != node_id
+        || pending.credential_id != credential_id
+        || !valid_traffic_batch_id(&pending.batch_id)
+        || !valid_traffic_payload_sha256(&pending.payload_sha256)
+        || traffic_batch_payload_sha256(&pending.reports) != pending.payload_sha256
+    {
+        return Err("traffic pending batch failed integrity or identity validation".into());
+    }
+    Ok(())
+}
+
+fn load_pending_traffic_at(
+    path: &Path,
+    node_id: &str,
+    credential_id: &str,
+) -> Result<Option<PendingTrafficBatch>, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "traffic pending path has no parent".to_string())?;
+    validate_private_pending_parent(parent)?;
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("traffic pending batch is unavailable".into()),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|_| "traffic pending batch metadata is unavailable".to_string())?;
+    let euid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != euid
+        || (metadata.mode() & 0o777) != 0o600
+        || metadata.len() > MAX_PENDING_TRAFFIC_BYTES
+    {
+        return Err("traffic pending batch must be owner-only mode 0600 regular file".into());
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|_| "traffic pending batch could not be read".to_string())?;
+    let pending: PendingTrafficBatch = serde_json::from_slice(&bytes)
+        .map_err(|_| "traffic pending batch is malformed".to_string())?;
+    validate_pending_batch(&pending, node_id, credential_id)?;
+    Ok(Some(pending))
+}
+
+#[derive(Debug)]
+enum PendingWriteError {
+    Clean(String),
+    RestartRequired(String),
+}
+
+impl PendingWriteError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Clean(message) | Self::RestartRequired(message) => message,
+        }
+    }
+
+    fn restart_required(&self) -> bool {
+        matches!(self, Self::RestartRequired(_))
+    }
+}
+
+fn sync_parent_directory(parent: &Path) -> Result<(), String> {
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "traffic pending directory could not be fsynced".to_string())
+}
+
+fn cleanup_installed_pending(path: &Path, parent: &Path) -> bool {
+    let removed = match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    };
+    removed && sync_parent_directory(parent).is_ok()
+}
+
+fn write_pending_traffic_at(
+    path: &Path,
+    pending: &PendingTrafficBatch,
+) -> Result<(), PendingWriteError> {
+    validate_pending_batch(pending, &pending.node_id, &pending.credential_id)
+        .map_err(PendingWriteError::Clean)?;
+    let parent = path.parent().ok_or_else(|| {
+        PendingWriteError::Clean("traffic pending path has no parent".to_string())
+    })?;
+    validate_private_pending_parent(parent).map_err(PendingWriteError::Clean)?;
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Err(PendingWriteError::Clean(
+            "traffic pending batch already exists".into(),
+        ));
+    }
+
+    let bytes = serde_json::to_vec(pending)
+        .map_err(|_| PendingWriteError::Clean("traffic pending batch encode failed".to_string()))?;
+    if bytes.len() as u64 > MAX_PENDING_TRAFFIC_BYTES {
+        return Err(PendingWriteError::Clean(
+            "traffic pending batch is unexpectedly large".into(),
+        ));
+    }
+    let temp = parent.join(format!(
+        ".traffic-report-pending.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temp)
+        .map_err(|_| {
+            PendingWriteError::Clean(
+                "traffic pending temporary file could not be created".to_string(),
+            )
+        })?;
+    let pre_rename = (|| -> Result<(), String> {
+        file.write_all(&bytes)
+            .map_err(|_| "traffic pending batch could not be written".to_string())?;
+        file.flush()
+            .map_err(|_| "traffic pending batch could not be flushed".to_string())?;
+        file.sync_all()
+            .map_err(|_| "traffic pending batch could not be fsynced".to_string())?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(message) = pre_rename {
+        let _ = std::fs::remove_file(&temp);
+        return Err(PendingWriteError::Clean(message));
+    }
+    // Same-directory hard-link install gives us atomic no-replace semantics:
+    // unlike rename(2), it cannot overwrite a pending batch created by another
+    // process between the existence check above and this commit point.
+    if std::fs::hard_link(&temp, path).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(PendingWriteError::Clean(
+            "traffic pending batch could not be committed".into(),
+        ));
+    }
+    // The final name now references the already-fsynced complete inode. The
+    // temporary link is best-effort cleanup; it contains no Credential Secret
+    // or Group Token and remains inside the owner-only directory if unlink
+    // itself fails.
+    let _ = std::fs::remove_file(&temp);
+
+    let post_rename = (|| -> Result<(), String> {
+        sync_parent_directory(parent)?;
+        let reopened = load_pending_traffic_at(path, &pending.node_id, &pending.credential_id)?
+            .ok_or_else(|| "traffic pending batch vanished after commit".to_string())?;
+        if reopened != *pending {
+            return Err("traffic pending batch verification mismatch".into());
+        }
+        Ok(())
+    })();
+    if let Err(message) = post_rename {
+        if cleanup_installed_pending(path, parent) {
+            return Err(PendingWriteError::Clean(message));
+        }
+        return Err(PendingWriteError::RestartRequired(format!(
+            "{message}; installed pending state could not be safely rolled back"
+        )));
+    }
+    Ok(())
+}
+
+fn remove_pending_traffic_at(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "traffic pending path has no parent".to_string())?;
+    validate_private_pending_parent(parent)?;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("traffic pending batch could not be removed".into()),
+    }
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| "traffic pending directory could not be fsynced".to_string())
+}
+
+fn strict_ack_matches(
+    pending: &PendingTrafficBatch,
+    response: &ApiResponse<TrafficBatchAck>,
+) -> bool {
+    if response.code != 0 {
+        return false;
+    }
+    let Some(ack) = response.data.as_ref() else {
+        return false;
+    };
+    ack.version == TRAFFIC_BATCH_PROTOCOL_VERSION
+        && ack.batch_id == pending.batch_id
+        && ack.payload_sha256 == pending.payload_sha256
+        && matches!(
+            ack.status,
+            TrafficBatchAckStatus::Applied | TrafficBatchAckStatus::AlreadyApplied
+        )
+}
+
+async fn report_traffic_legacy(config: &NodeConfig, counter: &TrafficCounter, node_id: &str) {
     let snap = counter.snapshot().await;
-    // debug, not info: this runs every poll cycle (default 10s) and would
-    // flood the log at info level on a healthy node. Only the per-request
-    // HTTP status below is worth keeping visible.
-    tracing::debug!("report_traffic: {} entries to report", snap.entries.len());
     if snap.entries.is_empty() {
         return;
     }
-
     let report = TrafficReport {
+        batch: None,
         reports: snap.entries.clone(),
     };
-
     let url = format!("{}/api/v1/node/report_traffic", config.panel_url);
     let client = reqwest::Client::new();
     match config
@@ -524,45 +789,143 @@ pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter, node_
         .send()
         .await
     {
-        Ok(r) => {
-            // v0.3.9: commit ONLY when the panel actually persisted the traffic.
-            // The panel returns HTTP 200 for EVERY response (Axum's Json is
-            // always 200), and signals business-level success via ApiResponse
-            // .code in the body. The old code only checked HTTP status, so a
-            // 401 (invalid/rotated token), 500 (DB error), 403 (cross-group)
-            // or 400 (overflow) all looked like success and the snapshot was
-            // committed — permanently dropping that traffic. Now we parse the
-            // body and require code == 0.
-            let status = r.status();
+        Ok(response) => {
+            let status = response.status();
             if !status.is_success() {
                 tracing::warn!("report_traffic HTTP {} (not 2xx)", status);
                 return;
             }
-            match r.json::<ApiResponse<()>>().await {
+            match response.json::<ApiResponse<()>>().await {
                 Ok(resp) if resp.code == 0 => {
                     snap.commit().await;
-                    tracing::info!("report_traffic HTTP {} code 0", status);
+                    tracing::info!("report_traffic legacy HTTP {} code 0", status);
                 }
-                Ok(resp) => {
-                    // Business-level rejection. Keep the bytes for retry next
-                    // cycle (the panel did NOT persist them).
-                    tracing::warn!(
-                        "report_traffic rejected: HTTP {} code {} msg={}",
-                        status,
-                        resp.code,
-                        resp.message
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "report_traffic: could not parse response body (HTTP {}): {}",
-                        status,
-                        e
-                    );
-                }
+                Ok(resp) => tracing::warn!(
+                    "report_traffic legacy rejected: code {} msg={}",
+                    resp.code,
+                    resp.message
+                ),
+                Err(error) => tracing::warn!("report_traffic legacy malformed response: {}", error),
             }
         }
-        Err(e) => tracing::warn!("report_traffic error: {}", e),
+        Err(error) => tracing::warn!("report_traffic legacy error: {}", error),
+    }
+}
+
+async fn report_traffic_strict(
+    config: &NodeConfig,
+    counter: &TrafficCounter,
+    node_id: &str,
+    credential_id: &str,
+    pending_path: &Path,
+) {
+    let mut pending = match load_pending_traffic_at(pending_path, node_id, credential_id) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!("strict traffic pending state unavailable: {}", error);
+            return;
+        }
+    };
+    if pending.is_none() {
+        let snap = counter.snapshot().await;
+        if snap.entries.is_empty() {
+            return;
+        }
+        let reports = snap.entries.clone();
+        let sealed = PendingTrafficBatch {
+            version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+            batch_id: uuid::Uuid::new_v4().to_string(),
+            payload_sha256: traffic_batch_payload_sha256(&reports),
+            node_id: node_id.to_string(),
+            credential_id: credential_id.to_string(),
+            reports,
+        };
+        if let Err(error) = write_pending_traffic_at(pending_path, &sealed) {
+            if error.restart_required() {
+                counter.strict_seal_poisoned.store(true, Ordering::Release);
+            }
+            tracing::error!(
+                "strict traffic batch could not be sealed: {}",
+                error.message()
+            );
+            return;
+        }
+        snap.commit().await;
+        pending = Some(sealed);
+    }
+
+    let pending = pending.expect("strict pending batch exists");
+    let report = TrafficReport {
+        batch: Some(TrafficBatchMetadata {
+            version: pending.version,
+            batch_id: pending.batch_id.clone(),
+            payload_sha256: pending.payload_sha256.clone(),
+        }),
+        reports: pending.reports.clone(),
+    };
+    let url = format!("{}/api/v1/node/report_traffic", config.panel_url);
+    let client = reqwest::Client::new();
+    let response = match config
+        .auth
+        .apply_reqwest(client.post(&url))
+        .header("X-Node-ID", node_id)
+        .json(&report)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!("strict report_traffic error: {}", error);
+            return;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!("strict report_traffic HTTP {} (not 2xx)", response.status());
+        return;
+    }
+    let response = match response.json::<ApiResponse<TrafficBatchAck>>().await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!("strict report_traffic malformed ACK: {}", error);
+            return;
+        }
+    };
+    if !strict_ack_matches(&pending, &response) {
+        tracing::warn!("strict report_traffic received non-matching ACK");
+        return;
+    }
+    if let Err(error) = remove_pending_traffic_at(pending_path) {
+        tracing::error!(
+            "strict traffic ACK could not be durably completed: {}",
+            error
+        );
+        return;
+    }
+    tracing::info!("strict report_traffic batch confirmed");
+}
+
+pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter, node_id: &str) {
+    let _report_guard = counter.report_gate.lock().await;
+    if matches!(config.auth, NodeRuntimeAuth::PermanentCredential { .. })
+        && counter.strict_seal_poisoned.load(Ordering::Acquire)
+    {
+        tracing::error!(
+            "strict traffic reporting is stopped after an uncertain local seal; restart required"
+        );
+        return;
+    }
+    let pending_path = match pending_traffic_path(&config.auth, node_id) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!("report_traffic strict identity unavailable: {}", error);
+            return;
+        }
+    };
+    match (&config.auth, pending_path) {
+        (NodeRuntimeAuth::PermanentCredential { credential_id, .. }, Some(path)) => {
+            report_traffic_strict(config, counter, node_id, credential_id, &path).await;
+        }
+        _ => report_traffic_legacy(config, counter, node_id).await,
     }
 }
 
@@ -1316,6 +1679,419 @@ mod tests {
             .iter()
             .find(|entry| entry.rule_id == rule_id)
             .map(|entry| (entry.upload, entry.download))
+    }
+
+    fn private_test_dir(label: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("reality-panel-t1-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    fn strict_test_config(panel_url: String, dir: &Path) -> NodeConfig {
+        NodeConfig {
+            panel_url,
+            auth: NodeRuntimeAuth::PermanentCredential {
+                credential_id: "cred-t1-node".into(),
+                secret: "rpn1_node_test_secret".into(),
+                secret_file: dir.join("node-credential.secret"),
+                state_node_id: "NODE_T1".into(),
+            },
+            poll_interval: 10,
+            tls_cert_path: None,
+            tls_key_path: None,
+            network_interface: "auto".into(),
+            listen_ipv4: "0.0.0.0".into(),
+            listen_ipv6: "::".into(),
+            outbound_interface: "auto".into(),
+            outbound_bind_ipv4: None,
+            nginx_sni_enabled: false,
+            nginx_sni_conf_path: String::new(),
+            nginx_sni_test_cmd: String::new(),
+            nginx_sni_reload_cmd: String::new(),
+            nginx_sni_default_backend: String::new(),
+            nginx_sni_access_log_path: String::new(),
+            nginx_sni_traffic_state_path: String::new(),
+            camouflage_sites_enabled: false,
+            camouflage_sites_manifest_path: String::new(),
+            camouflage_sites_state_dir: String::new(),
+            camouflage_wrapper_conf_path: String::new(),
+            certificate_lifecycle_enabled: false,
+            certificate_lifecycle_check_interval_secs: 60,
+            certbot_binary_path: String::new(),
+            certbot_live_dir: String::new(),
+            certificate_http01_webroot: String::new(),
+            certificate_http01_conf_path: String::new(),
+            certificate_state_dir: String::new(),
+            provisioning_capabilities_path: String::new(),
+        }
+    }
+
+    async fn read_http_traffic_report(stream: &mut tokio::net::TcpStream) -> TrafficReport {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut bytes = Vec::new();
+        let header_end;
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before request headers completed");
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(pos) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+        let header_text = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_len: usize = header_text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .expect("reqwest request has Content-Length");
+        while bytes.len() < header_end + content_len {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "client closed before request body completed");
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        serde_json::from_slice(&bytes[header_end..header_end + content_len]).unwrap()
+    }
+
+    async fn write_http_response(stream: &mut tokio::net::TcpStream, status: &str, body: &[u8]) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    fn ack_body(report: &TrafficReport, status: TrafficBatchAckStatus) -> Vec<u8> {
+        let batch = report.batch.as_ref().expect("strict batch metadata");
+        serde_json::to_vec(&ApiResponse {
+            code: 0,
+            message: "ok".into(),
+            data: Some(TrafficBatchAck {
+                version: batch.version,
+                batch_id: batch.batch_id.clone(),
+                payload_sha256: batch.payload_sha256.clone(),
+                status,
+            }),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sealed_pending_batch_is_private_durable_and_keeps_new_traffic_separate() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = private_test_dir("pending");
+        let path = dir.join(TRAFFIC_PENDING_FILENAME);
+        let counter = TrafficCounter::new();
+        counter.add(7, 10, 20).await;
+        let snapshot = counter.snapshot().await;
+        let reports = snapshot.entries.clone();
+        let pending = PendingTrafficBatch {
+            version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+            batch_id: "sealed-batch-1".into(),
+            payload_sha256: traffic_batch_payload_sha256(&reports),
+            node_id: "NODE_T1".into(),
+            credential_id: "cred-t1-node".into(),
+            reports: reports.clone(),
+        };
+        write_pending_traffic_at(&path, &pending).unwrap();
+        snapshot.commit().await;
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("rpn1_node_test_secret"));
+        assert!(!raw.contains("Bearer "));
+        assert!(!raw.contains("Authorization"));
+
+        // Simulated process restart: re-open the durable batch from disk with
+        // no dependency on the original TrafficSnapshot.
+        let restored = load_pending_traffic_at(&path, "NODE_T1", "cred-t1-node")
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored, pending);
+        assert!(load_pending_traffic_at(&path, "NODE_T1", "another-credential").is_err());
+
+        // Bytes arriving after sealing stay in the live counter and cannot
+        // mutate the immutable pending request.
+        counter.add(7, 3, 4).await;
+        let new_only = counter.snapshot().await;
+        assert_eq!(traffic(&new_only.entries, 7), Some((3, 4)));
+        drop(new_only);
+        let restored_again = load_pending_traffic_at(&path, "NODE_T1", "cred-t1-node")
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_again.reports, reports);
+        assert_eq!(restored_again.batch_id, "sealed-batch-1");
+
+        for status in [
+            TrafficBatchAckStatus::Applied,
+            TrafficBatchAckStatus::AlreadyApplied,
+        ] {
+            let response = ApiResponse {
+                code: 0,
+                message: "ok".into(),
+                data: Some(TrafficBatchAck {
+                    version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                    batch_id: pending.batch_id.clone(),
+                    payload_sha256: pending.payload_sha256.clone(),
+                    status,
+                }),
+            };
+            assert!(strict_ack_matches(&pending, &response));
+        }
+        let wrong_ack = ApiResponse {
+            code: 0,
+            message: "ok".into(),
+            data: Some(TrafficBatchAck {
+                version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                batch_id: "other-batch".into(),
+                payload_sha256: pending.payload_sha256.clone(),
+                status: TrafficBatchAckStatus::Applied,
+            }),
+        };
+        assert!(!strict_ack_matches(&pending, &wrong_ack));
+
+        remove_pending_traffic_at(&path).unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_report_retries_identical_batch_until_matching_ack() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<TrafficReport>::new()));
+        let captured_server = captured.clone();
+        let server = tokio::spawn(async move {
+            for step in 0..6 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let report = read_http_traffic_report(&mut stream).await;
+                captured_server.lock().await.push(report.clone());
+                match step {
+                    0 => write_http_response(&mut stream, "500 Internal Server Error", b"").await,
+                    1 => write_http_response(&mut stream, "429 Too Many Requests", b"").await,
+                    2 => write_http_response(&mut stream, "200 OK", b"{").await,
+                    3 => {
+                        let meta = report.batch.as_ref().unwrap();
+                        let wrong = ApiResponse::success(TrafficBatchAck {
+                            version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                            batch_id: format!("{}-wrong", meta.batch_id),
+                            payload_sha256: meta.payload_sha256.clone(),
+                            status: TrafficBatchAckStatus::AlreadyApplied,
+                        });
+                        let body = serde_json::to_vec(&wrong).unwrap();
+                        write_http_response(&mut stream, "200 OK", &body).await;
+                    }
+                    4 => {
+                        let body = ack_body(&report, TrafficBatchAckStatus::AlreadyApplied);
+                        write_http_response(&mut stream, "200 OK", &body).await;
+                    }
+                    5 => {
+                        let body = ack_body(&report, TrafficBatchAckStatus::Applied);
+                        write_http_response(&mut stream, "200 OK", &body).await;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+
+        let dir = private_test_dir("http-retry");
+        let config = strict_test_config(format!("http://{addr}"), &dir);
+        let counter = TrafficCounter::new();
+        counter.add(7, 10, 20).await;
+
+        report_traffic(&config, &counter, "NODE_T1").await;
+        let pending_path = dir.join(TRAFFIC_PENDING_FILENAME);
+        let first_pending = load_pending_traffic_at(&pending_path, "NODE_T1", "cred-t1-node")
+            .unwrap()
+            .unwrap();
+
+        counter.add(7, 3, 4).await;
+        report_traffic(&config, &counter, "NODE_T1").await;
+        report_traffic(&config, &counter, "NODE_T1").await;
+        report_traffic(&config, &counter, "NODE_T1").await;
+        report_traffic(&config, &counter, "NODE_T1").await;
+        assert!(
+            !pending_path.exists(),
+            "matching AlreadyApplied ACK completes batch"
+        );
+
+        let remaining = counter.snapshot().await;
+        assert_eq!(traffic(&remaining.entries, 7), Some((3, 4)));
+        drop(remaining);
+
+        report_traffic(&config, &counter, "NODE_T1").await;
+        server.await.unwrap();
+
+        let requests = captured.lock().await;
+        assert_eq!(requests.len(), 6);
+        let first_meta = requests[0].batch.as_ref().unwrap();
+        for request in &requests[..5] {
+            assert_eq!(request.batch.as_ref(), Some(first_meta));
+            assert_eq!(request.reports, first_pending.reports);
+        }
+        let next_meta = requests[5].batch.as_ref().unwrap();
+        assert_ne!(next_meta.batch_id, first_meta.batch_id);
+        assert_eq!(
+            traffic(&requests[5].reports, 7),
+            Some((3, 4)),
+            "new bytes form a later immutable batch"
+        );
+        assert!(!pending_path.exists());
+        assert!(counter.snapshot().await.entries.is_empty());
+
+        drop(requests);
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_connection_failure_keeps_same_durable_pending_batch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // force connection refused
+
+        let dir = private_test_dir("connect-fail");
+        let config = strict_test_config(format!("http://{addr}"), &dir);
+        let counter = TrafficCounter::new();
+        counter.add(9, 8, 6).await;
+
+        report_traffic(&config, &counter, "NODE_T1").await;
+        let path = dir.join(TRAFFIC_PENDING_FILENAME);
+        let first = load_pending_traffic_at(&path, "NODE_T1", "cred-t1-node")
+            .unwrap()
+            .unwrap();
+        report_traffic(&config, &counter, "NODE_T1").await;
+        let second = load_pending_traffic_at(&path, "NODE_T1", "cred-t1-node")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, second);
+        assert!(counter.snapshot().await.entries.is_empty());
+
+        remove_pending_traffic_at(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restarted_reporter_sends_exact_durable_pending_batch_first() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dir = private_test_dir("restart-send");
+        let config = strict_test_config(format!("http://{addr}"), &dir);
+        let path = dir.join(TRAFFIC_PENDING_FILENAME);
+        let reports = vec![TrafficEntry {
+            rule_id: 42,
+            upload: 91,
+            download: 17,
+        }];
+        let pending = PendingTrafficBatch {
+            version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+            batch_id: "restart-batch-1".into(),
+            payload_sha256: traffic_batch_payload_sha256(&reports),
+            node_id: "NODE_T1".into(),
+            credential_id: "cred-t1-node".into(),
+            reports: reports.clone(),
+        };
+        write_pending_traffic_at(&path, &pending).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let report = read_http_traffic_report(&mut stream).await;
+            let body = ack_body(&report, TrafficBatchAckStatus::AlreadyApplied);
+            write_http_response(&mut stream, "200 OK", &body).await;
+            report
+        });
+
+        // Fresh counter models a restarted process: the old in-memory snapshot
+        // is gone, so the durable pending request must be retried before any new
+        // snapshot can be sealed.
+        let restarted_counter = TrafficCounter::new();
+        report_traffic(&config, &restarted_counter, "NODE_T1").await;
+        let sent = server.await.unwrap();
+        assert_eq!(sent.reports, reports);
+        let sent_meta = sent.batch.expect("strict batch metadata");
+        assert_eq!(sent_meta.batch_id, pending.batch_id);
+        assert_eq!(sent_meta.payload_sha256, pending.payload_sha256);
+        assert!(!path.exists());
+        assert!(restarted_counter.snapshot().await.entries.is_empty());
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn uncertain_local_seal_poison_fails_closed_without_network_or_resnapshot() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dir = private_test_dir("seal-poison");
+        let config = strict_test_config(format!("http://{addr}"), &dir);
+        let counter = TrafficCounter::new();
+        counter.add(77, 13, 9).await;
+        counter.strict_seal_poisoned.store(true, Ordering::Release);
+
+        report_traffic(&config, &counter, "NODE_T1").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "poisoned strict reporter must not make a network request"
+        );
+        assert!(
+            !dir.join(TRAFFIC_PENDING_FILENAME).exists(),
+            "poisoned reporter must not attempt a new seal"
+        );
+        let retained = counter.snapshot().await;
+        assert_eq!(traffic(&retained.entries, 77), Some((13, 9)));
+        drop(retained);
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_report_calls_seal_and_send_only_one_batch() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<TrafficReport>::new()));
+        let captured_server = captured.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let report = read_http_traffic_report(&mut stream).await;
+            captured_server.lock().await.push(report.clone());
+            // Keep the first caller in flight briefly so the second caller is
+            // guaranteed to contend on report_gate rather than simply starting
+            // after completion.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let body = ack_body(&report, TrafficBatchAckStatus::Applied);
+            write_http_response(&mut stream, "200 OK", &body).await;
+        });
+
+        let dir = private_test_dir("concurrent-report");
+        let config = strict_test_config(format!("http://{addr}"), &dir);
+        let counter = TrafficCounter::new();
+        counter.add(71, 12, 8).await;
+
+        let (left, right) = tokio::join!(
+            report_traffic(&config, &counter, "NODE_T1"),
+            report_traffic(&config, &counter, "NODE_T1"),
+        );
+        let _ = (left, right);
+        server.await.unwrap();
+
+        assert_eq!(captured.lock().await.len(), 1);
+        assert!(counter.snapshot().await.entries.is_empty());
+        assert!(!dir.join(TRAFFIC_PENDING_FILENAME).exists());
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[tokio::test]

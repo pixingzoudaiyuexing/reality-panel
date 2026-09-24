@@ -136,6 +136,32 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_node_credentials_one_active
     ON node_credentials(home_group_id, node_id)
     WHERE activated_at IS NOT NULL AND revoked_at IS NULL;
 
+-- S4B-T1 strict traffic-report idempotency ledger. A row is visible only when
+-- the same transaction has committed every associated traffic/accounting write.
+CREATE TABLE IF NOT EXISTS traffic_report_batches (
+    home_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
+    node_id TEXT NOT NULL CHECK (
+        length(node_id) BETWEEN 1 AND 128
+        AND length(CAST(node_id AS BLOB)) = length(node_id)
+        AND node_id NOT GLOB '*[^A-Za-z0-9_-]*'
+    ),
+    credential_id TEXT NOT NULL REFERENCES node_credentials(credential_id) ON DELETE RESTRICT,
+    credential_generation INTEGER NOT NULL CHECK (credential_generation >= 1),
+    batch_id TEXT NOT NULL CHECK (
+        length(batch_id) BETWEEN 1 AND 64
+        AND batch_id NOT GLOB '*[^A-Za-z0-9_-]*'
+    ),
+    payload_sha256 TEXT NOT NULL CHECK (
+        length(payload_sha256) = 64
+        AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    state TEXT NOT NULL CHECK (state = 'APPLIED'),
+    applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (
+        home_group_id, node_id, credential_id, credential_generation, batch_id
+    )
+);
+
 -- Node Reuse V1 S2-A2B1/B2-02A: inert Concrete Node Claim authorization state.
 -- CREDENTIAL_PENDING is a one-time handoff to the separately-expiring delivery
 -- state machine; COMPLETED is terminal and still grants no runtime reuse authority.
@@ -2556,6 +2582,24 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .await?;
     tx.commit().await?;
     tracing::info!("Migration 55: inert node credential delivery state machine present");
+
+    // ── Migration 56: strict traffic-report batch idempotency ledger ──
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS traffic_report_batches (\
+             home_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,\
+             node_id TEXT NOT NULL CHECK (length(node_id) BETWEEN 1 AND 128 AND length(CAST(node_id AS BLOB)) = length(node_id) AND node_id NOT GLOB '*[^A-Za-z0-9_-]*'),\
+             credential_id TEXT NOT NULL REFERENCES node_credentials(credential_id) ON DELETE RESTRICT,\
+             credential_generation INTEGER NOT NULL CHECK (credential_generation >= 1),\
+             batch_id TEXT NOT NULL CHECK (length(batch_id) BETWEEN 1 AND 64 AND batch_id NOT GLOB '*[^A-Za-z0-9_-]*'),\
+             payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),\
+             state TEXT NOT NULL CHECK (state = 'APPLIED'),\
+             applied_at TEXT NOT NULL DEFAULT (datetime('now')),\
+             PRIMARY KEY (home_group_id, node_id, credential_id, credential_generation, batch_id)\
+         )",
+    )
+    .execute(pool)
+    .await?;
+    tracing::info!("Migration 56: traffic_report_batches idempotency ledger present");
 
     Ok(())
 }

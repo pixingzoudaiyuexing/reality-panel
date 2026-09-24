@@ -3341,6 +3341,327 @@ async fn pg_traffic_batch_single_entry_overflow_rejects_and_rolls_back() {
     cleanup(&db).await;
 }
 
+#[tokio::test]
+async fn pg_traffic_batch_idempotency_contract() {
+    let Some(db) = repo("t1_traffic_idempotency").await else {
+        return;
+    };
+
+    for (gid, rate) in [(10_i64, 1.5_f64), (20, 1.0)] {
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, rate)
+             VALUES ($1, $2, 'in', $3, 1, $4)",
+        )
+        .bind(gid)
+        .bind(format!("g{gid}"))
+        .bind(format!("tok-{gid}"))
+        .bind(rate)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    for (rid, gid, port) in [(100_i64, 10_i64, 20100_i64), (200, 20, 20200)] {
+        sqlx::query(
+            "INSERT INTO forward_rules
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port)
+             VALUES ($1, $2, 1, $3, $4, '127.0.0.1', 80)",
+        )
+        .bind(rid)
+        .bind(format!("r{rid}"))
+        .bind(port)
+        .bind(gid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    for (credential_id, home_group_id) in [("cred-a", 10_i64), ("cred-b", 20_i64)] {
+        sqlx::query(
+            "INSERT INTO node_credentials
+             (credential_id, home_group_id, node_id, generation, verifier_format,
+              verifier_version, verifier_data, activated_at)
+             VALUES ($1, $2, 'NODE_T1', 1, 'rp-node-sha256', 1, $3,
+                     to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))",
+        )
+        .bind(credential_id)
+        .bind(home_group_id)
+        .bind(vec![home_group_id as u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    fn scope(
+        home_group_id: i64,
+        credential_id: &str,
+        generation: i64,
+        batch_id: &str,
+        entries: &[TrafficEntry],
+    ) -> TrafficBatchScope {
+        TrafficBatchScope {
+            home_group_id,
+            node_id: "NODE_T1".into(),
+            credential_id: credential_id.into(),
+            credential_generation: generation,
+            batch_id: batch_id.into(),
+            payload_sha256: relay_shared::protocol::traffic_batch_payload_sha256(entries),
+        }
+    }
+
+    let main_entries = vec![TrafficEntry {
+        rule_id: 100,
+        upload: 10,
+        download: 20,
+    }];
+    let main_scope = scope(10, "cred-a", 1, "batch-main", &main_entries);
+    assert_eq!(
+        db.apply_idempotent_traffic_batch(&main_scope, &main_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Applied
+    );
+    assert_eq!(
+        db.apply_idempotent_traffic_batch(&main_scope, &main_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::AlreadyApplied
+    );
+
+    let changed_entries = vec![TrafficEntry {
+        rule_id: 100,
+        upload: 999,
+        download: 1,
+    }];
+    let mut conflicting_scope = main_scope.clone();
+    conflicting_scope.payload_sha256 =
+        relay_shared::protocol::traffic_batch_payload_sha256(&changed_entries);
+    assert_eq!(
+        db.apply_idempotent_traffic_batch(&conflicting_scope, &changed_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::PayloadConflict
+    );
+
+    let invalid_entries = vec![TrafficEntry {
+        rule_id: 200,
+        upload: 2,
+        download: 2,
+    }];
+    let invalid_scope = scope(10, "cred-a", 1, "batch-retry", &invalid_entries);
+    assert_eq!(
+        db.apply_idempotent_traffic_batch(&invalid_scope, &invalid_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Unavailable
+    );
+    let valid_retry = vec![TrafficEntry {
+        rule_id: 100,
+        upload: 2,
+        download: 2,
+    }];
+    let valid_retry_scope = scope(10, "cred-a", 1, "batch-retry", &valid_retry);
+    assert_eq!(
+        db.apply_idempotent_traffic_batch(&valid_retry_scope, &valid_retry)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Applied
+    );
+
+    let partial_invalid = vec![
+        TrafficEntry {
+            rule_id: 100,
+            upload: 3,
+            download: 3,
+        },
+        TrafficEntry {
+            rule_id: 200,
+            upload: 1,
+            download: 1,
+        },
+    ];
+    let partial_scope = scope(10, "cred-a", 1, "batch-partial", &partial_invalid);
+    assert_eq!(
+        db.apply_idempotent_traffic_batch(&partial_scope, &partial_invalid)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Unavailable
+    );
+
+    let missing_entries = vec![TrafficEntry {
+        rule_id: 999_999,
+        upload: 1,
+        download: 1,
+    }];
+    let missing_scope = scope(10, "cred-a", 1, "batch-missing", &missing_entries);
+    assert_eq!(
+        db.apply_idempotent_traffic_batch(&missing_scope, &missing_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Unavailable
+    );
+
+    let wrong_credential_entries = vec![TrafficEntry {
+        rule_id: 100,
+        upload: 1,
+        download: 1,
+    }];
+    let wrong_credential_scope = scope(
+        10,
+        "cred-b",
+        1,
+        "batch-wrong-credential",
+        &wrong_credential_entries,
+    );
+    assert_eq!(
+        db.apply_idempotent_traffic_batch(&wrong_credential_scope, &wrong_credential_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::IdentityUnavailable
+    );
+
+    let concurrent_entries = vec![TrafficEntry {
+        rule_id: 100,
+        upload: 5,
+        download: 5,
+    }];
+    let concurrent_scope = scope(10, "cred-a", 1, "batch-concurrent", &concurrent_entries);
+    let db_a = PgRepository::new(db.pool.clone());
+    let db_b = PgRepository::new(db.pool.clone());
+    let scope_a = concurrent_scope.clone();
+    let scope_b = concurrent_scope.clone();
+    let entries_a = concurrent_entries.clone();
+    let entries_b = concurrent_entries.clone();
+    let (left, right) = tokio::join!(
+        db_a.apply_idempotent_traffic_batch(&scope_a, &entries_a),
+        db_b.apply_idempotent_traffic_batch(&scope_b, &entries_b),
+    );
+    let mut outcomes = vec![left.unwrap(), right.unwrap()];
+    outcomes.sort_by_key(|result| match result {
+        IdempotentTrafficBatchResult::Applied => 0,
+        IdempotentTrafficBatchResult::AlreadyApplied => 1,
+        _ => 2,
+    });
+    assert_eq!(
+        outcomes,
+        vec![
+            IdempotentTrafficBatchResult::Applied,
+            IdempotentTrafficBatchResult::AlreadyApplied
+        ]
+    );
+
+    let bad_generation_entries = vec![TrafficEntry {
+        rule_id: 100,
+        upload: 1,
+        download: 1,
+    }];
+    let bad_generation_scope = scope(
+        10,
+        "cred-a",
+        2,
+        "batch-bad-generation",
+        &bad_generation_entries,
+    );
+    assert_eq!(
+        db.apply_idempotent_traffic_batch(&bad_generation_scope, &bad_generation_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::IdentityUnavailable
+    );
+
+    let overflow_entries = vec![TrafficEntry {
+        rule_id: 100,
+        upload: i64::MAX as u64 + 1,
+        download: 0,
+    }];
+    let overflow_scope = scope(10, "cred-a", 1, "batch-overflow", &overflow_entries);
+    assert_eq!(
+        db.apply_idempotent_traffic_batch(&overflow_scope, &overflow_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Overflow
+    );
+
+    let other_entries = vec![TrafficEntry {
+        rule_id: 200,
+        upload: 7,
+        download: 3,
+    }];
+    let other_scope = scope(20, "cred-b", 1, "batch-main", &other_entries);
+    assert_eq!(
+        db.apply_idempotent_traffic_batch(&other_scope, &other_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Applied
+    );
+
+    let rule100: i64 = sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id = 100")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let rule200: i64 = sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id = 200")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let user_used: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id = 1")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let history100: (i64, i64, i64) = sqlx::query_as(
+        "SELECT real_upload, real_download, billed_total
+         FROM traffic_history WHERE rule_id = 100",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rule100, 44);
+    assert_eq!(rule200, 10);
+    assert_eq!(user_used, 76);
+    assert_eq!(history100, (17, 27, 66));
+
+    for batch_id in [
+        "batch-bad-generation",
+        "batch-overflow",
+        "batch-partial",
+        "batch-missing",
+        "batch-wrong-credential",
+    ] {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM traffic_report_batches WHERE batch_id = $1")
+                .bind(batch_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    let database_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let base_url = pg_url().unwrap();
+    let database_url = replace_db_in_url(&base_url, &database_name);
+    db.pool.close().await;
+    let reopened_pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .unwrap();
+    let reopened = PgRepository::new(reopened_pool);
+    assert_eq!(
+        reopened
+            .apply_idempotent_traffic_batch(&main_scope, &main_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::AlreadyApplied
+    );
+    let rule100_after: i64 =
+        sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id = 100")
+            .fetch_one(&reopened.pool)
+            .await
+            .unwrap();
+    assert_eq!(rule100_after, 44);
+    cleanup(&reopened).await;
+}
+
 // ── v1.0.8: device-group rate billing ──
 
 async fn seed_group_with_rate(db: &PgRepository, gid: i64, rate: f64) {

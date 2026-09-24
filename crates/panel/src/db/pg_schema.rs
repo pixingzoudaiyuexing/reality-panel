@@ -133,6 +133,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_node_credentials_one_active
     ON node_credentials(home_group_id, node_id)
     WHERE activated_at IS NOT NULL AND revoked_at IS NULL;
 
+CREATE TABLE IF NOT EXISTS traffic_report_batches (
+    home_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
+    node_id TEXT NOT NULL CHECK (
+        char_length(node_id) BETWEEN 1 AND 128
+        AND octet_length(node_id) = char_length(node_id)
+        AND node_id !~ '[^A-Za-z0-9_-]'
+    ),
+    credential_id TEXT NOT NULL REFERENCES node_credentials(credential_id) ON DELETE RESTRICT,
+    credential_generation BIGINT NOT NULL CHECK (credential_generation >= 1),
+    batch_id TEXT NOT NULL CHECK (
+        char_length(batch_id) BETWEEN 1 AND 64
+        AND batch_id !~ '[^A-Za-z0-9_-]'
+    ),
+    payload_sha256 TEXT NOT NULL CHECK (
+        char_length(payload_sha256) = 64
+        AND payload_sha256 !~ '[^0-9a-f]'
+    ),
+    state TEXT NOT NULL CHECK (state = 'APPLIED'),
+    applied_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    PRIMARY KEY (home_group_id, node_id, credential_id, credential_generation, batch_id)
+);
+
 -- Node Reuse V1 S2-A2B1/B2-02A: inert Concrete Node Claim authorization state.
 CREATE TABLE IF NOT EXISTS node_credential_claims (
     claim_id TEXT PRIMARY KEY CHECK (char_length(claim_id) BETWEEN 1 AND 128),
@@ -633,7 +655,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 39;
+pub const PG_SCHEMA_VERSION: i32 = 40;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -2163,6 +2185,31 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tx.commit().await?;
         tracing::info!("PG migration 39: inert node credential delivery state machine present");
     }
+    if current < 40 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS traffic_report_batches (\
+                 home_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,\
+                 node_id TEXT NOT NULL CHECK (char_length(node_id) BETWEEN 1 AND 128 AND octet_length(node_id) = char_length(node_id) AND node_id !~ '[^A-Za-z0-9_-]'),\
+                 credential_id TEXT NOT NULL REFERENCES node_credentials(credential_id) ON DELETE RESTRICT,\
+                 credential_generation BIGINT NOT NULL CHECK (credential_generation >= 1),\
+                 batch_id TEXT NOT NULL CHECK (char_length(batch_id) BETWEEN 1 AND 64 AND batch_id !~ '[^A-Za-z0-9_-]'),\
+                 payload_sha256 TEXT NOT NULL CHECK (char_length(payload_sha256) = 64 AND payload_sha256 !~ '[^0-9a-f]'),\
+                 state TEXT NOT NULL CHECK (state = 'APPLIED'),\
+                 applied_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),\
+                 PRIMARY KEY (home_group_id, node_id, credential_id, credential_generation, batch_id)\
+             )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (40) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!("PG migration 40: traffic_report_batches idempotency ledger present");
+    }
     Ok(())
 }
 
@@ -2223,7 +2270,7 @@ mod tests {
 
     #[test]
     fn pg_schema_version_matches_latest_migration() {
-        assert_eq!(PG_SCHEMA_VERSION, 39);
+        assert_eq!(PG_SCHEMA_VERSION, 40);
     }
 
     #[test]

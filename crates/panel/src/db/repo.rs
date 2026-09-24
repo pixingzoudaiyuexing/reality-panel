@@ -1838,6 +1838,26 @@ pub enum TrafficEntryResult {
     Overflow,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrafficBatchScope {
+    pub home_group_id: i64,
+    pub node_id: String,
+    pub credential_id: String,
+    pub credential_generation: i64,
+    pub batch_id: String,
+    pub payload_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotentTrafficBatchResult {
+    Applied,
+    AlreadyApplied,
+    PayloadConflict,
+    IdentityUnavailable,
+    Unavailable,
+    Overflow,
+}
+
 #[async_trait]
 pub trait TrafficRepository: Send + Sync {
     /// Apply a batch of traffic entries atomically in ONE transaction.
@@ -1867,6 +1887,14 @@ pub trait TrafficRepository: Send + Sync {
         group_id: i64,
         entries: &[TrafficEntry],
     ) -> Result<Vec<TrafficEntryResult>, DbError>;
+
+    /// Strict VerifiedConcreteNode traffic settlement. The dedupe claim and all
+    /// rule/user/history accounting MUST commit or roll back in one transaction.
+    async fn apply_idempotent_traffic_batch(
+        &self,
+        scope: &TrafficBatchScope,
+        entries: &[TrafficEntry],
+    ) -> Result<IdempotentTrafficBatchResult, DbError>;
 
     // ── v1.2.0: hourly traffic history ──
 

@@ -617,16 +617,91 @@ impl NodeTransport {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+pub const TRAFFIC_BATCH_PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrafficReport {
+    /// Strict idempotency metadata. Old clients omit this field and continue to
+    /// use the legacy at-least-once settlement path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<TrafficBatchMetadata>,
     pub reports: Vec<TrafficEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrafficEntry {
     pub rule_id: i64,
     pub upload: u64,
     pub download: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrafficBatchMetadata {
+    pub version: u32,
+    pub batch_id: String,
+    pub payload_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TrafficBatchAckStatus {
+    Applied,
+    AlreadyApplied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrafficBatchAck {
+    pub version: u32,
+    pub batch_id: String,
+    pub payload_sha256: String,
+    pub status: TrafficBatchAckStatus,
+}
+
+/// Canonical digest for one immutable traffic batch.
+///
+/// Entries are sorted by their complete tuple before hashing. That makes the
+/// digest independent of HashMap iteration order while preserving duplicate
+/// entries as distinct payload content. Encoding is fixed-width big-endian,
+/// prefixed by a protocol domain/version marker and entry count.
+pub fn traffic_batch_payload_sha256(entries: &[TrafficEntry]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut canonical = entries.to_vec();
+    canonical.sort_by_key(|entry| (entry.rule_id, entry.upload, entry.download));
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"relay-traffic-batch\0");
+    hasher.update(TRAFFIC_BATCH_PROTOCOL_VERSION.to_be_bytes());
+    hasher.update((canonical.len() as u64).to_be_bytes());
+    for entry in canonical {
+        hasher.update(entry.rule_id.to_be_bytes());
+        hasher.update(entry.upload.to_be_bytes());
+        hasher.update(entry.download.to_be_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+pub fn valid_traffic_batch_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+pub fn valid_traffic_payload_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// Relay-local reconciliation state. This is additive status telemetry and is
@@ -1824,6 +1899,70 @@ impl<T: Serialize> ApiResponse<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traffic_batch_digest_is_canonical_and_content_sensitive() {
+        let a = vec![
+            TrafficEntry {
+                rule_id: 2,
+                upload: 30,
+                download: 40,
+            },
+            TrafficEntry {
+                rule_id: 1,
+                upload: 10,
+                download: 20,
+            },
+        ];
+        let b = vec![a[1].clone(), a[0].clone()];
+        let digest = traffic_batch_payload_sha256(&a);
+        assert_eq!(digest, traffic_batch_payload_sha256(&b));
+        assert!(valid_traffic_payload_sha256(&digest));
+
+        let mut changed = b.clone();
+        changed[0].download += 1;
+        assert_ne!(digest, traffic_batch_payload_sha256(&changed));
+
+        let with_duplicate = vec![a[0].clone(), a[0].clone()];
+        assert_ne!(digest, traffic_batch_payload_sha256(&with_duplicate));
+        assert!(valid_traffic_batch_id("batch_01-safe"));
+        assert!(!valid_traffic_batch_id(""));
+        assert!(!valid_traffic_batch_id("../bad"));
+    }
+
+    #[test]
+    fn traffic_report_legacy_and_strict_wire_are_backward_compatible() {
+        let legacy: TrafficReport = serde_json::from_value(serde_json::json!({
+            "reports": [{"rule_id": 7, "upload": 1, "download": 2}]
+        }))
+        .unwrap();
+        assert!(legacy.batch.is_none());
+
+        let hash = traffic_batch_payload_sha256(&legacy.reports);
+        let strict = TrafficReport {
+            batch: Some(TrafficBatchMetadata {
+                version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                batch_id: "batch-wire-1".into(),
+                payload_sha256: hash.clone(),
+            }),
+            reports: legacy.reports.clone(),
+        };
+        let value = serde_json::to_value(&strict).unwrap();
+        assert_eq!(value["batch"]["version"], TRAFFIC_BATCH_PROTOCOL_VERSION);
+        assert_eq!(value["batch"]["payload_sha256"], hash);
+
+        let ack = TrafficBatchAck {
+            version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+            batch_id: "batch-wire-1".into(),
+            payload_sha256: value["batch"]["payload_sha256"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            status: TrafficBatchAckStatus::AlreadyApplied,
+        };
+        let ack_value = serde_json::to_value(ack).unwrap();
+        assert_eq!(ack_value["status"], "ALREADY_APPLIED");
+    }
 
     fn create_rule_json() -> serde_json::Value {
         serde_json::json!({
