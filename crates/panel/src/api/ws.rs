@@ -472,6 +472,7 @@ async fn handle_node_ws(
             &certificate_state_dir,
             group_id,
             node_id.as_deref(),
+            verified_credential.is_some(),
         )
         .await
         {
@@ -601,6 +602,7 @@ pub(crate) async fn build_config_snapshot_for_node(
     certificate_state_dir: &std::path::Path,
     group_id: i64,
     node_id: Option<&str>,
+    verified_concrete_node: bool,
 ) -> Option<NodeConfigSnapshot> {
     // v0.3.6: delegate to the shared `build_node_config` (same function
     // `get_config` uses). This fixes the v0.3.5 drift where the WS path queried
@@ -612,11 +614,13 @@ pub(crate) async fn build_config_snapshot_for_node(
     // Returns None on DB error so the caller skips the snapshot push (rather
     // than pushing an empty config that would incorrectly tear down the node's
     // listeners). An empty Ok is a legitimate "no rules" snapshot.
-    match crate::service::node_config::build_node_config_snapshot_for_node_with_certificate_inventory(
+    match crate::service::node_config::build_guarded_node_config_snapshot_for_delivery(
         db,
         certificate_state_dir,
         group_id,
         node_id,
+        verified_concrete_node,
+        crate::service::node_config::NodeReuseRuntimeDeliveryMode::HomeOnly,
     )
     .await
     {

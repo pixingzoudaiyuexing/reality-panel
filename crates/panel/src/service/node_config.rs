@@ -47,6 +47,19 @@ pub enum NodeConfigBuildError {
     InvalidConfig(String),
 }
 
+/// Live delivery is deliberately Home-only in production while the S4-B
+/// traffic-replay and offline-LKG revocation contracts remain unresolved.
+///
+/// Tests may explicitly request GuardedCandidate so the exact same delivery
+/// snapshot/revision path can exercise an EffectiveConfig candidate without
+/// making that activation mode available in a production binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeReuseRuntimeDeliveryMode {
+    HomeOnly,
+    #[cfg(test)]
+    GuardedCandidate,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupCertificateScope {
     pub domain: String,
@@ -362,6 +375,79 @@ pub async fn build_node_config_snapshot_for_node_with_certificate_inventory(
         .await
 }
 
+/// Canonical live-delivery entry used by both HTTP and WebSocket configuration
+/// paths. Production callers can only select HomeOnly. The test-only
+/// GuardedCandidate branch validates the future S4-B composition through the
+/// same certificate/revision/fingerprint machinery without enabling runtime
+/// cross-group delivery in shipped binaries.
+pub async fn build_guarded_node_config_snapshot_for_delivery(
+    db: &dyn Repository,
+    certificate_state_dir: &Path,
+    group_id: i64,
+    node_id: Option<&str>,
+    verified_concrete_node: bool,
+    mode: NodeReuseRuntimeDeliveryMode,
+) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
+    #[cfg(not(test))]
+    let _ = verified_concrete_node;
+
+    match mode {
+        NodeReuseRuntimeDeliveryMode::HomeOnly => {
+            build_node_config_snapshot_for_node_inner(
+                db,
+                Some(certificate_state_dir),
+                group_id,
+                node_id,
+            )
+            .await
+        }
+        #[cfg(test)]
+        NodeReuseRuntimeDeliveryMode::GuardedCandidate => {
+            if !verified_concrete_node {
+                return build_node_config_snapshot_for_node_inner(
+                    db,
+                    Some(certificate_state_dir),
+                    group_id,
+                    node_id,
+                )
+                .await;
+            }
+            let node_id = node_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    NodeConfigBuildError::InvalidConfig(
+                        "verified concrete-node delivery requires node_id".into(),
+                    )
+                })?;
+            let lock = CONFIG_BUILD_LOCK.get_or_init(|| Mutex::new(()));
+            let _guard = lock.lock().await;
+            let candidate = crate::service::node_reuse::build_effective_config_candidate_for_node(
+                db, group_id, node_id,
+            )
+            .await
+            .map_err(|error| {
+                NodeConfigBuildError::InvalidConfig(format!(
+                    "guarded EffectiveConfig candidate unavailable: {error:?}"
+                ))
+            })?;
+            if !candidate.preview.known_runtime_prerequisites_satisfied {
+                return Err(NodeConfigBuildError::InvalidConfig(
+                    "guarded EffectiveConfig candidate has blocking conflicts".into(),
+                ));
+            }
+            finish_snapshot_locked(
+                db,
+                Some(certificate_state_dir),
+                group_id,
+                Some(node_id),
+                candidate.config,
+            )
+            .await
+        }
+    }
+}
+
 async fn build_node_config_snapshot_for_node_inner(
     db: &dyn Repository,
     certificate_state_dir: Option<&Path>,
@@ -370,7 +456,17 @@ async fn build_node_config_snapshot_for_node_inner(
 ) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
     let lock = CONFIG_BUILD_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().await;
-    let mut config = build_node_config_for_node(db, group_id, node_id).await?;
+    let config = build_node_config_for_node(db, group_id, node_id).await?;
+    finish_snapshot_locked(db, certificate_state_dir, group_id, node_id, config).await
+}
+
+async fn finish_snapshot_locked(
+    db: &dyn Repository,
+    certificate_state_dir: Option<&Path>,
+    group_id: i64,
+    node_id: Option<&str>,
+    mut config: NodeConfigResponse,
+) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
     if let Some(state_dir) = certificate_state_dir {
         let mut requested = BTreeMap::<String, BTreeSet<String>>::new();
         for site in &config.camouflage_sites {

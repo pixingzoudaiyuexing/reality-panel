@@ -12,7 +12,7 @@ use crate::db::repo::{
 };
 use crate::node_identity::{ReuseEligibleNodeId, ReuseEligibleNodeIdError};
 use crate::service::node_config::NodeConfigBuildError;
-use relay_shared::protocol::{NodeTransport, Protocol};
+use relay_shared::protocol::{NodeConfigResponse, NodeTransport, Protocol};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -121,6 +121,19 @@ pub struct EffectiveConfigPreview {
     pub known_runtime_prerequisites_satisfied: bool,
     /// Always false in S4-A. The preview is not a runtime config source.
     pub runtime_delivery_enabled: bool,
+}
+
+/// Read-only S4-B foundation: the exact config payload produced from the same
+/// source reads used to build EffectiveConfigPreview.
+///
+/// This is deliberately a candidate, not runtime authority. Callers must
+/// inspect preview.known_runtime_prerequisites_satisfied, and live HTTP/WS
+/// delivery remains Home-only while traffic replay and offline-LKG revocation
+/// contracts are unresolved.
+#[derive(Debug, Clone)]
+pub struct EffectiveConfigCandidate {
+    pub preview: EffectiveConfigPreview,
+    pub config: NodeConfigResponse,
 }
 
 /// Pure identity validation used before every mutation.
@@ -497,11 +510,11 @@ fn detect_preview_conflicts(
     conflicts
 }
 
-pub async fn preview_effective_config_for_node(
+async fn collect_effective_config_for_node(
     db: &dyn Repository,
     home_group_id: i64,
     node_id: &str,
-) -> Result<EffectiveConfigPreview, NodeReuseServiceError> {
+) -> Result<(EffectiveConfigPreview, NodeConfigResponse), NodeReuseServiceError> {
     let node_id =
         ReuseEligibleNodeId::parse(node_id).map_err(NodeReuseIdentityError::InvalidNodeId)?;
 
@@ -533,6 +546,8 @@ pub async fn preview_effective_config_for_node(
     let mut sources = Vec::with_capacity(source_group_ids.len());
     let mut listeners = Vec::new();
     let mut camouflage_sites = Vec::new();
+    let mut merged_listeners = Vec::new();
+    let mut merged_camouflage_sites = Vec::new();
 
     for source_group_id in source_group_ids.iter().copied() {
         let source =
@@ -571,6 +586,7 @@ pub async fn preview_effective_config_for_node(
         let mut rule_ids = BTreeSet::new();
         for listener in config.listeners {
             rule_ids.insert(listener.rule_id);
+            merged_listeners.push(listener.clone());
             listeners.push(EffectiveConfigPreviewListener {
                 source_group_id,
                 rule_id: listener.rule_id,
@@ -585,6 +601,7 @@ pub async fn preview_effective_config_for_node(
         }
         let camouflage_site_count = config.camouflage_sites.len();
         for site in config.camouflage_sites {
+            merged_camouflage_sites.push(site.clone());
             camouflage_sites.push(EffectiveConfigPreviewCamouflage {
                 source_group_id,
                 sni: site.sni,
@@ -629,7 +646,30 @@ pub async fn preview_effective_config_for_node(
     });
     let conflicts = detect_preview_conflicts(home_group_id, &listeners, &camouflage_sites);
 
-    Ok(EffectiveConfigPreview {
+    // Re-check the credential and exact Bindings after all source reads. This
+    // does not make the candidate a transactionally stable authorization
+    // snapshot, but a mutation observed during collection fails closed.
+    if db
+        .find_current_active_node_credential_for_identity(home_group_id, &node_id)
+        .await?
+        .is_none()
+    {
+        return Err(NodeReuseServiceError::AdmissionRejected(
+            NodeReuseBindingCreateRejection::ActiveCredentialMissing,
+        ));
+    }
+    for source_group_id in source_group_ids.iter().copied() {
+        if source_group_id != home_group_id
+            && db
+                .find_node_reuse_binding(source_group_id, home_group_id, node_id.as_str())
+                .await?
+                .is_none()
+        {
+            return Err(NodeReuseServiceError::BindingChangedDuringRead);
+        }
+    }
+
+    let preview = EffectiveConfigPreview {
         home_group_id,
         node_id: node_id.as_str().to_string(),
         source_group_ids,
@@ -639,7 +679,44 @@ pub async fn preview_effective_config_for_node(
         known_runtime_prerequisites_satisfied: conflicts.is_empty(),
         conflicts,
         runtime_delivery_enabled: false,
-    })
+    };
+    Ok((
+        preview,
+        NodeConfigResponse {
+            listeners: merged_listeners,
+            camouflage_sites: merged_camouflage_sites,
+        },
+    ))
+}
+
+pub async fn preview_effective_config_for_node(
+    db: &dyn Repository,
+    home_group_id: i64,
+    node_id: &str,
+) -> Result<EffectiveConfigPreview, NodeReuseServiceError> {
+    build_effective_config_candidate_for_node(db, home_group_id, node_id)
+        .await
+        .map(|candidate| {
+            let EffectiveConfigCandidate { preview, config } = candidate;
+            let _ = config;
+            preview
+        })
+}
+
+/// Build the exact-node EffectiveConfig candidate using the same source reads
+/// and conflict checks as the S4-A preview.
+///
+/// The returned config MUST NOT be sent to a live Node solely because this
+/// function succeeds. runtime_delivery_enabled remains false and the broader
+/// S4-B activation gate is intentionally blocked until traffic-report
+/// idempotency and offline-LKG revocation semantics are approved.
+pub async fn build_effective_config_candidate_for_node(
+    db: &dyn Repository,
+    home_group_id: i64,
+    node_id: &str,
+) -> Result<EffectiveConfigCandidate, NodeReuseServiceError> {
+    let (preview, config) = collect_effective_config_for_node(db, home_group_id, node_id).await?;
+    Ok(EffectiveConfigCandidate { preview, config })
 }
 
 /// Helper used by tests to pin conflict semantics without creating runtime side
@@ -792,6 +869,22 @@ mod tests {
         // Paused, banned-user and exhausted-quota rules from Group 20 are absent.
         assert_eq!(preview.sources[1].rule_ids, vec![200]);
 
+        let candidate = build_effective_config_candidate_for_node(&db, 10, "NODE_E")
+            .await
+            .unwrap();
+        assert_eq!(candidate.preview.source_group_ids, vec![10, 20, 30]);
+        assert!(candidate.preview.known_runtime_prerequisites_satisfied);
+        assert!(!candidate.preview.runtime_delivery_enabled);
+        assert_eq!(
+            candidate
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![100, 200, 300]
+        );
+
         let sibling = preview_effective_config_for_node(&db, 10, "NODE_F")
             .await
             .unwrap();
@@ -852,6 +945,20 @@ mod tests {
             .conflicts
             .iter()
             .any(|conflict| conflict.kind == "TCP_PORT_COLLISION"));
+        let candidate = build_effective_config_candidate_for_node(&db, 10, "NODE_E")
+            .await
+            .unwrap();
+        assert!(!candidate.preview.known_runtime_prerequisites_satisfied);
+        assert_eq!(
+            candidate
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![100, 200, 300],
+            "candidate assembly may be inspected, but a conflict keeps it non-deliverable"
+        );
 
         sqlx::query(
             "UPDATE node_credentials SET revoked_at = datetime('now')
