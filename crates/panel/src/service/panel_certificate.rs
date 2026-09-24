@@ -122,6 +122,33 @@ impl PanelCertificateManager {
             .map_err(|error| error.to_string())?
     }
 
+    pub async fn manifest_for_groups(
+        &self,
+        group_ids: &[i64],
+        desired_domains: &BTreeSet<String>,
+    ) -> Result<GroupCertificateManifest, String> {
+        let mut merged = BTreeMap::<String, BTreeSet<String>>::new();
+        for group_id in group_ids {
+            for scope in self.certificate_scopes(*group_id).await? {
+                if !desired_domains.contains(&scope.domain) {
+                    continue;
+                }
+                merged.entry(scope.domain).or_default().extend(scope.snis);
+            }
+        }
+        let scopes = merged
+            .into_iter()
+            .map(|(domain, snis)| GroupCertificateScope {
+                domain,
+                snis: snis.into_iter().collect(),
+            })
+            .collect::<Vec<_>>();
+        let state_dir = self.state_dir.clone();
+        tokio::task::spawn_blocking(move || build_group_manifest(&state_dir, &scopes))
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
     async fn certificate_scopes(
         &self,
         group_id: i64,
@@ -1554,6 +1581,87 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn multi_group_manifest_uses_source_group_scopes_and_only_requested_effective_domains() {
+        let (manager, _home, pool, _marker) = issuance_fixture("reuse-manifest").await;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid)
+             VALUES (20, 'reuse-source', 'in', 'reuse-token', 2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port, protocol,
+              public_transport, node_transport, entry_transport, sni, camouflage_enabled)
+             VALUES (200, 'reuse-cert', 2, 444, 20, '192.0.2.30', 444, 'tcp',
+                     'nginx_sni', 'nginx_sni', 'nginx_sni', 'reuse.example.net', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            manager.certificate_scopes(10).await.unwrap(),
+            vec![scope("b.example.com", "b.example.com")]
+        );
+        assert_eq!(
+            manager.certificate_scopes(20).await.unwrap(),
+            vec![scope("reuse.example.net", "reuse.example.net")]
+        );
+
+        let home_cert = candidate(&manager.state_dir, "home", "b.example.com", 90);
+        publish_candidate(
+            &manager.state_dir,
+            "b.example.com",
+            &home_cert.0,
+            &home_cert.1,
+        )
+        .unwrap();
+        let reuse_cert = candidate(&manager.state_dir, "reuse", "reuse.example.net", 90);
+        publish_candidate(
+            &manager.state_dir,
+            "reuse.example.net",
+            &reuse_cert.0,
+            &reuse_cert.1,
+        )
+        .unwrap();
+
+        let reuse_only = manager
+            .manifest_for_groups(
+                &[10, 20],
+                &BTreeSet::from(["reuse.example.net".to_string()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reuse_only.response.certificates.len(), 1);
+        assert_eq!(
+            reuse_only.response.certificates[0].domain,
+            "reuse.example.net"
+        );
+        assert!(reuse_only.response.missing_domains.is_empty());
+
+        let complete = manager
+            .manifest_for_groups(
+                &[10, 20],
+                &BTreeSet::from(["b.example.com".to_string(), "reuse.example.net".to_string()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            complete
+                .response
+                .certificates
+                .iter()
+                .map(|bundle| bundle.domain.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b.example.com", "reuse.example.net"]
+        );
+        assert!(complete.response.missing_domains.is_empty());
+        let _ = fs::remove_dir_all(&manager.state_dir);
     }
 
     #[tokio::test]

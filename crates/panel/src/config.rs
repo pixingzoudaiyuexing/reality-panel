@@ -60,6 +60,9 @@ pub struct Config {
     /// blocks node status or forwarding.
     pub geoip_enabled: bool,
     pub geoip_cache_ttl: u64,
+    /// Opt-in functional Node Reuse runtime. Default false keeps existing
+    /// deployments Home-only until an operator explicitly enables it.
+    pub node_reuse_runtime_enabled: bool,
 }
 
 impl Config {
@@ -107,6 +110,8 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(604_800); // 7 days
+        let node_reuse_runtime_enabled =
+            parse_feature_enabled(std::env::var("NODE_REUSE_RUNTIME_ENABLED").ok());
 
         let cfg = Self {
             database_path,
@@ -119,6 +124,7 @@ impl Config {
             cors_origins,
             geoip_enabled,
             geoip_cache_ttl,
+            node_reuse_runtime_enabled,
         };
         cfg.validate();
         cfg
@@ -169,6 +175,10 @@ fn certificate_check_interval_secs(raw: Option<String>) -> u64 {
 
 fn configured_jwt_secret(raw: Option<String>) -> String {
     raw.unwrap_or_else(|| INSECURE_JWT_SECRET.into())
+}
+
+fn parse_feature_enabled(raw: Option<String>) -> bool {
+    raw.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 /// v0.4.16: parse `GEOIP_ENABLED` into a boolean. Extracted as a pure function

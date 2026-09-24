@@ -23,6 +23,7 @@ struct ParsedLogLine {
     port: u16,
     sni: String,
     rule_id: Option<i64>,
+    config_revision: Option<u64>,
     bytes_sent: u64,
     bytes_received: u64,
 }
@@ -74,20 +75,25 @@ async fn ingest_once_inner(
         let Some(parsed) = parse_log_line(&line) else {
             continue;
         };
-        let current_rule_id = {
-            let mgr = manager.lock().await;
-            mgr.nginx_sni_rule_id_for(parsed.port, &parsed.sni)
-        };
-        let rule_id = match (parsed.rule_id, current_rule_id) {
-            (Some(logged), Some(current)) if logged == current => Some(current),
-            (None, Some(current)) => Some(current),
-            _ => None,
-        };
-        if let Some(rule_id) = rule_id {
+        let attributed =
+            if let (Some(revision), Some(rule_id)) = (parsed.config_revision, parsed.rule_id) {
+                Some((revision, rule_id))
+            } else {
+                let current_rule_id = {
+                    let mgr = manager.lock().await;
+                    mgr.nginx_sni_rule_id_for(parsed.port, &parsed.sni)
+                };
+                match (parsed.rule_id, current_rule_id) {
+                    (Some(logged), Some(current)) if logged == current => Some((0, current)),
+                    (None, Some(current)) => Some((0, current)),
+                    _ => None,
+                }
+            };
+        if let Some((revision, rule_id)) = attributed {
             // Nginx stream: bytes_received = client -> proxy (upload),
             // bytes_sent = proxy -> client (download).
             counter
-                .add(rule_id, parsed.bytes_received, parsed.bytes_sent)
+                .add_at(revision, rule_id, parsed.bytes_received, parsed.bytes_sent)
                 .await;
             processed += 1;
         }
@@ -99,15 +105,24 @@ async fn ingest_once_inner(
 }
 
 fn parse_log_line(line: &str) -> Option<ParsedLogLine> {
-    let mut parts = line.trim_end_matches(['\r', '\n']).split('|');
-    let _msec = parts.next()?;
-    let port = parts.next()?.parse::<u16>().ok()?;
-    let sni = parts.next()?.trim().to_ascii_lowercase();
-    let raw_rule_id = parts.next()?.trim();
+    let parts = line
+        .trim_end_matches(['\r', '\n'])
+        .split('|')
+        .collect::<Vec<_>>();
+    if parts.len() < 7 {
+        return None;
+    }
+    let port = parts[1].parse::<u16>().ok()?;
+    let sni = parts[2].trim().to_ascii_lowercase();
+    let raw_rule_id = parts[3].trim();
     let rule_id = raw_rule_id.parse::<i64>().ok().filter(|id| *id > 0);
-    let bytes_sent = parts.next()?.parse::<u64>().ok()?;
-    let bytes_received = parts.next()?.parse::<u64>().ok()?;
-    let _session_time = parts.next();
+    let (config_revision, bytes_sent_index) = if parts.len() >= 8 {
+        (parts[4].parse::<u64>().ok(), 5)
+    } else {
+        (None, 4)
+    };
+    let bytes_sent = parts[bytes_sent_index].parse::<u64>().ok()?;
+    let bytes_received = parts[bytes_sent_index + 1].parse::<u64>().ok()?;
     if sni.is_empty() || sni == "-" {
         return None;
     }
@@ -115,6 +130,7 @@ fn parse_log_line(line: &str) -> Option<ParsedLogLine> {
         port,
         sni,
         rule_id,
+        config_revision,
         bytes_sent,
         bytes_received,
     })
@@ -147,10 +163,21 @@ mod tests {
                 port: 443,
                 sni: "op1.example.com".to_string(),
                 rule_id: Some(12),
+                config_revision: None,
                 bytes_sent: 345,
                 bytes_received: 678,
             }
         );
+    }
+
+    #[test]
+    fn parse_log_line_reads_revision_aware_nginx_sni_fields() {
+        let parsed =
+            parse_log_line("1723550000.123|443|OP1.Example.COM|12|9|345|678|1.2\n").unwrap();
+        assert_eq!(parsed.config_revision, Some(9));
+        assert_eq!(parsed.rule_id, Some(12));
+        assert_eq!(parsed.bytes_sent, 345);
+        assert_eq!(parsed.bytes_received, 678);
     }
 
     #[test]

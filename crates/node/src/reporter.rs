@@ -37,6 +37,7 @@ impl RuleCounterState {
 }
 
 type RuleCounters = Arc<RuleCounterState>;
+type TrafficGenerationKey = (u64, i64);
 
 /// Connection-lifetime reference to one immutable counter generation. It is
 /// deliberately not Clone: every accepted TCP/TLS/WS connection acquires one
@@ -74,7 +75,9 @@ pub struct TrafficCounter {
     // bytes). Concurrent add()s to an already-present rule take a SHARED read
     // lock and do a lock-free atomic fetch_add, so they never serialize on each
     // other — this is the per-packet path for both TCP and UDP forwarding.
-    data: Arc<RwLock<HashMap<i64, RuleCounters>>>,
+    // (config_revision, rule_id) -> counters. Revision 0 is the legacy
+    // generation used before a versioned Panel snapshot is active.
+    data: Arc<RwLock<HashMap<TrafficGenerationKey, RuleCounters>>>,
     // At most one report snapshot may be in flight. The guard lives inside
     // TrafficSnapshot, so failed uploads release it simply by dropping the
     // snapshot while successful uploads release it after commit.
@@ -102,21 +105,32 @@ impl TrafficCounter {
     /// Acquire the immutable counter generation for one accepted stream
     /// connection. Creation and live-writer registration are serialized with
     /// commit/prune by the map write lock; chunk writes after this are lock-free.
+    #[cfg(test)]
     pub async fn handle(&self, rule_id: i64) -> RuleCounterHandle {
+        self.handle_at(0, rule_id).await
+    }
+
+    pub async fn handle_at(&self, config_revision: u64, rule_id: i64) -> RuleCounterHandle {
         let mut map = self.data.write().await;
         let state = map
-            .entry(rule_id)
+            .entry((config_revision, rule_id))
             .or_insert_with(|| Arc::new(RuleCounterState::new()))
             .clone();
         state.live_handles.fetch_add(1, Ordering::Relaxed);
         RuleCounterHandle { state }
     }
 
+    #[cfg(test)]
     pub async fn add(&self, rule_id: i64, upload: u64, download: u64) {
+        self.add_at(0, rule_id, upload, download).await;
+    }
+
+    pub async fn add_at(&self, config_revision: u64, rule_id: i64, upload: u64, download: u64) {
+        let key = (config_revision, rule_id);
         // Fast path: rule already present → shared read lock + atomic add.
         {
             let map = self.data.read().await;
-            if let Some(c) = map.get(&rule_id) {
+            if let Some(c) = map.get(&key) {
                 c.upload.fetch_add(upload, Ordering::Relaxed);
                 c.download.fetch_add(download, Ordering::Relaxed);
                 return;
@@ -125,7 +139,7 @@ impl TrafficCounter {
         // Slow path: first bytes for this rule → write lock to insert, then add.
         let mut map = self.data.write().await;
         let c = map
-            .entry(rule_id)
+            .entry(key)
             .or_insert_with(|| Arc::new(RuleCounterState::new()));
         c.upload.fetch_add(upload, Ordering::Relaxed);
         c.download.fetch_add(download, Ordering::Relaxed);
@@ -152,29 +166,47 @@ impl TrafficCounter {
                 || state.download.load(Ordering::Acquire) != 0
         });
 
+        // One strict batch describes exactly one delivered config revision.
+        // Drain the oldest non-empty generation first; newer generations wait
+        // until the older one has been durably ACKed.
+        let selected_revision = map
+            .iter()
+            .filter_map(|((revision, _), state)| {
+                let upload = state.upload.load(Ordering::Acquire);
+                let download = state.download.load(Ordering::Acquire);
+                (upload != 0 || download != 0).then_some(*revision)
+            })
+            .min();
         let mut entries = Vec::new();
         let mut captured = Vec::new();
-        for (rule_id, state) in map.iter() {
-            let upload = state.upload.load(Ordering::Acquire);
-            let download = state.download.load(Ordering::Acquire);
-            if upload == 0 && download == 0 {
-                continue;
+        if let Some(selected_revision) = selected_revision {
+            for ((revision, rule_id), state) in map.iter() {
+                if *revision != selected_revision {
+                    continue;
+                }
+                let upload = state.upload.load(Ordering::Acquire);
+                let download = state.download.load(Ordering::Acquire);
+                if upload == 0 && download == 0 {
+                    continue;
+                }
+                entries.push(TrafficEntry {
+                    rule_id: *rule_id,
+                    upload,
+                    download,
+                });
+                captured.push(SnapshotEntry {
+                    key: (*revision, *rule_id),
+                    state: state.clone(),
+                    upload,
+                    download,
+                });
             }
-            entries.push(TrafficEntry {
-                rule_id: *rule_id,
-                upload,
-                download,
-            });
-            captured.push(SnapshotEntry {
-                rule_id: *rule_id,
-                state: state.clone(),
-                upload,
-                download,
-            });
         }
+        entries.sort_by_key(|entry| entry.rule_id);
         drop(map);
         TrafficSnapshot {
             counter: self,
+            config_revision: selected_revision.filter(|revision| *revision != 0),
             entries,
             captured,
             _snapshot_guard: snapshot_guard,
@@ -188,27 +220,47 @@ impl TrafficCounter {
     #[allow(dead_code)]
     pub async fn drain(&self) -> Vec<TrafficEntry> {
         let mut map = self.data.write().await;
-        map.drain()
-            .map(|(rule_id, c)| TrafficEntry {
+        let mut totals = HashMap::<i64, (u64, u64)>::new();
+        for ((_, rule_id), c) in map.drain() {
+            let entry = totals.entry(rule_id).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(c.upload.load(Ordering::Relaxed));
+            entry.1 = entry.1.saturating_add(c.download.load(Ordering::Relaxed));
+        }
+        let mut out = totals
+            .into_iter()
+            .map(|(rule_id, (upload, download))| TrafficEntry {
                 rule_id,
-                upload: c.upload.load(Ordering::Relaxed),
-                download: c.download.load(Ordering::Relaxed),
+                upload,
+                download,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        out.sort_by_key(|entry| entry.rule_id);
+        out
     }
 
-    /// Remove all accumulated bytes for a single rule from the counter. Used
-    /// when a listener is permanently stopped (rule deleted or no longer in the
-    /// config) so that orphaned bytes don't poison future traffic batches — a
-    /// stale rule_id causes the panel to atomically reject the entire batch.
+    /// A rule leaving the active config stops future forwarding, but bytes it
+    /// already forwarded remain billable. Only discard generations that are
+    /// provably empty and have no live connection handle.
     pub async fn prune_rule(&self, rule_id: i64) {
-        self.data.write().await.remove(&rule_id);
+        self.data
+            .write()
+            .await
+            .retain(|(_, candidate_rule_id), state| {
+                *candidate_rule_id != rule_id
+                    || state.live_handles.load(Ordering::Acquire) != 0
+                    || state.upload.load(Ordering::Acquire) != 0
+                    || state.download.load(Ordering::Acquire) != 0
+            });
     }
 
     /// Test-only: check whether a rule_id has any accumulated bytes.
     #[cfg(test)]
     pub async fn has_rule(&self, rule_id: i64) -> bool {
-        self.data.read().await.contains_key(&rule_id)
+        self.data
+            .read()
+            .await
+            .keys()
+            .any(|(_, candidate_rule_id)| *candidate_rule_id == rule_id)
     }
 }
 
@@ -217,13 +269,14 @@ impl TrafficCounter {
 /// panel has persisted the report.
 pub struct TrafficSnapshot<'a> {
     counter: &'a TrafficCounter,
+    pub config_revision: Option<u64>,
     pub entries: Vec<TrafficEntry>,
     captured: Vec<SnapshotEntry>,
     _snapshot_guard: tokio::sync::MutexGuard<'a, ()>,
 }
 
 struct SnapshotEntry {
-    rule_id: i64,
+    key: TrafficGenerationKey,
     state: RuleCounters,
     upload: u64,
     download: u64,
@@ -243,7 +296,7 @@ impl TrafficSnapshot<'_> {
         let mut map = self.counter.data.write().await;
         for entry in &self.captured {
             let remove = {
-                let Some(current) = map.get(&entry.rule_id) else {
+                let Some(current) = map.get(&entry.key) else {
                     continue;
                 };
                 // A prune followed by reuse of the same rule_id creates a new
@@ -262,7 +315,7 @@ impl TrafficSnapshot<'_> {
 
                 // Tests can force the exact subtract -> add -> final-drop race.
                 // Production passes an empty inlined closure.
-                after_subtract(entry.rule_id);
+                after_subtract(entry.key.1);
 
                 current.live_handles.load(Ordering::Acquire) == 0
                     && current.upload.load(Ordering::Acquire) == 0
@@ -270,10 +323,10 @@ impl TrafficSnapshot<'_> {
             };
             if remove
                 && map
-                    .get(&entry.rule_id)
+                    .get(&entry.key)
                     .is_some_and(|current| Arc::ptr_eq(current, &entry.state))
             {
-                map.remove(&entry.rule_id);
+                map.remove(&entry.key);
             }
         }
     }
@@ -520,6 +573,8 @@ struct PendingTrafficBatch {
     payload_sha256: String,
     node_id: String,
     credential_id: String,
+    #[serde(default)]
+    config_revision: Option<u64>,
     reports: Vec<TrafficEntry>,
 }
 
@@ -838,6 +893,7 @@ async fn report_traffic_strict(
             payload_sha256: traffic_batch_payload_sha256(&reports),
             node_id: node_id.to_string(),
             credential_id: credential_id.to_string(),
+            config_revision: snap.config_revision,
             reports,
         };
         if let Err(error) = write_pending_traffic_at(pending_path, &sealed) {
@@ -860,6 +916,7 @@ async fn report_traffic_strict(
             version: pending.version,
             batch_id: pending.batch_id.clone(),
             payload_sha256: pending.payload_sha256.clone(),
+            config_revision: pending.config_revision,
         }),
         reports: pending.reports.clone(),
     };
@@ -1806,6 +1863,7 @@ mod tests {
             payload_sha256: traffic_batch_payload_sha256(&reports),
             node_id: "NODE_T1".into(),
             credential_id: "cred-t1-node".into(),
+            config_revision: None,
             reports: reports.clone(),
         };
         write_pending_traffic_at(&path, &pending).unwrap();
@@ -1913,7 +1971,7 @@ mod tests {
         let dir = private_test_dir("http-retry");
         let config = strict_test_config(format!("http://{addr}"), &dir);
         let counter = TrafficCounter::new();
-        counter.add(7, 10, 20).await;
+        counter.add_at(42, 7, 10, 20).await;
 
         report_traffic(&config, &counter, "NODE_T1").await;
         let pending_path = dir.join(TRAFFIC_PENDING_FILENAME);
@@ -1921,7 +1979,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        counter.add(7, 3, 4).await;
+        counter.add_at(99, 7, 3, 4).await;
         report_traffic(&config, &counter, "NODE_T1").await;
         report_traffic(&config, &counter, "NODE_T1").await;
         report_traffic(&config, &counter, "NODE_T1").await;
@@ -1941,12 +1999,14 @@ mod tests {
         let requests = captured.lock().await;
         assert_eq!(requests.len(), 6);
         let first_meta = requests[0].batch.as_ref().unwrap();
+        assert_eq!(first_meta.config_revision, Some(42));
         for request in &requests[..5] {
             assert_eq!(request.batch.as_ref(), Some(first_meta));
             assert_eq!(request.reports, first_pending.reports);
         }
         let next_meta = requests[5].batch.as_ref().unwrap();
         assert_ne!(next_meta.batch_id, first_meta.batch_id);
+        assert_eq!(next_meta.config_revision, Some(99));
         assert_eq!(
             traffic(&requests[5].reports, 7),
             Some((3, 4)),
@@ -2004,6 +2064,7 @@ mod tests {
             payload_sha256: traffic_batch_payload_sha256(&reports),
             node_id: "NODE_T1".into(),
             credential_id: "cred-t1-node".into(),
+            config_revision: None,
             reports: reports.clone(),
         };
         write_pending_traffic_at(&path, &pending).unwrap();
@@ -2190,15 +2251,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_detaches_stale_handle_without_resurrecting_rule() {
+    async fn prune_preserves_bytes_from_connection_that_finishes_after_rule_removal() {
         let counter = TrafficCounter::new();
         let stale = counter.handle(9).await;
         counter.prune_rule(9).await;
         stale.add_upload(12);
         stale.add_download(4);
         drop(stale);
+        let pending = counter.snapshot().await;
+        assert_eq!(traffic(&pending.entries, 9), Some((12, 4)));
+        pending.commit().await;
         assert!(!counter.has_rule(9).await);
-        assert!(counter.snapshot().await.entries.is_empty());
     }
 
     #[tokio::test]
@@ -2218,6 +2281,40 @@ mod tests {
         let current = counter.snapshot().await;
         assert_eq!(traffic(&current.entries, 10), Some((30, 0)));
         current.commit().await;
+    }
+
+    #[tokio::test]
+    async fn config_revision_generations_keep_removed_rule_bytes_separate_from_new_config() {
+        let counter = TrafficCounter::new();
+        counter.add_at(9, 200, 50, 20).await;
+        counter.prune_rule(200).await;
+        counter.add_at(10, 100, 3, 4).await;
+
+        let old = counter.snapshot().await;
+        assert_eq!(old.config_revision, Some(9));
+        assert_eq!(
+            old.entries,
+            vec![TrafficEntry {
+                rule_id: 200,
+                upload: 50,
+                download: 20,
+            }]
+        );
+        old.commit().await;
+
+        let new = counter.snapshot().await;
+        assert_eq!(new.config_revision, Some(10));
+        assert_eq!(
+            new.entries,
+            vec![TrafficEntry {
+                rule_id: 100,
+                upload: 3,
+                download: 4,
+            }]
+        );
+        new.commit().await;
+        assert!(!counter.has_rule(200).await);
+        assert!(!counter.has_rule(100).await);
     }
 
     #[tokio::test]

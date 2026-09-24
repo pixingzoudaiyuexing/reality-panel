@@ -52,6 +52,7 @@ pub async fn serve_udp_listener(
     rate_limit: RateLimit,
     counter: Arc<TrafficCounter>,
     connections: Arc<ConnectionTracker>,
+    config_revision: u64,
     rule_id: i64,
     source_ipv4: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -209,7 +210,9 @@ pub async fn serve_udp_listener(
                                 // through the shared per-rule limiter BEFORE
                                 // forwarding back to the client.
                                 rl_c.acquire_download(m as u64).await;
-                                counter_c.add(rule_id, 0, m as u64).await;
+                                counter_c
+                                    .add_at(config_revision, rule_id, 0, m as u64)
+                                    .await;
                                 // A reply is activity too: refresh the tracker
                                 // (cheap, sharded) and the session's last_active
                                 // so a long request/response flow isn't expired.
@@ -243,7 +246,7 @@ pub async fn serve_udp_listener(
         if let Err(e) = outbound_sock.send(&buf[..n]).await {
             tracing::debug!("UDP port {}: send to target failed: {}", port, e);
         } else {
-            counter.add(rule_id, n as u64, 0).await;
+            counter.add_at(config_revision, rule_id, n as u64, 0).await;
         }
     }
 }
@@ -546,6 +549,7 @@ mod tests {
             RateLimit::new(None, None),
             Arc::new(TrafficCounter::new()),
             Arc::new(ConnectionTracker::new()),
+            0,
             9,
             None,
         ));

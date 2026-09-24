@@ -640,6 +640,10 @@ pub struct TrafficBatchMetadata {
     pub version: u32,
     pub batch_id: String,
     pub payload_sha256: String,
+    /// The exact Node config revision under which these bytes were produced.
+    /// Older strict clients omit it and retain Home-only T1 settlement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1944,6 +1948,7 @@ mod tests {
                 version: TRAFFIC_BATCH_PROTOCOL_VERSION,
                 batch_id: "batch-wire-1".into(),
                 payload_sha256: hash.clone(),
+                config_revision: None,
             }),
             reports: legacy.reports.clone(),
         };

@@ -95,7 +95,10 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
         group_id,
         node_id.as_deref(),
         verified_concrete_node,
-        crate::service::node_config::NodeReuseRuntimeDeliveryMode::HomeOnly,
+        crate::service::node_config::runtime_delivery_mode(
+            state.config.node_reuse_runtime_enabled,
+            verified_concrete_node,
+        ),
     )
     .await
     {
@@ -130,6 +133,8 @@ pub async fn get_certificates(State(state): State<AppState>, headers: HeaderMap)
         return StatusCode::FORBIDDEN.into_response();
     }
     let group_id = identity.group_id();
+    let node_id = identity.node_id().map(str::to_string);
+    let verified_concrete_node = identity.verified().is_some();
     let manager = match crate::service::panel_certificate::PanelCertificateManager::new(
         state.db.clone(),
         &state.config,
@@ -140,7 +145,60 @@ pub async fn get_certificates(State(state): State<AppState>, headers: HeaderMap)
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    let manifest = match manager.group_manifest(group_id).await {
+    let manifest = if state.config.node_reuse_runtime_enabled && verified_concrete_node {
+        let Some(node_id) = node_id.as_deref() else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        let groups = match crate::service::node_reuse::effective_source_groups(
+            state.db.as_ref(),
+            group_id,
+            node_id,
+        )
+        .await
+        {
+            Ok(groups) => groups,
+            Err(error) => {
+                tracing::warn!(
+                    group_id,
+                    node_id,
+                    "get_certificates source discovery failed: {error}"
+                );
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        };
+        let certificate_state_dir = std::path::PathBuf::from(state.config.certificate_state_dir());
+        let snapshot =
+            match crate::service::node_config::build_guarded_node_config_snapshot_for_delivery(
+                state.db.as_ref(),
+                &certificate_state_dir,
+                group_id,
+                Some(node_id),
+                true,
+                crate::service::node_config::NodeReuseRuntimeDeliveryMode::EffectiveConfig,
+            )
+            .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(
+                        group_id,
+                        node_id,
+                        "get_certificates effective config unavailable: {error}"
+                    );
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+            };
+        let desired_domains = snapshot
+            .config
+            .camouflage_sites
+            .iter()
+            .map(|site| site.certificate.domain.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        manager.manifest_for_groups(&groups, &desired_domains).await
+    } else {
+        manager.group_manifest(group_id).await
+    };
+    let manifest = match manifest {
         Ok(manifest) => manifest,
         Err(error) => {
             tracing::warn!(group_id, "get_certificates failed: {error}");
@@ -320,6 +378,50 @@ pub async fn report_traffic(
             return traffic_business_error(409, "traffic batch identity or payload conflict");
         }
 
+        let rule_source_groups = if let Some(revision) = batch.config_revision {
+            let key = format!(
+                "node_config_rule_sources:{}:{}:{}",
+                verified.home_group_id,
+                verified.node_id.as_str(),
+                revision
+            );
+            let raw = match state.db.get(&key).await {
+                Ok(Some(raw)) => raw,
+                Ok(None) => {
+                    return traffic_business_error(
+                        403,
+                        "traffic batch config revision is unavailable for this node",
+                    )
+                }
+                Err(error) => {
+                    tracing::error!("report_traffic: config attribution lookup failed: {error}");
+                    return traffic_business_error(500, "database error");
+                }
+            };
+            let mapping = match serde_json::from_str::<std::collections::BTreeMap<i64, i64>>(&raw) {
+                Ok(mapping) => mapping,
+                Err(error) => {
+                    tracing::error!("report_traffic: config attribution state is invalid: {error}");
+                    return traffic_business_error(500, "database error");
+                }
+            };
+            if req
+                .reports
+                .iter()
+                .any(|entry| !mapping.contains_key(&entry.rule_id))
+            {
+                return traffic_business_error(
+                    403,
+                    "one or more rules are unavailable for this node config",
+                );
+            }
+            mapping
+        } else {
+            req.reports
+                .iter()
+                .map(|entry| (entry.rule_id, verified.home_group_id))
+                .collect()
+        };
         let scope = crate::db::repo::TrafficBatchScope {
             home_group_id: verified.home_group_id,
             node_id: verified.node_id.as_str().to_string(),
@@ -327,6 +429,8 @@ pub async fn report_traffic(
             credential_generation: verified.generation,
             batch_id: batch.batch_id.clone(),
             payload_sha256: batch.payload_sha256.clone(),
+            config_revision: batch.config_revision,
+            rule_source_groups,
         };
         return match crate::service::traffic::apply_idempotent_traffic_report(
             state.db.as_ref(),
@@ -677,6 +781,7 @@ mod tests {
                 cors_origins: vec![],
                 geoip_enabled: false,
                 geoip_cache_ttl: 604_800,
+                node_reuse_runtime_enabled: false,
             },
             release_cache: ReleaseCache::new(),
             node_connections: NodeConnections::new(),
@@ -927,6 +1032,7 @@ mod tests {
                 version: TRAFFIC_BATCH_PROTOCOL_VERSION,
                 batch_id: "router-batch-1".into(),
                 payload_sha256: payload_sha256.clone(),
+                config_revision: None,
             }),
             reports: entries.clone(),
         };
@@ -962,6 +1068,7 @@ mod tests {
                 version: TRAFFIC_BATCH_PROTOCOL_VERSION,
                 batch_id: "router-batch-lost-ack".into(),
                 payload_sha256: traffic_batch_payload_sha256(&lost_ack_entries),
+                config_revision: None,
             }),
             reports: lost_ack_entries,
         };
@@ -988,6 +1095,7 @@ mod tests {
                 version: TRAFFIC_BATCH_PROTOCOL_VERSION,
                 batch_id: "router-batch-1".into(),
                 payload_sha256: traffic_batch_payload_sha256(&changed_entries),
+                config_revision: None,
             }),
             reports: changed_entries,
         };
@@ -1019,6 +1127,120 @@ mod tests {
         assert!(legacy.data.is_none());
         assert_eq!(rule_traffic(&pool, 100).await, 45);
         assert_eq!(user_traffic(&pool, 2).await, 45);
+    }
+
+    #[tokio::test]
+    async fn delayed_old_effective_config_traffic_keeps_source_group_after_binding_deletion() {
+        let (mut state, pool) = seeded_state().await;
+        state.config.node_reuse_runtime_enabled = true;
+        sqlx::query("UPDATE device_groups SET rate=1.5 WHERE id=10")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, rate)
+             VALUES (20, 'reuse-source', 'in', 'tok-B', 2, 2.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port)
+             VALUES (200, 'reuse-rule', 2, 21000, 20, '127.0.0.1', 81)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO node_reuse_bindings (reusing_group_id, home_group_id, node_id)
+             VALUES (20, 10, 'NODE_T1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let secret =
+            install_active_runtime_credential(&pool, "cred-runtime-traffic", 10, "NODE_T1", 0xb1)
+                .await;
+        let headers = credential_config_headers("cred-runtime-traffic", &secret, "NODE_T1");
+
+        let config_response = get_config(State(state.clone()), headers.clone()).await;
+        assert_eq!(config_response.status(), StatusCode::OK);
+        let config_body = axum::body::to_bytes(config_response.into_body(), 65536)
+            .await
+            .unwrap();
+        let delivered: NodeConfigSnapshot = serde_json::from_slice(&config_body).unwrap();
+        assert_eq!(
+            delivered
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![100, 200]
+        );
+
+        sqlx::query(
+            "DELETE FROM node_reuse_bindings
+             WHERE reusing_group_id=20 AND home_group_id=10 AND node_id='NODE_T1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let entries = vec![
+            TrafficEntry {
+                rule_id: 100,
+                upload: 4,
+                download: 6,
+            },
+            TrafficEntry {
+                rule_id: 200,
+                upload: 3,
+                download: 7,
+            },
+        ];
+        let report = TrafficReport {
+            batch: Some(TrafficBatchMetadata {
+                version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                batch_id: "runtime-old-config-batch".into(),
+                payload_sha256: traffic_batch_payload_sha256(&entries),
+                config_revision: Some(delivered.config_revision),
+            }),
+            reports: entries,
+        };
+        let app = crate::api::routes().with_state(state);
+        let applied = router_post_traffic(app.clone(), headers.clone(), &report).await;
+        assert_eq!(applied.code, 0);
+        assert_eq!(
+            applied.data.expect("Applied ACK").status,
+            TrafficBatchAckStatus::Applied
+        );
+        assert_eq!(rule_traffic(&pool, 100).await, 10);
+        assert_eq!(rule_traffic(&pool, 200).await, 10);
+        assert_eq!(
+            user_traffic(&pool, 2).await,
+            35,
+            "Group 10 rate 1.5 + Group 20 rate 2.0 must bill independently"
+        );
+        let history: Vec<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT rule_id, group_id, billed_total
+             FROM traffic_history WHERE rule_id IN (100,200) ORDER BY rule_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(history, vec![(100, 10, 15), (200, 20, 20)]);
+
+        let replay = router_post_traffic(app, headers, &report).await;
+        assert_eq!(replay.code, 0);
+        assert_eq!(
+            replay.data.expect("AlreadyApplied ACK").status,
+            TrafficBatchAckStatus::AlreadyApplied
+        );
+        assert_eq!(rule_traffic(&pool, 100).await, 10);
+        assert_eq!(rule_traffic(&pool, 200).await, 10);
+        assert_eq!(user_traffic(&pool, 2).await, 35);
     }
 
     /// Normal batch: rule and user totals both move, atomically.
@@ -1584,6 +1806,7 @@ mod tests {
             10,
             Some("node-a"),
             false,
+            false,
         )
         .await
         .expect("WS snapshot");
@@ -1659,6 +1882,7 @@ mod tests {
             10,
             Some("node-a"),
             false,
+            false,
         )
         .await
         .expect("WS snapshot");
@@ -1702,6 +1926,7 @@ mod tests {
             10,
             Some("node-a"),
             true,
+            false,
         )
         .await
         .expect("verified WS snapshot");
@@ -1715,9 +1940,7 @@ mod tests {
             vec![100]
         );
 
-        // The isolated test-only mode proves the exact same snapshot machinery
-        // can compose the guarded candidate without making that mode available
-        // to production callers.
+        // Direct mode selection still exercises the same canonical builder.
         let guarded_candidate =
             crate::service::node_config::build_guarded_node_config_snapshot_for_delivery(
                 state.db.as_ref(),
@@ -1725,7 +1948,7 @@ mod tests {
                 10,
                 Some("node-a"),
                 true,
-                crate::service::node_config::NodeReuseRuntimeDeliveryMode::GuardedCandidate,
+                crate::service::node_config::NodeReuseRuntimeDeliveryMode::EffectiveConfig,
             )
             .await
             .expect("test-only guarded candidate snapshot");
@@ -1742,6 +1965,164 @@ mod tests {
         assert_eq!(
             guarded_candidate.config_fingerprint,
             relay_shared::reconciliation::config_fingerprint(&guarded_candidate.config).as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn node_reuse_runtime_enabled_delivers_exact_node_effective_config_and_converges_revocation(
+    ) {
+        let (mut state, pool) = seeded_state().await;
+        state.config.node_reuse_runtime_enabled = true;
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid)
+             VALUES (20, 'reuse-source', 'in', 'tok-B', 2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port)
+             VALUES (200, 'reuse-rule', 2, 21000, 20, '127.0.0.1', 81)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO node_reuse_bindings (reusing_group_id, home_group_id, node_id)
+             VALUES (20, 10, 'node-a')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let secret_a =
+            install_active_runtime_credential(&pool, "cred-runtime-a", 10, "node-a", 0x71).await;
+        let secret_f =
+            install_active_runtime_credential(&pool, "cred-runtime-f", 10, "node-f", 0x72).await;
+
+        let http = get_config(
+            State(state.clone()),
+            credential_config_headers("cred-runtime-a", &secret_a, "node-a"),
+        )
+        .await;
+        assert_eq!(http.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(http.into_body(), 65536).await.unwrap();
+        let snapshot: NodeConfigSnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            snapshot
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![100, 200]
+        );
+
+        let certificate_state_dir = std::path::PathBuf::from(state.config.certificate_state_dir());
+        let ws = crate::api::ws::build_config_snapshot_for_node(
+            state.db.as_ref(),
+            &certificate_state_dir,
+            10,
+            Some("node-a"),
+            true,
+            true,
+        )
+        .await
+        .expect("verified runtime WS snapshot");
+        assert_eq!(ws.config_revision, snapshot.config_revision);
+        assert_eq!(ws.config_fingerprint, snapshot.config_fingerprint);
+        assert_eq!(
+            serde_json::to_value(&ws.config).unwrap(),
+            serde_json::to_value(&snapshot.config).unwrap(),
+            "HTTP and WS must publish the same effective config"
+        );
+
+        let sibling = get_config(
+            State(state.clone()),
+            credential_config_headers("cred-runtime-f", &secret_f, "node-f"),
+        )
+        .await;
+        assert_eq!(sibling.status(), StatusCode::OK);
+        let sibling_body = axum::body::to_bytes(sibling.into_body(), 65536)
+            .await
+            .unwrap();
+        let sibling_snapshot: NodeConfigSnapshot = serde_json::from_slice(&sibling_body).unwrap();
+        assert_eq!(
+            sibling_snapshot
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![100],
+            "Node F must not inherit Node E/node-a's Binding"
+        );
+
+        let legacy = get_config(
+            State(state.clone()),
+            config_headers_for_node("tok-A", "node-a"),
+        )
+        .await;
+        assert_eq!(legacy.status(), StatusCode::OK);
+        let legacy_body = axum::body::to_bytes(legacy.into_body(), 65536)
+            .await
+            .unwrap();
+        let legacy_snapshot: NodeConfigSnapshot = serde_json::from_slice(&legacy_body).unwrap();
+        assert_eq!(
+            legacy_snapshot
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![100],
+            "Legacy Group Token remains Home-only even when runtime reuse is enabled"
+        );
+
+        let old_revision = snapshot.config_revision;
+        let old_attribution_key = format!("node_config_rule_sources:10:node-a:{old_revision}");
+        let old_attribution = state
+            .db
+            .get(&old_attribution_key)
+            .await
+            .unwrap()
+            .expect("delivered revision attribution");
+        let old_attribution: std::collections::BTreeMap<i64, i64> =
+            serde_json::from_str(&old_attribution).unwrap();
+        assert_eq!(old_attribution.get(&100), Some(&10));
+        assert_eq!(old_attribution.get(&200), Some(&20));
+
+        sqlx::query(
+            "DELETE FROM node_reuse_bindings
+             WHERE reusing_group_id=20 AND home_group_id=10 AND node_id='node-a'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let after = get_config(
+            State(state.clone()),
+            credential_config_headers("cred-runtime-a", &secret_a, "node-a"),
+        )
+        .await;
+        assert_eq!(after.status(), StatusCode::OK);
+        let after_body = axum::body::to_bytes(after.into_body(), 65536)
+            .await
+            .unwrap();
+        let after_snapshot: NodeConfigSnapshot = serde_json::from_slice(&after_body).unwrap();
+        assert_eq!(
+            after_snapshot
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![100]
+        );
+        assert!(after_snapshot.config_revision > old_revision);
+        assert!(
+            state.db.get(&old_attribution_key).await.unwrap().is_some(),
+            "old applied revision attribution must remain available for delayed traffic"
         );
     }
 

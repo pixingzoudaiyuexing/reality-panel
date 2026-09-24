@@ -247,6 +247,7 @@ pub(crate) async fn apply_cached_coordinated(
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
     config: &NodeConfigResponse,
+    config_revision: u64,
 ) -> CoordinatedApplyOutcome {
     let fingerprint = relay_shared::reconciliation::config_fingerprint(config);
     apply_coordinated(
@@ -256,7 +257,7 @@ pub(crate) async fn apply_cached_coordinated(
         Some(config),
         None,
         false,
-        0,
+        config_revision,
         fingerprint.as_str(),
     )
     .await
@@ -296,10 +297,18 @@ async fn apply_coordinated(
 
     let mut forwarders = manager.lock().await;
     let applied = if allow_cleanup {
-        forwarders.apply_config(&effective).await
+        forwarders
+            .apply_config_with_revision(&effective, config_revision)
+            .await
     } else {
         forwarders
-            .apply_config_scoped(&effective, &std::collections::HashSet::new(), false, false)
+            .apply_config_scoped_with_revision(
+                &effective,
+                &std::collections::HashSet::new(),
+                false,
+                false,
+                config_revision,
+            )
             .await
     };
     if !applied {

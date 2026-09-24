@@ -59,6 +59,7 @@ pub struct NginxSniPlan {
     rules: Vec<NginxSniRule>,
     default_backend: String,
     access_log_path: String,
+    config_revision: u64,
 }
 
 impl NginxSniPlan {
@@ -143,7 +144,13 @@ impl NginxSniPlan {
             rules,
             default_backend: default_backend.to_string(),
             access_log_path: access_log_path.to_string(),
+            config_revision: 0,
         })
+    }
+
+    pub fn with_config_revision(mut self, config_revision: u64) -> Self {
+        self.config_revision = config_revision;
+        self
     }
 
     pub(super) fn with_configured_targets(
@@ -218,7 +225,10 @@ impl NginxSniPlan {
             out.push_str("}\n\n");
         }
 
-        out.push_str("log_format relay_panel_sni_traffic '$msec|$server_port|$ssl_preread_server_name|$relay_panel_sni_rule_id|$bytes_sent|$bytes_received|$session_time';\n");
+        out.push_str(&format!(
+            "log_format relay_panel_sni_traffic '$msec|$server_port|$ssl_preread_server_name|$relay_panel_sni_rule_id|{}|$bytes_sent|$bytes_received|$session_time';\n",
+            self.config_revision
+        ));
         out.push_str(&format!(
             "access_log {} relay_panel_sni_traffic;\n\n",
             quote_nginx_string(&self.access_log_path)

@@ -400,7 +400,7 @@ fn listener_conflict_kind(
 }
 
 fn detect_preview_conflicts(
-    home_group_id: i64,
+    _home_group_id: i64,
     listeners: &[EffectiveConfigPreviewListener],
     camouflage_sites: &[EffectiveConfigPreviewCamouflage],
 ) -> Vec<EffectiveConfigPreviewConflict> {
@@ -469,18 +469,6 @@ fn detect_preview_conflicts(
                     site.certificate_domain.clone(),
                 ),
             );
-        }
-
-        if site.source_group_id != home_group_id {
-            conflicts.push(EffectiveConfigPreviewConflict {
-                kind: "CROSS_GROUP_CERTIFICATE_SCOPE_UNRESOLVED".into(),
-                source_group_id: site.source_group_id,
-                rule_id: None,
-                other_source_group_id: Some(home_group_id),
-                other_rule_id: None,
-                message: "a reusing Group certificate scope is not authority for the Home Group"
-                    .into(),
-            });
         }
     }
 
@@ -995,7 +983,7 @@ mod tests {
             certificate_domain: "*.example.com".into(),
         };
         let conflicts = preview_conflicts_for_test(10, &[listener], &[site]);
-        assert!(conflicts
+        assert!(!conflicts
             .iter()
             .any(|conflict| conflict.kind == "CROSS_GROUP_CERTIFICATE_SCOPE_UNRESOLVED"));
     }
