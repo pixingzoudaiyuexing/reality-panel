@@ -299,6 +299,17 @@ pub async fn delete_group(
                     ),
                 ));
             }
+            if let Some(in_use) =
+                e.downcast_ref::<crate::service::groups::GroupReuseBindingInUseError>()
+            {
+                return Json(err(
+                    409,
+                    format!(
+                        "该分组仍被 {} 条具体 Node 复用授权引用，请先删除对应授权。",
+                        in_use.binding_count
+                    ),
+                ));
+            }
             tracing::error!("delete_group {}: delete_group failed: {}", id, e);
             Json(err(500, "数据库错误"))
         }

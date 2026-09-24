@@ -6269,6 +6269,419 @@ async fn node_reuse_binding_repository_contract() {
 }
 
 #[tokio::test]
+async fn node_reuse_atomic_active_credential_admission_contract() {
+    let db = repo().await;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for gid in [10, 20, 30, 40, 50] {
+        seed_group(&db, gid).await;
+    }
+
+    let node = crate::node_identity::ReuseEligibleNodeId::parse("NODE_A").unwrap();
+    let candidate = db
+        .allocate_node_credential_candidate(&test_node_credential_candidate(
+            "s4a-active-1",
+            10,
+            "NODE_A",
+            0xa1,
+        ))
+        .await
+        .unwrap();
+    assert!(db
+        .find_current_active_node_credential_for_identity(10, &node)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        db.create_node_reuse_binding_if_active(20, 10, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Rejected(
+            NodeReuseBindingCreateRejection::ActiveCredentialMissing
+        )
+    );
+
+    assert_eq!(
+        db.activate_node_credential(&candidate.credential_id, 10, &node, candidate.generation)
+            .await
+            .unwrap(),
+        NodeCredentialMutationResult::Applied
+    );
+    assert_eq!(
+        db.find_current_active_node_credential_for_identity(10, &node)
+            .await
+            .unwrap()
+            .unwrap()
+            .credential_id,
+        "s4a-active-1"
+    );
+
+    assert!(matches!(
+        db.create_node_reuse_binding_if_active(20, 10, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Created(_)
+    ));
+    assert!(matches!(
+        db.create_node_reuse_binding_if_active(20, 10, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Existing(_)
+    ));
+
+    // Same node_id in another Home namespace is not evidence for that identity.
+    assert_eq!(
+        db.create_node_reuse_binding_if_active(20, 30, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Rejected(
+            NodeReuseBindingCreateRejection::ActiveCredentialMissing
+        )
+    );
+
+    // Two concurrent attempts for one exact binding converge to one durable row.
+    let (a, b) = tokio::join!(
+        db.create_node_reuse_binding_if_active(40, 10, &node),
+        db.create_node_reuse_binding_if_active(40, 10, &node)
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, NodeReuseBindingCreateResult::Created(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, NodeReuseBindingCreateResult::Existing(_)))
+            .count(),
+        1
+    );
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM node_reuse_bindings
+         WHERE reusing_group_id = 40 AND home_group_id = 10 AND node_id = 'NODE_A'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1);
+
+    // Non-inbound source is rejected for a new authorization.
+    sqlx::query("UPDATE device_groups SET group_type = 'out' WHERE id = 50")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.create_node_reuse_binding_if_active(50, 10, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Rejected(
+            NodeReuseBindingCreateRejection::ReusingGroupNotInbound
+        )
+    );
+
+    assert_eq!(
+        db.revoke_node_credential(&candidate.credential_id, 10, &node, candidate.generation)
+            .await
+            .unwrap(),
+        NodeCredentialMutationResult::Applied
+    );
+    assert!(db
+        .find_current_active_node_credential_for_identity(10, &node)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Existing admin history remains readable/idempotent after revocation.
+    assert!(matches!(
+        db.create_node_reuse_binding_if_active(20, 10, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Existing(_)
+    ));
+    // But revocation blocks widening authorization to another Group.
+    assert_eq!(
+        db.create_node_reuse_binding_if_active(30, 10, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Rejected(
+            NodeReuseBindingCreateRejection::ActiveCredentialMissing
+        )
+    );
+    assert_eq!(db.count_node_reuse_bindings_for_group(10).await.unwrap(), 2);
+    assert_eq!(db.count_node_reuse_bindings_for_group(20).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn node_reuse_concurrent_mutation_contract() {
+    let path = std::env::temp_dir().join(format!(
+        "reality-panel-s4a-reuse-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let url = format!("sqlite://{}", path.display());
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .unwrap()
+        .create_if_missing(true)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+    let db = SqliteRepository::new(pool.clone());
+    for gid in [10, 20, 30, 40, 50] {
+        seed_group(&db, gid).await;
+    }
+    for (credential_id, node_id, marker) in [
+        ("race-revoke", "NODE_REVOKE", 0xb1_u8),
+        ("race-group", "NODE_GROUP", 0xb2),
+        ("race-delete", "NODE_DELETE", 0xb3),
+        ("race-error", "NODE_ERROR", 0xb4),
+    ] {
+        sqlx::query(
+            "INSERT INTO node_credentials
+             (credential_id, home_group_id, node_id, generation, verifier_format,
+              verifier_version, verifier_data, activated_at)
+             VALUES (?, 10, ?, 1, 'rp-node-sha256', 1, ?, datetime('now'))",
+        )
+        .bind(credential_id)
+        .bind(node_id)
+        .bind(vec![marker; 32])
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let create_db = SqliteRepository::new(pool.clone());
+    let revoke_db = SqliteRepository::new(pool.clone());
+    let create_node = crate::node_identity::ReuseEligibleNodeId::parse("NODE_REVOKE").unwrap();
+    let revoke_node = crate::node_identity::ReuseEligibleNodeId::parse("NODE_REVOKE").unwrap();
+    let (created, revoked) = tokio::join!(
+        create_db.create_node_reuse_binding_if_active(20, 10, &create_node),
+        revoke_db.revoke_node_credential("race-revoke", 10, &revoke_node, 1),
+    );
+    assert_eq!(revoked.unwrap(), NodeCredentialMutationResult::Applied);
+    match created.unwrap() {
+        NodeReuseBindingCreateResult::Created(_) => assert!(db
+            .find_node_reuse_binding(20, 10, "NODE_REVOKE")
+            .await
+            .unwrap()
+            .is_some()),
+        NodeReuseBindingCreateResult::Rejected(
+            NodeReuseBindingCreateRejection::ActiveCredentialMissing,
+        ) => assert!(db
+            .find_node_reuse_binding(20, 10, "NODE_REVOKE")
+            .await
+            .unwrap()
+            .is_none()),
+        other => panic!("unexpected create-vs-revoke result: {other:?}"),
+    }
+    assert!(db
+        .find_current_active_node_credential_for_identity(10, &revoke_node)
+        .await
+        .unwrap()
+        .is_none());
+
+    let create_db = SqliteRepository::new(pool.clone());
+    let delete_db = SqliteRepository::new(pool.clone());
+    let node = crate::node_identity::ReuseEligibleNodeId::parse("NODE_GROUP").unwrap();
+    let (created, deleted) = tokio::join!(
+        create_db.create_node_reuse_binding_if_active(30, 10, &node),
+        delete_db.delete_group(30, &ResourceScope::All),
+    );
+    match (created.unwrap(), deleted) {
+        (NodeReuseBindingCreateResult::Created(_), Err(DbError::ForeignKeyViolation)) => {
+            assert!(db
+                .find_node_reuse_binding(30, 10, "NODE_GROUP")
+                .await
+                .unwrap()
+                .is_some());
+        }
+        (
+            NodeReuseBindingCreateResult::Rejected(
+                NodeReuseBindingCreateRejection::ReusingGroupMissing,
+            ),
+            Ok(1),
+        ) => assert!(db
+            .find_node_reuse_binding(30, 10, "NODE_GROUP")
+            .await
+            .unwrap()
+            .is_none()),
+        other => panic!("unexpected create-vs-group-delete result: {other:?}"),
+    }
+
+    let create_db = SqliteRepository::new(pool.clone());
+    let delete_db = SqliteRepository::new(pool.clone());
+    let node = crate::node_identity::ReuseEligibleNodeId::parse("NODE_DELETE").unwrap();
+    let (created, deleted) = tokio::join!(
+        create_db.create_node_reuse_binding_if_active(40, 10, &node),
+        delete_db.delete_node_reuse_binding(40, 10, "NODE_DELETE"),
+    );
+    assert!(matches!(
+        created.unwrap(),
+        NodeReuseBindingCreateResult::Created(_)
+    ));
+    let deleted = deleted.unwrap();
+    assert!(deleted <= 1);
+    assert_eq!(
+        db.find_node_reuse_binding(40, 10, "NODE_DELETE")
+            .await
+            .unwrap()
+            .is_some(),
+        deleted == 0
+    );
+
+    let error_node = crate::node_identity::ReuseEligibleNodeId::parse("NODE_ERROR").unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_s4a_reuse_insert
+         BEFORE INSERT ON node_reuse_bindings
+         WHEN NEW.node_id = 'NODE_ERROR'
+         BEGIN SELECT RAISE(ABORT, 'forced s4a insert failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(db
+        .create_node_reuse_binding_if_active(50, 10, &error_node)
+        .await
+        .is_err());
+    assert!(db
+        .find_node_reuse_binding(50, 10, "NODE_ERROR")
+        .await
+        .unwrap()
+        .is_none());
+    sqlx::query("DROP TRIGGER fail_s4a_reuse_insert")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.create_node_reuse_binding_if_active(50, 10, &error_node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Created(_)
+    ));
+
+    pool.close().await;
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+}
+
+#[tokio::test]
+async fn node_reuse_preview_business_contract() {
+    let db = repo().await;
+    for gid in [10, 20, 30] {
+        seed_group(&db, gid).await;
+    }
+    for (id, group_id, port, paused) in [
+        (9100_i64, 10_i64, 19100_i64, 0_i64),
+        (9200, 20, 19200, 0),
+        (9201, 20, 19201, 1),
+        (9300, 30, 19300, 0),
+    ] {
+        sqlx::query(
+            "INSERT INTO forward_rules
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port, paused)
+             VALUES (?, ?, 1, ?, ?, '127.0.0.1', 80, ?)",
+        )
+        .bind(id)
+        .bind(format!("preview-{id}"))
+        .bind(port)
+        .bind(group_id)
+        .bind(paused)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    for (credential_id, home_group_id) in [("preview-home", 10_i64), ("preview-same-id", 30)] {
+        sqlx::query(
+            "INSERT INTO node_credentials
+             (credential_id, home_group_id, node_id, generation, verifier_format,
+              verifier_version, verifier_data, activated_at)
+             VALUES (?, ?, 'NODE_PREVIEW', 1, 'rp-node-sha256', 1, ?, datetime('now'))",
+        )
+        .bind(credential_id)
+        .bind(home_group_id)
+        .bind(vec![home_group_id as u8; 32])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    db.insert_node_reuse_binding(20, 10, "NODE_PREVIEW")
+        .await
+        .unwrap();
+    db.insert_node_reuse_binding(30, 10, "NODE_PREVIEW")
+        .await
+        .unwrap();
+
+    assert!(db
+        .get("node_config_revision:10:NODE_PREVIEW")
+        .await
+        .unwrap()
+        .is_none());
+    let preview =
+        crate::service::node_reuse::preview_effective_config_for_node(&db, 10, "NODE_PREVIEW")
+            .await
+            .unwrap();
+    assert_eq!(preview.source_group_ids, vec![10, 20, 30]);
+    assert_eq!(
+        preview
+            .listeners
+            .iter()
+            .map(|listener| (listener.source_group_id, listener.rule_id))
+            .collect::<Vec<_>>(),
+        vec![(10, 9100), (20, 9200), (30, 9300)]
+    );
+    assert!(!preview.runtime_delivery_enabled);
+    assert!(db
+        .get("node_config_revision:10:NODE_PREVIEW")
+        .await
+        .unwrap()
+        .is_none());
+
+    let same_id_other_home =
+        crate::service::node_reuse::preview_effective_config_for_node(&db, 30, "NODE_PREVIEW")
+            .await
+            .unwrap();
+    assert_eq!(same_id_other_home.source_group_ids, vec![30]);
+
+    assert_eq!(
+        db.delete_node_reuse_binding(20, 10, "NODE_PREVIEW")
+            .await
+            .unwrap(),
+        1
+    );
+    let after_delete =
+        crate::service::node_reuse::preview_effective_config_for_node(&db, 10, "NODE_PREVIEW")
+            .await
+            .unwrap();
+    assert_eq!(after_delete.source_group_ids, vec![10, 30]);
+
+    sqlx::query(
+        "UPDATE node_credentials SET revoked_at = datetime('now')
+         WHERE credential_id = 'preview-home'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        crate::service::node_reuse::preview_effective_config_for_node(&db, 10, "NODE_PREVIEW")
+            .await,
+        Err(
+            crate::service::node_reuse::NodeReuseServiceError::AdmissionRejected(
+                NodeReuseBindingCreateRejection::ActiveCredentialMissing
+            )
+        )
+    ));
+}
+
+#[tokio::test]
 async fn node_reuse_schema_constraints_and_fk_restrict() {
     let db = repo().await;
     sqlx::query("PRAGMA foreign_keys = ON")

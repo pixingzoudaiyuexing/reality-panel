@@ -110,11 +110,25 @@ pub async fn build_node_config_for_node(
     group_id: i64,
     node_id: Option<&str>,
 ) -> Result<NodeConfigResponse, NodeConfigBuildError> {
+    build_node_config_for_source_group_on_home_node(db, group_id, group_id, node_id).await
+}
+
+/// Pure read-only builder used by S4-A EffectiveConfig preview. Rules and
+/// ownership come from `source_group_id`; concrete-node status/camouflage IP
+/// identity remains namespaced by `node_home_group_id`. This function does
+/// not allocate a config revision, write a fingerprint/LKG, issue certificates,
+/// touch DNS, or notify a live Node.
+pub async fn build_node_config_for_source_group_on_home_node(
+    db: &dyn Repository,
+    source_group_id: i64,
+    node_home_group_id: i64,
+    node_id: Option<&str>,
+) -> Result<NodeConfigResponse, NodeConfigBuildError> {
     // 1. Group + "in" gate. Non-`in` groups (out / monitor / chained_outbound)
     //    never receive listeners — they are egress/observation only.
     // find_by_id exists on both UserRepository and GroupRepository; we want the
     // group one, so qualify the call.
-    let group = match GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await? {
+    let group = match GroupRepository::find_by_id(db, source_group_id, &ResourceScope::All).await? {
         Some(g) if g.group_type == "in" => g,
         Some(_) => return Err(NodeConfigBuildError::NotInboundGroup),
         None => return Err(NodeConfigBuildError::GroupNotFound),
@@ -168,7 +182,7 @@ pub async fn build_node_config_for_node(
                         .await?
                         .domain;
                 if let Some(expected_public_ip) =
-                    expected_camouflage_public_ipv4(db, &group, node_id).await?
+                    expected_camouflage_public_ipv4(db, node_home_group_id, &group, node_id).await?
                 {
                     camouflage_by_sni
                         .entry(sni.clone())
@@ -429,11 +443,12 @@ async fn build_node_config_snapshot_for_node_inner(
 
 async fn expected_camouflage_public_ipv4(
     db: &dyn Repository,
+    node_home_group_id: i64,
     group: &DeviceGroup,
     node_id: Option<&str>,
 ) -> Result<Option<String>, NodeConfigBuildError> {
     if let Some(node_id) = node_id.map(str::trim).filter(|id| !id.is_empty()) {
-        let key = format!("node_status:{}:{}", group.id, node_id);
+        let key = format!("node_status:{node_home_group_id}:{node_id}");
         let Some(raw) = db.get(&key).await? else {
             return Ok(None);
         };

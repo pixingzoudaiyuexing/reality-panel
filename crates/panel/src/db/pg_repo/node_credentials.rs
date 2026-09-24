@@ -89,6 +89,32 @@ impl NodeCredentialRepository for PgRepository {
         .await?)
     }
 
+    async fn find_current_active_node_credential_for_identity(
+        &self,
+        home_group_id: i64,
+        node_id: &crate::node_identity::ReuseEligibleNodeId,
+    ) -> Result<Option<NodeCredentialRecord>, DbError> {
+        Ok(sqlx::query_as::<_, NodeCredentialRecord>(
+            "SELECT credential_id, home_group_id, node_id, generation, verifier_format, \
+                    verifier_version, verifier_data, created_at, updated_at, activated_at, revoked_at \
+             FROM node_credentials AS current \
+             WHERE current.home_group_id = $1 AND current.node_id = $2 \
+               AND current.activated_at IS NOT NULL \
+               AND current.revoked_at IS NULL \
+               AND current.generation = ( \
+                   SELECT MAX(history.generation) FROM node_credentials AS history \
+                   WHERE history.home_group_id = current.home_group_id \
+                     AND history.node_id = current.node_id \
+                     AND history.activated_at IS NOT NULL \
+               ) \
+             LIMIT 1",
+        )
+        .bind(home_group_id)
+        .bind(node_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     async fn list_node_credentials_for_identity(
         &self,
         home_group_id: i64,

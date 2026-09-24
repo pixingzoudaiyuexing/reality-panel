@@ -4,6 +4,7 @@ use serde::Serialize;
 mod auth;
 mod dnsmgr;
 mod groups;
+mod node_reuse;
 mod nodes;
 mod password;
 mod plans;
@@ -15,6 +16,7 @@ mod users;
 
 pub use dnsmgr::*;
 pub use groups::*;
+pub use node_reuse::*;
 pub use password::*;
 pub use plans::*;
 pub use profiles::*;

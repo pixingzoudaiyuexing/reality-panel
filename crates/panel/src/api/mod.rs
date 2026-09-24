@@ -164,6 +164,27 @@ pub fn routes() -> Router<AppState> {
                 )),
         )
         .route(
+            "/admin/node-reuse/bindings",
+            axum::routing::post(admin::create_binding)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/admin/node-reuse/bindings/{reusing_group_id}/{home_group_id}/{node_id}",
+            axum::routing::get(admin::get_binding).delete(admin::delete_binding),
+        )
+        .route(
+            "/admin/node-reuse/nodes/{home_group_id}/{node_id}/bindings",
+            axum::routing::get(admin::list_bindings_for_node),
+        )
+        .route(
+            "/admin/node-reuse/groups/{reusing_group_id}/nodes",
+            axum::routing::get(admin::list_reused_nodes_for_group),
+        )
+        .route(
+            "/admin/node-reuse/nodes/{home_group_id}/{node_id}/effective-config-preview",
+            axum::routing::get(admin::preview_effective_config),
+        )
+        .route(
             "/admin/node-enrollments",
             axum::routing::post(node_enrollment::create_enrollment),
         )

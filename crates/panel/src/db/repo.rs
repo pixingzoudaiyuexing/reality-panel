@@ -595,12 +595,28 @@ pub struct ConcreteNodeIdentity {
 
 /// One explicit authorization for `reusing_group_id` to run on exactly one
 /// concrete Home-Group node. This does not transfer node ownership.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
 pub struct NodeReuseBinding {
     pub reusing_group_id: i64,
     pub home_group_id: i64,
     pub node_id: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeReuseBindingCreateRejection {
+    ReusingGroupMissing,
+    HomeGroupMissing,
+    ReusingGroupNotInbound,
+    HomeGroupNotInbound,
+    ActiveCredentialMissing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeReuseBindingCreateResult {
+    Created(NodeReuseBinding),
+    Existing(NodeReuseBinding),
+    Rejected(NodeReuseBindingCreateRejection),
 }
 
 #[async_trait]
@@ -611,6 +627,20 @@ pub trait NodeReuseRepository: Send + Sync {
         home_group_id: i64,
         node_id: &str,
     ) -> Result<(), DbError>;
+    /// Atomically admits a new exact-node reuse binding. Implementations must
+    /// re-check both Group rows and the exact identity's current ACTIVE
+    /// Credential in the same transaction as the INSERT so a concurrent Group
+    /// deletion/type change or Credential revocation cannot race admission.
+    ///
+    /// An already-persisted exact binding returns Existing without requiring
+    /// the Credential to still be active: a binding is durable admin history,
+    /// while runtime/preview authority is revalidated separately.
+    async fn create_node_reuse_binding_if_active(
+        &self,
+        reusing_group_id: i64,
+        home_group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+    ) -> Result<NodeReuseBindingCreateResult, DbError>;
     async fn find_node_reuse_binding(
         &self,
         reusing_group_id: i64,
@@ -632,6 +662,9 @@ pub trait NodeReuseRepository: Send + Sync {
         &self,
         home_group_id: i64,
     ) -> Result<i64, DbError>;
+    /// Counts bindings that reference this Group in either role. Used by the
+    /// admin Group deletion guard; FK RESTRICT remains the database backstop.
+    async fn count_node_reuse_bindings_for_group(&self, group_id: i64) -> Result<i64, DbError>;
     async fn delete_node_reuse_binding(
         &self,
         reusing_group_id: i64,
@@ -830,6 +863,14 @@ pub trait NodeCredentialRepository: Send + Sync {
     async fn find_active_node_credential_for_runtime(
         &self,
         credential_id: &str,
+    ) -> Result<Option<NodeCredentialRecord>, DbError>;
+
+    /// Identity-scoped form of the current-ACTIVE lookup. Returns exactly the
+    /// latest activated generation only when it is still non-revoked.
+    async fn find_current_active_node_credential_for_identity(
+        &self,
+        home_group_id: i64,
+        node_id: &ReuseEligibleNodeId,
     ) -> Result<Option<NodeCredentialRecord>, DbError>;
 
     async fn list_node_credentials_for_identity(
