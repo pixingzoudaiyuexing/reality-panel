@@ -2020,6 +2020,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matching_strict_ack_clears_old_pending_and_advances_next_generation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<TrafficReport>::new()));
+        let captured_server = captured.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let report = read_http_traffic_report(&mut stream).await;
+                captured_server.lock().await.push(report.clone());
+                let body = ack_body(&report, TrafficBatchAckStatus::Applied);
+                write_http_response(&mut stream, "200 OK", &body).await;
+            }
+        });
+
+        let dir = private_test_dir("deleted-history-ack-progress");
+        let config = strict_test_config(format!("http://{addr}"), &dir);
+        let counter = TrafficCounter::new();
+
+        // Model bytes sealed under an old applied config. A real Panel may ACK
+        // these after billing a deleted historical rule or terminally disposing
+        // an unbillable historical entry; either outcome is represented by the
+        // same strict Applied ACK contract.
+        counter.add_at(42, 7, 10, 20).await;
+        report_traffic(&config, &counter, "NODE_T1").await;
+        let pending_path = dir.join(TRAFFIC_PENDING_FILENAME);
+        assert!(
+            !pending_path.exists(),
+            "matching Applied ACK must clear the durable old pending batch"
+        );
+
+        // Traffic produced under the next applied config must now be free to
+        // form and send a new immutable batch rather than remaining blocked.
+        counter.add_at(43, 7, 3, 4).await;
+        report_traffic(&config, &counter, "NODE_T1").await;
+        assert!(!pending_path.exists());
+        assert!(counter.snapshot().await.entries.is_empty());
+
+        server.await.unwrap();
+        let requests = captured.lock().await;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].batch.as_ref().unwrap().config_revision,
+            Some(42)
+        );
+        assert_eq!(
+            requests[1].batch.as_ref().unwrap().config_revision,
+            Some(43)
+        );
+        assert_ne!(
+            requests[0].batch.as_ref().unwrap().batch_id,
+            requests[1].batch.as_ref().unwrap().batch_id
+        );
+        assert_eq!(traffic(&requests[1].reports, 7), Some((3, 4)));
+
+        drop(requests);
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn strict_connection_failure_keeps_same_durable_pending_batch() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
