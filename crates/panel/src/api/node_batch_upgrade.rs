@@ -787,6 +787,7 @@ mod tests {
                 cors_origins: vec![],
                 geoip_enabled: false,
                 geoip_cache_ttl: 604_800,
+                node_reuse_runtime_enabled: false,
             },
             release_cache: ReleaseCache::new(),
             node_connections: NodeConnections::new(),

@@ -205,7 +205,6 @@ impl TrafficRepository for PgRepository {
         scope: &TrafficBatchScope,
         entries: &[TrafficEntry],
     ) -> Result<IdempotentTrafficBatchResult, DbError> {
-        let group_id = scope.home_group_id;
         let mut tx = self.pool.begin().await?;
 
         let computed = relay_shared::protocol::traffic_batch_payload_sha256(entries);
@@ -276,27 +275,6 @@ impl TrafficRepository for PgRepository {
             return Ok(IdempotentTrafficBatchResult::IdentityUnavailable);
         }
 
-        // ── v1.0.8: read this group's billing rate once for the whole batch
-        // (every entry in a batch is for the SAME group_id). rate lives on
-        // device_groups; users are CHARGED real * rate (rounded) while
-        // forward_rules keeps real bytes. Missing group → rate=1.0 (defensive;
-        // its rules will be rejected as Unavailable below anyway). ──
-        let rate: f64 = sqlx::query_scalar("SELECT rate FROM device_groups WHERE id = $1")
-            .bind(group_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .flatten()
-            .unwrap_or(1.0);
-        if !(0.1..=100.0).contains(&rate) {
-            let _ = tx.rollback().await;
-            tracing::error!(
-                "traffic_batch: group {} has out-of-range rate {} (expected 0.1..=100)",
-                group_id,
-                rate
-            );
-            return Ok(IdempotentTrafficBatchResult::Overflow);
-        }
-
         // ── Pass 1: validate u64→i64 per entry + aggregate duplicate rule_ids
         // into one per-rule delta (so the cumulative overflow check sees the
         // true batch total, not a per-row slice). ──
@@ -336,6 +314,7 @@ impl TrafficRepository for PgRepository {
             /// v1.0.8: billed bytes charged to the USER = round((up+down) * rate).
             /// Separate from delta_up/delta_down (real bytes for the rule).
             billed_delta: i64,
+            source_group_id: i64,
         }
         let mut resolved: Vec<Resolved> = Vec::with_capacity(rule_delta.len());
         let mut user_delta: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
@@ -347,6 +326,25 @@ impl TrafficRepository for PgRepository {
                     return Ok(IdempotentTrafficBatchResult::Overflow);
                 }
             };
+            let Some(&source_group_id) = scope.rule_source_groups.get(rule_id) else {
+                let _ = tx.rollback().await;
+                return Ok(IdempotentTrafficBatchResult::Unavailable);
+            };
+            let rate: f64 = sqlx::query_scalar("SELECT rate FROM device_groups WHERE id = $1")
+                .bind(source_group_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten()
+                .unwrap_or(1.0);
+            if !(0.1..=100.0).contains(&rate) {
+                let _ = tx.rollback().await;
+                tracing::error!(
+                    "traffic_batch: source group {} has out-of-range rate {} (expected 0.1..=100)",
+                    source_group_id,
+                    rate
+                );
+                return Ok(IdempotentTrafficBatchResult::Overflow);
+            }
             // JOIN users to fetch both the rule's and the user's current totals
             // in one round trip (same as the SQLite path).
             let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
@@ -356,7 +354,7 @@ impl TrafficRepository for PgRepository {
                  WHERE fr.id = $1 AND fr.device_group_in = $2",
             )
             .bind(rule_id)
-            .bind(group_id)
+            .bind(source_group_id)
             .fetch_optional(&mut *tx)
             .await?;
             let Some((rid, uid, rule_used, user_used)) = row else {
@@ -364,7 +362,7 @@ impl TrafficRepository for PgRepository {
                     "traffic_batch: rule {} not available to group {} \
                      (missing or foreign) — rejecting batch",
                     rule_id,
-                    group_id
+                    source_group_id
                 );
                 let _ = tx.rollback().await;
                 return Ok(IdempotentTrafficBatchResult::Unavailable);
@@ -403,6 +401,7 @@ impl TrafficRepository for PgRepository {
                 delta_up: *dup,
                 delta_down: *ddown,
                 billed_delta,
+                source_group_id,
             });
         }
 
@@ -444,7 +443,7 @@ impl TrafficRepository for PgRepository {
             // v1.2.0: the batch's group — the rule's group by construction
             // (pass 2 verified ownership against it). Refreshed on conflict so
             // a row the backfill left at 0 self-heals on the next report.
-            .bind(group_id)
+            .bind(r.source_group_id)
             .bind(&hour_ts)
             .bind(up)
             .bind(down)

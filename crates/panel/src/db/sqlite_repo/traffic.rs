@@ -244,7 +244,6 @@ impl TrafficRepository for SqliteRepository {
         scope: &TrafficBatchScope,
         entries: &[TrafficEntry],
     ) -> Result<IdempotentTrafficBatchResult, DbError> {
-        let group_id = scope.home_group_id;
         let mut tx = self.pool.begin().await?;
 
         let computed = relay_shared::protocol::traffic_batch_payload_sha256(entries);
@@ -312,33 +311,6 @@ impl TrafficRepository for SqliteRepository {
             return Ok(IdempotentTrafficBatchResult::IdentityUnavailable);
         }
 
-        // ── v1.0.8: read this group's billing rate once for the whole batch
-        // (every entry in a batch is for the SAME group_id — the node reports
-        // per-group). rate is stored on device_groups; users are CHARGED
-        // real * rate (rounded), while forward_rules keeps real bytes. A group
-        // missing here is treated as rate=1.0 (defensive: a deleted group mid-
-        // batch shouldn't crash accounting — the per-rule ownership check below
-        // will reject its rules as Unavailable anyway). ──
-        let rate: f64 = sqlx::query_scalar("SELECT rate FROM device_groups WHERE id = ?")
-            .bind(group_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            // Group deleted mid-batch → treat as rate=1.0 (its rules will be
-            // rejected as Unavailable in Pass 2 anyway; don't crash accounting).
-            .flatten()
-            .unwrap_or(1.0);
-        if !(0.1..=100.0).contains(&rate) {
-            // Out-of-range rate is a data integrity bug; refuse the batch
-            // rather than silently billing a wrong amount.
-            let _ = tx.rollback().await;
-            tracing::error!(
-                "traffic_batch: group {} has out-of-range rate {} (expected 0.1..=100)",
-                group_id,
-                rate
-            );
-            return Ok(IdempotentTrafficBatchResult::Overflow);
-        }
-
         // ── Pass 1: validate u64→i64 per entry (a single entry's upload or
         // download alone can exceed i64::MAX; reject before any DB read). ──
         // Aggregate duplicate rule_ids INTO ONE delta first so the per-rule
@@ -381,6 +353,7 @@ impl TrafficRepository for SqliteRepository {
             /// v1.0.8: billed bytes charged to the USER = round((up+down) * rate).
             /// Kept separate from delta_up/delta_down (real bytes for the rule).
             billed_delta: i64,
+            source_group_id: i64,
         }
         let mut resolved: Vec<Resolved> = Vec::with_capacity(rule_delta.len());
         // Track the per-USER aggregate delta (a user may own several rules in
@@ -395,6 +368,25 @@ impl TrafficRepository for SqliteRepository {
                     return Ok(IdempotentTrafficBatchResult::Overflow);
                 }
             };
+            let Some(&source_group_id) = scope.rule_source_groups.get(rule_id) else {
+                let _ = tx.rollback().await;
+                return Ok(IdempotentTrafficBatchResult::Unavailable);
+            };
+            let rate: f64 = sqlx::query_scalar("SELECT rate FROM device_groups WHERE id = ?")
+                .bind(source_group_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten()
+                .unwrap_or(1.0);
+            if !(0.1..=100.0).contains(&rate) {
+                let _ = tx.rollback().await;
+                tracing::error!(
+                    "traffic_batch: source group {} has out-of-range rate {} (expected 0.1..=100)",
+                    source_group_id,
+                    rate
+                );
+                return Ok(IdempotentTrafficBatchResult::Overflow);
+            }
             let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
                 "SELECT fr.id, fr.uid, fr.traffic_used, u.traffic_used \
                  FROM forward_rules fr \
@@ -402,7 +394,7 @@ impl TrafficRepository for SqliteRepository {
                  WHERE fr.id = ? AND fr.device_group_in = ?",
             )
             .bind(rule_id)
-            .bind(group_id)
+            .bind(source_group_id)
             .fetch_optional(&mut *tx)
             .await?;
             let Some((rid, uid, rule_used, user_used)) = row else {
@@ -412,7 +404,7 @@ impl TrafficRepository for SqliteRepository {
                     "traffic_batch: rule {} not available to group {} \
                      (missing or foreign) — rejecting batch",
                     rule_id,
-                    group_id
+                    source_group_id
                 );
                 let _ = tx.rollback().await;
                 return Ok(IdempotentTrafficBatchResult::Unavailable);
@@ -454,6 +446,7 @@ impl TrafficRepository for SqliteRepository {
                 delta_up: *dup,
                 delta_down: *ddown,
                 billed_delta,
+                source_group_id,
             });
         }
 
@@ -506,7 +499,7 @@ impl TrafficRepository for SqliteRepository {
             // group, and pass 2 already verified ownership against THIS group,
             // so it is the rule's group by construction. Refreshed on conflict
             // so a row the backfill left at 0 self-heals on the next report.
-            .bind(group_id)
+            .bind(r.source_group_id)
             .bind(&hour_ts)
             .bind(up)
             .bind(down)

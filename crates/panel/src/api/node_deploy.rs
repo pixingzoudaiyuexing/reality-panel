@@ -1894,6 +1894,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
                 cors_origins: vec![],
                 geoip_enabled: false,
                 geoip_cache_ttl: 60,
+                node_reuse_runtime_enabled: false,
             },
             release_cache: ReleaseCache::new(),
             node_connections: NodeConnections::new(),

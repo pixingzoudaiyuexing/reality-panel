@@ -1716,6 +1716,11 @@ async fn traffic_batch_idempotency_contract() {
             credential_generation: generation,
             batch_id: batch_id.into(),
             payload_sha256: relay_shared::protocol::traffic_batch_payload_sha256(entries),
+            config_revision: None,
+            rule_source_groups: entries
+                .iter()
+                .map(|entry| (entry.rule_id, home_group_id))
+                .collect(),
         }
     }
 
@@ -1972,6 +1977,59 @@ async fn traffic_batch_idempotency_contract() {
             .await
             .unwrap();
     assert_eq!(rule100_after, 44);
+
+    let mixed_entries = vec![
+        TrafficEntry {
+            rule_id: 100,
+            upload: 4,
+            download: 6,
+        },
+        TrafficEntry {
+            rule_id: 200,
+            upload: 3,
+            download: 7,
+        },
+    ];
+    let mut mixed_scope = scope(10, "cred-a", 1, "batch-mixed-groups", &mixed_entries);
+    mixed_scope.config_revision = Some(77);
+    mixed_scope.rule_source_groups = [(100_i64, 10_i64), (200, 20)].into_iter().collect();
+    assert_eq!(
+        reopened
+            .apply_idempotent_traffic_batch(&mixed_scope, &mixed_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Applied
+    );
+    assert_eq!(
+        reopened
+            .apply_idempotent_traffic_batch(&mixed_scope, &mixed_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::AlreadyApplied
+    );
+    let mixed_rules: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT id, traffic_used FROM forward_rules WHERE id IN (100,200) ORDER BY id",
+    )
+    .fetch_all(&reopened_pool)
+    .await
+    .unwrap();
+    assert_eq!(mixed_rules, vec![(100, 54), (200, 20)]);
+    let mixed_user: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=1")
+        .fetch_one(&reopened_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        mixed_user, 101,
+        "10 bytes at rate 1.5 plus 10 bytes at rate 1.0 adds 25 billed bytes"
+    );
+    let mixed_history: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT rule_id, group_id FROM traffic_history
+         WHERE rule_id IN (100,200) ORDER BY rule_id",
+    )
+    .fetch_all(&reopened_pool)
+    .await
+    .unwrap();
+    assert_eq!(mixed_history, vec![(100, 10), (200, 20)]);
 
     reopened_pool.close().await;
     let _ = std::fs::remove_file(&path);
