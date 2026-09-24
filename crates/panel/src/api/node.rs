@@ -1284,6 +1284,181 @@ mod tests {
         assert_eq!(user_traffic(&pool, 2).await, 35);
     }
 
+    #[tokio::test]
+    async fn deleted_historical_rule_is_settled_and_does_not_block_next_revision() {
+        let (mut state, pool) = seeded_state().await;
+        state.config.node_reuse_runtime_enabled = true;
+        sqlx::query("UPDATE device_groups SET rate=1.5 WHERE id=10")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid, rate)
+             VALUES (20, 'reuse-source', 'in', 'tok-B', 2, 2.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO forward_rules
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port)
+             VALUES (200, 'reuse-rule', 2, 21000, 20, '127.0.0.1', 81)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO node_reuse_bindings (reusing_group_id, home_group_id, node_id)
+             VALUES (20, 10, 'NODE_T1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let secret =
+            install_active_runtime_credential(&pool, "cred-deleted-history", 10, "NODE_T1", 0xb2)
+                .await;
+        let headers = credential_config_headers("cred-deleted-history", &secret, "NODE_T1");
+
+        let old_response = get_config(State(state.clone()), headers.clone()).await;
+        assert_eq!(old_response.status(), StatusCode::OK);
+        let old_body = axum::body::to_bytes(old_response.into_body(), 65536)
+            .await
+            .unwrap();
+        let old_snapshot: NodeConfigSnapshot = serde_json::from_slice(&old_body).unwrap();
+        assert!(old_snapshot
+            .config
+            .listeners
+            .iter()
+            .any(|listener| listener.rule_id == 200));
+
+        // The Node may already have bytes for this exact applied revision when
+        // the Panel physically deletes A and removes the reuse Binding.
+        sqlx::query("DELETE FROM forward_rules WHERE id=200")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "DELETE FROM node_reuse_bindings
+             WHERE reusing_group_id=20 AND home_group_id=10 AND node_id='NODE_T1'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let old_entries = vec![
+            TrafficEntry {
+                rule_id: 100,
+                upload: 4,
+                download: 6,
+            },
+            TrafficEntry {
+                rule_id: 200,
+                upload: 3,
+                download: 7,
+            },
+        ];
+        let old_report = TrafficReport {
+            batch: Some(TrafficBatchMetadata {
+                version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                batch_id: "deleted-history-old".into(),
+                payload_sha256: traffic_batch_payload_sha256(&old_entries),
+                config_revision: Some(old_snapshot.config_revision),
+            }),
+            reports: old_entries,
+        };
+        let app = crate::api::routes().with_state(state.clone());
+        let applied = router_post_traffic(app.clone(), headers.clone(), &old_report).await;
+        assert_eq!(applied.code, 0);
+        assert_eq!(
+            applied.data.expect("Applied ACK").status,
+            TrafficBatchAckStatus::Applied
+        );
+        assert_eq!(rule_traffic(&pool, 100).await, 10);
+        assert_eq!(
+            user_traffic(&pool, 2).await,
+            35,
+            "live B bills at old Home rate and deleted A bills at its saved source rate"
+        );
+        let history: Vec<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT rule_id, group_id, billed_total
+             FROM traffic_history WHERE rule_id IN (100,200) ORDER BY rule_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(history, vec![(100, 10, 15), (200, 20, 20)]);
+
+        let replay = router_post_traffic(app.clone(), headers.clone(), &old_report).await;
+        assert_eq!(replay.code, 0);
+        assert_eq!(
+            replay.data.expect("AlreadyApplied ACK").status,
+            TrafficBatchAckStatus::AlreadyApplied
+        );
+        assert_eq!(user_traffic(&pool, 2).await, 35);
+
+        // D: the same historical revision cannot bless a rule id that was never
+        // in that exact-node delivered config.
+        let unknown_entries = vec![TrafficEntry {
+            rule_id: 999,
+            upload: 1,
+            download: 1,
+        }];
+        let unknown_report = TrafficReport {
+            batch: Some(TrafficBatchMetadata {
+                version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                batch_id: "deleted-history-unknown".into(),
+                payload_sha256: traffic_batch_payload_sha256(&unknown_entries),
+                config_revision: Some(old_snapshot.config_revision),
+            }),
+            reports: unknown_entries,
+        };
+        let unknown = router_post_traffic(app.clone(), headers.clone(), &unknown_report).await;
+        assert_eq!(unknown.code, 403);
+        assert!(unknown.data.is_none());
+        assert_eq!(user_traffic(&pool, 2).await, 35);
+
+        // A/F: after the old Pending batch receives its real strict ACK, a new
+        // config revision and new traffic can advance normally.
+        let new_response = get_config(State(state), headers.clone()).await;
+        assert_eq!(new_response.status(), StatusCode::OK);
+        let new_body = axum::body::to_bytes(new_response.into_body(), 65536)
+            .await
+            .unwrap();
+        let new_snapshot: NodeConfigSnapshot = serde_json::from_slice(&new_body).unwrap();
+        assert!(new_snapshot.config_revision > old_snapshot.config_revision);
+        assert_eq!(
+            new_snapshot
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![100]
+        );
+        let next_entries = vec![TrafficEntry {
+            rule_id: 100,
+            upload: 1,
+            download: 1,
+        }];
+        let next_report = TrafficReport {
+            batch: Some(TrafficBatchMetadata {
+                version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                batch_id: "deleted-history-next".into(),
+                payload_sha256: traffic_batch_payload_sha256(&next_entries),
+                config_revision: Some(new_snapshot.config_revision),
+            }),
+            reports: next_entries,
+        };
+        let next = router_post_traffic(app, headers, &next_report).await;
+        assert_eq!(next.code, 0);
+        assert_eq!(
+            next.data.expect("next Applied ACK").status,
+            TrafficBatchAckStatus::Applied
+        );
+        assert_eq!(rule_traffic(&pool, 100).await, 12);
+        assert_eq!(user_traffic(&pool, 2).await, 38);
+    }
+
     /// Normal batch: rule and user totals both move, atomically.
     #[tokio::test]
     async fn traffic_report_updates_rule_and_user() {
