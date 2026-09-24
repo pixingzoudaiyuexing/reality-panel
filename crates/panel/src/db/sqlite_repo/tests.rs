@@ -1721,6 +1721,7 @@ async fn traffic_batch_idempotency_contract() {
                 .iter()
                 .map(|entry| (entry.rule_id, home_group_id))
                 .collect(),
+            rule_owner_uids: std::collections::BTreeMap::new(),
         }
     }
 
