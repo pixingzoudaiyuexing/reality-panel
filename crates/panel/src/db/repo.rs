@@ -1847,9 +1847,13 @@ pub struct TrafficBatchScope {
     pub batch_id: String,
     pub payload_sha256: String,
     pub config_revision: Option<u64>,
-    /// Server-recorded rule ownership for the exact delivered config revision.
+    /// Server-recorded rule source Group for the exact delivered config revision.
     /// Legacy strict batches map every rule to home_group_id.
     pub rule_source_groups: std::collections::BTreeMap<i64, i64>,
+    /// Server-recorded rule owner for the exact delivered config revision.
+    /// Empty for legacy strict batches and for revisions delivered before this
+    /// owner-attribution snapshot was introduced.
+    pub rule_owner_uids: std::collections::BTreeMap<i64, i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

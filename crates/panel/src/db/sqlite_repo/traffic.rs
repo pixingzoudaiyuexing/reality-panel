@@ -88,92 +88,227 @@ impl TrafficRepository for SqliteRepository {
             };
         }
 
-        // ── Pass 2: ownership + existing-value resolution.
-        // SINGLE query per distinct rule_id: id+uid gated by device_group_in.
-        // A miss means "not available to this node" (missing OR foreign) — we
-        // do NOT run a second "does this id exist elsewhere?" query; that was
-        // the rule-id existence oracle. The reason is logged, not returned.
+        // ── Pass 2: exact delivered-revision attribution.
+        //
+        // Legacy strict batches keep the old Home-only contract. Versioned
+        // batches may use the immutable owner snapshot to settle a physically
+        // deleted rule against its historical user and source Group.
+        //
+        // A rule that still exists in a different Group is not charged here:
+        // traffic_history is keyed by (rule_id, hour_ts), so old- and new-Group
+        // bytes in the same hour cannot be represented without relabelling one
+        // side. Such traffic, and pre-fix deleted rules whose historical uid is
+        // unavailable, are terminally recorded as UNBILLED dispositions. The
+        // disposition and the APPLIED batch ledger commit atomically.
         struct Resolved {
             rule_id: i64,
             uid: i64,
             delta_up: u64,
             delta_down: u64,
-            /// v1.0.8: billed bytes charged to the USER = round((up+down) * rate).
-            /// Kept separate from delta_up/delta_down (real bytes for the rule).
             billed_delta: i64,
+            source_group_id: i64,
+            update_rule: bool,
         }
+        struct Disposition {
+            rule_id: i64,
+            source_group_id: i64,
+            historical_uid: Option<i64>,
+            delta_up: u64,
+            delta_down: u64,
+            reason: &'static str,
+        }
+
         let mut resolved: Vec<Resolved> = Vec::with_capacity(rule_delta.len());
-        // Track the per-USER aggregate delta (a user may own several rules in
-        // this batch) for the cumulative overflow check.
-        let mut user_delta: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        let mut dispositions: Vec<Disposition> = Vec::new();
+        let mut user_delta: std::collections::HashMap<i64, i64> =
+            std::collections::HashMap::new();
+
         for (rule_id, (dup, ddown)) in &rule_delta {
-            // The rule's own delta must fit in i64 (upload+download summed).
             let rule_delta_sum = match dup.checked_add(*ddown) {
                 Some(v) if v <= i64::MAX as u64 => v as i64,
                 _ => {
                     let _ = tx.rollback().await;
-                    return Ok(vec![TrafficEntryResult::Overflow]);
+                    return Ok(IdempotentTrafficBatchResult::Overflow);
                 }
             };
-            let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
-                "SELECT fr.id, fr.uid, fr.traffic_used, u.traffic_used \
-                 FROM forward_rules fr \
-                 JOIN users u ON u.id = fr.uid \
-                 WHERE fr.id = ? AND fr.device_group_in = ?",
-            )
-            .bind(rule_id)
-            .bind(group_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some((rid, uid, rule_used, user_used)) = row else {
-                // Not available: missing OR foreign. Log the id (server-side
-                // only) and roll the whole batch back with a uniform 403.
-                tracing::warn!(
-                    "traffic_batch: rule {} not available to group {} \
-                     (missing or foreign) — rejecting batch",
-                    rule_id,
-                    group_id
-                );
+            let Some(&source_group_id) = scope.rule_source_groups.get(rule_id) else {
                 let _ = tx.rollback().await;
-                return Ok(vec![TrafficEntryResult::Unavailable]);
+                return Ok(IdempotentTrafficBatchResult::Unavailable);
             };
-            // Per-rule cumulative overflow: existing + this batch's delta.
-            // Rule statistics are REAL bytes (rate does not apply here).
-            if rule_used.checked_add(rule_delta_sum).is_none() {
+            let historical_uid = scope.rule_owner_uids.get(rule_id).copied();
+            let current_rule: Option<(i64, i64, i64, i64)> =
+                sqlx::query_as("SELECT id, uid, device_group_in, traffic_used FROM forward_rules WHERE id = ?")
+                    .bind(rule_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+
+            let (uid, user_used, rule_used, update_rule, rate) =
+                if scope.config_revision.is_some() {
+                    let (uid, rule_used, update_rule) = match current_rule {
+                        Some((_rid, _current_uid, current_group_id, _current_used))
+                            if current_group_id != source_group_id =>
+                        {
+                            dispositions.push(Disposition {
+                                rule_id: *rule_id,
+                                source_group_id,
+                                historical_uid,
+                                delta_up: *dup,
+                                delta_down: *ddown,
+                                reason: "rule_moved_from_historical_group",
+                            });
+                            continue;
+                        }
+                        Some((_rid, current_uid, _current_group_id, _current_used))
+                            if historical_uid.is_some()
+                                && historical_uid != Some(current_uid) =>
+                        {
+                            dispositions.push(Disposition {
+                                rule_id: *rule_id,
+                                source_group_id,
+                                historical_uid,
+                                delta_up: *dup,
+                                delta_down: *ddown,
+                                reason: "rule_owner_changed_since_historical_config",
+                            });
+                            continue;
+                        }
+                        Some((_rid, current_uid, _current_group_id, current_used)) => {
+                            (historical_uid.unwrap_or(current_uid), Some(current_used), true)
+                        }
+                        None => match historical_uid {
+                            Some(uid) => (uid, None, false),
+                            None => {
+                                dispositions.push(Disposition {
+                                    rule_id: *rule_id,
+                                    source_group_id,
+                                    historical_uid: None,
+                                    delta_up: *dup,
+                                    delta_down: *ddown,
+                                    reason: "rule_deleted_without_historical_owner",
+                                });
+                                continue;
+                            }
+                        },
+                    };
+
+                    let rate = match sqlx::query_scalar::<_, f64>("SELECT rate FROM device_groups WHERE id = ?")
+                        .bind(source_group_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .flatten()
+                    {
+                        Some(rate) => rate,
+                        None => {
+                            dispositions.push(Disposition {
+                                rule_id: *rule_id,
+                                source_group_id,
+                                historical_uid: Some(uid),
+                                delta_up: *dup,
+                                delta_down: *ddown,
+                                reason: "historical_source_group_missing",
+                            });
+                            continue;
+                        }
+                    };
+                    let user_used = match sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM users WHERE id = ?")
+                        .bind(uid)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                    {
+                        Some(value) => value,
+                        None => {
+                            dispositions.push(Disposition {
+                                rule_id: *rule_id,
+                                source_group_id,
+                                historical_uid: Some(uid),
+                                delta_up: *dup,
+                                delta_down: *ddown,
+                                reason: "historical_user_missing",
+                            });
+                            continue;
+                        }
+                    };
+                    (uid, user_used, rule_used, update_rule, rate)
+                } else {
+                    let Some((_rid, uid, current_group_id, rule_used)) = current_rule else {
+                        tracing::warn!(
+                            "traffic_batch: legacy strict rule {} unavailable in home group {}",
+                            rule_id,
+                            source_group_id
+                        );
+                        let _ = tx.rollback().await;
+                        return Ok(IdempotentTrafficBatchResult::Unavailable);
+                    };
+                    if current_group_id != source_group_id {
+                        tracing::warn!(
+                            "traffic_batch: legacy strict rule {} unavailable in home group {}",
+                            rule_id,
+                            source_group_id
+                        );
+                        let _ = tx.rollback().await;
+                        return Ok(IdempotentTrafficBatchResult::Unavailable);
+                    }
+                    let rate = sqlx::query_scalar::<_, f64>("SELECT rate FROM device_groups WHERE id = ?")
+                        .bind(source_group_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .flatten()
+                        .unwrap_or(1.0);
+                    let Some(user_used) = sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM users WHERE id = ?")
+                        .bind(uid)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                    else {
+                        let _ = tx.rollback().await;
+                        return Ok(IdempotentTrafficBatchResult::Unavailable);
+                    };
+                    (uid, user_used, Some(rule_used), true, rate)
+                };
+
+            if !(0.1..=100.0).contains(&rate) {
                 let _ = tx.rollback().await;
-                return Ok(vec![TrafficEntryResult::Overflow]);
+                tracing::error!(
+                    "traffic_batch: source group {} has out-of-range rate {} (expected 0.1..=100)",
+                    source_group_id,
+                    rate
+                );
+                return Ok(IdempotentTrafficBatchResult::Overflow);
             }
-            // v1.0.8: billed delta charged to the user = round(real * rate).
-            // f64 mul can't overflow (rule_delta_sum ≤ i64::MAX, rate ≤ 100),
-            // but the rounded result must fit in i64 — guard it.
+            if let Some(rule_used) = rule_used {
+                if rule_used.checked_add(rule_delta_sum).is_none() {
+                    let _ = tx.rollback().await;
+                    return Ok(IdempotentTrafficBatchResult::Overflow);
+                }
+            }
+
             let billed_raw = (rule_delta_sum as f64) * rate;
             let billed_delta = if billed_raw.is_finite() && billed_raw <= i64::MAX as f64 {
                 billed_raw.round() as i64
             } else {
                 let _ = tx.rollback().await;
-                return Ok(vec![TrafficEntryResult::Overflow]);
+                return Ok(IdempotentTrafficBatchResult::Overflow);
             };
-            // Per-user cumulative: existing user total + (running user delta),
-            // charged in BILLED bytes (rate applied).
             let cur_user_delta = *user_delta.get(&uid).unwrap_or(&0);
             let new_user_delta = match cur_user_delta.checked_add(billed_delta) {
                 Some(v) => v,
                 None => {
                     let _ = tx.rollback().await;
-                    return Ok(vec![TrafficEntryResult::Overflow]);
+                    return Ok(IdempotentTrafficBatchResult::Overflow);
                 }
             };
             if user_used.checked_add(new_user_delta).is_none() {
                 let _ = tx.rollback().await;
-                return Ok(vec![TrafficEntryResult::Overflow]);
+                return Ok(IdempotentTrafficBatchResult::Overflow);
             }
             user_delta.insert(uid, new_user_delta);
             resolved.push(Resolved {
-                rule_id: rid,
+                rule_id: *rule_id,
                 uid,
                 delta_up: *dup,
                 delta_down: *ddown,
                 billed_delta,
+                source_group_id,
+                update_rule,
             });
         }
 
@@ -191,17 +326,58 @@ impl TrafficRepository for SqliteRepository {
         // mid-loop.
         let hour_ts = chrono::Utc::now().format("%Y-%m-%d %H:00:00").to_string();
 
+        for disposition in &dispositions {
+            let detail = serde_json::json!({
+                "batch_id": &scope.batch_id,
+                "config_revision": scope.config_revision,
+                "node_id": &scope.node_id,
+                "source_group_id": disposition.source_group_id,
+                "historical_uid": disposition.historical_uid,
+                "upload": disposition.delta_up,
+                "download": disposition.delta_down,
+                "reason": disposition.reason,
+                "billed": false,
+            })
+            .to_string();
+            sqlx::query(
+                "INSERT INTO audit_log
+                   (ts, actor_id, actor_name, action, target_type, target_id, detail)
+                 VALUES (datetime('now'), NULL, 'system',
+                         'traffic_historical_unbillable', 'forward_rule', ?, ?)",
+            )
+            .bind(disposition.rule_id.to_string())
+            .bind(detail)
+            .execute(&mut *tx)
+            .await?;
+            tracing::warn!(
+                "traffic_batch: terminally disposed unbillable historical traffic: rule={} source_group={} reason={}",
+                disposition.rule_id,
+                disposition.source_group_id,
+                disposition.reason
+            );
+        }
+
         for r in &resolved {
             let up = r.delta_up as i64;
             let down = r.delta_down as i64;
-            sqlx::query(
-                "UPDATE forward_rules SET traffic_used = traffic_used + ? + ? WHERE id = ?",
-            )
-            .bind(up)
-            .bind(down)
-            .bind(r.rule_id)
-            .execute(&mut *tx)
-            .await?;
+            if r.update_rule {
+                let updated = sqlx::query(
+                    "UPDATE forward_rules
+                     SET traffic_used = traffic_used + ? + ?
+                     WHERE id = ? AND uid = ? AND device_group_in = ?",
+                )
+                .bind(up)
+                .bind(down)
+                .bind(r.rule_id)
+                .bind(r.uid)
+                .bind(r.source_group_id)
+                .execute(&mut *tx)
+                .await?;
+                if updated.rows_affected() != 1 {
+                    let _ = tx.rollback().await;
+                    return Ok(IdempotentTrafficBatchResult::Unavailable);
+                }
+            }
             sqlx::query("UPDATE users SET traffic_used = traffic_used + ? WHERE id = ?")
                 .bind(r.billed_delta)
                 .bind(r.uid)

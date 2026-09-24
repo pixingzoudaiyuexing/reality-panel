@@ -531,16 +531,41 @@ async fn finish_snapshot_locked(
             }
         }
     }
+    let mut rule_owner_uids = BTreeMap::new();
+    for (rule_id, source_group_id) in &rule_sources {
+        let rule = crate::db::repo::RuleRepository::find_rule_by_id(
+            db,
+            *rule_id,
+            &ResourceScope::All,
+        )
+        .await?
+        .ok_or_else(|| {
+            NodeConfigBuildError::InvalidConfig(format!(
+                "rule {rule_id} disappeared while config attribution was being recorded"
+            ))
+        })?;
+        if rule.device_group_in != *source_group_id {
+            return Err(NodeConfigBuildError::InvalidConfig(format!(
+                "rule {rule_id} changed source group while config attribution was being recorded"
+            )));
+        }
+        rule_owner_uids.insert(*rule_id, rule.uid);
+    }
+
     let fingerprint = relay_shared::reconciliation::config_fingerprint(&config)
         .as_str()
         .to_string();
     let attribution_fingerprint = {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(b"relay-node-config-rule-sources\0");
+        hasher.update(b"relay-node-config-rule-attribution-v2\0");
         for (rule_id, source_group_id) in &rule_sources {
             hasher.update(rule_id.to_be_bytes());
             hasher.update(source_group_id.to_be_bytes());
+            let uid = rule_owner_uids
+                .get(rule_id)
+                .expect("owner attribution exists for every delivered rule");
+            hasher.update(uid.to_be_bytes());
         }
         format!("{:x}", hasher.finalize())
     };
@@ -577,10 +602,14 @@ async fn finish_snapshot_locked(
         let attribution_key = format!("node_config_rule_sources:{group_id}:{node_id}:{revision}");
         let attribution = serde_json::to_string(&rule_sources)
             .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
+        let owner_key = format!("node_config_rule_owners:{group_id}:{node_id}:{revision}");
+        let owners = serde_json::to_string(&rule_owner_uids)
+            .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
         // Persist immutable settlement attribution before exposing the matching
         // revision. An unused row after a later failure is harmless; the reverse
-        // ordering could expose a revision without source-group evidence.
+        // ordering could expose a revision without source-group/owner evidence.
         db.set(&attribution_key, &attribution).await?;
+        db.set(&owner_key, &owners).await?;
     }
     db.set(&key, &state).await?;
     Ok(NodeConfigSnapshot {
