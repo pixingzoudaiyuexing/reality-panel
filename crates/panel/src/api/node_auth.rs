@@ -224,13 +224,40 @@ mod tests {
     use crate::api::system::ReleaseCache;
     use crate::api::ws::NodeConnections;
     use crate::config::Config;
+    use crate::db::pg_repo::PgRepository;
+    use crate::db::pg_schema::{apply_pg_schema, run_pg_migrations};
     use crate::db::schema::SCHEMA_SQL;
     use crate::db::sqlite_repo::SqliteRepository;
     use crate::node_credential::NodeCredentialVerifier;
+    use sqlx::postgres::PgPoolOptions;
     use sqlx::sqlite::SqlitePoolOptions;
     use std::sync::Arc;
 
-    async fn state_with_active_credential() -> (AppState, NodeCredentialSecret, sqlx::SqlitePool) {
+    fn app_state(db: Arc<dyn crate::db::Repository>) -> AppState {
+        AppState {
+            db,
+            config: Config {
+                database_path: "test".into(),
+                listen: "127.0.0.1:0".into(),
+                key: "test-key".into(),
+                jwt_secret: "test-secret".into(),
+                public_dir: "public".into(),
+                public_panel_url: String::new(),
+                registration_enabled: false,
+                cors_origins: vec![],
+                geoip_enabled: false,
+                geoip_cache_ttl: 604_800,
+            },
+            release_cache: ReleaseCache::new(),
+            node_connections: NodeConnections::new(),
+            node_operations: crate::api::node_ops::NodeOperationRegistry::new(),
+            deployments: crate::api::node_deploy::DeploymentRegistry::default(),
+            diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
+            geoip_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+
+    async fn sqlite_state_with_active_credential() -> (AppState, NodeCredentialSecret) {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -257,28 +284,66 @@ mod tests {
         .await
         .unwrap();
 
-        let state = AppState {
-            db: Arc::new(SqliteRepository::new(pool.clone())),
-            config: Config {
-                database_path: "sqlite::memory:".into(),
-                listen: "127.0.0.1:0".into(),
-                key: "test-key".into(),
-                jwt_secret: "test-secret".into(),
-                public_dir: "public".into(),
-                public_panel_url: String::new(),
-                registration_enabled: false,
-                cors_origins: vec![],
-                geoip_enabled: false,
-                geoip_cache_ttl: 604_800,
-            },
-            release_cache: ReleaseCache::new(),
-            node_connections: NodeConnections::new(),
-            node_operations: crate::api::node_ops::NodeOperationRegistry::new(),
-            deployments: crate::api::node_deploy::DeploymentRegistry::default(),
-            diagnose: crate::api::diagnose::DiagnoseRegistry::new(),
-            geoip_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        (app_state(Arc::new(SqliteRepository::new(pool))), secret)
+    }
+
+    fn replace_db_in_url(url: &str, db_name: &str) -> String {
+        let (base, query) = match url.split_once('?') {
+            Some((base, query)) => (base, Some(query)),
+            None => (url, None),
         };
-        (state, secret, pool)
+        let head = base.rsplit_once('/').map(|(head, _)| head).unwrap_or(base);
+        match query {
+            Some(query) => format!("{head}/{db_name}?{query}"),
+            None => format!("{head}/{db_name}"),
+        }
+    }
+
+    async fn pg_state_with_active_credential() -> Option<(AppState, NodeCredentialSecret)> {
+        let url = std::env::var("TEST_PG_URL")
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        let db_name = format!("test_s3_runtime_auth_{}", uuid::Uuid::new_v4().simple());
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&replace_db_in_url(&url, "postgres"))
+            .await
+            .expect("connect PG admin DB");
+        sqlx::query(&format!("CREATE DATABASE {db_name}"))
+            .execute(&admin)
+            .await
+            .expect("create S3 runtime-auth PG DB");
+        admin.close().await;
+
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&replace_db_in_url(&url, &db_name))
+            .await
+            .expect("connect S3 runtime-auth PG DB");
+        apply_pg_schema(&pool).await.expect("apply PG schema");
+        run_pg_migrations(&pool).await.expect("run PG migrations");
+        sqlx::query(
+            "INSERT INTO device_groups (id, name, group_type, token, uid) \
+             VALUES (10, 'home', 'in', 'legacy-token', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let node_id = ReuseEligibleNodeId::parse("Node_A").unwrap();
+        let secret = NodeCredentialSecret::from_test_bytes([0x42; 32]);
+        let verifier = NodeCredentialVerifier::derive("cred-active", 10, &node_id, &secret);
+        sqlx::query(
+            "INSERT INTO node_credentials \
+             (credential_id, home_group_id, node_id, generation, verifier_format, verifier_version, verifier_data, activated_at) \
+             VALUES ('cred-active', 10, 'Node_A', 3, 'rp-node-sha256', 1, $1, \
+                     to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))",
+        )
+        .bind(verifier.data().as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        Some((app_state(Arc::new(PgRepository::new(pool))), secret))
     }
 
     fn credential_headers(secret: &NodeCredentialSecret, node_id: &str) -> HeaderMap {
@@ -302,10 +367,7 @@ mod tests {
         assert!(!valid_credential_id(&"a".repeat(129)));
     }
 
-    #[tokio::test]
-    async fn runtime_auth_distinguishes_legacy_and_verified_and_fails_closed() {
-        let (state, secret, pool) = state_with_active_credential().await;
-
+    async fn exercise_runtime_auth_contract(state: AppState, secret: NodeCredentialSecret) {
         let mut legacy = HeaderMap::new();
         legacy.insert(AUTHORIZATION, "Bearer legacy-token".parse().unwrap());
         legacy.insert(NODE_ID_HEADER, "self-reported".parse().unwrap());
@@ -346,6 +408,45 @@ mod tests {
             NodeAuthError::Unauthorized
         );
 
+        let mut wrong_id = credential_headers(&secret, "Node_A");
+        wrong_id.insert(
+            NODE_CREDENTIAL_ID_HEADER,
+            "missing-credential".parse().unwrap(),
+        );
+        assert_eq!(
+            authenticate_node(&state, &wrong_id).await.unwrap_err(),
+            NodeAuthError::Unauthorized
+        );
+
+        let mut malformed_id = credential_headers(&secret, "Node_A");
+        malformed_id.insert(
+            NODE_CREDENTIAL_ID_HEADER,
+            "bad credential id".parse().unwrap(),
+        );
+        assert_eq!(
+            authenticate_node(&state, &malformed_id).await.unwrap_err(),
+            NodeAuthError::Unauthorized
+        );
+
+        let mut malformed_secret = credential_headers(&secret, "Node_A");
+        malformed_secret.insert(
+            AUTHORIZATION,
+            "RelayNodeCredential rpn1_too-short".parse().unwrap(),
+        );
+        assert_eq!(
+            authenticate_node(&state, &malformed_secret)
+                .await
+                .unwrap_err(),
+            NodeAuthError::Unauthorized
+        );
+
+        let mut missing_id = credential_headers(&secret, "Node_A");
+        missing_id.remove(NODE_CREDENTIAL_ID_HEADER);
+        assert_eq!(
+            authenticate_node(&state, &missing_id).await.unwrap_err(),
+            NodeAuthError::Unauthorized
+        );
+
         let mut mixed = legacy.clone();
         mixed.insert(NODE_CREDENTIAL_ID_HEADER, "cred-active".parse().unwrap());
         assert_eq!(
@@ -353,12 +454,15 @@ mod tests {
             NodeAuthError::Unauthorized
         );
 
-        sqlx::query(
-            "UPDATE node_credentials SET revoked_at = datetime('now') WHERE credential_id = 'cred-active'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let node_id = ReuseEligibleNodeId::parse("Node_A").unwrap();
+        assert_eq!(
+            state
+                .db
+                .revoke_node_credential("cred-active", 10, &node_id, 3)
+                .await
+                .unwrap(),
+            crate::db::repo::NodeCredentialMutationResult::Applied
+        );
         assert!(!verified_credential_still_active(&state, &verified)
             .await
             .unwrap());
@@ -368,5 +472,20 @@ mod tests {
                 .unwrap_err(),
             NodeAuthError::Unauthorized
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_auth_contract_sqlite() {
+        let (state, secret) = sqlite_state_with_active_credential().await;
+        exercise_runtime_auth_contract(state, secret).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_auth_contract_real_postgres() {
+        let Some((state, secret)) = pg_state_with_active_credential().await else {
+            return;
+        };
+        println!("S3 REAL POSTGRES RUNTIME AUTH CONTRACT: EXECUTED");
+        exercise_runtime_auth_contract(state, secret).await;
     }
 }
