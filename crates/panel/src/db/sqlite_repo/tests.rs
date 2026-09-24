@@ -2097,8 +2097,8 @@ async fn traffic_batch_idempotency_contract() {
     assert_eq!(deleted_history.0, 1);
     assert_eq!(deleted_history.1, 20);
     assert_eq!(
-        deleted_history.2, 15,
-        "existing 10 billed bytes + 5 historical deleted-rule bytes"
+        deleted_history.2, 25,
+        "existing 20 billed bytes + 5 historical deleted-rule bytes"
     );
 
     // C: if the id still exists but moved Groups, do not relabel old bytes to
