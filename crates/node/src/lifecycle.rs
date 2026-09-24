@@ -1,6 +1,6 @@
 //! Restricted lifecycle actions received over the authenticated Panel WS.
 
-use crate::config::NodeConfig;
+use crate::config::{NodeConfig, PersistedNodeAuth};
 use relay_shared::protocol::{
     lifecycle_artifact_architecture, NodeLifecycleAck, NodeLifecycleAction, NodeLifecycleCommand,
     NodeLifecycleEvent, NodeLifecycleEventStatus,
@@ -51,7 +51,7 @@ struct UninstallJob {
     operation_id: String,
     node_id: String,
     panel_url: String,
-    token: String,
+    auth: PersistedNodeAuth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -243,7 +243,7 @@ fn write_uninstall_job(
         operation_id: command.operation_id.clone(),
         node_id: command.node_id.clone(),
         panel_url: config.panel_url.clone(),
-        token: config.token.clone(),
+        auth: config.auth.persistent_descriptor(),
     };
     let bytes = serde_json::to_vec(&job).map_err(|error| error.to_string())?;
     let mut file = std::fs::OpenOptions::new()
@@ -447,8 +447,10 @@ async fn download_artifact(
         .timeout(std::time::Duration::from_secs(180))
         .build()
         .map_err(|error| format!("build artifact client: {error}"))?
-        .get(url)
-        .bearer_auth(&config.token)
+        .get(url);
+    let response = config
+        .auth
+        .apply_reqwest(response)
         .header("X-Node-ID", &command.node_id)
         .send()
         .await
@@ -509,7 +511,7 @@ pub(crate) async fn execute(
     let result = match command.action {
         NodeLifecycleAction::Logs => {
             let logs = requested_log_lines(command.log_lines)
-                .and_then(|lines| read_logs(lines, &config.token));
+                .and_then(|lines| read_logs(lines, config.auth.sensitive_value()));
             match logs {
                 Ok(logs) => {
                     let mut done = event(
@@ -1120,62 +1122,40 @@ fn report_uninstall_once(
         "{}/api/v1/node/uninstall_result",
         job.panel_url.trim_end_matches('/')
     );
-    let body = serde_json::json!({ "operation_id": job.operation_id, "node_id": job.node_id, "success": success, "destructive_started": destructive_started, "message": message }).to_string();
-    let root = PathBuf::from(format!(
-        "/run/relay-node-uninstall-report-{}",
-        job.operation_id
-    ));
-    let headers = root.with_extension("headers");
-    let body_path = root.with_extension("json");
-    let _ = std::fs::remove_file(&headers);
-    let _ = std::fs::remove_file(&body_path);
-    let write_private = |path: &Path, value: &[u8]| -> Result<(), String> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|error| format!("create uninstall callback file: {error}"))?;
-        use std::io::Write;
-        file.write_all(value)
-            .map_err(|error| format!("write uninstall callback file: {error}"))
-    };
-    write_private(
-        &headers,
-        format!(
-            "Authorization: Bearer {}\nX-Node-ID: {}\nContent-Type: application/json\n",
-            job.token, job.node_id
-        )
-        .as_bytes(),
-    )?;
-    if let Err(error) = write_private(&body_path, body.as_bytes()) {
-        let _ = std::fs::remove_file(&headers);
-        return Err(error);
+    let auth = job.auth.load_runtime()?;
+    if !auth.transport_allowed(&job.panel_url) {
+        return Err("permanent Credential uninstall callback requires HTTPS".into());
     }
-    let header_arg = format!("@{}", headers.display());
-    let body_arg = format!("@{}", body_path.display());
-    let status = Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "10",
-            "-X",
-            "POST",
-            "-H",
-            &header_arg,
-            "--data-binary",
-            &body_arg,
-            &url,
-        ])
-        .status();
-    let _ = std::fs::remove_file(headers);
-    let _ = std::fs::remove_file(body_path);
-    status
-        .is_ok_and(|status| status.success())
-        .then_some(())
-        .ok_or_else(|| "Panel rejected uninstall result".into())
+    let body = serde_json::json!({
+        "operation_id": job.operation_id,
+        "node_id": job.node_id,
+        "success": success,
+        "destructive_started": destructive_started,
+        "message": message
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("build uninstall callback runtime: {error}"))?;
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| format!("build uninstall callback client: {error}"))?;
+        let response = auth
+            .apply_reqwest(client.post(url))
+            .header("X-Node-ID", &job.node_id)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| "Panel uninstall callback failed".to_string())?;
+        response
+            .status()
+            .is_success()
+            .then_some(())
+            .ok_or_else(|| "Panel rejected uninstall result".into())
+    })
 }
 
 fn completion_attempt<C, R>(
@@ -1616,7 +1596,9 @@ mod tests {
                 operation_id: "operation-a".into(),
                 node_id: "node-a".into(),
                 panel_url: "https://panel.example".into(),
-                token: "secret".into(),
+                auth: PersistedNodeAuth::LegacyGroupToken {
+                    token: "secret".into(),
+                },
             },
             cleanup_success: false,
             destructive_started: false,
@@ -1672,7 +1654,9 @@ mod tests {
                     operation_id: "operation-b".into(),
                     node_id: "node-b".into(),
                     panel_url: "https://panel.example".into(),
-                    token: "secret".into(),
+                    auth: PersistedNodeAuth::LegacyGroupToken {
+                        token: "secret".into(),
+                    },
                 },
                 cleanup_success: true,
                 destructive_started: true,

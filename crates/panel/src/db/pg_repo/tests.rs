@@ -6869,6 +6869,16 @@ async fn pg_node_credential_lifecycle_contract() {
             .unwrap(),
         NodeCredentialMutationResult::Applied
     );
+    assert!(db
+        .find_active_node_credential_for_runtime("cred-life-1")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(db
+        .find_active_node_credential_for_runtime("cred-life-2")
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(
         db.activate_node_credential("cred-life-1", 10, &node_id, 1)
             .await
@@ -6929,6 +6939,16 @@ async fn pg_node_credential_lifecycle_contract() {
         .unwrap();
     assert!(old.revoked_at.is_some());
     assert!(current.activated_at.is_some() && current.revoked_at.is_none());
+    assert!(db
+        .find_active_node_credential_for_runtime("cred-life-1")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .find_active_node_credential_for_runtime("cred-life-2")
+        .await
+        .unwrap()
+        .is_some());
 
     assert_eq!(
         db.activate_node_credential("cred-life-1", 10, &node_id, 1)
@@ -6942,6 +6962,24 @@ async fn pg_node_credential_lifecycle_contract() {
             .unwrap(),
         NodeCredentialMutationResult::Applied
     );
+    assert!(db
+        .find_active_node_credential_for_runtime("cred-life-2")
+        .await
+        .unwrap()
+        .is_none());
+    // Historical generations fail closed even if inconsistent persisted
+    // state accidentally clears their revocation marker.
+    sqlx::query(
+        "UPDATE node_credentials SET revoked_at = NULL WHERE credential_id = 'cred-life-1'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(db
+        .find_active_node_credential_for_runtime("cred-life-1")
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(
         db.revoke_node_credential("cred-life-2", 10, &node_id, 2)
             .await

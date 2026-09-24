@@ -80,7 +80,6 @@ pub async fn run_ws_loop(
 
         let exit = connect_and_run(
             &ws_url,
-            &config.token,
             config,
             manager,
             camouflage,
@@ -171,7 +170,7 @@ fn classify_ws_connect_error(e: tokio_tungstenite::tungstenite::Error) -> WsExit
                 ))
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => WsExit::PermanentError(format!(
-                "authentication rejected (HTTP {}): invalid or revoked token",
+                "authentication rejected (HTTP {}): invalid or revoked node authentication",
                 status.as_u16()
             )),
             _ => WsExit::Error(format!("connect: HTTP {} from panel", status.as_u16())),
@@ -184,7 +183,6 @@ fn classify_ws_connect_error(e: tokio_tungstenite::tungstenite::Error) -> WsExit
 #[allow(clippy::too_many_arguments)] // Keep control-channel dependencies explicit, including immutable startup node_id.
 async fn connect_and_run(
     ws_url: &str,
-    token: &str,
     config: &NodeConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     camouflage: &Arc<Mutex<CamouflageSiteManager>>,
@@ -210,10 +208,17 @@ async fn connect_and_run(
         Err(e) => return WsExit::Error(format!("request build: {}", e)),
     };
 
-    // Authorization: Bearer <token> is REQUIRED by the panel's
-    // node_ws_handler; without it the upgrade returns 401.
-    if let Ok(v) = format!("Bearer {}", token).parse() {
-        request.headers_mut().insert("Authorization", v);
+    let authorization = match config.auth.authorization_value().parse() {
+        Ok(value) => value,
+        Err(_) => return WsExit::PermanentError("invalid local node authentication".into()),
+    };
+    request.headers_mut().insert("Authorization", authorization);
+    if let Some(credential_id) = config.auth.credential_id() {
+        let value = match credential_id.parse() {
+            Ok(value) => value,
+            Err(_) => return WsExit::PermanentError("invalid local Credential ID".into()),
+        };
+        request.headers_mut().insert("X-Node-Credential-ID", value);
     }
     // v0.4.0: config-protocol version gate. The panel refuses the upgrade
     // (426) if this is absent or mismatches, so an old node keeps its cached

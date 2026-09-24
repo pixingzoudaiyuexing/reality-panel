@@ -488,6 +488,10 @@ async fn run() {
     // node-id file, so the panel can tell multiple nodes sharing one group
     // token apart (otherwise their status entries overwrite each other).
     let node_id = poller::get_or_create_node_id();
+    if let Err(error) = config.auth.validate_startup_node_id(&node_id) {
+        eprintln!("FATAL: invalid permanent Credential identity: {error}");
+        std::process::exit(1);
+    }
     let panel_certificate_sync = Arc::new(Mutex::new(
         panel_certificate::PanelCertificateSync::new()
             .expect("failed to initialize Panel certificate HTTP client"),
@@ -601,7 +605,7 @@ async fn run() {
         // and are reported over plain HTTP, so they keep working even if WS
         // is down.
         forwarder::nginx_sni_traffic::ingest_once(&nginx_sni_traffic, &manager, &counter).await;
-        reporter::report_traffic(&config, &counter).await;
+        reporter::report_traffic(&config, &counter, &node_id).await;
         // Drain any listener bind/runtime errors captured since the last cycle
         // and forward them to the panel so an operator can see WHY a rule isn't
         // forwarding (port in use, permission denied, etc.).

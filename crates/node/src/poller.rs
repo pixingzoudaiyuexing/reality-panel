@@ -39,12 +39,10 @@ pub enum FetchResult {
 fn build_config_request(
     client: &reqwest::Client,
     url: &str,
-    token: &str,
+    auth: &crate::config::NodeRuntimeAuth,
     node_id: &str,
 ) -> reqwest::RequestBuilder {
-    client
-        .get(url)
-        .header("Authorization", format!("Bearer {token}"))
+    auth.apply_reqwest(client.get(url))
         .header("X-Node-ID", node_id)
         .header("X-Config-Protocol-Version", CONFIG_PROTOCOL_VERSION)
 }
@@ -56,7 +54,7 @@ pub async fn fetch_config(config: &NodeConfig, node_id: &str) -> FetchResult {
     // `node_id` is resolved exactly once at process startup. Re-reading the
     // persistence file here can split HTTP from the long-lived WS/status
     // identity if that file changes while relay-node is still running.
-    let resp = match build_config_request(&client, &url, &config.token, node_id)
+    let resp = match build_config_request(&client, &url, &config.auth, node_id)
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
@@ -1107,10 +1105,13 @@ mod tests {
     }
 
     fn request_node_id(startup_node_id: &str) -> String {
+        let auth = crate::config::NodeRuntimeAuth::LegacyGroupToken {
+            token: "test-token".into(),
+        };
         let request = build_config_request(
             &reqwest::Client::new(),
             "http://127.0.0.1:18888/api/v1/node/config",
-            "test-token",
+            &auth,
             startup_node_id,
         )
         .build()

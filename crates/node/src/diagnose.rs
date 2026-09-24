@@ -878,9 +878,10 @@ async fn probe_tcp(addr: &str) -> TargetProbeOutcome {
 async fn report(config: &NodeConfig, result: DiagnoseResult) -> Result<(), String> {
     let url = format!("{}/api/v1/node/diagnose_result", config.panel_url);
     let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", config.token))
+    let resp = config
+        .auth
+        .apply_reqwest(client.post(&url))
+        .header("X-Node-ID", &result.node_id)
         .json(&result)
         .send()
         .await

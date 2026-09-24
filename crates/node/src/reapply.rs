@@ -41,9 +41,11 @@ pub async fn run_and_report(
 
 async fn report(config: &NodeConfig, result: &ReapplyNginxSniResult) -> Result<(), String> {
     let url = format!("{}/api/v1/node/reapply_nginx_sni_result", config.panel_url);
-    let response = reqwest::Client::new()
-        .post(url)
-        .header("Authorization", format!("Bearer {}", config.token))
+    let client = reqwest::Client::new();
+    let response = config
+        .auth
+        .apply_reqwest(client.post(url))
+        .header("X-Node-ID", &result.node_id)
         .json(result)
         .send()
         .await

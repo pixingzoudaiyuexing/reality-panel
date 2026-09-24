@@ -35,9 +35,10 @@ pub(crate) fn run_hook(args: &[String]) -> Result<(), String> {
         return Err("unexpected hook arguments".into());
     }
     let panel_url = std::env::var("PANEL_URL").map_err(|_| "Panel URL is unavailable")?;
-    let token = std::env::var("NODE_TOKEN").map_err(|_| "Node credential is unavailable")?;
-    if token.trim().is_empty() || token == "default-token" {
-        return Err("Node credential is unavailable".into());
+    let auth = crate::config::NodeRuntimeAuth::load()
+        .map_err(|_| "Node authentication is unavailable".to_string())?;
+    if !auth.transport_allowed(&panel_url) {
+        return Err("permanent Credential authentication requires HTTPS".into());
     }
     let certbot_domain =
         std::env::var("CERTBOT_DOMAIN").map_err(|_| "challenge domain is unavailable")?;
@@ -48,6 +49,8 @@ pub(crate) fn run_hook(args: &[String]) -> Result<(), String> {
     if node_id.trim().is_empty() {
         return Err("Node identity is unavailable".into());
     }
+    auth.validate_startup_node_id(&node_id)
+        .map_err(|_| "Node Credential identity mismatch".to_string())?;
     let endpoint = format!(
         "{}/api/v1/node/acme-dns01/{action}",
         panel_url.trim_end_matches('/')
@@ -68,9 +71,8 @@ pub(crate) fn run_hook(args: &[String]) -> Result<(), String> {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| "HTTP client is unavailable")?;
-        let response = client
-            .post(endpoint)
-            .bearer_auth(token)
+        let response = auth
+            .apply_reqwest(client.post(endpoint))
             .header("X-Config-Protocol-Version", CONFIG_PROTOCOL_VERSION)
             .header("X-Node-ID", node_id)
             .json(&request)

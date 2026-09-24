@@ -1932,6 +1932,7 @@ dependencies = [
  "tar",
  "time",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-http",
  "tracing",

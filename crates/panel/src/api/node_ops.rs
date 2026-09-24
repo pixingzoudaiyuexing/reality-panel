@@ -1,5 +1,5 @@
 use crate::api::middleware::AdminOnly;
-use crate::api::node::extract_node_token;
+use crate::api::node_auth::authenticate_node;
 use crate::api::provisioning::{NODE_ARTIFACT_ROOT, NODE_ARTIFACT_ROOT_ENV};
 use crate::api::AppState;
 use axum::extract::{Path, Query, State};
@@ -1249,29 +1249,18 @@ pub async fn download_artifact(
     headers: HeaderMap,
     Path(operation_id): Path<String>,
 ) -> Response {
-    let Some(token) = extract_node_token(&headers) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let identity = match authenticate_node(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(error) => return error.status().into_response(),
     };
-    let group = match state.db.find_by_token(&token).await {
-        Ok(Some(group)) if group.group_type == "in" => group,
-        Ok(_) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(error) => {
-            tracing::error!("lifecycle artifact token lookup: {error}");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    };
-    let Some(node_id) = headers
-        .get("X-Node-ID")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    let group_id = identity.group_id();
+    let Some(node_id) = identity.node_id() else {
         return StatusCode::FORBIDDEN.into_response();
     };
     let Some((architecture, version, sha256)) =
         state
             .node_operations
-            .artifact_target(group.id, node_id, &operation_id)
+            .artifact_target(group_id, node_id, &operation_id)
     else {
         return StatusCode::FORBIDDEN.into_response();
     };
@@ -1308,19 +1297,12 @@ pub async fn receive_uninstall_result(
     headers: HeaderMap,
     Json(request): Json<UninstallResultRequest>,
 ) -> Response {
-    let Some(token) = extract_node_token(&headers) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let identity = match authenticate_node(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(error) => return error.status().into_response(),
     };
-    let group = match state.db.find_by_token(&token).await {
-        Ok(Some(group)) if group.group_type == "in" => group,
-        Ok(_) => return StatusCode::UNAUTHORIZED.into_response(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let authenticated_node_id = headers
-        .get("X-Node-ID")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim);
-    if authenticated_node_id != Some(request.node_id.trim()) {
+    let group_id = identity.group_id();
+    if identity.node_id() != Some(request.node_id.trim()) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let operation_id = request.operation_id.trim();
@@ -1333,7 +1315,7 @@ pub async fn receive_uninstall_result(
         let Ok(Some(durable)) = load_durable_uninstall(&state, operation_id).await else {
             return StatusCode::FORBIDDEN.into_response();
         };
-        if durable.operation.group_id != group.id
+        if durable.operation.group_id != group_id
             || durable.operation.node_id != node_id
             || durable.operation.action != NodeLifecycleAction::Uninstall
         {
@@ -1350,7 +1332,7 @@ pub async fn receive_uninstall_result(
     if request.destructive_started {
         match crate::service::relay_preference::mark_uninstall_gate_destructive(
             state.db.as_ref(),
-            group.id,
+            group_id,
             node_id,
             operation_id,
         )
@@ -1363,7 +1345,7 @@ pub async fn receive_uninstall_result(
     }
     let currently_connected = state
         .node_connections
-        .config_online_node_ids(group.id)
+        .config_online_node_ids(group_id)
         .await
         .contains(node_id);
     {
@@ -1371,7 +1353,7 @@ pub async fn receive_uninstall_result(
         let Ok(Some(mut durable)) = load_durable_uninstall(&state, operation_id).await else {
             return StatusCode::FORBIDDEN.into_response();
         };
-        if durable.operation.group_id != group.id
+        if durable.operation.group_id != group_id
             || durable.operation.node_id != node_id
             || durable.operation.action != NodeLifecycleAction::Uninstall
             || durable.operation.status.terminal()
@@ -1401,7 +1383,7 @@ pub async fn receive_uninstall_result(
         };
         match crate::service::relay_preference::release_uninstall_gate(
             state.db.as_ref(),
-            group.id,
+            group_id,
             node_id,
             operation_id,
         )
@@ -1415,7 +1397,7 @@ pub async fn receive_uninstall_result(
         }
     }
     let _ = state.node_operations.uninstall_result(
-        group.id,
+        group_id,
         node_id,
         operation_id,
         request.success,

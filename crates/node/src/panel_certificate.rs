@@ -33,10 +33,9 @@ impl PanelCertificateSync {
             "{}/api/v1/node/certificates",
             config.panel_url.trim_end_matches('/')
         );
-        let mut request = self
-            .client
-            .get(endpoint)
-            .bearer_auth(&config.token)
+        let mut request = config
+            .auth
+            .apply_reqwest(self.client.get(endpoint))
             .header("X-Node-ID", node_id);
         let sources_complete =
             crate::forwarder::camouflage_site::panel_sources_complete_shared(camouflage).await;
