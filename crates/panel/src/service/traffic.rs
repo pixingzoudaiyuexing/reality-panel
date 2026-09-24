@@ -8,7 +8,7 @@
 //! assembly).
 
 use crate::db::error::DbError;
-use crate::db::repo::TrafficEntryResult;
+use crate::db::repo::{IdempotentTrafficBatchResult, TrafficBatchScope, TrafficEntryResult};
 use crate::db::Repository;
 use relay_shared::protocol::TrafficEntry;
 
@@ -38,7 +38,15 @@ pub enum TrafficReportError {
     /// indistinguishable (closes the rule-id existence oracle). Maps to a
     /// uniform 403.
     Unavailable,
+    PayloadConflict,
+    IdentityUnavailable,
     Database(DbError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictTrafficReportStatus {
+    Applied,
+    AlreadyApplied,
 }
 
 /// Apply a node's traffic report atomically.
@@ -92,6 +100,39 @@ pub async fn apply_traffic_report(
         return Err(TrafficReportError::Overflow);
     }
     Ok(())
+}
+
+pub async fn apply_idempotent_traffic_report(
+    db: &dyn Repository,
+    scope: &TrafficBatchScope,
+    reports: &[TrafficEntry],
+) -> Result<StrictTrafficReportStatus, TrafficReportError> {
+    for entry in reports {
+        let sum = entry
+            .upload
+            .checked_add(entry.download)
+            .ok_or(TrafficReportError::Overflow)?;
+        if sum > i64::MAX as u64 {
+            return Err(TrafficReportError::Overflow);
+        }
+    }
+
+    match db
+        .apply_idempotent_traffic_batch(scope, reports)
+        .await
+        .map_err(TrafficReportError::Database)?
+    {
+        IdempotentTrafficBatchResult::Applied => Ok(StrictTrafficReportStatus::Applied),
+        IdempotentTrafficBatchResult::AlreadyApplied => {
+            Ok(StrictTrafficReportStatus::AlreadyApplied)
+        }
+        IdempotentTrafficBatchResult::PayloadConflict => Err(TrafficReportError::PayloadConflict),
+        IdempotentTrafficBatchResult::IdentityUnavailable => {
+            Err(TrafficReportError::IdentityUnavailable)
+        }
+        IdempotentTrafficBatchResult::Unavailable => Err(TrafficReportError::Unavailable),
+        IdempotentTrafficBatchResult::Overflow => Err(TrafficReportError::Overflow),
+    }
 }
 
 /// Delete the legacy per-group status key for `group_id` if its stored

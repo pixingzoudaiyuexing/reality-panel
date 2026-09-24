@@ -1897,6 +1897,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "x509-parser 0.16.0",
 ]
 
