@@ -414,7 +414,6 @@ impl TrafficRepository for PgRepository {
                 .bind(source_group_id)
                 .fetch_optional(&mut *tx)
                 .await?
-                .flatten()
                 {
                     Some(rate) => rate,
                     None => {
@@ -464,7 +463,6 @@ impl TrafficRepository for PgRepository {
                         .bind(source_group_id)
                         .fetch_optional(&mut *tx)
                         .await?
-                        .flatten()
                         .unwrap_or(1.0);
                 let Some(user_used) =
                     sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM users WHERE id = $1")
