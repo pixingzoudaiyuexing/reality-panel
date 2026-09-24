@@ -408,11 +408,13 @@ impl TrafficRepository for PgRepository {
                     },
                 };
 
-                let rate = match sqlx::query_scalar::<_, f64>("SELECT rate FROM device_groups WHERE id = $1")
-                    .bind(source_group_id)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .flatten()
+                let rate = match sqlx::query_scalar::<_, f64>(
+                    "SELECT rate FROM device_groups WHERE id = $1",
+                )
+                .bind(source_group_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten()
                 {
                     Some(rate) => rate,
                     None => {
@@ -427,10 +429,12 @@ impl TrafficRepository for PgRepository {
                         continue;
                     }
                 };
-                let user_used = match sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM users WHERE id = $1")
-                    .bind(uid)
-                    .fetch_optional(&mut *tx)
-                    .await?
+                let user_used = match sqlx::query_scalar::<_, i64>(
+                    "SELECT traffic_used FROM users WHERE id = $1",
+                )
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await?
                 {
                     Some(value) => value,
                     None => {
@@ -455,16 +459,18 @@ impl TrafficRepository for PgRepository {
                     let _ = tx.rollback().await;
                     return Ok(IdempotentTrafficBatchResult::Unavailable);
                 }
-                let rate = sqlx::query_scalar::<_, f64>("SELECT rate FROM device_groups WHERE id = $1")
-                    .bind(source_group_id)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .flatten()
-                    .unwrap_or(1.0);
-                let Some(user_used) = sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM users WHERE id = $1")
-                    .bind(uid)
-                    .fetch_optional(&mut *tx)
-                    .await?
+                let rate =
+                    sqlx::query_scalar::<_, f64>("SELECT rate FROM device_groups WHERE id = $1")
+                        .bind(source_group_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .flatten()
+                        .unwrap_or(1.0);
+                let Some(user_used) =
+                    sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM users WHERE id = $1")
+                        .bind(uid)
+                        .fetch_optional(&mut *tx)
+                        .await?
                 else {
                     let _ = tx.rollback().await;
                     return Ok(IdempotentTrafficBatchResult::Unavailable);
