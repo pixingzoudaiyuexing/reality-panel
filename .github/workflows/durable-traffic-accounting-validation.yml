@@ -33,7 +33,7 @@ jobs:
       - name: Checkout exact candidate
         uses: actions/checkout@v4
         with:
-          ref: 29b434d2243239223c0891f3904ba2d7bc4a8236
+          ref: 1a5efaf206f26cc756943aa06359a6c52125e8b0
       - name: Install Rust toolchain
         run: rustup show
       - name: cargo fmt --check
