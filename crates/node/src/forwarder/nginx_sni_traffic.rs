@@ -6,7 +6,7 @@ use crate::reporter::{
 use relay_shared::protocol::TrafficEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +30,17 @@ struct LogState {
     generation: u64,
     #[serde(default)]
     committed_spool_sequence: Option<u64>,
+}
+
+const SOURCE_HISTORY_MARKER_FORMAT_VERSION: u32 = 1;
+const SOURCE_HISTORY_MARKER_SUFFIX: &str = ".source-history.json";
+const MAX_SOURCE_HISTORY_MARKER_BYTES: u64 = 16_384;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SourceHistoryMarker {
+    format_version: u32,
+    source: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +238,112 @@ fn source_key(cfg: &NginxSniTrafficConfig) -> String {
     cfg.state_path.to_string_lossy().into_owned()
 }
 
+fn source_history_path(cfg: &NginxSniTrafficConfig) -> std::io::Result<PathBuf> {
+    let parent = cfg.state_path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "nginx_sni traffic state path has no parent")
+    })?;
+    let filename = cfg.state_path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "nginx_sni traffic state filename is invalid")
+    })?;
+    Ok(parent.join(format!("{filename}{SOURCE_HISTORY_MARKER_SUFFIX}")))
+}
+
+fn load_source_history_marker(cfg: &NginxSniTrafficConfig) -> std::io::Result<Option<SourceHistoryMarker>> {
+    let path = source_history_path(cfg)?;
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    let expected_uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || (metadata.mode() & 0o777) != 0o600
+        || metadata.len() > MAX_SOURCE_HISTORY_MARKER_BYTES
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "nginx_sni source-history marker is not a private regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)?;
+    let marker: SourceHistoryMarker = serde_json::from_slice(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if marker.format_version != SOURCE_HISTORY_MARKER_FORMAT_VERSION || marker.source != source_key(cfg) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "nginx_sni source-history marker does not match this source",
+        ));
+    }
+    Ok(Some(marker))
+}
+
+fn ensure_source_history_marker(cfg: &NginxSniTrafficConfig) -> std::io::Result<()> {
+    if load_source_history_marker(cfg)?.is_some() { return Ok(()); }
+    let path = source_history_path(cfg)?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "nginx_sni source-history marker has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let marker = SourceHistoryMarker {
+        format_version: SOURCE_HISTORY_MARKER_FORMAT_VERSION,
+        source: source_key(cfg),
+    };
+    let bytes = serde_json::to_vec(&marker)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let filename = path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "nginx_sni source-history marker filename is invalid")
+    })?;
+    let temp = parent.join(format!(".{filename}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true).create_new(true).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temp)?;
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(&bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    match std::fs::hard_link(&temp, &path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&temp);
+            let current = load_source_history_marker(cfg)?;
+            if current.as_ref() == Some(&marker) { return Ok(()); }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "nginx_sni source-history marker changed during creation",
+            ));
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+    }
+    std::fs::remove_file(&temp)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    let current = load_source_history_marker(cfg)?;
+    if current.as_ref() != Some(&marker) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "nginx_sni source-history marker verification mismatch",
+        ));
+    }
+    Ok(())
+}
+
 fn cursor_tuple(state: &LogState) -> Option<(u64, u64, u64, u64)> {
     let identity = state.file_identity()?;
     Some((
@@ -361,10 +478,20 @@ async fn ingest_strict_locked<F>(
 where
     F: FnMut(&Path, &LogState) -> std::io::Result<()>,
 {
-    // Existing malformed/unreadable state fails closed; genuine NotFound is the
-    // only case allowed to begin with a default cursor.
+    // A durable source-history marker distinguishes genuine first boot from
+    // later cursor loss without becoming a second offset/cursor authority.
+    let history_present = load_source_history_marker(cfg)?.is_some();
     let mut state = load_state_optional(&cfg.state_path)?;
     recover_committed_checkpoints(cfg, counter, auth, node_id, &mut state, write_state)?;
+    if state.is_none() && history_present {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "nginx_sni cursor is missing for a source with prior durable history",
+        ));
+    }
+    if state.is_some() && !history_present {
+        ensure_source_history_marker(cfg)?;
+    }
 
     // Recovery is intentionally performed even when ingestion is disabled or
     // the access log is temporarily absent, so a spool->cursor half-transition
@@ -395,6 +522,9 @@ where
     if durable_state.as_ref() != Some(&state) {
         write_state(&cfg.state_path, &state)?;
     }
+    // On true first boot, persist the initial cursor/identity before installing
+    // the history marker; then fsync the marker before consuming source bytes.
+    ensure_source_history_marker(cfg)?;
     let mut persisted_state = state.clone();
 
     let mut reader = BufReader::new(file);
