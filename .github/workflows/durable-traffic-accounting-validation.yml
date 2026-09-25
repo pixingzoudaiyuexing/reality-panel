@@ -33,20 +33,20 @@ jobs:
       - name: Checkout exact candidate
         uses: actions/checkout@v4
         with:
-          ref: 7ead4ccc3f3e12b39909da35f99ab1f4118376e4
+          ref: af9d8afe43f75f5ecdab63796ddd5e2f4e5953ef
       - name: Install Rust toolchain
         run: rustup show
       - name: cargo fmt --check
         run: cargo fmt --check
+      - name: focused reporter tests
+        run: cargo test -p relay-node reporter::tests
+      - name: focused nginx_sni_traffic tests
+        run: cargo test -p relay-node forwarder::nginx_sni_traffic::tests
       - name: cargo clippy --workspace --all-targets
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test --workspace
         run: cargo test --workspace
       - name: cargo test -p relay-node
         run: cargo test -p relay-node
-      - name: focused reporter tests
-        run: cargo test -p relay-node reporter::tests
-      - name: focused nginx_sni_traffic tests
-        run: cargo test -p relay-node forwarder::nginx_sni_traffic::tests
       - name: repo test parity
         run: bash scripts/check-repo-test-parity.sh
