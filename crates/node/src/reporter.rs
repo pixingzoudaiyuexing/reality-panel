@@ -2729,19 +2729,19 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn crash_before_batch_install_keeps_no_committed_queue_item() {
+    #[tokio::test]
+    async fn crash_before_batch_install_keeps_live_snapshot_retryable() {
         let dir = private_test_dir("before-install");
         let config = strict_test_config("http://127.0.0.1:1".into(), &dir);
-        let reports = vec![TrafficEntry {
-            rule_id: 7,
-            upload: 10,
-            download: 20,
-        }];
+        let counter = TrafficCounter::new();
+        counter.add_at(42, 7, 10, 20).await;
+        let snapshot = counter.snapshot().await;
+        let reports = snapshot.entries.clone();
+
         let error = seal_strict_spool_batch_with_failpoint(
             &config.auth,
             "NODE_T1",
-            Some(42),
+            snapshot.config_revision,
             reports,
             None,
             SpoolWriteFailpoint::BeforeInstall,
@@ -2751,6 +2751,14 @@ mod tests {
         assert!(test_read_strict_spool(&config.auth, "NODE_T1")
             .unwrap()
             .is_empty());
+
+        // No durable batch exists, so the snapshot must remain uncommitted. A
+        // retry sees the exact same live traffic.
+        drop(snapshot);
+        let retry = counter.snapshot().await;
+        assert_eq!(retry.config_revision, Some(42));
+        assert_eq!(traffic(&retry.entries, 7), Some((10, 20)));
+        drop(retry);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2782,6 +2790,45 @@ mod tests {
         assert_eq!(first[0].3, reports);
         assert!(valid_traffic_batch_id(&first[0].0));
         assert!(valid_traffic_payload_sha256(&first[0].1));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn durable_spool_files_are_private_and_sequence_is_monotonic() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = private_test_dir("spool-permissions");
+        let config = strict_test_config("http://127.0.0.1:1".into(), &dir);
+        for revision in [42, 43] {
+            seal_strict_spool_batch(
+                &config.auth,
+                "NODE_T1",
+                Some(revision),
+                vec![TrafficEntry {
+                    rule_id: 7,
+                    upload: revision,
+                    download: revision + 1,
+                }],
+                None,
+            )
+            .unwrap();
+        }
+
+        let spool_dir = dir.join(TRAFFIC_SPOOL_DIRNAME);
+        let spool_mode = std::fs::metadata(&spool_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(spool_mode, 0o700);
+        let sequence_path = spool_dir.join(TRAFFIC_SPOOL_SEQUENCE_FILENAME);
+        let sequence_mode =
+            std::fs::metadata(&sequence_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(sequence_mode, 0o600);
+
+        let files = list_spool_files(&spool_dir).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files[0].0 < files[1].0);
+        for (_, path) in files {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
