@@ -7,6 +7,28 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.25] - 2026-09-25
+
+### 新增
+
+- 完成 Node Reuse V1 运行链路：一个具体 Relay Node 可在保持 Home Group 生命周期归属不变的前提下，同时承载 Home Group 与显式复用 Group 的规则。
+- HTTP 与 WebSocket 使用同一 EffectiveConfig 构建结果；Node 掉线、Panel 不可达及离线重启时，Home 与复用规则共用现有 LKG 恢复机制。
+- 复用规则所需证书按实际 EffectiveConfig 的来源 Group 与域名聚合下发，不要求跨组规则使用独立证书平台。
+
+### 修复
+
+- Strict traffic report 按 exact config revision 保存并使用历史 rule -> source Group / owner 归属，支持断线重试与重复 ACK 幂等。
+- 规则已删除时可按历史归属继续结算；无法安全恢复的历史条目会明确记录为 `traffic_historical_unbillable`，不会永久阻塞 Node 后续批次。
+- `traffic_history` 身份升级为 `(rule_id, group_id, hour_ts)`，避免同一 rule ID 在同小时迁组后把旧 Group 已结算流量重新标到新 Group。
+- 修复 Carrier Apply 在 DNS Provider 模糊写入后重建同一逻辑记录并更换 record ID 时的 ownership 恢复：仅允许从完整历史 `ERROR + MUTATION_UNKNOWN` 归属进行可重试的精确恢复；DNSMgr 子域过滤返回空时会用完整 zone inventory 交叉确认，避免误判记录不存在。
+
+### 兼容性
+
+- SQLite 新增 Migration 57；PostgreSQL schema revision 提升到 41。升级前应按现有生产流程备份数据库。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- `NODE_REUSE_RUNTIME_ENABLED` 默认关闭；升级 Panel 与 Node 本身不会自动启用跨组运行，需在生产验收阶段单独开启。
+- v1.1.24 可升级到 v1.1.25；本版本同时包含 Panel 与 relay-node 运行时代码变更。
+
 ## [1.1.24] - 2026-09-11
 
 ### 修复
