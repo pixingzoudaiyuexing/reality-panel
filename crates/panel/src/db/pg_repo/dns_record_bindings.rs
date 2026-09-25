@@ -122,8 +122,7 @@ impl DnsRecordBindingRepository for PgRepository {
         rebind: &AmbiguousDnsRecordBindingRebind,
     ) -> Result<u64, DbError> {
         Ok(sqlx::query(
-            "UPDATE dns_record_bindings SET record_id = $1, state = 'BOUND', \
-                 last_observed_at = $2, last_error_category = NULL, updated_at = $3 \
+            "UPDATE dns_record_bindings SET record_id = $1, last_observed_at = $2, updated_at = $3 \
              WHERE id = $4 AND rule_id = $5 AND fqdn = $6 AND zone_id = $7 \
                AND zone_name = $8 AND host = $9 AND record_type = $10 AND line = $11 \
                AND line_key = $12 AND record_id = $13 AND desired_value = $14 \
