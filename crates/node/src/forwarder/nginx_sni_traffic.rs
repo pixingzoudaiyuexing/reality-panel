@@ -268,6 +268,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_strict_segment<F>(
     cfg: &NginxSniTrafficConfig,
     counter: &TrafficCounter,
