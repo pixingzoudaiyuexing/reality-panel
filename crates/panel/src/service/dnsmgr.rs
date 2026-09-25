@@ -396,10 +396,12 @@ async fn fetch_record_inventory(
             )
             .await?;
         let count = page.rows.len();
-        authoritative_complete &= page.authoritative_total;
+        let page_end = u64::from(offset).saturating_add(count as u64);
+        let contradictory_empty =
+            page.authoritative_total && count == 0 && page_end < page.total;
+        authoritative_complete &= page.authoritative_total && !contradictory_empty;
         records.extend(page.rows);
-        let reached_total = page.authoritative_total
-            && u64::from(offset).saturating_add(count as u64) >= page.total;
+        let reached_total = page.authoritative_total && page_end >= page.total;
         if count == 0
             || reached_total
             || (!page.authoritative_total && count < DISCOVERY_PAGE_LIMIT as usize)
@@ -3503,6 +3505,34 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn record_discovery_rejects_contradictory_empty_full_inventory() {
+        let router = Router::new().route(
+            "/api/record/data/7",
+            post(|Form(_form): Form<HashMap<String, String>>| async move {
+                Json(json!({"total": 1, "rows": []}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client =
+            DnsMgrClient::new(DnsMgrClientConfig::new(&base_url, 7, "key").unwrap()).unwrap();
+
+        let result = discover_records(
+            &client,
+            &zone(),
+            DnsRecordType::A,
+            &ProviderLine::from_provider("Dianxin", Some("电信")),
+        )
+        .await;
+        handle.abort();
+        assert!(matches!(
+            result,
+            RecordDiscovery::UpstreamFailure(DnsMgrError::ProtocolContractViolation(_))
+        ));
     }
 
     #[tokio::test]
