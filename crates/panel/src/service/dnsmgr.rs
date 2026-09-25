@@ -348,8 +348,7 @@ pub(crate) async fn discover_records(
         Ok(inventory) => inventory,
         Err(error) => return RecordDiscovery::UpstreamFailure(error),
     };
-    let filtered_result =
-        classify_records(zone, expected_type, expected_line, filtered.records);
+    let filtered_result = classify_records(zone, expected_type, expected_line, filtered.records);
     if !matches!(filtered_result, RecordDiscovery::NoRecord) {
         return filtered_result;
     }
@@ -362,8 +361,7 @@ pub(crate) async fn discover_records(
         Ok(inventory) => inventory,
         Err(error) => return RecordDiscovery::UpstreamFailure(error),
     };
-    let complete_result =
-        classify_records(zone, expected_type, expected_line, complete.records);
+    let complete_result = classify_records(zone, expected_type, expected_line, complete.records);
     if matches!(complete_result, RecordDiscovery::NoRecord) && !complete.authoritative_complete {
         return RecordDiscovery::UpstreamFailure(DnsMgrError::ProtocolContractViolation(
             "DNSMgr returned a non-authoritative empty/unmatched record inventory".into(),
@@ -2014,11 +2012,7 @@ fn ambiguous_binding_matches_replacement(
         && (binding.line_key == DEFAULT_LINE_KEY
             || (binding.line == line.raw_id && binding.line == record.line.raw_id))
         && binding.record_id != record.record.record_id
-        && record
-            .record
-            .host
-            .trim()
-            .eq_ignore_ascii_case(&zone.host)
+        && record.record.host.trim().eq_ignore_ascii_case(&zone.host)
         && record
             .record
             .record_type
@@ -2072,8 +2066,7 @@ async fn recover_ambiguous_binding_replacement(
         _ => return Err(LineRecordSnapshotError::OwnershipUnverified),
     };
 
-    let zone_id =
-        i64::try_from(zone.domain_id).map_err(|_| LineRecordSnapshotError::Database)?;
+    let zone_id = i64::try_from(zone.domain_id).map_err(|_| LineRecordSnapshotError::Database)?;
     if db
         .find_dns_record_binding_by_record(zone_id, &confirmed.record.record_id)
         .await
@@ -2117,13 +2110,8 @@ async fn recover_ambiguous_binding_replacement(
         .await
         .map_err(|_| LineRecordSnapshotError::Database)?
         .ok_or(LineRecordSnapshotError::OwnershipUnverified)?;
-    if binding_matches_record(
-        Some(&persisted),
-        fqdn,
-        zone,
-        record_type,
-        &confirmed,
-    ) && binding_still_owns_exact_value(Some(&persisted), record_type, &confirmed)
+    if binding_matches_record(Some(&persisted), fqdn, zone, record_type, &confirmed)
+        && binding_still_owns_exact_value(Some(&persisted), record_type, &confirmed)
         && persisted.state == "BOUND"
         && persisted.last_error_category.is_none()
     {
@@ -2188,13 +2176,9 @@ async fn inspect_line_record_inner(
     match discover_records(client, &zone, DnsRecordType::A, &line).await {
         RecordDiscovery::NoRecord => Ok(LineRecordSnapshot::Absent),
         RecordDiscovery::SingleMatchingRecord(record) => {
-            let owned = binding_matches_record(
-                binding.as_ref(),
-                &fqdn,
-                &zone,
-                DnsRecordType::A,
-                &record,
-            ) && binding_still_owns_exact_value(binding.as_ref(), DnsRecordType::A, &record);
+            let owned =
+                binding_matches_record(binding.as_ref(), &fqdn, &zone, DnsRecordType::A, &record)
+                    && binding_still_owns_exact_value(binding.as_ref(), DnsRecordType::A, &record);
             let recovered = if owned {
                 false
             } else if let Some(stale) = binding.as_ref() {
@@ -2232,8 +2216,7 @@ async fn inspect_line_record_inner(
                 record_id: record.record.record_id,
             })
         }
-        RecordDiscovery::MultipleMatchingRecords(_)
-        | RecordDiscovery::ConflictingRecordType(_) => {
+        RecordDiscovery::MultipleMatchingRecords(_) | RecordDiscovery::ConflictingRecordType(_) => {
             Err(LineRecordSnapshotError::OwnershipUnverified)
         }
         RecordDiscovery::UpstreamFailure(error) => Err(LineRecordSnapshotError::Provider(error)),
@@ -3950,12 +3933,7 @@ mod tests {
         configure_eligible_rule(&mismatch_db, "op1.example.com", "192.0.2.10").await;
         insert_line_binding(&mismatch_db, "Dianxin", "stale-id", "192.0.2.20").await;
         let mismatch_binding = mismatch_db
-            .find_dns_record_binding_for_rule(
-                100,
-                "op1.example.com",
-                "A",
-                "dnsmgr:Dianxin",
-            )
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
             .await
             .unwrap()
             .unwrap();
@@ -3980,12 +3958,7 @@ mod tests {
             Err(LineRecordSnapshotError::OwnershipUnverified)
         ));
         let still_stale = mismatch_db
-            .find_dns_record_binding_for_rule(
-                100,
-                "op1.example.com",
-                "A",
-                "dnsmgr:Dianxin",
-            )
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
             .await
             .unwrap()
             .unwrap();
