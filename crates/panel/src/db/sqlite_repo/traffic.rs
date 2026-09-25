@@ -214,18 +214,16 @@ impl TrafficRepository for SqliteRepository {
                 "INSERT INTO traffic_history \
                    (rule_id, uid, group_id, hour_ts, real_upload, real_download, billed_total) \
                  VALUES (?, ?, ?, ?, ?, ?, ?) \
-                 ON CONFLICT(rule_id, hour_ts) DO UPDATE SET \
+                 ON CONFLICT(rule_id, group_id, hour_ts) DO UPDATE SET \
                    real_upload = real_upload + excluded.real_upload, \
                    real_download = real_download + excluded.real_download, \
-                   billed_total = billed_total + excluded.billed_total, \
-                   group_id = excluded.group_id",
+                   billed_total = billed_total + excluded.billed_total",
             )
             .bind(r.rule_id)
             .bind(r.uid)
-            // v1.2.0: the batch's group. A rule belongs to exactly one inbound
-            // group, and pass 2 already verified ownership against THIS group,
-            // so it is the rule's group by construction. Refreshed on conflict
-            // so a row the backfill left at 0 self-heals on the next report.
+            // The source group is part of the history key. If the same rule id
+            // moves groups within this hour, the new group's bytes get a separate
+            // row instead of relabeling traffic already attributed to the old one.
             .bind(group_id)
             .bind(&hour_ts)
             .bind(up)
@@ -349,11 +347,12 @@ impl TrafficRepository for SqliteRepository {
         // under its original source Group.
         //
         // A rule that moved to another Group is never billed to that new Group.
-        // Because traffic_history is keyed by (rule_id, hour_ts), old/new Group
-        // traffic for one rule in the same hour cannot be represented safely.
-        // Those bytes are terminally marked unbillable instead of being
-        // mislabeled. The same terminal path is used for pre-fix revisions whose
-        // physically deleted rule has no historical uid snapshot.
+        // Historical bytes from the stale revision remain terminally unbillable
+        // because the live rule no longer matches the exact historical source.
+        // traffic_history itself is now keyed by (rule_id, group_id, hour_ts), so
+        // legitimate post-move traffic can coexist with pre-move history without
+        // relabeling either row. The same terminal path is used for pre-fix
+        // revisions whose physically deleted rule has no historical uid snapshot.
         struct Resolved {
             rule_id: i64,
             uid: i64,
@@ -628,18 +627,16 @@ impl TrafficRepository for SqliteRepository {
                 "INSERT INTO traffic_history \
                    (rule_id, uid, group_id, hour_ts, real_upload, real_download, billed_total) \
                  VALUES (?, ?, ?, ?, ?, ?, ?) \
-                 ON CONFLICT(rule_id, hour_ts) DO UPDATE SET \
+                 ON CONFLICT(rule_id, group_id, hour_ts) DO UPDATE SET \
                    real_upload = real_upload + excluded.real_upload, \
                    real_download = real_download + excluded.real_download, \
-                   billed_total = billed_total + excluded.billed_total, \
-                   group_id = excluded.group_id",
+                   billed_total = billed_total + excluded.billed_total",
             )
             .bind(r.rule_id)
             .bind(r.uid)
-            // v1.2.0: the batch's group. A rule belongs to exactly one inbound
-            // group, and pass 2 already verified ownership against THIS group,
-            // so it is the rule's group by construction. Refreshed on conflict
-            // so a row the backfill left at 0 self-heals on the next report.
+            // The immutable source group is part of the history key, so a
+            // later incarnation of this rule id in another group cannot overwrite
+            // or absorb bytes already attributed to this historical source.
             .bind(r.source_group_id)
             .bind(&hour_ts)
             .bind(up)

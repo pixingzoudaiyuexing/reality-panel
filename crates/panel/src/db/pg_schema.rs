@@ -385,8 +385,8 @@ CREATE INDEX IF NOT EXISTS idx_redeem_codes_batch ON redeem_codes(batch_id);
 CREATE INDEX IF NOT EXISTS idx_redeem_codes_used_by ON redeem_codes(used_by);
 
 -- v1.2.0: hourly traffic history (mirrors the SQLite baseline — see the
--- comment there for why one row per (rule, hour), why billed_total reuses the
--- exact charged number, and why there is deliberately NO FK).
+-- comment there for why one row per (rule, group, hour), why billed_total
+-- reuses the exact charged number, and why there is deliberately NO FK).
 CREATE TABLE IF NOT EXISTS traffic_history (
     rule_id BIGINT NOT NULL,
     uid BIGINT NOT NULL,
@@ -397,7 +397,7 @@ CREATE TABLE IF NOT EXISTS traffic_history (
     real_upload BIGINT NOT NULL DEFAULT 0,
     real_download BIGINT NOT NULL DEFAULT 0,
     billed_total BIGINT NOT NULL DEFAULT 0,
-    PRIMARY KEY (rule_id, hour_ts)
+    PRIMARY KEY (rule_id, group_id, hour_ts)
 );
 CREATE INDEX IF NOT EXISTS idx_traffic_history_uid ON traffic_history(uid, hour_ts);
 CREATE INDEX IF NOT EXISTS idx_traffic_history_hour ON traffic_history(hour_ts);
@@ -655,7 +655,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 40;
+pub const PG_SCHEMA_VERSION: i32 = 41;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -2210,6 +2210,33 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         tx.commit().await?;
         tracing::info!("PG migration 40: traffic_report_batches idempotency ledger present");
     }
+
+    // ── Revision 41: traffic_history identity includes source group ──
+    // Existing rows are already unique by (rule_id, hour_ts), so widening the
+    // primary key cannot encounter duplicates and preserves every row verbatim.
+    if current < 41 {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "ALTER TABLE traffic_history DROP CONSTRAINT IF EXISTS traffic_history_pkey",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE traffic_history ADD CONSTRAINT traffic_history_pkey \
+             PRIMARY KEY (rule_id, group_id, hour_ts)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES (41) ON CONFLICT (version) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!(
+            "PG migration 41: traffic_history uses (rule_id, group_id, hour_ts) identity"
+        );
+    }
     Ok(())
 }
 
@@ -2270,7 +2297,8 @@ mod tests {
 
     #[test]
     fn pg_schema_version_matches_latest_migration() {
-        assert_eq!(PG_SCHEMA_VERSION, 40);
+        assert_eq!(PG_SCHEMA_VERSION, 41);
+        assert!(PG_SCHEMA_SQL.contains("PRIMARY KEY (rule_id, group_id, hour_ts)"));
     }
 
     #[test]

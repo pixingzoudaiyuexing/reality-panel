@@ -5775,6 +5775,68 @@ async fn pg_traffic_history_upserts_within_the_hour() {
     cleanup(&db).await;
 }
 
+
+#[tokio::test]
+async fn pg_traffic_history_preserves_same_hour_rows_across_group_move() {
+    let Some(db) = repo("th_move").await else {
+        return;
+    };
+    let uid = pg_seed_history_fixture(&db, "hist_move", 73, 305, 1.0).await;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid, rate) \
+         VALUES (74, 'hist-move-new', 'in', 'tok-74', $1, 1.0)",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    db.apply_traffic_batch(
+        73,
+        &[relay_shared::protocol::TrafficEntry {
+            rule_id: 305,
+            upload: 100,
+            download: 0,
+        }],
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE forward_rules SET device_group_in = 74 WHERE id = 305")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.apply_traffic_batch(
+        74,
+        &[relay_shared::protocol::TrafficEntry {
+            rule_id: 305,
+            upload: 50,
+            download: 0,
+        }],
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        "SELECT group_id, hour_ts, real_upload, billed_total \
+         FROM traffic_history WHERE rule_id = 305 ORDER BY group_id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "same-hour group move must keep two history rows");
+    assert_eq!(rows[0].0, 73);
+    assert_eq!(rows[0].2, 100);
+    assert_eq!(rows[0].3, 100);
+    assert_eq!(rows[1].0, 74);
+    assert_eq!(rows[1].2, 50);
+    assert_eq!(rows[1].3, 50);
+    assert_eq!(
+        rows[0].1, rows[1].1,
+        "test must exercise a migration inside one hourly bucket"
+    );
+    cleanup(&db).await;
+}
+
 #[tokio::test]
 async fn pg_traffic_history_query_scopes_and_aggregates() {
     let Some(db) = repo("th_scope").await else {
