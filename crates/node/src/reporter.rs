@@ -1623,7 +1623,9 @@ fn log_traffic_request_error(prefix: &str, error: TrafficRequestError, request_t
         ),
         TrafficRequestError::Request(error) => tracing::warn!("{prefix} error: {error}"),
         TrafficRequestError::Http(status) => tracing::warn!("{prefix} HTTP {status} (not 2xx)"),
-        TrafficRequestError::Malformed(error) => tracing::warn!("{prefix} malformed response: {error}"),
+        TrafficRequestError::Malformed(error) => {
+            tracing::warn!("{prefix} malformed response: {error}")
+        }
     }
 }
 
@@ -1637,20 +1639,29 @@ async fn report_traffic_legacy_with_deadline(
     if snap.entries.is_empty() {
         return TrafficReportOutcome::Current;
     }
-    let report = TrafficReport { batch: None, reports: snap.entries.clone() };
-    let response = match send_traffic_json::<ApiResponse<()>>(config, node_id, &report, request_timeout).await {
-        Ok(response) => response,
-        Err(error) => {
-            log_traffic_request_error("report_traffic legacy", error, request_timeout);
-            return TrafficReportOutcome::Stopped;
-        }
+    let report = TrafficReport {
+        batch: None,
+        reports: snap.entries.clone(),
     };
+    let response =
+        match send_traffic_json::<ApiResponse<()>>(config, node_id, &report, request_timeout).await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                log_traffic_request_error("report_traffic legacy", error, request_timeout);
+                return TrafficReportOutcome::Stopped;
+            }
+        };
     if response.code == 0 {
         snap.commit().await;
         tracing::info!("report_traffic legacy code 0");
         TrafficReportOutcome::Current
     } else {
-        tracing::warn!("report_traffic legacy rejected: code {} msg={}", response.code, response.message);
+        tracing::warn!(
+            "report_traffic legacy rejected: code {} msg={}",
+            response.code,
+            response.message
+        );
         TrafficReportOutcome::Stopped
     }
 }
@@ -1691,8 +1702,13 @@ async fn report_traffic_strict_with_limits(
                 true
             }
             Err(error) => {
-                if error.restart_required() { counter.poison_strict_reporting(); }
-                tracing::error!("strict traffic batch could not be durably queued: {}", error.message());
+                if error.restart_required() {
+                    counter.poison_strict_reporting();
+                }
+                tracing::error!(
+                    "strict traffic batch could not be durably queued: {}",
+                    error.message()
+                );
                 return TrafficReportOutcome::Stopped;
             }
         }
@@ -1738,11 +1754,16 @@ async fn report_traffic_strict_with_limits(
         match durable_batch_send_ready(&queued) {
             Ok(true) => {}
             Ok(false) => {
-                tracing::warn!("strict Nginx traffic batch is waiting for durable source-cursor commit proof");
+                tracing::warn!(
+                    "strict Nginx traffic batch is waiting for durable source-cursor commit proof"
+                );
                 return TrafficReportOutcome::Stopped;
             }
             Err(error) => {
-                tracing::error!("strict Nginx traffic batch cursor proof unavailable: {}", error);
+                tracing::error!(
+                    "strict Nginx traffic batch cursor proof unavailable: {}",
+                    error
+                );
                 return TrafficReportOutcome::Stopped;
             }
         }
@@ -1757,7 +1778,14 @@ async fn report_traffic_strict_with_limits(
             }),
             reports: pending.reports.clone(),
         };
-        let response = match send_traffic_json::<ApiResponse<TrafficBatchAck>>(config, node_id, &report, request_timeout).await {
+        let response = match send_traffic_json::<ApiResponse<TrafficBatchAck>>(
+            config,
+            node_id,
+            &report,
+            request_timeout,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
                 log_traffic_request_error("strict report_traffic", error, request_timeout);
@@ -1769,7 +1797,10 @@ async fn report_traffic_strict_with_limits(
             return TrafficReportOutcome::Stopped;
         }
         if let Err(error) = remove_durable_batch_at(&queued, node_id, credential_id) {
-            tracing::error!("strict traffic ACK could not be durably completed: {}", error);
+            tracing::error!(
+                "strict traffic ACK could not be durably completed: {}",
+                error
+            );
             return TrafficReportOutcome::Stopped;
         }
         tracing::info!("strict report_traffic batch confirmed");
@@ -1800,9 +1831,15 @@ async fn report_traffic_with_limits(
     match &config.auth {
         NodeRuntimeAuth::PermanentCredential { credential_id, .. } => {
             report_traffic_strict_with_limits(
-                config, counter, node_id, credential_id, request_timeout,
-                drain_batch_limit, drain_time_budget,
-            ).await
+                config,
+                counter,
+                node_id,
+                credential_id,
+                request_timeout,
+                drain_batch_limit,
+                drain_time_budget,
+            )
+            .await
         }
         NodeRuntimeAuth::LegacyGroupToken { .. } => {
             report_traffic_legacy_with_deadline(config, counter, node_id, request_timeout).await
@@ -1810,11 +1847,20 @@ async fn report_traffic_with_limits(
     }
 }
 
-pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter, node_id: &str) -> TrafficReportOutcome {
+pub async fn report_traffic(
+    config: &NodeConfig,
+    counter: &TrafficCounter,
+    node_id: &str,
+) -> TrafficReportOutcome {
     report_traffic_with_limits(
-        config, counter, node_id, TRAFFIC_REPORT_REQUEST_TIMEOUT,
-        STRICT_TRAFFIC_DRAIN_BATCH_LIMIT, STRICT_TRAFFIC_DRAIN_TIME_BUDGET,
-    ).await
+        config,
+        counter,
+        node_id,
+        TRAFFIC_REPORT_REQUEST_TIMEOUT,
+        STRICT_TRAFFIC_DRAIN_BATCH_LIMIT,
+        STRICT_TRAFFIC_DRAIN_TIME_BUDGET,
+    )
+    .await
 }
 
 /// Report real system metrics: CPU %, memory %, active connections, uptime.
@@ -2678,11 +2724,7 @@ mod tests {
         .unwrap()
     }
 
-    fn write_nginx_commit_proof(
-        path: &Path,
-        checkpoint: &NginxTrafficCheckpoint,
-        sequence: u64,
-    ) {
+    fn write_nginx_commit_proof(path: &Path, checkpoint: &NginxTrafficCheckpoint, sequence: u64) {
         let bytes = serde_json::to_vec(&serde_json::json!({
             "offset": checkpoint.end_offset,
             "device": checkpoint.device,
@@ -3211,7 +3253,11 @@ mod tests {
                 &config.auth,
                 "NODE_T1",
                 Some(revision),
-                vec![TrafficEntry { rule_id: 7, upload: revision, download: revision + 1 }],
+                vec![TrafficEntry {
+                    rule_id: 7,
+                    upload: revision,
+                    download: revision + 1,
+                }],
                 None,
             )
             .unwrap();
@@ -3233,7 +3279,11 @@ mod tests {
                 &config.auth,
                 "NODE_T1",
                 Some(nginx_revision),
-                vec![TrafficEntry { rule_id: 8, upload: 30 + cycle, download: 40 + cycle }],
+                vec![TrafficEntry {
+                    rule_id: 8,
+                    upload: 30 + cycle,
+                    download: 40 + cycle,
+                }],
                 checkpoint.clone(),
             )
             .unwrap();
@@ -3241,10 +3291,14 @@ mod tests {
             expected_revisions.push(Some(nginx_revision));
 
             let ordinary_revision = 2000 + cycle;
-            counter.add_at(ordinary_revision, 9, 50 + cycle, 60 + cycle).await;
+            counter
+                .add_at(ordinary_revision, 9, 50 + cycle, 60 + cycle)
+                .await;
             expected_revisions.push(Some(ordinary_revision));
 
-            let before = test_read_strict_spool(&config.auth, "NODE_T1").unwrap().len();
+            let before = test_read_strict_spool(&config.auth, "NODE_T1")
+                .unwrap()
+                .len();
             let outcome = report_traffic_with_limits(
                 &config,
                 &counter,
@@ -3254,8 +3308,13 @@ mod tests {
                 Duration::from_secs(30),
             )
             .await;
-            let after = test_read_strict_spool(&config.auth, "NODE_T1").unwrap().len();
-            assert!(after < before, "healthy catch-up must reduce queue depth every cycle");
+            let after = test_read_strict_spool(&config.auth, "NODE_T1")
+                .unwrap()
+                .len();
+            assert!(
+                after < before,
+                "healthy catch-up must reduce queue depth every cycle"
+            );
             if cycle < 9 {
                 assert_eq!(outcome, TrafficReportOutcome::BacklogRemaining);
             } else {
@@ -3294,22 +3353,54 @@ mod tests {
         let config = strict_test_config(format!("http://{addr}"), &dir);
         for revision in 41..=43_u64 {
             seal_strict_spool_batch(
-                &config.auth, "NODE_T1", Some(revision),
-                vec![TrafficEntry { rule_id: 7, upload: revision, download: revision }], None,
-            ).unwrap();
+                &config.auth,
+                "NODE_T1",
+                Some(revision),
+                vec![TrafficEntry {
+                    rule_id: 7,
+                    upload: revision,
+                    download: revision,
+                }],
+                None,
+            )
+            .unwrap();
         }
         let counter = TrafficCounter::new();
         assert_eq!(
-            report_traffic_with_limits(&config, &counter, "NODE_T1", Duration::from_secs(1), 2, Duration::from_secs(30)).await,
+            report_traffic_with_limits(
+                &config,
+                &counter,
+                "NODE_T1",
+                Duration::from_secs(1),
+                2,
+                Duration::from_secs(30)
+            )
+            .await,
             TrafficReportOutcome::BacklogRemaining
         );
-        assert_eq!(test_read_strict_spool(&config.auth, "NODE_T1").unwrap().len(), 1);
         assert_eq!(
-            report_traffic_with_limits(&config, &counter, "NODE_T1", Duration::from_secs(1), 2, Duration::from_secs(30)).await,
+            test_read_strict_spool(&config.auth, "NODE_T1")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            report_traffic_with_limits(
+                &config,
+                &counter,
+                "NODE_T1",
+                Duration::from_secs(1),
+                2,
+                Duration::from_secs(30)
+            )
+            .await,
             TrafficReportOutcome::Current
         );
         server.await.unwrap();
-        let revisions = captured.lock().await.iter()
+        let revisions = captured
+            .lock()
+            .await
+            .iter()
             .map(|report| report.batch.as_ref().unwrap().config_revision)
             .collect::<Vec<_>>();
         assert_eq!(revisions, vec![Some(41), Some(42), Some(43)]);
@@ -3324,20 +3415,33 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let report = read_http_traffic_report(&mut stream).await;
             write_http_response(&mut stream, "503 Service Unavailable", b"").await;
-            let no_second = tokio::time::timeout(Duration::from_millis(75), listener.accept()).await.is_err();
+            let no_second = tokio::time::timeout(Duration::from_millis(75), listener.accept())
+                .await
+                .is_err();
             (report, no_second)
         });
         let dir = private_test_dir("failed-send-stops-drain");
         let config = strict_test_config(format!("http://{addr}"), &dir);
         for revision in 71..=73_u64 {
             seal_strict_spool_batch(
-                &config.auth, "NODE_T1", Some(revision),
-                vec![TrafficEntry { rule_id: 7, upload: revision, download: revision }], None,
-            ).unwrap();
+                &config.auth,
+                "NODE_T1",
+                Some(revision),
+                vec![TrafficEntry {
+                    rule_id: 7,
+                    upload: revision,
+                    download: revision,
+                }],
+                None,
+            )
+            .unwrap();
         }
         let before = test_read_strict_spool(&config.auth, "NODE_T1").unwrap();
         let counter = TrafficCounter::new();
-        assert_eq!(report_traffic(&config, &counter, "NODE_T1").await, TrafficReportOutcome::Stopped);
+        assert_eq!(
+            report_traffic(&config, &counter, "NODE_T1").await,
+            TrafficReportOutcome::Stopped
+        );
         let (sent, no_second) = server.await.unwrap();
         assert!(no_second);
         let after = test_read_strict_spool(&config.auth, "NODE_T1").unwrap();
@@ -3356,7 +3460,10 @@ mod tests {
         let captured_server = captured.clone();
         let server = tokio::spawn(async move {
             let (mut stalled, _) = listener.accept().await.unwrap();
-            captured_server.lock().await.push(read_http_traffic_report(&mut stalled).await);
+            captured_server
+                .lock()
+                .await
+                .push(read_http_traffic_report(&mut stalled).await);
             tokio::time::sleep(Duration::from_millis(150)).await;
             drop(stalled);
             for _ in 0..2 {
@@ -3373,9 +3480,14 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             report_traffic_with_limits(
-                &config, &counter, "NODE_T1", Duration::from_millis(50),
-                STRICT_TRAFFIC_DRAIN_BATCH_LIMIT, STRICT_TRAFFIC_DRAIN_TIME_BUDGET,
-            ).await,
+                &config,
+                &counter,
+                "NODE_T1",
+                Duration::from_millis(50),
+                STRICT_TRAFFIC_DRAIN_BATCH_LIMIT,
+                STRICT_TRAFFIC_DRAIN_TIME_BUDGET,
+            )
+            .await,
             TrafficReportOutcome::Stopped
         );
         assert!(started.elapsed() < Duration::from_millis(500));
@@ -3388,21 +3500,37 @@ mod tests {
         counter.add_at(82, 7, 30, 40).await;
         assert_eq!(
             report_traffic_with_limits(
-                &config, &counter, "NODE_T1", Duration::from_secs(1),
-                STRICT_TRAFFIC_DRAIN_BATCH_LIMIT, STRICT_TRAFFIC_DRAIN_TIME_BUDGET,
-            ).await,
+                &config,
+                &counter,
+                "NODE_T1",
+                Duration::from_secs(1),
+                STRICT_TRAFFIC_DRAIN_BATCH_LIMIT,
+                STRICT_TRAFFIC_DRAIN_TIME_BUDGET,
+            )
+            .await,
             TrafficReportOutcome::Current
         );
         server.await.unwrap();
-        assert!(test_read_strict_spool(&config.auth, "NODE_T1").unwrap().is_empty());
+        assert!(test_read_strict_spool(&config.auth, "NODE_T1")
+            .unwrap()
+            .is_empty());
         let requests = captured.lock().await;
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[0].batch.as_ref().unwrap().batch_id, first_id);
-        assert_eq!(requests[0].batch.as_ref().unwrap().payload_sha256, first_hash);
+        assert_eq!(
+            requests[0].batch.as_ref().unwrap().payload_sha256,
+            first_hash
+        );
         assert_eq!(requests[1].batch.as_ref().unwrap().batch_id, first_id);
-        assert_eq!(requests[1].batch.as_ref().unwrap().payload_sha256, first_hash);
+        assert_eq!(
+            requests[1].batch.as_ref().unwrap().payload_sha256,
+            first_hash
+        );
         assert_ne!(requests[2].batch.as_ref().unwrap().batch_id, first_id);
-        assert_eq!(requests[2].batch.as_ref().unwrap().config_revision, Some(82));
+        assert_eq!(
+            requests[2].batch.as_ref().unwrap().config_revision,
+            Some(82)
+        );
         drop(requests);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -3418,15 +3546,22 @@ mod tests {
         });
         let dir = private_test_dir("legacy-hung-timeout");
         let mut config = strict_test_config(format!("http://{addr}"), &dir);
-        config.auth = NodeRuntimeAuth::LegacyGroupToken { token: "legacy-test-token".into() };
+        config.auth = NodeRuntimeAuth::LegacyGroupToken {
+            token: "legacy-test-token".into(),
+        };
         let counter = TrafficCounter::new();
         counter.add_at(91, 7, 11, 22).await;
         let started = Instant::now();
         assert_eq!(
             report_traffic_with_limits(
-                &config, &counter, "NODE_T1", Duration::from_millis(50),
-                STRICT_TRAFFIC_DRAIN_BATCH_LIMIT, STRICT_TRAFFIC_DRAIN_TIME_BUDGET,
-            ).await,
+                &config,
+                &counter,
+                "NODE_T1",
+                Duration::from_millis(50),
+                STRICT_TRAFFIC_DRAIN_BATCH_LIMIT,
+                STRICT_TRAFFIC_DRAIN_TIME_BUDGET,
+            )
+            .await,
             TrafficReportOutcome::Stopped
         );
         assert!(started.elapsed() < Duration::from_millis(500));
