@@ -122,8 +122,7 @@ impl DnsRecordBindingRepository for SqliteRepository {
         rebind: &AmbiguousDnsRecordBindingRebind,
     ) -> Result<u64, DbError> {
         Ok(sqlx::query(
-            "UPDATE dns_record_bindings SET record_id = ?, state = 'BOUND', \
-                 last_observed_at = ?, last_error_category = NULL, updated_at = ? \
+            "UPDATE dns_record_bindings SET record_id = ?, last_observed_at = ?, updated_at = ? \
              WHERE id = ? AND rule_id = ? AND fqdn = ? AND zone_id = ? \
                AND zone_name = ? AND host = ? AND record_type = ? AND line = ? \
                AND line_key = ? AND record_id = ? AND desired_value = ? \
