@@ -397,8 +397,7 @@ async fn fetch_record_inventory(
             .await?;
         let count = page.rows.len();
         let page_end = u64::from(offset).saturating_add(count as u64);
-        let contradictory_empty =
-            page.authoritative_total && count == 0 && page_end < page.total;
+        let contradictory_empty = page.authoritative_total && count == 0 && page_end < page.total;
         authoritative_complete &= page.authoritative_total && !contradictory_empty;
         records.extend(page.rows);
         let reached_total = page.authoritative_total && page_end >= page.total;
