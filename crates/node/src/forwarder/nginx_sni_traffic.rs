@@ -1211,6 +1211,7 @@ mod tests {
         assert_eq!(before[0].3[0].download, 10);
         let before_id = before[0].0.clone();
         let before_hash = before[0].1.clone();
+        let before_sequence = before[0].5;
 
         // Fresh process: checkpoint recovery persists the cursor first, then the
         // same source is already at EOF and cannot create a second queue item.
@@ -1231,7 +1232,12 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].0, before_id);
         assert_eq!(after[0].1, before_hash);
-        assert_eq!(load_state(&paths.state).unwrap().offset, line.len() as u64);
+        let recovered_state = load_state(&paths.state).unwrap();
+        assert_eq!(recovered_state.offset, line.len() as u64);
+        assert_eq!(
+            recovered_state.committed_spool_sequence,
+            Some(before_sequence)
+        );
         assert!(restart_counter.snapshot().await.entries.is_empty());
     }
 
@@ -1269,11 +1275,13 @@ mod tests {
             .unwrap(),
             0
         );
-        assert_eq!(load_state(&paths.state).unwrap().offset, line.len() as u64);
+        let recovered_state = load_state(&paths.state).unwrap();
+        assert_eq!(recovered_state.offset, line.len() as u64);
+        let queued = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        assert_eq!(queued.len(), 1, "recovery must not delete the durable batch");
         assert_eq!(
-            test_read_strict_spool(&auth, "NODE_T1").unwrap().len(),
-            1,
-            "recovery must not delete the durable batch"
+            recovered_state.committed_spool_sequence,
+            Some(queued[0].5)
         );
     }
 
@@ -1285,6 +1293,7 @@ mod tests {
             device: Some(1),
             inode: Some(2),
             generation: 3,
+            committed_spool_sequence: Some(17),
         };
         save_state(&paths.state, &state).unwrap();
         let metadata = std::fs::metadata(&paths.state).unwrap();
