@@ -2678,6 +2678,22 @@ mod tests {
         .unwrap()
     }
 
+    fn write_nginx_commit_proof(
+        path: &Path,
+        checkpoint: &NginxTrafficCheckpoint,
+        sequence: u64,
+    ) {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "offset": checkpoint.end_offset,
+            "device": checkpoint.device,
+            "inode": checkpoint.inode,
+            "generation": checkpoint.generation,
+            "committed_spool_sequence": sequence,
+        }))
+        .unwrap();
+        atomic_replace_private_file(path, &bytes, "test Nginx cursor proof").unwrap();
+    }
+
     #[tokio::test]
     async fn legacy_single_pending_file_remains_readable_and_private() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2755,16 +2771,13 @@ mod tests {
         let second_hash = queued[1].1.clone();
 
         // Fresh in-memory counter models a process restart while A and B are
-        // both unacknowledged. The immutable queue is the only source needed.
+        // both unacknowledged. A healthy bounded invocation drains both FIFO
+        // batches instead of waiting a full poll between them.
         let restarted_counter = TrafficCounter::new();
-        report_traffic(&config, &restarted_counter, "NODE_T1").await;
-        let after_first_ack = test_read_strict_spool(&config.auth, "NODE_T1").unwrap();
-        assert_eq!(after_first_ack.len(), 1);
-        assert_eq!(after_first_ack[0].0, second_id);
-        assert_eq!(after_first_ack[0].1, second_hash);
-        assert_eq!(after_first_ack[0].2, Some(43));
-
-        report_traffic(&config, &restarted_counter, "NODE_T1").await;
+        assert_eq!(
+            report_traffic(&config, &restarted_counter, "NODE_T1").await,
+            TrafficReportOutcome::Current
+        );
         server.await.unwrap();
         assert!(test_read_strict_spool(&config.auth, "NODE_T1")
             .unwrap()
@@ -3149,7 +3162,18 @@ mod tests {
 
         let counter = TrafficCounter::new();
         counter.add_at(42, 7, 1, 2).await;
-        report_traffic(&config, &counter, "NODE_T1").await;
+        assert_eq!(
+            report_traffic_with_limits(
+                &config,
+                &counter,
+                "NODE_T1",
+                Duration::from_secs(1),
+                1,
+                Duration::from_secs(30),
+            )
+            .await,
+            TrafficReportOutcome::BacklogRemaining
+        );
         let sent = server.await.unwrap();
         assert_eq!(sent.batch.as_ref().unwrap().batch_id, legacy.batch_id);
         assert_eq!(sent.reports, legacy_reports);
@@ -3159,6 +3183,258 @@ mod tests {
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].2, Some(42));
         assert_eq!(traffic(&queue[0].3, 7), Some((1, 2)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn healthy_backlog_converges_with_sustained_nginx_and_counter_traffic() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<TrafficReport>::new()));
+        let captured_server = captured.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..40 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let report = read_http_traffic_report(&mut stream).await;
+                let body = ack_body(&report, TrafficBatchAckStatus::Applied);
+                captured_server.lock().await.push(report);
+                write_http_response(&mut stream, "200 OK", &body).await;
+            }
+        });
+
+        let dir = private_test_dir("healthy-backlog-convergence");
+        let config = strict_test_config(format!("http://{addr}"), &dir);
+        let counter = TrafficCounter::new();
+        let mut expected_revisions = Vec::new();
+        for revision in 1..=20_u64 {
+            seal_strict_spool_batch(
+                &config.auth,
+                "NODE_T1",
+                Some(revision),
+                vec![TrafficEntry { rule_id: 7, upload: revision, download: revision + 1 }],
+                None,
+            )
+            .unwrap();
+            expected_revisions.push(Some(revision));
+        }
+
+        let proof_path = dir.join("nginx-cursor-proof.json");
+        for cycle in 0..10_u64 {
+            let nginx_revision = 1000 + cycle;
+            let checkpoint = NginxTrafficCheckpoint {
+                source: proof_path.to_string_lossy().into_owned(),
+                device: 11,
+                inode: 22,
+                generation: 0,
+                start_offset: cycle * 10,
+                end_offset: cycle * 10 + 10,
+            };
+            let sequence = seal_nginx_traffic_batch(
+                &config.auth,
+                "NODE_T1",
+                Some(nginx_revision),
+                vec![TrafficEntry { rule_id: 8, upload: 30 + cycle, download: 40 + cycle }],
+                checkpoint.clone(),
+            )
+            .unwrap();
+            write_nginx_commit_proof(&proof_path, &checkpoint, sequence);
+            expected_revisions.push(Some(nginx_revision));
+
+            let ordinary_revision = 2000 + cycle;
+            counter.add_at(ordinary_revision, 9, 50 + cycle, 60 + cycle).await;
+            expected_revisions.push(Some(ordinary_revision));
+
+            let before = test_read_strict_spool(&config.auth, "NODE_T1").unwrap().len();
+            let outcome = report_traffic_with_limits(
+                &config,
+                &counter,
+                "NODE_T1",
+                Duration::from_secs(1),
+                4,
+                Duration::from_secs(30),
+            )
+            .await;
+            let after = test_read_strict_spool(&config.auth, "NODE_T1").unwrap().len();
+            assert!(after < before, "healthy catch-up must reduce queue depth every cycle");
+            if cycle < 9 {
+                assert_eq!(outcome, TrafficReportOutcome::BacklogRemaining);
+            } else {
+                assert_eq!(outcome, TrafficReportOutcome::Current);
+                assert_eq!(after, 0);
+            }
+        }
+
+        server.await.unwrap();
+        let requests = captured.lock().await;
+        let actual_revisions = requests
+            .iter()
+            .map(|report| report.batch.as_ref().unwrap().config_revision)
+            .collect::<Vec<_>>();
+        assert_eq!(actual_revisions, expected_revisions);
+        drop(requests);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_budget_reports_backlog_and_next_invocation_continues_fifo() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<TrafficReport>::new()));
+        let captured_server = captured.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let report = read_http_traffic_report(&mut stream).await;
+                let body = ack_body(&report, TrafficBatchAckStatus::Applied);
+                captured_server.lock().await.push(report);
+                write_http_response(&mut stream, "200 OK", &body).await;
+            }
+        });
+        let dir = private_test_dir("bounded-backlog-signal");
+        let config = strict_test_config(format!("http://{addr}"), &dir);
+        for revision in 41..=43_u64 {
+            seal_strict_spool_batch(
+                &config.auth, "NODE_T1", Some(revision),
+                vec![TrafficEntry { rule_id: 7, upload: revision, download: revision }], None,
+            ).unwrap();
+        }
+        let counter = TrafficCounter::new();
+        assert_eq!(
+            report_traffic_with_limits(&config, &counter, "NODE_T1", Duration::from_secs(1), 2, Duration::from_secs(30)).await,
+            TrafficReportOutcome::BacklogRemaining
+        );
+        assert_eq!(test_read_strict_spool(&config.auth, "NODE_T1").unwrap().len(), 1);
+        assert_eq!(
+            report_traffic_with_limits(&config, &counter, "NODE_T1", Duration::from_secs(1), 2, Duration::from_secs(30)).await,
+            TrafficReportOutcome::Current
+        );
+        server.await.unwrap();
+        let revisions = captured.lock().await.iter()
+            .map(|report| report.batch.as_ref().unwrap().config_revision)
+            .collect::<Vec<_>>();
+        assert_eq!(revisions, vec![Some(41), Some(42), Some(43)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_failed_send_stops_drain_and_later_batches_do_not_overtake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let report = read_http_traffic_report(&mut stream).await;
+            write_http_response(&mut stream, "503 Service Unavailable", b"").await;
+            let no_second = tokio::time::timeout(Duration::from_millis(75), listener.accept()).await.is_err();
+            (report, no_second)
+        });
+        let dir = private_test_dir("failed-send-stops-drain");
+        let config = strict_test_config(format!("http://{addr}"), &dir);
+        for revision in 71..=73_u64 {
+            seal_strict_spool_batch(
+                &config.auth, "NODE_T1", Some(revision),
+                vec![TrafficEntry { rule_id: 7, upload: revision, download: revision }], None,
+            ).unwrap();
+        }
+        let before = test_read_strict_spool(&config.auth, "NODE_T1").unwrap();
+        let counter = TrafficCounter::new();
+        assert_eq!(report_traffic(&config, &counter, "NODE_T1").await, TrafficReportOutcome::Stopped);
+        let (sent, no_second) = server.await.unwrap();
+        assert!(no_second);
+        let after = test_read_strict_spool(&config.auth, "NODE_T1").unwrap();
+        assert_eq!(after, before);
+        assert_eq!(sent.batch.as_ref().unwrap().batch_id, before[0].0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hung_panel_timeout_keeps_exact_batch_and_allows_later_sealing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dir = private_test_dir("hung-panel-timeout");
+        let config = strict_test_config(format!("http://{addr}"), &dir);
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<TrafficReport>::new()));
+        let captured_server = captured.clone();
+        let server = tokio::spawn(async move {
+            let (mut stalled, _) = listener.accept().await.unwrap();
+            captured_server.lock().await.push(read_http_traffic_report(&mut stalled).await);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(stalled);
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let report = read_http_traffic_report(&mut stream).await;
+                let body = ack_body(&report, TrafficBatchAckStatus::Applied);
+                captured_server.lock().await.push(report);
+                write_http_response(&mut stream, "200 OK", &body).await;
+            }
+        });
+
+        let counter = TrafficCounter::new();
+        counter.add_at(81, 7, 10, 20).await;
+        let started = Instant::now();
+        assert_eq!(
+            report_traffic_with_limits(
+                &config, &counter, "NODE_T1", Duration::from_millis(50),
+                STRICT_TRAFFIC_DRAIN_BATCH_LIMIT, STRICT_TRAFFIC_DRAIN_TIME_BUDGET,
+            ).await,
+            TrafficReportOutcome::Stopped
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(!counter.strict_reporting_poisoned());
+        let queued = test_read_strict_spool(&config.auth, "NODE_T1").unwrap();
+        assert_eq!(queued.len(), 1);
+        let first_id = queued[0].0.clone();
+        let first_hash = queued[0].1.clone();
+
+        counter.add_at(82, 7, 30, 40).await;
+        assert_eq!(
+            report_traffic_with_limits(
+                &config, &counter, "NODE_T1", Duration::from_secs(1),
+                STRICT_TRAFFIC_DRAIN_BATCH_LIMIT, STRICT_TRAFFIC_DRAIN_TIME_BUDGET,
+            ).await,
+            TrafficReportOutcome::Current
+        );
+        server.await.unwrap();
+        assert!(test_read_strict_spool(&config.auth, "NODE_T1").unwrap().is_empty());
+        let requests = captured.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].batch.as_ref().unwrap().batch_id, first_id);
+        assert_eq!(requests[0].batch.as_ref().unwrap().payload_sha256, first_hash);
+        assert_eq!(requests[1].batch.as_ref().unwrap().batch_id, first_id);
+        assert_eq!(requests[1].batch.as_ref().unwrap().payload_sha256, first_hash);
+        assert_ne!(requests[2].batch.as_ref().unwrap().batch_id, first_id);
+        assert_eq!(requests[2].batch.as_ref().unwrap().config_revision, Some(82));
+        drop(requests);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_hung_panel_timeout_returns_with_live_snapshot_intact() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_traffic_report(&mut stream).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        });
+        let dir = private_test_dir("legacy-hung-timeout");
+        let mut config = strict_test_config(format!("http://{addr}"), &dir);
+        config.auth = NodeRuntimeAuth::LegacyGroupToken { token: "legacy-test-token".into() };
+        let counter = TrafficCounter::new();
+        counter.add_at(91, 7, 11, 22).await;
+        let started = Instant::now();
+        assert_eq!(
+            report_traffic_with_limits(
+                &config, &counter, "NODE_T1", Duration::from_millis(50),
+                STRICT_TRAFFIC_DRAIN_BATCH_LIMIT, STRICT_TRAFFIC_DRAIN_TIME_BUDGET,
+            ).await,
+            TrafficReportOutcome::Stopped
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let retained = counter.snapshot().await;
+        assert_eq!(retained.config_revision, Some(91));
+        assert_eq!(traffic(&retained.entries, 7), Some((11, 22)));
+        drop(retained);
+        server.await.unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
