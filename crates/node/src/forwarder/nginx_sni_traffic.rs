@@ -1115,34 +1115,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_read_error_leaves_source_retryable_and_retry_converges_once() {
+    async fn injected_read_error_after_committed_prefix_retries_suffix_exactly_once() {
         let paths = TestPaths::new();
-        let first = revision_line(10, 20);
-        let second = revision_line(30, 40);
+        let first = revision_line_at(42, 10, 20);
+        let second = revision_line_at(43, 30, 40);
         std::fs::write(&paths.log, format!("{first}{second}")).unwrap();
         let (manager, counter) = traffic_context();
         let auth = paths.auth();
 
+        // Reading revision 43 flushes revision 42 first. The injected error is
+        // then raised before EOF, while 43 exists only in local parse state.
         let error = ingest_once_inner_with_failpoints(
             &paths.config(),
             &manager,
             &counter,
             &auth,
             "NODE_T1",
-            Some(1),
+            Some(2),
             save_state,
         )
         .await
         .expect_err("injected read error");
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
-        assert!(!paths.state.exists());
-        assert!(test_read_strict_spool(&auth, "NODE_T1").unwrap().is_empty());
+
+        let after_error = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        assert_eq!(after_error.len(), 1);
+        assert_eq!(after_error[0].2, Some(42));
+        assert_eq!(after_error[0].3[0].upload, 20);
+        assert_eq!(after_error[0].3[0].download, 10);
+        assert_eq!(load_state(&paths.state).unwrap().offset, first.len() as u64);
         assert!(counter.snapshot().await.entries.is_empty());
 
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 2);
-        let checkpoint = drain_single_spool(&paths, 60, 40);
-        assert_eq!(checkpoint.start_offset, 0);
-        assert_eq!(checkpoint.end_offset, (first.len() + second.len()) as u64);
+        // Retry starts at the durable cursor, re-reads only revision 43, and
+        // appends exactly one later immutable batch.
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        let after_retry = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        assert_eq!(after_retry.len(), 2);
+        assert_eq!(after_retry[0].0, after_error[0].0);
+        assert_eq!(after_retry[0].1, after_error[0].1);
+        assert_eq!(after_retry[0].2, Some(42));
+        assert_eq!(after_retry[1].2, Some(43));
+        assert!(after_retry[0].5 < after_retry[1].5);
+        assert_eq!(after_retry[1].3[0].upload, 40);
+        assert_eq!(after_retry[1].3[0].download, 30);
         assert_eq!(
             load_state(&paths.state).unwrap().offset,
             (first.len() + second.len()) as u64
