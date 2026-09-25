@@ -1587,9 +1587,10 @@ pub trait DnsRecordBindingRepository: Send + Sync {
     ) -> Result<u64, DbError>;
 
     /// Recover provider identity only for a binding left in the explicit
-    /// ambiguous-mutation terminal state. Every previous identity field is part
-    /// of the atomic predicate; a normal BOUND/MISSING/CONFLICT binding cannot
-    /// use this path.
+    /// ambiguous-mutation recoverable state. The transfer deliberately preserves
+    /// ERROR + MUTATION_UNKNOWN until normal reconciliation verifies the provider.
+    /// Every previous identity field is part of the atomic predicate; a normal
+    /// BOUND/MISSING/CONFLICT binding cannot use this path.
     async fn rebind_ambiguous_dns_record_binding(
         &self,
         rebind: &AmbiguousDnsRecordBindingRebind,
