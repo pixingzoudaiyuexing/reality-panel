@@ -1218,7 +1218,10 @@ mod tests {
         assert!(counter.strict_reporting_poisoned());
         let precommit_state = load_state(&paths.state).unwrap();
         assert_eq!(precommit_state.offset, 0);
-        assert_eq!(precommit_state.file_identity(), Some(identity_at(&paths.log)));
+        assert_eq!(
+            precommit_state.file_identity(),
+            Some(identity_at(&paths.log))
+        );
         assert_eq!(precommit_state.committed_spool_sequence, None);
 
         let before = test_read_strict_spool(&auth, "NODE_T1").unwrap();
@@ -1275,8 +1278,7 @@ mod tests {
         let old_identity = old_state.file_identity().unwrap();
 
         let replacement = revision_line(30, 40);
-        let replacement_identity =
-            replace_file_with_distinct_inode(&paths.log, &replacement);
+        let replacement_identity = replace_file_with_distinct_inode(&paths.log, &replacement);
         assert_ne!(replacement_identity, old_identity);
 
         let mut state_writes = 0usize;
@@ -1302,14 +1304,8 @@ mod tests {
 
         let transition_state = load_state(&paths.state).unwrap();
         assert_eq!(transition_state.offset, 0);
-        assert_eq!(
-            transition_state.generation,
-            old_state.generation + 1
-        );
-        assert_eq!(
-            transition_state.file_identity(),
-            Some(replacement_identity)
-        );
+        assert_eq!(transition_state.generation, old_state.generation + 1);
+        assert_eq!(transition_state.file_identity(), Some(replacement_identity));
         let before = test_read_strict_spool(&auth, "NODE_T1").unwrap();
         assert_eq!(before.len(), 1);
         let before_id = before[0].0.clone();
