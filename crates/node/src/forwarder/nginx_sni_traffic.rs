@@ -726,8 +726,14 @@ mod tests {
         (manager, counter)
     }
 
+    fn revision_line_at(revision: u64, bytes_sent: u64, bytes_received: u64) -> String {
+        format!(
+            "1723550000.123|443|OP1.Example.COM|12|{revision}|{bytes_sent}|{bytes_received}|1.2\n"
+        )
+    }
+
     fn revision_line(bytes_sent: u64, bytes_received: u64) -> String {
-        format!("1723550000.123|443|OP1.Example.COM|12|9|{bytes_sent}|{bytes_received}|1.2\n")
+        revision_line_at(9, bytes_sent, bytes_received)
     }
 
     async fn ingest_test_once(
@@ -1010,6 +1016,39 @@ mod tests {
             Some(replacement_identity)
         );
         assert_eq!(after_replacement.offset, replacement_contents.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn mixed_config_revisions_become_distinct_ordered_batches() {
+        let paths = TestPaths::new();
+        let first = revision_line_at(42, 10, 20);
+        let second = revision_line_at(43, 30, 40);
+        std::fs::write(&paths.log, format!("{first}{second}")).unwrap();
+        let (manager, counter) = traffic_context();
+
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 2);
+        let queue = test_read_strict_spool(&paths.auth(), "NODE_T1").unwrap();
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].2, Some(42));
+        assert_eq!(queue[1].2, Some(43));
+        assert!(queue[0].5 < queue[1].5);
+        assert_eq!(queue[0].3[0].upload, 20);
+        assert_eq!(queue[0].3[0].download, 10);
+        assert_eq!(queue[1].3[0].upload, 40);
+        assert_eq!(queue[1].3[0].download, 30);
+        let first_checkpoint = queue[0].4.as_ref().unwrap();
+        let second_checkpoint = queue[1].4.as_ref().unwrap();
+        assert_eq!(first_checkpoint.start_offset, 0);
+        assert_eq!(first_checkpoint.end_offset, first.len() as u64);
+        assert_eq!(second_checkpoint.start_offset, first.len() as u64);
+        assert_eq!(
+            second_checkpoint.end_offset,
+            (first.len() + second.len()) as u64
+        );
+        assert_eq!(
+            load_state(&paths.state).unwrap().offset,
+            (first.len() + second.len()) as u64
+        );
     }
 
     #[tokio::test]
