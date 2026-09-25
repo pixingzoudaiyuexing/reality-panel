@@ -240,15 +240,27 @@ fn source_key(cfg: &NginxSniTrafficConfig) -> String {
 
 fn source_history_path(cfg: &NginxSniTrafficConfig) -> std::io::Result<PathBuf> {
     let parent = cfg.state_path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "nginx_sni traffic state path has no parent")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "nginx_sni traffic state path has no parent",
+        )
     })?;
-    let filename = cfg.state_path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "nginx_sni traffic state filename is invalid")
-    })?;
+    let filename = cfg
+        .state_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "nginx_sni traffic state filename is invalid",
+            )
+        })?;
     Ok(parent.join(format!("{filename}{SOURCE_HISTORY_MARKER_SUFFIX}")))
 }
 
-fn load_source_history_marker(cfg: &NginxSniTrafficConfig) -> std::io::Result<Option<SourceHistoryMarker>> {
+fn load_source_history_marker(
+    cfg: &NginxSniTrafficConfig,
+) -> std::io::Result<Option<SourceHistoryMarker>> {
     let path = source_history_path(cfg)?;
     let mut file = match std::fs::OpenOptions::new()
         .read(true)
@@ -275,7 +287,9 @@ fn load_source_history_marker(cfg: &NginxSniTrafficConfig) -> std::io::Result<Op
     file.read_to_end(&mut bytes)?;
     let marker: SourceHistoryMarker = serde_json::from_slice(&bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    if marker.format_version != SOURCE_HISTORY_MARKER_FORMAT_VERSION || marker.source != source_key(cfg) {
+    if marker.format_version != SOURCE_HISTORY_MARKER_FORMAT_VERSION
+        || marker.source != source_key(cfg)
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "nginx_sni source-history marker does not match this source",
@@ -285,10 +299,15 @@ fn load_source_history_marker(cfg: &NginxSniTrafficConfig) -> std::io::Result<Op
 }
 
 fn ensure_source_history_marker(cfg: &NginxSniTrafficConfig) -> std::io::Result<()> {
-    if load_source_history_marker(cfg)?.is_some() { return Ok(()); }
+    if load_source_history_marker(cfg)?.is_some() {
+        return Ok(());
+    }
     let path = source_history_path(cfg)?;
     let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "nginx_sni source-history marker has no parent")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "nginx_sni source-history marker has no parent",
+        )
     })?;
     std::fs::create_dir_all(parent)?;
     let marker = SourceHistoryMarker {
@@ -297,12 +316,20 @@ fn ensure_source_history_marker(cfg: &NginxSniTrafficConfig) -> std::io::Result<
     };
     let bytes = serde_json::to_vec(&marker)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    let filename = path.file_name().and_then(|value| value.to_str()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "nginx_sni source-history marker filename is invalid")
-    })?;
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "nginx_sni source-history marker filename is invalid",
+            )
+        })?;
     let temp = parent.join(format!(".{filename}.{}.tmp", uuid::Uuid::new_v4()));
     let mut file = std::fs::OpenOptions::new()
-        .write(true).create_new(true).mode(0o600)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&temp)?;
     let write_result = (|| -> std::io::Result<()> {
@@ -321,7 +348,9 @@ fn ensure_source_history_marker(cfg: &NginxSniTrafficConfig) -> std::io::Result<
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let _ = std::fs::remove_file(&temp);
             let current = load_source_history_marker(cfg)?;
-            if current.as_ref() == Some(&marker) { return Ok(()); }
+            if current.as_ref() == Some(&marker) {
+                return Ok(());
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "nginx_sni source-history marker changed during creation",
@@ -920,7 +949,11 @@ mod tests {
             auth,
             "NODE_T1",
             Some(revision),
-            vec![TrafficEntry { rule_id: 12, upload: 20, download: 10 }],
+            vec![TrafficEntry {
+                rule_id: 12,
+                upload: 20,
+                download: 10,
+            }],
             NginxTrafficCheckpoint {
                 source: source_key(&paths.config()),
                 device: identity.device,
@@ -943,7 +976,10 @@ mod tests {
                     .and_then(|value| value.to_str())
                     .is_some_and(|name| {
                         name.ends_with(".json")
-                            && name.as_bytes().first().is_some_and(|byte| byte.is_ascii_digit())
+                            && name
+                                .as_bytes()
+                                .first()
+                                .is_some_and(|byte| byte.is_ascii_digit())
                     })
             })
             .collect::<Vec<_>>();
@@ -1298,15 +1334,22 @@ mod tests {
         let before = test_read_strict_spool(&auth, "NODE_T1").unwrap();
         assert_eq!(before.len(), 1);
         assert!(!paths.state.exists());
-        assert!(load_source_history_marker(&paths.config()).unwrap().is_none());
+        assert!(load_source_history_marker(&paths.config())
+            .unwrap()
+            .is_none());
         let (manager, counter) = traffic_context();
 
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 0);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            0
+        );
         let state = load_state(&paths.state).unwrap();
         assert_eq!(state.offset, line.len() as u64);
         assert_eq!(state.generation, 0);
         assert_eq!(state.committed_spool_sequence, Some(sequence));
-        assert!(load_source_history_marker(&paths.config()).unwrap().is_some());
+        assert!(load_source_history_marker(&paths.config())
+            .unwrap()
+            .is_some());
         let after = test_read_strict_spool(&auth, "NODE_T1").unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].0, before[0].0);
@@ -1328,7 +1371,9 @@ mod tests {
             .expect_err("nonzero surviving checkpoint cannot bootstrap a missing cursor");
         assert!(error.to_string().contains("bootstrap checkpoint"));
         assert!(!paths.state.exists());
-        assert!(load_source_history_marker(&paths.config()).unwrap().is_none());
+        assert!(load_source_history_marker(&paths.config())
+            .unwrap()
+            .is_none());
         assert_eq!(test_read_strict_spool(&auth, "NODE_T1").unwrap(), before);
         assert!(counter.snapshot().await.entries.is_empty());
     }
@@ -1352,7 +1397,10 @@ mod tests {
         remove_oldest_spool_file(&paths);
         let before = test_read_strict_spool(&auth, "NODE_T1").unwrap();
         assert_eq!(before.len(), 1);
-        assert_eq!(before[0].4.as_ref().unwrap().start_offset, first.len() as u64);
+        assert_eq!(
+            before[0].4.as_ref().unwrap().start_offset,
+            first.len() as u64
+        );
         let (manager, counter) = traffic_context();
 
         let error = ingest_test_once(&paths, &manager, &counter)
@@ -1370,9 +1418,14 @@ mod tests {
         std::fs::write(&paths.log, &line).unwrap();
         let auth = paths.auth();
         let (manager, counter) = traffic_context();
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            1
+        );
         assert_eq!(test_drain_strict_spool(&auth, "NODE_T1").unwrap().len(), 1);
-        assert!(load_source_history_marker(&paths.config()).unwrap().is_some());
+        assert!(load_source_history_marker(&paths.config())
+            .unwrap()
+            .is_some());
         std::fs::remove_file(&paths.state).unwrap();
         let (restart_manager, restart_counter) = traffic_context();
 
