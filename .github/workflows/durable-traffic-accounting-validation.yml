@@ -1,0 +1,52 @@
+name: Durable traffic accounting candidate validation
+
+on:
+  push:
+    branches:
+      - ci/durable-traffic-accounting-validation
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: relaytest
+          POSTGRES_PASSWORD: relaytest
+          POSTGRES_DB: relaytest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relaytest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_PG_URL: postgres://relaytest:relaytest@localhost:5432/relaytest
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@v4
+        with:
+          ref: 29b434d2243239223c0891f3904ba2d7bc4a8236
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test --workspace
+        run: cargo test --workspace
+      - name: cargo test -p relay-node
+        run: cargo test -p relay-node
+      - name: focused reporter tests
+        run: cargo test -p relay-node reporter::tests
+      - name: focused nginx_sni_traffic tests
+        run: cargo test -p relay-node forwarder::nginx_sni_traffic::tests
+      - name: repo test parity
+        run: bash scripts/check-repo-test-parity.sh
