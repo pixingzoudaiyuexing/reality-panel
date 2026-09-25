@@ -604,7 +604,14 @@ async fn run() {
         // channel — these values reflect real active TCP/UDP forwarding state
         // and are reported over plain HTTP, so they keep working even if WS
         // is down.
-        forwarder::nginx_sni_traffic::ingest_once(&nginx_sni_traffic, &manager, &counter).await;
+        forwarder::nginx_sni_traffic::ingest_once(
+            &nginx_sni_traffic,
+            &manager,
+            &counter,
+            &config.auth,
+            &node_id,
+        )
+        .await;
         reporter::report_traffic(&config, &counter, &node_id).await;
         // Drain any listener bind/runtime errors captured since the last cycle
         // and forward them to the panel so an operator can see WHY a rule isn't
