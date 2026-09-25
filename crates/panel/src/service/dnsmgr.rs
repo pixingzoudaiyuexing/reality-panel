@@ -3987,8 +3987,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.record_id, "replacement-id");
-        assert_eq!(recovered.state, "BOUND");
-        assert_eq!(recovered.last_error_category, None);
+        assert_eq!(recovered.state, "ERROR");
+        assert_eq!(
+            recovered.last_error_category.as_deref(),
+            Some("MUTATION_UNKNOWN")
+        );
         assert_eq!(mock.state.total_mutations(), 0);
 
         let mismatch_db = ensure_db().await;
