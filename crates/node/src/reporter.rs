@@ -580,6 +580,16 @@ const TRAFFIC_SPOOL_SEQUENCE_FILENAME: &str = "sequence.json";
 const TRAFFIC_SPOOL_FORMAT_VERSION: u32 = 1;
 const TRAFFIC_SPOOL_FILENAME_WIDTH: usize = 20;
 const MAX_PENDING_TRAFFIC_BYTES: u64 = 1_048_576;
+const TRAFFIC_REPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const STRICT_TRAFFIC_DRAIN_BATCH_LIMIT: usize = 64;
+const STRICT_TRAFFIC_DRAIN_TIME_BUDGET: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrafficReportOutcome {
+    Current,
+    BacklogRemaining,
+    Stopped,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1368,6 +1378,7 @@ pub(crate) fn recover_nginx_checkpoint(
     };
     let queue = load_spool_queue(auth, node_id, credential_id)?;
     let mut matched = None;
+    let mut source_checkpoint_seen = false;
     for (_, record) in queue {
         let Some(checkpoint) = record.nginx_checkpoint else {
             continue;
@@ -1375,6 +1386,7 @@ pub(crate) fn recover_nginx_checkpoint(
         if checkpoint.source != source {
             continue;
         }
+        source_checkpoint_seen = true;
         let cursor_matches = match cursor {
             Some((device, inode, generation, offset)) => {
                 checkpoint.device == device
@@ -1395,6 +1407,12 @@ pub(crate) fn recover_nginx_checkpoint(
                 checkpoint,
             });
         }
+    }
+    if cursor.is_none() && matched.is_none() && source_checkpoint_seen {
+        return Err(
+            "Nginx cursor is missing while durable source history has no unique generation-0 offset-0 bootstrap checkpoint"
+                .into(),
+        );
     }
     Ok(matched)
 }
@@ -1544,74 +1562,123 @@ fn strict_ack_matches(
         )
 }
 
-async fn report_traffic_legacy(config: &NodeConfig, counter: &TrafficCounter, node_id: &str) {
-    let snap = counter.snapshot().await;
-    if snap.entries.is_empty() {
-        return;
-    }
-    let report = TrafficReport {
-        batch: None,
-        reports: snap.entries.clone(),
-    };
+#[derive(Debug)]
+enum TrafficRequestError {
+    Timeout,
+    Request(String),
+    Http(reqwest::StatusCode),
+    Malformed(String),
+}
+
+async fn send_traffic_json<T>(
+    config: &NodeConfig,
+    node_id: &str,
+    report: &TrafficReport,
+    request_timeout: Duration,
+) -> Result<T, TrafficRequestError>
+where
+    T: serde::de::DeserializeOwned,
+{
     let url = format!("{}/api/v1/node/report_traffic", config.panel_url);
-    let client = reqwest::Client::new();
-    match config
+    let client = reqwest::Client::builder()
+        .timeout(request_timeout)
+        .build()
+        .map_err(|error| TrafficRequestError::Request(error.to_string()))?;
+    let request = config
         .auth
         .apply_reqwest(client.post(&url))
         .header("X-Node-ID", node_id)
-        .json(&report)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            let status = response.status();
-            if !status.is_success() {
-                tracing::warn!("report_traffic HTTP {} (not 2xx)", status);
-                return;
+        .json(report);
+    let operation = async {
+        let response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                TrafficRequestError::Timeout
+            } else {
+                TrafficRequestError::Request(error.to_string())
             }
-            match response.json::<ApiResponse<()>>().await {
-                Ok(resp) if resp.code == 0 => {
-                    snap.commit().await;
-                    tracing::info!("report_traffic legacy HTTP {} code 0", status);
-                }
-                Ok(resp) => tracing::warn!(
-                    "report_traffic legacy rejected: code {} msg={}",
-                    resp.code,
-                    resp.message
-                ),
-                Err(error) => tracing::warn!("report_traffic legacy malformed response: {}", error),
-            }
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(TrafficRequestError::Http(status));
         }
-        Err(error) => tracing::warn!("report_traffic legacy error: {}", error),
+        response.json::<T>().await.map_err(|error| {
+            if error.is_timeout() {
+                TrafficRequestError::Timeout
+            } else {
+                TrafficRequestError::Malformed(error.to_string())
+            }
+        })
+    };
+    match tokio::time::timeout(request_timeout, operation).await {
+        Ok(result) => result,
+        Err(_) => Err(TrafficRequestError::Timeout),
     }
 }
 
-async fn report_traffic_strict(
+fn log_traffic_request_error(prefix: &str, error: TrafficRequestError, request_timeout: Duration) {
+    match error {
+        TrafficRequestError::Timeout => tracing::warn!(
+            "{prefix} timed out after {} ms",
+            request_timeout.as_millis()
+        ),
+        TrafficRequestError::Request(error) => tracing::warn!("{prefix} error: {error}"),
+        TrafficRequestError::Http(status) => tracing::warn!("{prefix} HTTP {status} (not 2xx)"),
+        TrafficRequestError::Malformed(error) => tracing::warn!("{prefix} malformed response: {error}"),
+    }
+}
+
+async fn report_traffic_legacy_with_deadline(
+    config: &NodeConfig,
+    counter: &TrafficCounter,
+    node_id: &str,
+    request_timeout: Duration,
+) -> TrafficReportOutcome {
+    let snap = counter.snapshot().await;
+    if snap.entries.is_empty() {
+        return TrafficReportOutcome::Current;
+    }
+    let report = TrafficReport { batch: None, reports: snap.entries.clone() };
+    let response = match send_traffic_json::<ApiResponse<()>>(config, node_id, &report, request_timeout).await {
+        Ok(response) => response,
+        Err(error) => {
+            log_traffic_request_error("report_traffic legacy", error, request_timeout);
+            return TrafficReportOutcome::Stopped;
+        }
+    };
+    if response.code == 0 {
+        snap.commit().await;
+        tracing::info!("report_traffic legacy code 0");
+        TrafficReportOutcome::Current
+    } else {
+        tracing::warn!("report_traffic legacy rejected: code {} msg={}", response.code, response.message);
+        TrafficReportOutcome::Stopped
+    }
+}
+
+async fn report_traffic_strict_with_limits(
     config: &NodeConfig,
     counter: &TrafficCounter,
     node_id: &str,
     credential_id: &str,
-) {
-    // Validate every committed queue entry before touching live counters. A
-    // corrupt later entry therefore fails closed rather than being overtaken.
+    request_timeout: Duration,
+    drain_batch_limit: usize,
+    drain_time_budget: Duration,
+) -> TrafficReportOutcome {
     let queue_before = match load_spool_queue(&config.auth, node_id, credential_id) {
         Ok(queue) => queue,
         Err(error) => {
             tracing::error!("strict traffic spool unavailable: {}", error);
-            return;
+            return TrafficReportOutcome::Stopped;
         }
     };
     let legacy_before = match load_legacy_pending(&config.auth, node_id, credential_id) {
         Ok(value) => value,
         Err(error) => {
             tracing::error!("strict legacy traffic pending state unavailable: {}", error);
-            return;
+            return TrafficReportOutcome::Stopped;
         }
     };
 
-    // Seal one fresh in-memory generation before attempting the oldest upload.
-    // A Panel outage can block A indefinitely while B/C still become immutable
-    // durable batches rather than living only in process RAM.
     let snap = counter.snapshot().await;
     let sealed_new = if snap.entries.is_empty() {
         drop(snap);
@@ -1624,126 +1691,130 @@ async fn report_traffic_strict(
                 true
             }
             Err(error) => {
-                if error.restart_required() {
-                    counter.poison_strict_reporting();
-                }
-                tracing::error!(
-                    "strict traffic batch could not be durably queued: {}",
-                    error.message()
-                );
-                return;
+                if error.restart_required() { counter.poison_strict_reporting(); }
+                tracing::error!("strict traffic batch could not be durably queued: {}", error.message());
+                return TrafficReportOutcome::Stopped;
             }
         }
     };
 
-    let queued = if let Some(legacy) = legacy_before {
-        legacy
-    } else if let Some(oldest) = oldest_queue_batch(&queue_before) {
-        oldest
-    } else if sealed_new {
-        let queue_after = match load_spool_queue(&config.auth, node_id, credential_id) {
+    let queue = if sealed_new {
+        match load_spool_queue(&config.auth, node_id, credential_id) {
             Ok(queue) => queue,
             Err(error) => {
                 tracing::error!("strict traffic spool unavailable after seal: {}", error);
-                return;
+                return TrafficReportOutcome::Stopped;
+            }
+        }
+    } else {
+        queue_before
+    };
+
+    let drain_started = Instant::now();
+    let mut confirmed = 0usize;
+    let mut queue_index = 0usize;
+    let mut legacy = legacy_before;
+    loop {
+        let queued = if let Some(legacy_batch) = legacy.as_ref() {
+            legacy_batch.clone()
+        } else if let Some((path, record)) = queue.get(queue_index) {
+            DurableQueuedBatch {
+                batch: record.batch.clone(),
+                location: DurableBatchLocation::Queue {
+                    path: path.clone(),
+                    record: Box::new(record.clone()),
+                },
+            }
+        } else {
+            return TrafficReportOutcome::Current;
+        };
+
+        if confirmed >= drain_batch_limit
+            || (confirmed > 0 && drain_started.elapsed() >= drain_time_budget)
+        {
+            return TrafficReportOutcome::BacklogRemaining;
+        }
+
+        match durable_batch_send_ready(&queued) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!("strict Nginx traffic batch is waiting for durable source-cursor commit proof");
+                return TrafficReportOutcome::Stopped;
+            }
+            Err(error) => {
+                tracing::error!("strict Nginx traffic batch cursor proof unavailable: {}", error);
+                return TrafficReportOutcome::Stopped;
+            }
+        }
+
+        let pending = &queued.batch;
+        let report = TrafficReport {
+            batch: Some(TrafficBatchMetadata {
+                version: pending.version,
+                batch_id: pending.batch_id.clone(),
+                payload_sha256: pending.payload_sha256.clone(),
+                config_revision: pending.config_revision,
+            }),
+            reports: pending.reports.clone(),
+        };
+        let response = match send_traffic_json::<ApiResponse<TrafficBatchAck>>(config, node_id, &report, request_timeout).await {
+            Ok(response) => response,
+            Err(error) => {
+                log_traffic_request_error("strict report_traffic", error, request_timeout);
+                return TrafficReportOutcome::Stopped;
             }
         };
-        let Some(oldest) = oldest_queue_batch(&queue_after) else {
-            tracing::error!("strict traffic spool lost a just-sealed batch");
-            counter.poison_strict_reporting();
-            return;
-        };
-        oldest
-    } else {
-        return;
-    };
-
-    match durable_batch_send_ready(&queued) {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                "strict Nginx traffic batch is waiting for durable source-cursor commit proof"
-            );
-            return;
+        if !strict_ack_matches(pending, &response) {
+            tracing::warn!("strict report_traffic received rejected or non-matching ACK");
+            return TrafficReportOutcome::Stopped;
         }
-        Err(error) => {
-            tracing::error!(
-                "strict Nginx traffic batch cursor proof unavailable: {}",
-                error
-            );
-            return;
+        if let Err(error) = remove_durable_batch_at(&queued, node_id, credential_id) {
+            tracing::error!("strict traffic ACK could not be durably completed: {}", error);
+            return TrafficReportOutcome::Stopped;
+        }
+        tracing::info!("strict report_traffic batch confirmed");
+        confirmed = confirmed.saturating_add(1);
+        if matches!(&queued.location, DurableBatchLocation::Legacy(_)) {
+            legacy = None;
+        } else {
+            queue_index = queue_index.saturating_add(1);
         }
     }
-
-    let pending = &queued.batch;
-    let report = TrafficReport {
-        batch: Some(TrafficBatchMetadata {
-            version: pending.version,
-            batch_id: pending.batch_id.clone(),
-            payload_sha256: pending.payload_sha256.clone(),
-            config_revision: pending.config_revision,
-        }),
-        reports: pending.reports.clone(),
-    };
-    let url = format!("{}/api/v1/node/report_traffic", config.panel_url);
-    let client = reqwest::Client::new();
-    let response = match config
-        .auth
-        .apply_reqwest(client.post(&url))
-        .header("X-Node-ID", node_id)
-        .json(&report)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!("strict report_traffic error: {}", error);
-            return;
-        }
-    };
-    if !response.status().is_success() {
-        tracing::warn!("strict report_traffic HTTP {} (not 2xx)", response.status());
-        return;
-    }
-    let response = match response.json::<ApiResponse<TrafficBatchAck>>().await {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!("strict report_traffic malformed ACK: {}", error);
-            return;
-        }
-    };
-    if !strict_ack_matches(pending, &response) {
-        tracing::warn!("strict report_traffic received non-matching ACK");
-        return;
-    }
-    if let Err(error) = remove_durable_batch_at(&queued, node_id, credential_id) {
-        tracing::error!(
-            "strict traffic ACK could not be durably completed: {}",
-            error
-        );
-        return;
-    }
-    tracing::info!("strict report_traffic batch confirmed");
 }
 
-pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter, node_id: &str) {
+async fn report_traffic_with_limits(
+    config: &NodeConfig,
+    counter: &TrafficCounter,
+    node_id: &str,
+    request_timeout: Duration,
+    drain_batch_limit: usize,
+    drain_time_budget: Duration,
+) -> TrafficReportOutcome {
     let _report_guard = counter.durable_accounting_guard().await;
     if matches!(config.auth, NodeRuntimeAuth::PermanentCredential { .. })
         && counter.strict_reporting_poisoned()
     {
-        tracing::error!(
-            "strict traffic reporting is stopped after an uncertain local accounting transition; restart required"
-        );
-        return;
+        tracing::error!("strict traffic reporting is stopped after an uncertain local accounting transition; restart required");
+        return TrafficReportOutcome::Stopped;
     }
     match &config.auth {
         NodeRuntimeAuth::PermanentCredential { credential_id, .. } => {
-            report_traffic_strict(config, counter, node_id, credential_id).await;
+            report_traffic_strict_with_limits(
+                config, counter, node_id, credential_id, request_timeout,
+                drain_batch_limit, drain_time_budget,
+            ).await
         }
         NodeRuntimeAuth::LegacyGroupToken { .. } => {
-            report_traffic_legacy(config, counter, node_id).await;
+            report_traffic_legacy_with_deadline(config, counter, node_id, request_timeout).await
         }
     }
+}
+
+pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter, node_id: &str) -> TrafficReportOutcome {
+    report_traffic_with_limits(
+        config, counter, node_id, TRAFFIC_REPORT_REQUEST_TIMEOUT,
+        STRICT_TRAFFIC_DRAIN_BATCH_LIMIT, STRICT_TRAFFIC_DRAIN_TIME_BUDGET,
+    ).await
 }
 
 /// Report real system metrics: CPU %, memory %, active connections, uptime.
