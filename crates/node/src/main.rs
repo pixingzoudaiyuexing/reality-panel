@@ -529,6 +529,7 @@ async fn run() {
     // failures keep the normal interval.
     let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval));
     const MISMATCH_BACKOFF_SECS: u64 = 300; // 5 minutes
+    const TRAFFIC_BACKLOG_CATCHUP_WINDOW: Duration = Duration::from_secs(2);
     let mut in_mismatch_backoff = false;
     loop {
         interval.tick().await;
@@ -612,7 +613,7 @@ async fn run() {
             &node_id,
         )
         .await;
-        reporter::report_traffic(&config, &counter, &node_id).await;
+        let mut traffic_outcome = reporter::report_traffic(&config, &counter, &node_id).await;
         // Drain any listener bind/runtime errors captured since the last cycle
         // and forward them to the panel so an operator can see WHY a rule isn't
         // forwarding (port in use, permission denied, etc.).
@@ -640,6 +641,25 @@ async fn run() {
             reconciliation_status,
         )
         .await;
+
+        // A healthy bounded drain may still leave backlog. Continue it promptly
+        // only after status reporting, and only within a finite wall-clock
+        // window. Timeout/network/ACK/local failures return Stopped and therefore
+        // never enter a tight retry loop.
+        if matches!(
+            traffic_outcome,
+            reporter::TrafficReportOutcome::BacklogRemaining
+        ) {
+            let catchup_deadline = Instant::now() + TRAFFIC_BACKLOG_CATCHUP_WINDOW;
+            while matches!(
+                traffic_outcome,
+                reporter::TrafficReportOutcome::BacklogRemaining
+            ) && Instant::now() < catchup_deadline
+            {
+                tokio::task::yield_now().await;
+                traffic_outcome = reporter::report_traffic(&config, &counter, &node_id).await;
+            }
+        }
     }
 }
 
