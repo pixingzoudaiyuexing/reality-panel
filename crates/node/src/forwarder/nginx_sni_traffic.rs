@@ -907,6 +907,51 @@ mod tests {
         replacement_identity
     }
 
+    fn seal_checkpoint(
+        paths: &TestPaths,
+        auth: &NodeRuntimeAuth,
+        start_offset: u64,
+        end_offset: u64,
+        generation: u64,
+        revision: u64,
+    ) -> u64 {
+        let identity = identity_at(&paths.log);
+        seal_nginx_traffic_batch(
+            auth,
+            "NODE_T1",
+            Some(revision),
+            vec![TrafficEntry { rule_id: 12, upload: 20, download: 10 }],
+            NginxTrafficCheckpoint {
+                source: source_key(&paths.config()),
+                device: identity.device,
+                inode: identity.inode,
+                generation,
+                start_offset,
+                end_offset,
+            },
+        )
+        .unwrap()
+    }
+
+    fn remove_oldest_spool_file(paths: &TestPaths) {
+        let spool_dir = paths.dir.join("traffic-report-spool");
+        let mut files = std::fs::read_dir(&spool_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| {
+                        name.ends_with(".json")
+                            && name.as_bytes().first().is_some_and(|byte| byte.is_ascii_digit())
+                    })
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        std::fs::remove_file(files.first().expect("oldest spool file")).unwrap();
+        std::fs::File::open(&spool_dir).unwrap().sync_all().unwrap();
+    }
+
     #[test]
     fn parse_log_line_reads_nginx_sni_fields() {
         let parsed = parse_log_line("1723550000.123|443|OP1.Example.COM|12|345|678|1.2\n").unwrap();
@@ -1228,6 +1273,116 @@ mod tests {
         let state = load_state(&paths.state).unwrap();
         assert_eq!(state.offset, line.len() as u64);
         assert_eq!(state.file_identity(), Some(identity_at(&paths.log)));
+        let marker = load_source_history_marker(&paths.config())
+            .unwrap()
+            .expect("first strict source consumption creates history marker");
+        assert_eq!(marker.source, source_key(&paths.config()));
+        assert_eq!(marker.format_version, SOURCE_HISTORY_MARKER_FORMAT_VERSION);
+        assert_eq!(
+            std::fs::metadata(source_history_path(&paths.config()).unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_cursor_with_unique_gen0_start0_checkpoint_recovers_safely() {
+        let paths = TestPaths::new();
+        let line = revision_line(10, 20);
+        std::fs::write(&paths.log, &line).unwrap();
+        let auth = paths.auth();
+        let sequence = seal_checkpoint(&paths, &auth, 0, line.len() as u64, 0, 42);
+        let before = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(!paths.state.exists());
+        assert!(load_source_history_marker(&paths.config()).unwrap().is_none());
+        let (manager, counter) = traffic_context();
+
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 0);
+        let state = load_state(&paths.state).unwrap();
+        assert_eq!(state.offset, line.len() as u64);
+        assert_eq!(state.generation, 0);
+        assert_eq!(state.committed_spool_sequence, Some(sequence));
+        assert!(load_source_history_marker(&paths.config()).unwrap().is_some());
+        let after = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].0, before[0].0);
+        assert!(counter.snapshot().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_cursor_with_nonzero_checkpoint_fails_closed() {
+        let paths = TestPaths::new();
+        let line = revision_line(10, 20);
+        std::fs::write(&paths.log, &line).unwrap();
+        let auth = paths.auth();
+        seal_checkpoint(&paths, &auth, 7, line.len() as u64 + 7, 0, 42);
+        let before = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        let (manager, counter) = traffic_context();
+
+        let error = ingest_test_once(&paths, &manager, &counter)
+            .await
+            .expect_err("nonzero surviving checkpoint cannot bootstrap a missing cursor");
+        assert!(error.to_string().contains("bootstrap checkpoint"));
+        assert!(!paths.state.exists());
+        assert!(load_source_history_marker(&paths.config()).unwrap().is_none());
+        assert_eq!(test_read_strict_spool(&auth, "NODE_T1").unwrap(), before);
+        assert!(counter.snapshot().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_cursor_with_removed_earlier_checkpoint_fails_closed() {
+        let paths = TestPaths::new();
+        let first = revision_line(10, 20);
+        let second = revision_line(30, 40);
+        std::fs::write(&paths.log, format!("{first}{second}")).unwrap();
+        let auth = paths.auth();
+        seal_checkpoint(&paths, &auth, 0, first.len() as u64, 0, 42);
+        seal_checkpoint(
+            &paths,
+            &auth,
+            first.len() as u64,
+            (first.len() + second.len()) as u64,
+            0,
+            43,
+        );
+        remove_oldest_spool_file(&paths);
+        let before = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].4.as_ref().unwrap().start_offset, first.len() as u64);
+        let (manager, counter) = traffic_context();
+
+        let error = ingest_test_once(&paths, &manager, &counter)
+            .await
+            .expect_err("later surviving checkpoint must not look like first boot");
+        assert!(error.to_string().contains("bootstrap checkpoint"));
+        assert_eq!(test_read_strict_spool(&auth, "NODE_T1").unwrap(), before);
+        assert!(counter.snapshot().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_cursor_with_prior_history_and_empty_queue_fails_closed() {
+        let paths = TestPaths::new();
+        let line = revision_line(10, 20);
+        std::fs::write(&paths.log, &line).unwrap();
+        let auth = paths.auth();
+        let (manager, counter) = traffic_context();
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(test_drain_strict_spool(&auth, "NODE_T1").unwrap().len(), 1);
+        assert!(load_source_history_marker(&paths.config()).unwrap().is_some());
+        std::fs::remove_file(&paths.state).unwrap();
+        let (restart_manager, restart_counter) = traffic_context();
+
+        let error = ingest_test_once(&paths, &restart_manager, &restart_counter)
+            .await
+            .expect_err("history marker plus missing cursor must fail closed after queue drain");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(test_read_strict_spool(&auth, "NODE_T1").unwrap().is_empty());
+        assert!(!paths.state.exists());
+        assert!(restart_counter.snapshot().await.entries.is_empty());
     }
 
     #[tokio::test]
