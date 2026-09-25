@@ -2100,6 +2100,7 @@ async fn recover_ambiguous_binding_replacement(
             // Another worker may have completed the exact same recovery after
             // our snapshot; the persisted read-back below is authoritative.
         }
+        Ok(_) => return Err(LineRecordSnapshotError::Database),
         Err(crate::db::error::DbError::UniqueViolation) => {
             return Err(LineRecordSnapshotError::OwnershipUnverified)
         }
