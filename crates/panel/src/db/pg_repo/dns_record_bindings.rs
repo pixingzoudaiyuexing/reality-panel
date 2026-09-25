@@ -117,7 +117,6 @@ impl DnsRecordBindingRepository for PgRepository {
         .rows_affected())
     }
 
-
     async fn rebind_ambiguous_dns_record_binding(
         &self,
         rebind: &AmbiguousDnsRecordBindingRebind,
