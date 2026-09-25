@@ -1282,6 +1282,7 @@ fn load_legacy_pending(
     }))
 }
 
+#[cfg(test)]
 fn oldest_queue_batch(queue: &[(PathBuf, DurableSpoolRecord)]) -> Option<DurableQueuedBatch> {
     let (path, record) = queue.first()?;
     Some(DurableQueuedBatch {
@@ -2810,7 +2811,6 @@ mod tests {
         let first_id = queued[0].0.clone();
         let first_hash = queued[0].1.clone();
         let second_id = queued[1].0.clone();
-        let second_hash = queued[1].1.clone();
 
         // Fresh in-memory counter models a process restart while A and B are
         // both unacknowledged. A healthy bounded invocation drains both FIFO
