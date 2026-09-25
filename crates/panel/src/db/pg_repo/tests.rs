@@ -6792,6 +6792,182 @@ async fn pg_dns_record_bindings_preserve_exact_ownership_and_enforce_uniqueness(
 }
 
 #[tokio::test]
+async fn pg_ambiguous_dns_record_rebind_requires_complete_terminal_identity() {
+    let Some(db) = repo("dns_binding_ambiguous_rebind").await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid) \
+         VALUES (10, 'dns-group', 'in', 'dns-token', 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    for (id, port) in [(100_i64, 21000_i32), (101, 21001)] {
+        sqlx::query(
+            "INSERT INTO forward_rules \
+             (id, name, uid, listen_port, device_group_in, target_addr, target_port) \
+             VALUES ($1, $2, 1, $3, 10, '127.0.0.1', 80)",
+        )
+        .bind(id)
+        .bind(format!("rule-{id}"))
+        .bind(port)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    let id = db
+        .insert_dns_record_binding(&pg_new_dns_binding(100, "stale-old"))
+        .await
+        .unwrap();
+    db.update_dns_record_binding_observation(
+        id,
+        "ERROR",
+        Some("2026-09-25 00:00:00"),
+        Some("MUTATION_UNKNOWN"),
+        "2026-09-25 00:00:00",
+    )
+    .await
+    .unwrap();
+
+    let exact = AmbiguousDnsRecordBindingRebind {
+        binding_id: id,
+        rule_id: 100,
+        fqdn: "op1.example.com".into(),
+        zone_id: 7,
+        zone_name: "example.com".into(),
+        host: "op1".into(),
+        record_type: "A".into(),
+        line: "Default".into(),
+        line_key: "default".into(),
+        previous_record_id: "stale-old".into(),
+        replacement_record_id: "replacement".into(),
+        desired_value: "192.0.2.10".into(),
+        observed_at: "2026-09-25 00:01:00".into(),
+        updated_at: "2026-09-25 00:01:00".into(),
+    };
+
+    let mut mismatches = Vec::new();
+    let mut wrong = exact.clone();
+    wrong.binding_id += 1000;
+    mismatches.push(wrong);
+    let mut wrong = exact.clone();
+    wrong.rule_id = 101;
+    mismatches.push(wrong);
+    let mut wrong = exact.clone();
+    wrong.fqdn = "other.example.com".into();
+    mismatches.push(wrong);
+    let mut wrong = exact.clone();
+    wrong.zone_id = 8;
+    mismatches.push(wrong);
+    let mut wrong = exact.clone();
+    wrong.zone_name = "other.example".into();
+    mismatches.push(wrong);
+    let mut wrong = exact.clone();
+    wrong.host = "other".into();
+    mismatches.push(wrong);
+    let mut wrong = exact.clone();
+    wrong.record_type = "AAAA".into();
+    mismatches.push(wrong);
+    let mut wrong = exact.clone();
+    wrong.line = "Other".into();
+    mismatches.push(wrong);
+    let mut wrong = exact.clone();
+    wrong.line_key = "dnsmgr:Other".into();
+    mismatches.push(wrong);
+    let mut wrong = exact.clone();
+    wrong.previous_record_id = "wrong-old".into();
+    mismatches.push(wrong);
+    let mut wrong = exact.clone();
+    wrong.desired_value = "192.0.2.99".into();
+    mismatches.push(wrong);
+    let mut wrong = exact.clone();
+    wrong.replacement_record_id = "stale-old".into();
+    mismatches.push(wrong);
+
+    for mismatch in mismatches {
+        assert_eq!(
+            db.rebind_ambiguous_dns_record_binding(&mismatch)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    db.update_dns_record_binding_observation(
+        id,
+        "ERROR",
+        Some("2026-09-25 00:00:30"),
+        Some("UPSTREAM_FAILURE"),
+        "2026-09-25 00:00:30",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.rebind_ambiguous_dns_record_binding(&exact)
+            .await
+            .unwrap(),
+        0
+    );
+    db.update_dns_record_binding_observation(
+        id,
+        "ERROR",
+        Some("2026-09-25 00:00:40"),
+        Some("MUTATION_UNKNOWN"),
+        "2026-09-25 00:00:40",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db.rebind_ambiguous_dns_record_binding(&exact)
+            .await
+            .unwrap(),
+        1
+    );
+    let recovered = db
+        .find_dns_record_binding_by_record(7, "replacement")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.id, id);
+    assert_eq!(recovered.state, "BOUND");
+    assert_eq!(recovered.last_error_category, None);
+    assert_eq!(
+        recovered.last_observed_at.as_deref(),
+        Some("2026-09-25 00:01:00")
+    );
+    assert_eq!(recovered.updated_at, "2026-09-25 00:01:00");
+    assert_eq!(
+        db.rebind_ambiguous_dns_record_binding(&exact)
+            .await
+            .unwrap(),
+        0
+    );
+
+    sqlx::query(
+        "UPDATE dns_record_bindings SET record_id = 'stale-again', state = 'ERROR', \
+         last_error_category = 'MUTATION_UNKNOWN' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    db.insert_dns_record_binding(&pg_new_dns_binding(101, "claimed"))
+        .await
+        .unwrap();
+    let mut conflict = exact;
+    conflict.previous_record_id = "stale-again".into();
+    conflict.replacement_record_id = "claimed".into();
+    assert!(matches!(
+        db.rebind_ambiguous_dns_record_binding(&conflict).await,
+        Err(DbError::UniqueViolation)
+    ));
+    cleanup(&db).await;
+}
+
+#[tokio::test]
 async fn pg_dns_record_sync_state_is_durable_and_due_queries_are_bounded() {
     let Some(db) = repo("dns_sync").await else {
         return;
