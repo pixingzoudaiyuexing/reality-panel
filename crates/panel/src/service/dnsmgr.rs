@@ -4480,6 +4480,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn carrier_apply_preflight_recovers_ambiguous_provider_recreation() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&db, "Dianxin", "stale-id", "192.0.2.20").await;
+        let stale = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_dns_record_binding_observation(
+            stale.id,
+            "ERROR",
+            Some("2026-09-25 00:00:00"),
+            Some("MUTATION_UNKNOWN"),
+            "2026-09-25 00:00:00",
+        )
+        .await
+        .unwrap();
+
+        let mock = spawn_ensure_mock(
+            vec![record("replacement-id", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        db.set(
+            DNSMGR_CONFIG_KEY,
+            &serde_json::json!({
+                "enabled": true,
+                "base_url": mock.base_url.clone(),
+                "uid": 7,
+                "api_key": "key"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        db.set(
+            "relay_preference:10",
+            &serde_json::json!({
+                "active_routing_mode": "carrier",
+                "normal_default_node_id": "node-a",
+                "preferred_node_id": "node-a",
+                "pending_node_id": null,
+                "state": "idle",
+                "started_at": null,
+                "last_error": null,
+                "carrier_policy": {
+                    "default_node_id": "node-a",
+                    "bindings": [{
+                        "line_id": "Dianxin",
+                        "mode": "follow_default"
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        db.set(
+            "node_status:10:node-a",
+            &serde_json::json!({
+                "last_seen": chrono::Utc::now().to_rfc3339(),
+                "public_ipv4": "192.0.2.10",
+                "public_ipv4_reported": true,
+                "config_protocol_version": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+                "active_listener_rule_ids": [100],
+                "camouflage_sites": [{
+                    "site_id": "site-100",
+                    "sni": "op1.example.com",
+                    "site_status": "active",
+                    "certificate_status": "active"
+                }],
+                "reconciliation": {"state": "CONVERGED", "recovery_source": "PANEL"}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let connections = crate::api::ws::NodeConnections::new();
+        let (_, _rx) = connections.register(10, Some("node-a".into())).await;
+
+        assert_eq!(
+            crate::service::relay_preference::start_carrier_policy_apply(
+                &db,
+                &connections,
+                10,
+                crate::service::relay_preference::CarrierPolicy {
+                    default_node_id: Some("node-a".into()),
+                    bindings: Vec::new(),
+                },
+            )
+            .await
+            .unwrap(),
+            crate::service::relay_preference::CarrierPolicyApplyOutcome::Started
+        );
+        let recovered = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.record_id, "replacement-id");
+        assert_eq!(recovered.state, "BOUND");
+        assert_eq!(recovered.last_error_category, None);
+        assert_eq!(mock.state.total_mutations(), 0);
+    }
+
+    #[tokio::test]
     async fn carrier_removal_preflight_rejects_same_id_value_drift_before_transaction() {
         let db = ensure_db().await;
         configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
