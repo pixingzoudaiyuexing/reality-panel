@@ -606,6 +606,18 @@ pub(crate) struct NginxTrafficCheckpoint {
     pub end_offset: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NginxTrafficRecovery {
+    pub sequence: u64,
+    pub checkpoint: NginxTrafficCheckpoint,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NginxCursorCommitProof {
+    #[serde(default)]
+    committed_spool_sequence: Option<u64>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct DurableSpoolRecord {
@@ -1118,7 +1130,7 @@ fn seal_strict_spool_batch_with_failpoint(
     reports: Vec<TrafficEntry>,
     nginx_checkpoint: Option<NginxTrafficCheckpoint>,
     failpoint: SpoolWriteFailpoint,
-) -> Result<PendingTrafficBatch, PendingWriteError> {
+) -> Result<(PendingTrafficBatch, u64), PendingWriteError> {
     if reports.is_empty() {
         return Err(PendingWriteError::Clean(
             "traffic spool refuses an empty batch".into(),
@@ -1152,7 +1164,7 @@ fn seal_strict_spool_batch_with_failpoint(
         nginx_checkpoint,
     };
     write_spool_record_at(&spool_dir, &record, failpoint)?;
-    Ok(pending)
+    Ok((pending, sequence))
 }
 
 fn seal_strict_spool_batch(
@@ -1170,6 +1182,7 @@ fn seal_strict_spool_batch(
         nginx_checkpoint,
         SpoolWriteFailpoint::None,
     )
+    .map(|(batch, _)| batch)
 }
 
 pub(crate) fn seal_nginx_traffic_batch(
@@ -1178,8 +1191,16 @@ pub(crate) fn seal_nginx_traffic_batch(
     config_revision: Option<u64>,
     reports: Vec<TrafficEntry>,
     checkpoint: NginxTrafficCheckpoint,
-) -> Result<(), PendingWriteError> {
-    seal_strict_spool_batch(auth, node_id, config_revision, reports, Some(checkpoint)).map(|_| ())
+) -> Result<u64, PendingWriteError> {
+    seal_strict_spool_batch_with_failpoint(
+        auth,
+        node_id,
+        config_revision,
+        reports,
+        Some(checkpoint),
+        SpoolWriteFailpoint::None,
+    )
+    .map(|(_, sequence)| sequence)
 }
 
 fn load_spool_queue_at(
@@ -1298,7 +1319,7 @@ pub(crate) fn recover_nginx_checkpoint(
     node_id: &str,
     source: &str,
     cursor: Option<(u64, u64, u64, u64)>,
-) -> Result<Option<NginxTrafficCheckpoint>, String> {
+) -> Result<Option<NginxTrafficRecovery>, String> {
     let Some(credential_id) = strict_credential_id(auth, node_id)? else {
         return Ok(None);
     };
@@ -1326,7 +1347,10 @@ pub(crate) fn recover_nginx_checkpoint(
                     "multiple traffic spool checkpoints claim the same Nginx cursor".into(),
                 );
             }
-            matched = Some(checkpoint);
+            matched = Some(NginxTrafficRecovery {
+                sequence: record.sequence,
+                checkpoint,
+            });
         }
     }
     Ok(matched)
