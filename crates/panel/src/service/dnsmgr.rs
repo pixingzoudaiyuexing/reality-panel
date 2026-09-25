@@ -2121,8 +2121,8 @@ async fn recover_ambiguous_binding_replacement(
         .ok_or(LineRecordSnapshotError::OwnershipUnverified)?;
     if binding_matches_record(Some(&persisted), fqdn, zone, record_type, &confirmed)
         && binding_still_owns_exact_value(Some(&persisted), record_type, &confirmed)
-        && persisted.state == "BOUND"
-        && persisted.last_error_category.is_none()
+        && persisted.state == "ERROR"
+        && persisted.last_error_category.as_deref() == Some("MUTATION_UNKNOWN")
     {
         Ok(Some(persisted))
     } else {
@@ -4786,9 +4786,157 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.record_id, "replacement-id");
-        assert_eq!(recovered.state, "BOUND");
-        assert_eq!(recovered.last_error_category, None);
+        assert_eq!(recovered.state, "ERROR");
+        assert_eq!(
+            recovered.last_error_category.as_deref(),
+            Some("MUTATION_UNKNOWN")
+        );
         assert_eq!(mock.state.total_mutations(), 0);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_carrier_recovery_stays_retryable_across_provider_recreation_race() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&db, "Dianxin", "old-id", "192.0.2.20").await;
+        let stale = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_dns_record_binding_observation(
+            stale.id,
+            "ERROR",
+            Some("2026-09-25 00:00:00"),
+            Some("MUTATION_UNKNOWN"),
+            "2026-09-25 00:00:00",
+        )
+        .await
+        .unwrap();
+        db.insert_dns_record_sync(&NewDnsRecordSync {
+            rule_id: 100,
+            fqdn: "op1.example.com".into(),
+            record_type: "A".into(),
+            expected_value: Some("192.0.2.20".into()),
+            line: "Dianxin".into(),
+            line_key: "dnsmgr:Dianxin".into(),
+            desired_action: "UPSERT".into(),
+            state: "PENDING".into(),
+            ownership: "UNKNOWN".into(),
+            last_error_category: None,
+            next_attempt_at: Some(utc_now()),
+            created_at: utc_now(),
+            updated_at: utc_now(),
+        })
+        .await
+        .unwrap();
+
+        let mock = spawn_ensure_mock(
+            vec![record("replacement-1", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+
+        assert_eq!(
+            inspect_line_record(&db, &mock.client, 100, "Dianxin")
+                .await
+                .unwrap(),
+            LineRecordSnapshot::PanelOwned {
+                value: "192.0.2.20".into(),
+                record_id: "replacement-1".into(),
+            }
+        );
+        let provisional = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provisional.record_id, "replacement-1");
+        assert_eq!(provisional.state, "ERROR");
+        assert_eq!(
+            provisional.last_error_category.as_deref(),
+            Some("MUTATION_UNKNOWN")
+        );
+        assert_eq!(mock.state.total_mutations(), 0);
+
+        *mock.state.records.lock().unwrap() =
+            vec![record("replacement-2", "A", "192.0.2.20", "Dianxin")];
+
+        let sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_one(&db, sync, &mock.client).await;
+        let failed_sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_sync.state, "FAILED");
+        assert_eq!(
+            failed_sync.last_error_category.as_deref(),
+            Some("DNS_OWNERSHIP_UNVERIFIED")
+        );
+        assert_eq!(mock.state.total_mutations(), 0);
+        let still_retryable = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_retryable.record_id, "replacement-1");
+        assert_eq!(still_retryable.state, "ERROR");
+        assert_eq!(
+            still_retryable.last_error_category.as_deref(),
+            Some("MUTATION_UNKNOWN")
+        );
+
+        assert_eq!(
+            inspect_line_record(&db, &mock.client, 100, "Dianxin")
+                .await
+                .unwrap(),
+            LineRecordSnapshot::PanelOwned {
+                value: "192.0.2.20".into(),
+                record_id: "replacement-2".into(),
+            }
+        );
+        let recovered_again = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_again.record_id, "replacement-2");
+        assert_eq!(recovered_again.state, "ERROR");
+        assert_eq!(
+            recovered_again.last_error_category.as_deref(),
+            Some("MUTATION_UNKNOWN")
+        );
+        assert_eq!(mock.state.total_mutations(), 0);
+
+        let sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_one(&db, sync, &mock.client).await;
+
+        assert_eq!(mock.state.total_mutations(), 0);
+        let verified = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified.record_id, "replacement-2");
+        assert_eq!(verified.state, "BOUND");
+        assert_eq!(verified.last_error_category, None);
+        let verified_sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified_sync.state, "PROPAGATED");
+        assert_eq!(verified_sync.ownership, "PANEL");
     }
 
     #[tokio::test]
