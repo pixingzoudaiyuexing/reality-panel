@@ -113,16 +113,7 @@ async fn ingest_once_inner_with_state_writer<F>(
 where
     F: FnMut(&Path, &LogState) -> std::io::Result<()>,
 {
-    ingest_once_inner_with_failpoints(
-        cfg,
-        manager,
-        counter,
-        auth,
-        node_id,
-        None,
-        write_state,
-    )
-    .await
+    ingest_once_inner_with_failpoints(cfg, manager, counter, auth, node_id, None, write_state).await
 }
 
 async fn ingest_once_inner_with_failpoints<F>(
@@ -258,8 +249,8 @@ where
     let source = source_key(cfg);
     loop {
         let cursor = state.as_ref().and_then(cursor_tuple);
-        let checkpoint =
-            recover_nginx_checkpoint(auth, node_id, &source, cursor).map_err(std::io::Error::other)?;
+        let checkpoint = recover_nginx_checkpoint(auth, node_id, &source, cursor)
+            .map_err(std::io::Error::other)?;
         let Some(checkpoint) = checkpoint else {
             break;
         };
@@ -378,7 +369,8 @@ where
 
     let mut state = state.unwrap_or_default();
     prepare_state_for_file(&mut state, current_identity, len)?;
-    let mut persisted_state = load_state_optional(&cfg.state_path)?.unwrap_or_else(|| state.clone());
+    let mut persisted_state =
+        load_state_optional(&cfg.state_path)?.unwrap_or_else(|| state.clone());
 
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(state.offset))?;
@@ -413,16 +405,13 @@ where
             .ok_or_else(|| std::io::Error::other("nginx_sni cursor overflow"))?;
 
         let attributed = match parse_log_line(&line) {
-            Some(parsed) => resolve_attribution(&parsed, manager)
-                .await
-                .map(|(revision, rule_id)| {
-                    (
-                        revision,
-                        rule_id,
-                        parsed.bytes_received,
-                        parsed.bytes_sent,
-                    )
-                }),
+            Some(parsed) => {
+                resolve_attribution(&parsed, manager)
+                    .await
+                    .map(|(revision, rule_id)| {
+                        (revision, rule_id, parsed.bytes_received, parsed.bytes_sent)
+                    })
+            }
             None => None,
         };
 
@@ -532,12 +521,7 @@ where
             .ok_or_else(|| std::io::Error::other("nginx_sni cursor overflow"))?;
         if let Some(parsed) = parse_log_line(&line) {
             if let Some((revision, rule_id)) = resolve_attribution(&parsed, manager).await {
-                additions.push((
-                    revision,
-                    rule_id,
-                    parsed.bytes_received,
-                    parsed.bytes_sent,
-                ));
+                additions.push((revision, rule_id, parsed.bytes_received, parsed.bytes_sent));
             }
         }
         cursor = line_end;
@@ -664,9 +648,7 @@ fn save_state(path: &Path, state: &LogState) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reporter::{
-        test_drain_strict_spool, test_read_strict_spool, ConnectionTracker,
-    };
+    use crate::reporter::{test_drain_strict_spool, test_read_strict_spool, ConnectionTracker};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt as _;
     use uuid::Uuid;
@@ -741,21 +723,10 @@ mod tests {
         manager: &Arc<Mutex<ForwarderManager>>,
         counter: &Arc<TrafficCounter>,
     ) -> std::io::Result<usize> {
-        ingest_once_inner(
-            &paths.config(),
-            manager,
-            counter,
-            &paths.auth(),
-            "NODE_T1",
-        )
-        .await
+        ingest_once_inner(&paths.config(), manager, counter, &paths.auth(), "NODE_T1").await
     }
 
-    fn drain_single_spool(
-        paths: &TestPaths,
-        upload: u64,
-        download: u64,
-    ) -> NginxTrafficCheckpoint {
+    fn drain_single_spool(paths: &TestPaths, upload: u64, download: u64) -> NginxTrafficCheckpoint {
         let batches = test_drain_strict_spool(&paths.auth(), "NODE_T1").unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].2, Some(9));
@@ -820,7 +791,10 @@ mod tests {
         let original_identity = identity_at(&paths.log);
         let (manager, counter) = traffic_context();
 
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            1
+        );
         let first_checkpoint = drain_single_spool(&paths, 20, 10);
         assert_eq!(first_checkpoint.start_offset, 0);
         assert_eq!(first_checkpoint.end_offset, first.len() as u64);
@@ -836,7 +810,10 @@ mod tests {
         log.write_all(second.as_bytes()).unwrap();
         drop(log);
 
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            1
+        );
         let second_checkpoint = drain_single_spool(&paths, 40, 30);
         assert_eq!(second_checkpoint.start_offset, first.len() as u64);
         assert_eq!(
@@ -858,7 +835,10 @@ mod tests {
         let original_identity = identity_at(&paths.log);
         let (manager, counter) = traffic_context();
 
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 8);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            8
+        );
         let old_checkpoint = drain_single_spool(&paths, 20 * 8, 10 * 8);
         assert_eq!(old_checkpoint.generation, 0);
         let old_state = load_state(&paths.state).unwrap();
@@ -874,7 +854,10 @@ mod tests {
 
         assert_eq!(identity_at(&paths.log), original_identity);
         assert!(std::fs::metadata(&paths.log).unwrap().len() < old_state.offset);
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            1
+        );
         let new_checkpoint = drain_single_spool(&paths, 11, 7);
         assert_eq!(new_checkpoint.generation, 1);
         assert_eq!(new_checkpoint.start_offset, 0);
@@ -892,7 +875,10 @@ mod tests {
         std::fs::write(&paths.log, &old_contents).unwrap();
         let (manager, counter) = traffic_context();
 
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 6);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            6
+        );
         let _ = drain_single_spool(&paths, 20 * 6, 10 * 6);
         let old_state = load_state(&paths.state).unwrap();
         let old_identity = old_state.file_identity().unwrap();
@@ -913,8 +899,7 @@ mod tests {
             ingest_test_once(&paths, &manager, &counter).await.unwrap(),
             replacement_lines as usize
         );
-        let checkpoint =
-            drain_single_spool(&paths, 17 * replacement_lines, 13 * replacement_lines);
+        let checkpoint = drain_single_spool(&paths, 17 * replacement_lines, 13 * replacement_lines);
         assert_eq!(checkpoint.start_offset, 0);
         assert_eq!(checkpoint.generation, old_state.generation + 1);
         let state = load_state(&paths.state).unwrap();
@@ -941,7 +926,10 @@ mod tests {
         assert_eq!(legacy.file_identity(), None);
         assert_eq!(legacy.generation, 0);
 
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            1
+        );
         let checkpoint = drain_single_spool(&paths, 40, 30);
         assert_eq!(checkpoint.start_offset, already_accounted.len() as u64);
         assert_eq!(checkpoint.generation, 0);
@@ -1005,11 +993,7 @@ mod tests {
                 .unwrap(),
             replacement_lines as usize
         );
-        let _ = drain_single_spool(
-            &paths,
-            60 * replacement_lines,
-            50 * replacement_lines,
-        );
+        let _ = drain_single_spool(&paths, 60 * replacement_lines, 50 * replacement_lines);
         let after_replacement = load_state(&paths.state).unwrap();
         assert_eq!(
             after_replacement.file_identity(),
@@ -1026,7 +1010,10 @@ mod tests {
         std::fs::write(&paths.log, format!("{first}{second}")).unwrap();
         let (manager, counter) = traffic_context();
 
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 2);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            2
+        );
         let queue = test_read_strict_spool(&paths.auth(), "NODE_T1").unwrap();
         assert_eq!(queue.len(), 2);
         assert_eq!(queue[0].2, Some(42));
@@ -1077,7 +1064,10 @@ mod tests {
         let (manager, counter) = traffic_context();
         assert!(!paths.state.exists());
 
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            1
+        );
         let checkpoint = drain_single_spool(&paths, 20, 10);
         assert_eq!(checkpoint.start_offset, 0);
         let state = load_state(&paths.state).unwrap();
@@ -1094,7 +1084,10 @@ mod tests {
         std::fs::write(&paths.log, format!("{first}{partial}")).unwrap();
         let (manager, counter) = traffic_context();
 
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            1
+        );
         let _ = drain_single_spool(&paths, 20, 10);
         assert_eq!(load_state(&paths.state).unwrap().offset, first.len() as u64);
 
@@ -1105,7 +1098,10 @@ mod tests {
         log.write_all(b"\n").unwrap();
         drop(log);
 
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            1
+        );
         let checkpoint = drain_single_spool(&paths, 40, 30);
         assert_eq!(checkpoint.start_offset, first.len() as u64);
         assert_eq!(
@@ -1148,7 +1144,10 @@ mod tests {
 
         // Retry starts at the durable cursor, re-reads only revision 43, and
         // appends exactly one later immutable batch.
-        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            1
+        );
         let after_retry = test_read_strict_spool(&auth, "NODE_T1").unwrap();
         assert_eq!(after_retry.len(), 2);
         assert_eq!(after_retry[0].0, after_error[0].0);
