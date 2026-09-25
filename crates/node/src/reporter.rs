@@ -1290,6 +1290,27 @@ fn remove_file_and_sync_parent(path: &Path, label: &str) -> Result<(), String> {
     sync_directory(parent, &format!("{label} parent directory"))
 }
 
+fn durable_batch_send_ready(queued: &DurableQueuedBatch) -> Result<bool, String> {
+    let DurableBatchLocation::Queue { record, .. } = &queued.location else {
+        return Ok(true);
+    };
+    let Some(checkpoint) = record.nginx_checkpoint.as_ref() else {
+        return Ok(true);
+    };
+
+    // A Nginx batch is not sendable merely because its immutable spool file is
+    // durable. Its source cursor must independently prove that it has advanced
+    // past this exact spool sequence. This prevents ACK/delete from making old
+    // log bytes replayable after a crash or a temporary state-path change.
+    let text = std::fs::read_to_string(&checkpoint.source)
+        .map_err(|_| "Nginx cursor commit proof is unavailable".to_string())?;
+    let proof: NginxCursorCommitProof = serde_json::from_str(&text)
+        .map_err(|_| "Nginx cursor commit proof is malformed".to_string())?;
+    Ok(proof
+        .committed_spool_sequence
+        .is_some_and(|sequence| sequence >= record.sequence))
+}
+
 fn remove_durable_batch_at(
     queued: &DurableQueuedBatch,
     node_id: &str,
@@ -1614,6 +1635,23 @@ async fn report_traffic_strict(
     } else {
         return;
     };
+
+    match durable_batch_send_ready(&queued) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                "strict Nginx traffic batch is waiting for durable source-cursor commit proof"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::error!(
+                "strict Nginx traffic batch cursor proof unavailable: {}",
+                error
+            );
+            return;
+        }
+    }
 
     let pending = &queued.batch;
     let report = TrafficReport {
