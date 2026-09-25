@@ -1,8 +1,8 @@
 use super::PgRepository;
 use crate::db::error::DbError;
 use crate::db::repo::{
-    DetachedDnsRecordBindingAdoption, DnsRecordBinding, DnsRecordBindingRepository,
-    NewDnsRecordBinding,
+    AmbiguousDnsRecordBindingRebind, DetachedDnsRecordBindingAdoption, DnsRecordBinding,
+    DnsRecordBindingRepository, NewDnsRecordBinding,
 };
 use async_trait::async_trait;
 
@@ -112,6 +112,37 @@ impl DnsRecordBindingRepository for PgRepository {
         .bind(observed_at)
         .bind(updated_at)
         .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    async fn rebind_ambiguous_dns_record_binding(
+        &self,
+        rebind: &AmbiguousDnsRecordBindingRebind,
+    ) -> Result<u64, DbError> {
+        Ok(sqlx::query(
+            "UPDATE dns_record_bindings SET record_id = $1, last_observed_at = $2, updated_at = $3 \
+             WHERE id = $4 AND rule_id = $5 AND fqdn = $6 AND zone_id = $7 \
+               AND zone_name = $8 AND host = $9 AND record_type = $10 AND line = $11 \
+               AND line_key = $12 AND record_id = $13 AND desired_value = $14 \
+               AND state = 'ERROR' AND last_error_category = 'MUTATION_UNKNOWN' AND record_id <> $15",
+        )
+        .bind(&rebind.replacement_record_id)
+        .bind(&rebind.observed_at)
+        .bind(&rebind.updated_at)
+        .bind(rebind.binding_id)
+        .bind(rebind.rule_id)
+        .bind(&rebind.fqdn)
+        .bind(rebind.zone_id)
+        .bind(&rebind.zone_name)
+        .bind(&rebind.host)
+        .bind(&rebind.record_type)
+        .bind(&rebind.line)
+        .bind(&rebind.line_key)
+        .bind(&rebind.previous_record_id)
+        .bind(&rebind.desired_value)
+        .bind(&rebind.replacement_record_id)
         .execute(&self.pool)
         .await?
         .rows_affected())

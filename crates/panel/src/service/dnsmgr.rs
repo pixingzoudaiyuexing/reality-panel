@@ -7,8 +7,8 @@
 use crate::api::AppState;
 use crate::db::repo::GroupRepository;
 use crate::db::repo::{
-    DetachedDnsRecordBindingAdoption, DnsRecordBinding, DnsRecordSync, NewDnsRecordBinding,
-    NewDnsRecordSync, ResourceScope, RuleRepository,
+    AmbiguousDnsRecordBindingRebind, DetachedDnsRecordBindingAdoption, DnsRecordBinding,
+    DnsRecordSync, NewDnsRecordBinding, NewDnsRecordSync, ResourceScope, RuleRepository,
 };
 use crate::db::Repository;
 use crate::integrations::dnsmgr::{
@@ -344,43 +344,86 @@ pub(crate) async fn discover_records(
     expected_type: DnsRecordType,
     expected_line: &ProviderLine,
 ) -> RecordDiscovery {
+    let filtered = match fetch_record_inventory(client, zone, Some(zone.host.as_str())).await {
+        Ok(inventory) => inventory,
+        Err(error) => return RecordDiscovery::UpstreamFailure(error),
+    };
+    let filtered_result = classify_records(zone, expected_type, expected_line, filtered.records);
+    if !matches!(filtered_result, RecordDiscovery::NoRecord) {
+        return if filtered.complete {
+            filtered_result
+        } else {
+            RecordDiscovery::UpstreamFailure(DnsMgrError::ProtocolContractViolation(
+                "DNSMgr returned an incomplete filtered record inventory".into(),
+            ))
+        };
+    }
+
+    // DNSMgr has been observed returning a successful but empty subdomain-filtered
+    // snapshot while the same record is present in the complete zone inventory.
+    // Before treating filtered emptiness as authoritative absence (and possibly
+    // scheduling a create), cross-check once without the provider-side filter.
+    let complete = match fetch_record_inventory(client, zone, None).await {
+        Ok(inventory) => inventory,
+        Err(error) => return RecordDiscovery::UpstreamFailure(error),
+    };
+    if !complete.complete {
+        return RecordDiscovery::UpstreamFailure(DnsMgrError::ProtocolContractViolation(
+            "DNSMgr returned an incomplete full-zone record inventory".into(),
+        ));
+    }
+    classify_records(zone, expected_type, expected_line, complete.records)
+}
+
+struct RecordInventory {
+    records: Vec<DnsMgrRecord>,
+    complete: bool,
+}
+
+async fn fetch_record_inventory(
+    client: &DnsMgrClient,
+    zone: &ResolvedZone,
+    subdomain: Option<&str>,
+) -> Result<RecordInventory, DnsMgrError> {
     let mut records = Vec::new();
     let mut offset = 0_u32;
+    let mut complete = false;
     loop {
-        let page = match client
+        let page = client
             .list_records(
                 zone.domain_id,
                 &RecordListParams {
                     offset,
                     limit: DISCOVERY_PAGE_LIMIT,
-                    subdomain: Some(zone.host.clone()),
+                    subdomain: subdomain.map(str::to_string),
                     ..Default::default()
                 },
             )
-            .await
-        {
-            Ok(page) => page,
-            Err(error) => return RecordDiscovery::UpstreamFailure(error),
-        };
+            .await?;
         let count = page.rows.len();
+        let page_end = u64::from(offset).saturating_add(count as u64);
+        let contradictory_empty = page.authoritative_total && count == 0 && page_end < page.total;
         records.extend(page.rows);
-        let reached_total = page.authoritative_total
-            && u64::from(offset).saturating_add(count as u64) >= page.total;
-        if count == 0
-            || reached_total
-            || (!page.authoritative_total && count < DISCOVERY_PAGE_LIMIT as usize)
-        {
+        let reached_total = page.authoritative_total && page_end >= page.total;
+        let inferred_complete = !page.authoritative_total && count < DISCOVERY_PAGE_LIMIT as usize;
+        if contradictory_empty {
+            break;
+        }
+        if reached_total || inferred_complete {
+            complete = true;
+            break;
+        }
+        if count == 0 {
             break;
         }
         let Some(next) = offset.checked_add(count as u32) else {
-            return RecordDiscovery::UpstreamFailure(DnsMgrError::ProtocolContractViolation(
+            return Err(DnsMgrError::ProtocolContractViolation(
                 "record pagination offset overflow".into(),
             ));
         };
         offset = next;
     }
-
-    classify_records(zone, expected_type, expected_line, records)
+    Ok(RecordInventory { records, complete })
 }
 
 #[allow(dead_code)] // Slice 3 foundation; consumed by Slice 4 ensure_record.
@@ -1951,6 +1994,142 @@ pub(crate) async fn schedule_transaction_line(
     persist_line_desired(db, &desired, action, value, true).await
 }
 
+fn ambiguous_binding_matches_replacement(
+    binding: &DnsRecordBinding,
+    rule_id: i64,
+    fqdn: &NormalizedFqdn,
+    zone: &ResolvedZone,
+    record_type: DnsRecordType,
+    line: &ProviderLine,
+    record: &DiscoveredRecord,
+) -> bool {
+    let Ok(zone_id) = i64::try_from(zone.domain_id) else {
+        return false;
+    };
+    binding.rule_id == Some(rule_id)
+        && binding.state == "ERROR"
+        && binding.last_error_category.as_deref() == Some("MUTATION_UNKNOWN")
+        && binding.fqdn == fqdn.as_str()
+        && binding.zone_id == zone_id
+        && binding.zone_name == zone.zone_name
+        && binding.host == zone.host
+        && binding.record_type == record_type.as_str()
+        && binding.line_key == line.key
+        && binding.line_key == record.line.key
+        && (binding.line_key == DEFAULT_LINE_KEY
+            || (binding.line == line.raw_id && binding.line == record.line.raw_id))
+        && binding.record_id != record.record.record_id
+        && record.record.host.trim().eq_ignore_ascii_case(&zone.host)
+        && record
+            .record
+            .record_type
+            .eq_ignore_ascii_case(record_type.as_str())
+        && binding_still_owns_exact_value(Some(binding), record_type, record)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_ambiguous_binding_replacement(
+    db: &dyn Repository,
+    client: &DnsMgrClient,
+    binding: &DnsRecordBinding,
+    rule_id: i64,
+    fqdn: &NormalizedFqdn,
+    zone: &ResolvedZone,
+    record_type: DnsRecordType,
+    line: &ProviderLine,
+    candidate: &DiscoveredRecord,
+) -> Result<Option<DnsRecordBinding>, LineRecordSnapshotError> {
+    if !ambiguous_binding_matches_replacement(
+        binding,
+        rule_id,
+        fqdn,
+        zone,
+        record_type,
+        line,
+        candidate,
+    ) {
+        return Ok(None);
+    }
+
+    // Require a second stable provider read before transferring persisted
+    // provenance to a replacement provider identity.
+    let confirmed = match discover_records(client, zone, record_type, line).await {
+        RecordDiscovery::SingleMatchingRecord(record)
+            if record.record.record_id == candidate.record.record_id
+                && ambiguous_binding_matches_replacement(
+                    binding,
+                    rule_id,
+                    fqdn,
+                    zone,
+                    record_type,
+                    line,
+                    &record,
+                ) =>
+        {
+            record
+        }
+        RecordDiscovery::UpstreamFailure(error) => {
+            return Err(LineRecordSnapshotError::Provider(error));
+        }
+        _ => return Err(LineRecordSnapshotError::OwnershipUnverified),
+    };
+
+    let zone_id = i64::try_from(zone.domain_id).map_err(|_| LineRecordSnapshotError::Database)?;
+    if db
+        .find_dns_record_binding_by_record(zone_id, &confirmed.record.record_id)
+        .await
+        .map_err(|_| LineRecordSnapshotError::Database)?
+        .is_some_and(|existing| existing.id != binding.id)
+    {
+        return Err(LineRecordSnapshotError::OwnershipUnverified);
+    }
+
+    let now = utc_now();
+    let rebind = AmbiguousDnsRecordBindingRebind {
+        binding_id: binding.id,
+        rule_id,
+        fqdn: fqdn.as_str().to_string(),
+        zone_id,
+        zone_name: zone.zone_name.clone(),
+        host: zone.host.clone(),
+        record_type: record_type.as_str().to_string(),
+        line: binding.line.clone(),
+        line_key: line.key.clone(),
+        previous_record_id: binding.record_id.clone(),
+        replacement_record_id: confirmed.record.record_id.clone(),
+        desired_value: binding.desired_value.clone(),
+        observed_at: now.clone(),
+        updated_at: now,
+    };
+    match db.rebind_ambiguous_dns_record_binding(&rebind).await {
+        Ok(1) => {}
+        Ok(0) => {
+            // Another worker may have completed the exact same recovery after
+            // our snapshot; the persisted read-back below is authoritative.
+        }
+        Ok(_) => return Err(LineRecordSnapshotError::Database),
+        Err(crate::db::error::DbError::UniqueViolation) => {
+            return Err(LineRecordSnapshotError::OwnershipUnverified)
+        }
+        Err(_) => return Err(LineRecordSnapshotError::Database),
+    }
+
+    let persisted = db
+        .find_dns_record_binding_for_rule(rule_id, fqdn.as_str(), record_type.as_str(), &line.key)
+        .await
+        .map_err(|_| LineRecordSnapshotError::Database)?
+        .ok_or(LineRecordSnapshotError::OwnershipUnverified)?;
+    if binding_matches_record(Some(&persisted), fqdn, zone, record_type, &confirmed)
+        && binding_still_owns_exact_value(Some(&persisted), record_type, &confirmed)
+        && persisted.state == "ERROR"
+        && persisted.last_error_category.as_deref() == Some("MUTATION_UNKNOWN")
+    {
+        Ok(Some(persisted))
+    } else {
+        Err(LineRecordSnapshotError::OwnershipUnverified)
+    }
+}
+
 pub(crate) async fn inspect_line_record(
     db: &dyn Repository,
     client: &DnsMgrClient,
@@ -2005,15 +2184,33 @@ async fn inspect_line_record_inner(
         .map_err(|_| LineRecordSnapshotError::Database)?;
     match discover_records(client, &zone, DnsRecordType::A, &line).await {
         RecordDiscovery::NoRecord => Ok(LineRecordSnapshot::Absent),
-        RecordDiscovery::SingleMatchingRecord(record)
-            if binding_matches_record(
-                binding.as_ref(),
-                &fqdn,
-                &zone,
-                DnsRecordType::A,
-                &record,
-            ) && binding_still_owns_exact_value(binding.as_ref(), DnsRecordType::A, &record) =>
-        {
+        RecordDiscovery::SingleMatchingRecord(record) => {
+            let owned =
+                binding_matches_record(binding.as_ref(), &fqdn, &zone, DnsRecordType::A, &record)
+                    && binding_still_owns_exact_value(binding.as_ref(), DnsRecordType::A, &record);
+            let recovered = if owned {
+                false
+            } else if let Some(stale) = binding.as_ref() {
+                recover_ambiguous_binding_replacement(
+                    db,
+                    client,
+                    stale,
+                    rule_id,
+                    &fqdn,
+                    &zone,
+                    DnsRecordType::A,
+                    &line,
+                    &record,
+                )
+                .await?
+                .is_some()
+            } else {
+                false
+            };
+            if !owned && !recovered {
+                return Err(LineRecordSnapshotError::OwnershipUnverified);
+            }
+
             let [value] = record.record.values.as_slice() else {
                 return Err(LineRecordSnapshotError::OwnershipUnverified);
             };
@@ -2028,9 +2225,7 @@ async fn inspect_line_record_inner(
                 record_id: record.record.record_id,
             })
         }
-        RecordDiscovery::SingleMatchingRecord(_)
-        | RecordDiscovery::MultipleMatchingRecords(_)
-        | RecordDiscovery::ConflictingRecordType(_) => {
+        RecordDiscovery::MultipleMatchingRecords(_) | RecordDiscovery::ConflictingRecordType(_) => {
             Err(LineRecordSnapshotError::OwnershipUnverified)
         }
         RecordDiscovery::UpstreamFailure(error) => Err(LineRecordSnapshotError::Provider(error)),
@@ -3278,6 +3473,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_discovery_cross_checks_filtered_empty_against_full_inventory() {
+        let router = Router::new().route(
+            "/api/record/data/7",
+            post(|Form(form): Form<HashMap<String, String>>| async move {
+                if form.contains_key("subdomain") {
+                    return Json(json!({"total": 0, "rows": []}));
+                }
+                Json(json!({
+                    "total": 1,
+                    "rows": [{
+                        "RecordId": "replacement-1", "Domain": "example.com", "Name": "op1",
+                        "Type": "A", "Value": "192.0.2.20", "Line": "Dianxin",
+                        "TTL": 300, "Status": "1", "MX": null, "Weight": null,
+                        "Remark": null, "UpdateTime": null
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client =
+            DnsMgrClient::new(DnsMgrClientConfig::new(&base_url, 7, "key").unwrap()).unwrap();
+
+        let result = discover_records(
+            &client,
+            &zone(),
+            DnsRecordType::A,
+            &ProviderLine::from_provider("Dianxin", Some("电信")),
+        )
+        .await;
+        handle.abort();
+        match result {
+            RecordDiscovery::SingleMatchingRecord(record) => {
+                assert_eq!(record.record.record_id, "replacement-1");
+                assert_eq!(record.record.values, vec!["192.0.2.20"]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_discovery_rejects_contradictory_empty_full_inventory() {
+        let router = Router::new().route(
+            "/api/record/data/7",
+            post(|Form(_form): Form<HashMap<String, String>>| async move {
+                Json(json!({"total": 1, "rows": []}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client =
+            DnsMgrClient::new(DnsMgrClientConfig::new(&base_url, 7, "key").unwrap()).unwrap();
+
+        let result = discover_records(
+            &client,
+            &zone(),
+            DnsRecordType::A,
+            &ProviderLine::from_provider("Dianxin", Some("电信")),
+        )
+        .await;
+        handle.abort();
+        assert!(matches!(
+            result,
+            RecordDiscovery::UpstreamFailure(DnsMgrError::ProtocolContractViolation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_discovery_filtered_empty_and_complete_full_empty_is_no_record() {
+        let router = Router::new().route(
+            "/api/record/data/7",
+            post(|Form(_form): Form<HashMap<String, String>>| async move {
+                Json(json!({"total": 0, "rows": []}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client =
+            DnsMgrClient::new(DnsMgrClientConfig::new(&base_url, 7, "key").unwrap()).unwrap();
+
+        let result = discover_records(
+            &client,
+            &zone(),
+            DnsRecordType::A,
+            &ProviderLine::from_provider("Dianxin", Some("电信")),
+        )
+        .await;
+        handle.abort();
+        assert_eq!(result, RecordDiscovery::NoRecord);
+    }
+
+    #[tokio::test]
     async fn zone_resolution_reads_complete_authoritative_inventory() {
         let router = Router::new().route(
             "/api/domain",
@@ -3654,6 +3944,267 @@ mod tests {
             Err(LineRecordSnapshotError::OwnershipUnverified)
         ));
         assert_eq!(duplicate.state.total_mutations(), 0);
+    }
+
+    #[tokio::test]
+    async fn carrier_preflight_recovers_only_exact_ambiguous_recreated_identity() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&db, "Dianxin", "stale-id", "192.0.2.20").await;
+        let stale = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_dns_record_binding_observation(
+            stale.id,
+            "ERROR",
+            Some("2026-09-25 00:00:00"),
+            Some("MUTATION_UNKNOWN"),
+            "2026-09-25 00:00:00",
+        )
+        .await
+        .unwrap();
+
+        let mock = spawn_ensure_mock(
+            vec![record("replacement-id", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert_eq!(
+            inspect_line_record(&db, &mock.client, 100, "Dianxin")
+                .await
+                .unwrap(),
+            LineRecordSnapshot::PanelOwned {
+                value: "192.0.2.20".into(),
+                record_id: "replacement-id".into(),
+            }
+        );
+        let recovered = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.record_id, "replacement-id");
+        assert_eq!(recovered.state, "ERROR");
+        assert_eq!(
+            recovered.last_error_category.as_deref(),
+            Some("MUTATION_UNKNOWN")
+        );
+        assert_eq!(mock.state.total_mutations(), 0);
+
+        let mismatch_db = ensure_db().await;
+        configure_eligible_rule(&mismatch_db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&mismatch_db, "Dianxin", "stale-id", "192.0.2.20").await;
+        let mismatch_binding = mismatch_db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        mismatch_db
+            .update_dns_record_binding_observation(
+                mismatch_binding.id,
+                "ERROR",
+                Some("2026-09-25 00:00:00"),
+                Some("MUTATION_UNKNOWN"),
+                "2026-09-25 00:00:00",
+            )
+            .await
+            .unwrap();
+        let mismatch = spawn_ensure_mock(
+            vec![record("replacement-id", "A", "192.0.2.99", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert!(matches!(
+            inspect_line_record(&mismatch_db, &mismatch.client, 100, "Dianxin").await,
+            Err(LineRecordSnapshotError::OwnershipUnverified)
+        ));
+        let still_stale = mismatch_db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_stale.record_id, "stale-id");
+        assert_eq!(still_stale.state, "ERROR");
+        assert_eq!(
+            still_stale.last_error_category.as_deref(),
+            Some("MUTATION_UNKNOWN")
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_preflight_recovery_rejects_multiple_claimed_and_bound_replacements() {
+        let multiple_db = ensure_db().await;
+        configure_eligible_rule(&multiple_db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&multiple_db, "Dianxin", "stale-id", "192.0.2.20").await;
+        let multiple_binding = multiple_db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        multiple_db
+            .update_dns_record_binding_observation(
+                multiple_binding.id,
+                "ERROR",
+                Some("2026-09-25 00:00:00"),
+                Some("MUTATION_UNKNOWN"),
+                "2026-09-25 00:00:00",
+            )
+            .await
+            .unwrap();
+        let multiple = spawn_ensure_mock(
+            vec![
+                record("replacement-1", "A", "192.0.2.20", "Dianxin"),
+                record("replacement-2", "A", "192.0.2.20", "Dianxin"),
+            ],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert!(matches!(
+            inspect_line_record(&multiple_db, &multiple.client, 100, "Dianxin").await,
+            Err(LineRecordSnapshotError::OwnershipUnverified)
+        ));
+        let still_multiple = multiple_db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_multiple.record_id, "stale-id");
+        assert_eq!(still_multiple.state, "ERROR");
+        assert_eq!(multiple.state.total_mutations(), 0);
+
+        let claimed_db = ensure_db().await;
+        configure_eligible_rule(&claimed_db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&claimed_db, "Dianxin", "stale-id", "192.0.2.20").await;
+        let claimed_stale = claimed_db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        claimed_db
+            .update_dns_record_binding_observation(
+                claimed_stale.id,
+                "ERROR",
+                Some("2026-09-25 00:00:00"),
+                Some("MUTATION_UNKNOWN"),
+                "2026-09-25 00:00:00",
+            )
+            .await
+            .unwrap();
+        claimed_db
+            .insert_dns_record_binding(&NewDnsRecordBinding {
+                rule_id: None,
+                fqdn: "op1.example.com".into(),
+                zone_id: 7,
+                zone_name: "example.com".into(),
+                host: "op1".into(),
+                record_type: "A".into(),
+                line: "Dianxin".into(),
+                line_key: "dnsmgr:Dianxin".into(),
+                record_id: "replacement-id".into(),
+                desired_value: "192.0.2.20".into(),
+                state: "BOUND".into(),
+                last_observed_at: Some("2026-09-25 00:00:00".into()),
+                created_at: "2026-09-25 00:00:00".into(),
+            })
+            .await
+            .unwrap();
+        let claimed = spawn_ensure_mock(
+            vec![record("replacement-id", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert!(matches!(
+            inspect_line_record(&claimed_db, &claimed.client, 100, "Dianxin").await,
+            Err(LineRecordSnapshotError::OwnershipUnverified)
+        ));
+        let still_claimed = claimed_db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_claimed.record_id, "stale-id");
+        assert_eq!(still_claimed.state, "ERROR");
+        assert_eq!(claimed.state.total_mutations(), 0);
+
+        let bound_db = ensure_db().await;
+        configure_eligible_rule(&bound_db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&bound_db, "Dianxin", "stale-id", "192.0.2.20").await;
+        let bound = spawn_ensure_mock(
+            vec![record("replacement-id", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert!(matches!(
+            inspect_line_record(&bound_db, &bound.client, 100, "Dianxin").await,
+            Err(LineRecordSnapshotError::OwnershipUnverified)
+        ));
+        let still_bound = bound_db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_bound.record_id, "stale-id");
+        assert_eq!(still_bound.state, "BOUND");
+        assert_eq!(still_bound.last_error_category, None);
+        assert_eq!(bound.state.total_mutations(), 0);
+    }
+
+    #[tokio::test]
+    async fn carrier_preflight_does_not_rebind_when_provider_line_changed() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&db, "Dianxin", "stale-id", "192.0.2.20").await;
+        let stale = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_dns_record_binding_observation(
+            stale.id,
+            "ERROR",
+            Some("2026-09-25 00:00:00"),
+            Some("MUTATION_UNKNOWN"),
+            "2026-09-25 00:00:00",
+        )
+        .await
+        .unwrap();
+
+        let changed_line = spawn_ensure_mock(
+            vec![record(
+                "replacement-id",
+                "A",
+                "192.0.2.20",
+                "Dianxin_Shandong",
+            )],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert_eq!(
+            inspect_line_record(&db, &changed_line.client, 100, "Dianxin")
+                .await
+                .unwrap(),
+            LineRecordSnapshot::Absent
+        );
+        let still_stale = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_stale.record_id, "stale-id");
+        assert_eq!(still_stale.state, "ERROR");
+        assert_eq!(
+            still_stale.last_error_category.as_deref(),
+            Some("MUTATION_UNKNOWN")
+        );
+        assert_eq!(changed_line.state.total_mutations(), 0);
     }
 
     #[tokio::test]
@@ -4133,6 +4684,262 @@ mod tests {
         assert_eq!(normal.preferred_node_id.as_deref(), Some("node-a"));
         assert_eq!(normal.carrier_policy, updated_policy);
         assert!(normal.pending_routing_mode.is_none());
+    }
+
+    #[tokio::test]
+    async fn carrier_apply_preflight_recovers_ambiguous_provider_recreation() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&db, "Dianxin", "stale-id", "192.0.2.20").await;
+        let stale = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_dns_record_binding_observation(
+            stale.id,
+            "ERROR",
+            Some("2026-09-25 00:00:00"),
+            Some("MUTATION_UNKNOWN"),
+            "2026-09-25 00:00:00",
+        )
+        .await
+        .unwrap();
+
+        let mock = spawn_ensure_mock(
+            vec![record("replacement-id", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        db.set(
+            DNSMGR_CONFIG_KEY,
+            &serde_json::json!({
+                "enabled": true,
+                "base_url": mock.base_url.clone(),
+                "uid": 7,
+                "api_key": "key"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        db.set(
+            "relay_preference:10",
+            &serde_json::json!({
+                "active_routing_mode": "carrier",
+                "normal_default_node_id": "node-a",
+                "preferred_node_id": "node-a",
+                "pending_node_id": null,
+                "state": "idle",
+                "started_at": null,
+                "last_error": null,
+                "carrier_policy": {
+                    "default_node_id": "node-a",
+                    "bindings": [{
+                        "line_id": "Dianxin",
+                        "mode": "follow_default"
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        db.set(
+            "node_status:10:node-a",
+            &serde_json::json!({
+                "last_seen": chrono::Utc::now().to_rfc3339(),
+                "public_ipv4": "192.0.2.10",
+                "public_ipv4_reported": true,
+                "config_protocol_version": relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+                "active_listener_rule_ids": [100],
+                "camouflage_sites": [{
+                    "site_id": "site-100",
+                    "sni": "op1.example.com",
+                    "site_status": "active",
+                    "certificate_status": "active"
+                }],
+                "reconciliation": {"state": "CONVERGED", "recovery_source": "PANEL"}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let connections = crate::api::ws::NodeConnections::new();
+        let (_, _rx) = connections.register(10, Some("node-a".into())).await;
+
+        assert_eq!(
+            crate::service::relay_preference::start_carrier_policy_apply(
+                &db,
+                &connections,
+                10,
+                crate::service::relay_preference::CarrierPolicy {
+                    default_node_id: Some("node-a".into()),
+                    bindings: Vec::new(),
+                },
+            )
+            .await
+            .unwrap(),
+            crate::service::relay_preference::CarrierPolicyApplyOutcome::Started
+        );
+        let recovered = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.record_id, "replacement-id");
+        assert_eq!(recovered.state, "ERROR");
+        assert_eq!(
+            recovered.last_error_category.as_deref(),
+            Some("MUTATION_UNKNOWN")
+        );
+        assert_eq!(mock.state.total_mutations(), 0);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_carrier_recovery_stays_retryable_across_provider_recreation_race() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        insert_line_binding(&db, "Dianxin", "old-id", "192.0.2.20").await;
+        let stale = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_dns_record_binding_observation(
+            stale.id,
+            "ERROR",
+            Some("2026-09-25 00:00:00"),
+            Some("MUTATION_UNKNOWN"),
+            "2026-09-25 00:00:00",
+        )
+        .await
+        .unwrap();
+        db.insert_dns_record_sync(&NewDnsRecordSync {
+            rule_id: 100,
+            fqdn: "op1.example.com".into(),
+            record_type: "A".into(),
+            expected_value: Some("192.0.2.20".into()),
+            line: "Dianxin".into(),
+            line_key: "dnsmgr:Dianxin".into(),
+            desired_action: "UPSERT".into(),
+            state: "PENDING".into(),
+            ownership: "UNKNOWN".into(),
+            last_error_category: None,
+            next_attempt_at: Some(utc_now()),
+            created_at: utc_now(),
+            updated_at: utc_now(),
+        })
+        .await
+        .unwrap();
+
+        let mock = spawn_ensure_mock(
+            vec![record("replacement-1", "A", "192.0.2.20", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+
+        assert_eq!(
+            inspect_line_record(&db, &mock.client, 100, "Dianxin")
+                .await
+                .unwrap(),
+            LineRecordSnapshot::PanelOwned {
+                value: "192.0.2.20".into(),
+                record_id: "replacement-1".into(),
+            }
+        );
+        let provisional = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provisional.record_id, "replacement-1");
+        assert_eq!(provisional.state, "ERROR");
+        assert_eq!(
+            provisional.last_error_category.as_deref(),
+            Some("MUTATION_UNKNOWN")
+        );
+        assert_eq!(mock.state.total_mutations(), 0);
+
+        *mock.state.records.lock().unwrap() =
+            vec![record("replacement-2", "A", "192.0.2.20", "Dianxin")];
+
+        let sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_one(&db, sync, &mock.client).await;
+        let failed_sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_sync.state, "FAILED");
+        assert_eq!(
+            failed_sync.last_error_category.as_deref(),
+            Some("DNS_OWNERSHIP_UNVERIFIED")
+        );
+        assert_eq!(mock.state.total_mutations(), 0);
+        let still_retryable = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_retryable.record_id, "replacement-1");
+        assert_eq!(still_retryable.state, "ERROR");
+        assert_eq!(
+            still_retryable.last_error_category.as_deref(),
+            Some("MUTATION_UNKNOWN")
+        );
+
+        assert_eq!(
+            inspect_line_record(&db, &mock.client, 100, "Dianxin")
+                .await
+                .unwrap(),
+            LineRecordSnapshot::PanelOwned {
+                value: "192.0.2.20".into(),
+                record_id: "replacement-2".into(),
+            }
+        );
+        let recovered_again = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered_again.record_id, "replacement-2");
+        assert_eq!(recovered_again.state, "ERROR");
+        assert_eq!(
+            recovered_again.last_error_category.as_deref(),
+            Some("MUTATION_UNKNOWN")
+        );
+        assert_eq!(mock.state.total_mutations(), 0);
+
+        let sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_one(&db, sync, &mock.client).await;
+
+        assert_eq!(mock.state.total_mutations(), 0);
+        let verified = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified.record_id, "replacement-2");
+        assert_eq!(verified.state, "BOUND");
+        assert_eq!(verified.last_error_category, None);
+        let verified_sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified_sync.state, "PROPAGATED");
+        assert_eq!(verified_sync.ownership, "PANEL");
     }
 
     #[tokio::test]
@@ -5236,7 +6043,7 @@ mod tests {
             EnsureRecordResult::MutationOutcomeUnknown
         );
         assert_eq!(mock.state.add_attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(mock.state.list_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(mock.state.list_attempts.load(Ordering::SeqCst), 3);
         assert!(db
             .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "default")
             .await

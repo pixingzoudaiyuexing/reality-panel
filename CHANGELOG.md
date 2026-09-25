@@ -20,6 +20,7 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 - Strict traffic report 按 exact config revision 保存并使用历史 rule -> source Group / owner 归属，支持断线重试与重复 ACK 幂等。
 - 规则已删除时可按历史归属继续结算；无法安全恢复的历史条目会明确记录为 `traffic_historical_unbillable`，不会永久阻塞 Node 后续批次。
 - `traffic_history` 身份升级为 `(rule_id, group_id, hour_ts)`，避免同一 rule ID 在同小时迁组后把旧 Group 已结算流量重新标到新 Group。
+- 修复 Carrier Apply 在 DNS Provider 模糊写入后重建同一逻辑记录并更换 record ID 时的 ownership 恢复：仅允许从完整历史 `ERROR + MUTATION_UNKNOWN` 归属进行可重试的精确恢复；DNSMgr 子域过滤返回空时会用完整 zone inventory 交叉确认，避免误判记录不存在。
 
 ### 兼容性
 
