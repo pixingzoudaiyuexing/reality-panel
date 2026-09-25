@@ -2981,13 +2981,7 @@ mod tests {
         );
         assert!(durable_batch_send_ready(&queued).unwrap());
 
-        write_proof(
-            999,
-            999,
-            checkpoint.generation + 1,
-            0,
-            sequence,
-        );
+        write_proof(999, 999, checkpoint.generation + 1, 0, sequence);
         assert!(
             durable_batch_send_ready(&queued).unwrap(),
             "a later durably opened source generation proves older cursor progress"
