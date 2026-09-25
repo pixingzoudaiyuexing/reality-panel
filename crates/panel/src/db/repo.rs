@@ -1525,6 +1525,24 @@ pub struct DetachedDnsRecordBindingAdoption {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AmbiguousDnsRecordBindingRebind {
+    pub binding_id: i64,
+    pub rule_id: i64,
+    pub fqdn: String,
+    pub zone_id: i64,
+    pub zone_name: String,
+    pub host: String,
+    pub record_type: String,
+    pub line: String,
+    pub line_key: String,
+    pub previous_record_id: String,
+    pub replacement_record_id: String,
+    pub desired_value: String,
+    pub observed_at: String,
+    pub updated_at: String,
+}
+
 #[async_trait]
 pub trait DnsRecordBindingRepository: Send + Sync {
     async fn insert_dns_record_binding(
@@ -1566,6 +1584,16 @@ pub trait DnsRecordBindingRepository: Send + Sync {
         desired_value: &str,
         observed_at: &str,
         updated_at: &str,
+    ) -> Result<u64, DbError>;
+
+    /// Recover provider identity only for a binding left in the explicit
+    /// ambiguous-mutation recoverable state. The transfer deliberately preserves
+    /// ERROR + MUTATION_UNKNOWN until normal reconciliation verifies the provider.
+    /// Every previous identity field is part of the atomic predicate; a normal
+    /// BOUND/MISSING/CONFLICT binding cannot use this path.
+    async fn rebind_ambiguous_dns_record_binding(
+        &self,
+        rebind: &AmbiguousDnsRecordBindingRebind,
     ) -> Result<u64, DbError>;
 
     /// Atomically transfer preserved Panel ownership to a replacement Rule.
