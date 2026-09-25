@@ -418,6 +418,78 @@ async fn pg_apply_schema_seeds_baseline_version() {
 }
 
 #[tokio::test]
+async fn pg_traffic_history_primary_key_upgrade_preserves_same_hour_group_rows() {
+    let Some(pool) = fresh_pool("traffic_history_pk41").await else {
+        return;
+    };
+    for statement in [
+        "CREATE TABLE schema_version (version INTEGER PRIMARY KEY)",
+        "INSERT INTO schema_version (version) VALUES (40)",
+        "CREATE TABLE traffic_history (\
+             rule_id BIGINT NOT NULL,\
+             uid BIGINT NOT NULL,\
+             group_id BIGINT NOT NULL DEFAULT 0,\
+             hour_ts TEXT NOT NULL,\
+             real_upload BIGINT NOT NULL DEFAULT 0,\
+             real_download BIGINT NOT NULL DEFAULT 0,\
+             billed_total BIGINT NOT NULL DEFAULT 0,\
+             PRIMARY KEY (rule_id, hour_ts)\
+         )",
+        "INSERT INTO traffic_history \
+             (rule_id, uid, group_id, hour_ts, real_upload, billed_total) \
+         VALUES (100, 1, 10, '2026-09-25 02:00:00', 10, 10)",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+
+    run_pg_migrations(&pool).await.unwrap();
+
+    let pk_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT kcu.column_name \
+         FROM information_schema.table_constraints tc \
+         JOIN information_schema.key_column_usage kcu \
+           ON tc.constraint_name = kcu.constraint_name \
+          AND tc.constraint_schema = kcu.constraint_schema \
+         WHERE tc.table_schema = 'public' \
+           AND tc.table_name = 'traffic_history' \
+           AND tc.constraint_type = 'PRIMARY KEY' \
+         ORDER BY kcu.ordinal_position",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pk_columns, vec!["rule_id", "group_id", "hour_ts"]);
+
+    sqlx::query(
+        "INSERT INTO traffic_history \
+             (rule_id, uid, group_id, hour_ts, real_upload, billed_total) \
+         VALUES (100, 1, 20, '2026-09-25 02:00:00', 5, 5)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT group_id, real_upload, billed_total \
+         FROM traffic_history WHERE rule_id = 100 ORDER BY group_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, vec![(10, 10, 10), (20, 5, 5)]);
+
+    run_pg_migrations(&pool).await.unwrap();
+    let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(version, crate::db::pg_schema::PG_SCHEMA_VERSION);
+
+    let db = PgRepository::new(pool);
+    cleanup(&db).await;
+}
+
+#[tokio::test]
 async fn pg_migration_34_preserves_rc8_sync_and_enables_composite_identity() {
     let Some(pool) = fresh_pool("dns_sync_migration_34").await else {
         return;

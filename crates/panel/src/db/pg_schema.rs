@@ -2216,15 +2216,26 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     // primary key cannot encounter duplicates and preserves every row verbatim.
     if current < 41 {
         let mut tx = pool.begin().await?;
-        sqlx::query("ALTER TABLE traffic_history DROP CONSTRAINT IF EXISTS traffic_history_pkey")
+        // Production startup runs apply_pg_schema first, so this table always
+        // exists there. The guard keeps run_pg_migrations independently
+        // idempotent for historical/minimal migration fixtures as well.
+        let history_exists: bool =
+            sqlx::query_scalar("SELECT to_regclass('traffic_history') IS NOT NULL")
+                .fetch_one(&mut *tx)
+                .await?;
+        if history_exists {
+            sqlx::query(
+                "ALTER TABLE traffic_history DROP CONSTRAINT IF EXISTS traffic_history_pkey",
+            )
             .execute(&mut *tx)
             .await?;
-        sqlx::query(
-            "ALTER TABLE traffic_history ADD CONSTRAINT traffic_history_pkey \
-             PRIMARY KEY (rule_id, group_id, hour_ts)",
-        )
-        .execute(&mut *tx)
-        .await?;
+            sqlx::query(
+                "ALTER TABLE traffic_history ADD CONSTRAINT traffic_history_pkey \
+                 PRIMARY KEY (rule_id, group_id, hour_ts)",
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
         sqlx::query(
             "INSERT INTO schema_version (version) VALUES (41) ON CONFLICT (version) DO NOTHING",
         )
