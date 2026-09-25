@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -100,6 +100,18 @@ impl TrafficCounter {
             report_gate: Mutex::new(()),
             strict_seal_poisoned: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) async fn durable_accounting_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.report_gate.lock().await
+    }
+
+    pub(crate) fn strict_reporting_poisoned(&self) -> bool {
+        self.strict_seal_poisoned.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn poison_strict_reporting(&self) {
+        self.strict_seal_poisoned.store(true, Ordering::Release);
     }
 
     /// Acquire the immutable counter generation for one accepted stream
@@ -563,6 +575,10 @@ impl Drop for TcpConnectionGuard {
 }
 
 const TRAFFIC_PENDING_FILENAME: &str = "traffic-report-pending.json";
+const TRAFFIC_SPOOL_DIRNAME: &str = "traffic-report-spool";
+const TRAFFIC_SPOOL_SEQUENCE_FILENAME: &str = "sequence.json";
+const TRAFFIC_SPOOL_FORMAT_VERSION: u32 = 1;
+const TRAFFIC_SPOOL_FILENAME_WIDTH: usize = 20;
 const MAX_PENDING_TRAFFIC_BYTES: u64 = 1_048_576;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -578,7 +594,51 @@ struct PendingTrafficBatch {
     reports: Vec<TrafficEntry>,
 }
 
-fn pending_traffic_path(auth: &NodeRuntimeAuth, node_id: &str) -> Result<Option<PathBuf>, String> {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NginxTrafficCheckpoint {
+    pub source: String,
+    pub device: u64,
+    pub inode: u64,
+    #[serde(default)]
+    pub generation: u64,
+    pub start_offset: u64,
+    pub end_offset: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DurableSpoolRecord {
+    format_version: u32,
+    sequence: u64,
+    batch: PendingTrafficBatch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nginx_checkpoint: Option<NginxTrafficCheckpoint>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SpoolSequenceState {
+    format_version: u32,
+    next_sequence: u64,
+}
+
+#[derive(Debug, Clone)]
+enum DurableBatchLocation {
+    Legacy(PathBuf),
+    Queue {
+        path: PathBuf,
+        record: DurableSpoolRecord,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct DurableQueuedBatch {
+    location: DurableBatchLocation,
+    batch: PendingTrafficBatch,
+}
+
+fn strict_traffic_parent(auth: &NodeRuntimeAuth, node_id: &str) -> Result<Option<PathBuf>, String> {
     match auth {
         NodeRuntimeAuth::LegacyGroupToken { .. } => Ok(None),
         NodeRuntimeAuth::PermanentCredential {
@@ -592,26 +652,130 @@ fn pending_traffic_path(auth: &NodeRuntimeAuth, node_id: &str) -> Result<Option<
             let parent = secret_file
                 .parent()
                 .ok_or_else(|| "Credential Secret has no private parent directory".to_string())?;
-            Ok(Some(parent.join(TRAFFIC_PENDING_FILENAME)))
+            Ok(Some(parent.to_path_buf()))
         }
     }
 }
 
-fn validate_private_pending_parent(parent: &Path) -> Result<(), String> {
-    let metadata = std::fs::symlink_metadata(parent)
-        .map_err(|_| "traffic pending directory is unavailable".to_string())?;
+fn pending_traffic_path(auth: &NodeRuntimeAuth, node_id: &str) -> Result<Option<PathBuf>, String> {
+    Ok(strict_traffic_parent(auth, node_id)?
+        .map(|parent| parent.join(TRAFFIC_PENDING_FILENAME)))
+}
+
+fn strict_credential_id<'a>(
+    auth: &'a NodeRuntimeAuth,
+    node_id: &str,
+) -> Result<Option<&'a str>, String> {
+    match auth {
+        NodeRuntimeAuth::LegacyGroupToken { .. } => Ok(None),
+        NodeRuntimeAuth::PermanentCredential {
+            credential_id,
+            state_node_id,
+            ..
+        } => {
+            if state_node_id != node_id {
+                return Err("traffic batch node identity does not match Credential state".into());
+            }
+            Ok(Some(credential_id.as_str()))
+        }
+    }
+}
+
+fn validate_private_directory(path: &Path, label: &str) -> Result<(), String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| format!("{label} is unavailable"))?;
     let euid = unsafe { libc::geteuid() };
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
         || metadata.uid() != euid
         || (metadata.mode() & 0o777) != 0o700
     {
-        return Err(
-            "traffic pending directory must be owner-only mode 0700 and must not be a symlink"
-                .into(),
-        );
+        return Err(format!(
+            "{label} must be owner-only mode 0700 and must not be a symlink"
+        ));
     }
     Ok(())
+}
+
+fn validate_private_pending_parent(parent: &Path) -> Result<(), String> {
+    validate_private_directory(parent, "traffic pending directory")
+}
+
+fn validate_private_spool_dir(spool_dir: &Path) -> Result<(), String> {
+    validate_private_directory(spool_dir, "traffic spool directory")
+}
+
+fn sync_directory(path: &Path, label: &str) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| format!("{label} could not be fsynced"))
+}
+
+fn ensure_spool_dir(parent: &Path) -> Result<PathBuf, String> {
+    validate_private_pending_parent(parent)?;
+    let spool_dir = parent.join(TRAFFIC_SPOOL_DIRNAME);
+    match std::fs::symlink_metadata(&spool_dir) {
+        Ok(_) => {
+            validate_private_spool_dir(&spool_dir)?;
+            Ok(spool_dir)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&spool_dir) {
+                Ok(()) => {
+                    sync_directory(parent, "traffic state directory")?;
+                    validate_private_spool_dir(&spool_dir)?;
+                    Ok(spool_dir)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    validate_private_spool_dir(&spool_dir)?;
+                    Ok(spool_dir)
+                }
+                Err(_) => Err("traffic spool directory could not be created".into()),
+            }
+        }
+        Err(_) => Err("traffic spool directory is unavailable".into()),
+    }
+}
+
+fn existing_spool_dir(parent: &Path) -> Result<Option<PathBuf>, String> {
+    validate_private_pending_parent(parent)?;
+    let spool_dir = parent.join(TRAFFIC_SPOOL_DIRNAME);
+    match std::fs::symlink_metadata(&spool_dir) {
+        Ok(_) => {
+            validate_private_spool_dir(&spool_dir)?;
+            Ok(Some(spool_dir))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("traffic spool directory is unavailable".into()),
+    }
+}
+
+fn read_private_regular_file(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>, String> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| format!("{label} is unavailable"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| format!("{label} metadata is unavailable"))?;
+    let euid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != euid
+        || (metadata.mode() & 0o777) != 0o600
+        || metadata.len() > max_bytes
+    {
+        return Err(format!(
+            "{label} must be owner-only mode 0600 regular file"
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|_| format!("{label} could not be read"))?;
+    Ok(bytes)
 }
 
 fn validate_pending_batch(
@@ -622,6 +786,7 @@ fn validate_pending_batch(
     if pending.version != TRAFFIC_BATCH_PROTOCOL_VERSION
         || pending.node_id != node_id
         || pending.credential_id != credential_id
+        || pending.reports.is_empty()
         || !valid_traffic_batch_id(&pending.batch_id)
         || !valid_traffic_payload_sha256(&pending.payload_sha256)
         || traffic_batch_payload_sha256(&pending.reports) != pending.payload_sha256
@@ -640,30 +805,13 @@ fn load_pending_traffic_at(
         .parent()
         .ok_or_else(|| "traffic pending path has no parent".to_string())?;
     validate_private_pending_parent(parent)?;
-    let mut file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-    {
-        Ok(file) => file,
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err("traffic pending batch is unavailable".into()),
-    };
-    let metadata = file
-        .metadata()
-        .map_err(|_| "traffic pending batch metadata is unavailable".to_string())?;
-    let euid = unsafe { libc::geteuid() };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.uid() != euid
-        || (metadata.mode() & 0o777) != 0o600
-        || metadata.len() > MAX_PENDING_TRAFFIC_BYTES
-    {
-        return Err("traffic pending batch must be owner-only mode 0600 regular file".into());
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)
-        .map_err(|_| "traffic pending batch could not be read".to_string())?;
+    let bytes =
+        read_private_regular_file(path, MAX_PENDING_TRAFFIC_BYTES, "traffic pending batch")?;
     let pending: PendingTrafficBatch = serde_json::from_slice(&bytes)
         .map_err(|_| "traffic pending batch is malformed".to_string())?;
     validate_pending_batch(&pending, node_id, credential_id)?;
@@ -671,38 +819,581 @@ fn load_pending_traffic_at(
 }
 
 #[derive(Debug)]
-enum PendingWriteError {
+pub(crate) enum PendingWriteError {
     Clean(String),
     RestartRequired(String),
 }
 
 impl PendingWriteError {
-    fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         match self {
             Self::Clean(message) | Self::RestartRequired(message) => message,
         }
     }
 
-    fn restart_required(&self) -> bool {
+    pub(crate) fn restart_required(&self) -> bool {
         matches!(self, Self::RestartRequired(_))
     }
 }
 
-fn sync_parent_directory(parent: &Path) -> Result<(), String> {
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| "traffic pending directory could not be fsynced".to_string())
+fn atomic_replace_private_file(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} path has no parent"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{label} path has an invalid filename"))?;
+    let temp = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temp)
+        .map_err(|_| format!("{label} temporary file could not be created"))?;
+    let pre_rename = (|| -> Result<(), String> {
+        file.write_all(bytes)
+            .map_err(|_| format!("{label} could not be written"))?;
+        file.flush()
+            .map_err(|_| format!("{label} could not be flushed"))?;
+        file.sync_all()
+            .map_err(|_| format!("{label} could not be fsynced"))?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = pre_rename {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    if std::fs::rename(&temp, path).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("{label} could not be atomically replaced"));
+    }
+    sync_directory(parent, &format!("{label} parent directory"))
 }
 
-fn cleanup_installed_pending(path: &Path, parent: &Path) -> bool {
-    let removed = match std::fs::remove_file(path) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
+fn load_sequence_state_at(spool_dir: &Path) -> Result<Option<SpoolSequenceState>, String> {
+    let path = spool_dir.join(TRAFFIC_SPOOL_SEQUENCE_FILENAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("traffic spool sequence state is unavailable".into()),
+    }
+    let bytes = read_private_regular_file(&path, 4096, "traffic spool sequence state")?;
+    let state: SpoolSequenceState = serde_json::from_slice(&bytes)
+        .map_err(|_| "traffic spool sequence state is malformed".to_string())?;
+    if state.format_version != TRAFFIC_SPOOL_FORMAT_VERSION || state.next_sequence == 0 {
+        return Err("traffic spool sequence state is invalid".into());
+    }
+    Ok(Some(state))
+}
+
+fn save_sequence_state_at(spool_dir: &Path, next_sequence: u64) -> Result<(), String> {
+    if next_sequence == 0 {
+        return Err("traffic spool sequence overflow".into());
+    }
+    let bytes = serde_json::to_vec(&SpoolSequenceState {
+        format_version: TRAFFIC_SPOOL_FORMAT_VERSION,
+        next_sequence,
+    })
+    .map_err(|_| "traffic spool sequence state encode failed".to_string())?;
+    atomic_replace_private_file(
+        &spool_dir.join(TRAFFIC_SPOOL_SEQUENCE_FILENAME),
+        &bytes,
+        "traffic spool sequence state",
+    )
+}
+
+fn parse_spool_filename(name: &str) -> Option<u64> {
+    let digits = name.strip_suffix(".json")?;
+    if digits.len() != TRAFFIC_SPOOL_FILENAME_WIDTH
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let sequence = digits.parse::<u64>().ok()?;
+    (sequence != 0).then_some(sequence)
+}
+
+fn known_spool_temp(name: &str) -> bool {
+    (name.starts_with(".traffic-report-spool-record.") && name.ends_with(".tmp"))
+        || (name.starts_with(".sequence.json.") && name.ends_with(".tmp"))
+}
+
+fn list_spool_files(spool_dir: &Path) -> Result<Vec<(u64, PathBuf)>, String> {
+    validate_private_spool_dir(spool_dir)?;
+    let mut files = Vec::new();
+    let entries =
+        std::fs::read_dir(spool_dir).map_err(|_| "traffic spool directory could not be read")?;
+    for entry in entries {
+        let entry = entry.map_err(|_| "traffic spool directory entry is unavailable")?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "traffic spool contains a non-UTF8 filename".to_string())?;
+        if name == TRAFFIC_SPOOL_SEQUENCE_FILENAME || known_spool_temp(&name) {
+            continue;
+        }
+        let sequence = parse_spool_filename(&name)
+            .ok_or_else(|| "traffic spool contains an unexpected committed entry".to_string())?;
+        files.push((sequence, entry.path()));
+    }
+    files.sort_by_key(|(sequence, _)| *sequence);
+    Ok(files)
+}
+
+fn reserve_spool_sequence(parent: &Path) -> Result<(PathBuf, u64), String> {
+    let spool_dir = ensure_spool_dir(parent)?;
+    let max_committed = list_spool_files(&spool_dir)?
+        .last()
+        .map(|(sequence, _)| *sequence);
+    let persisted_next = load_sequence_state_at(&spool_dir)?
+        .map(|state| state.next_sequence)
+        .unwrap_or(1);
+    let committed_next = match max_committed {
+        Some(sequence) => sequence
+            .checked_add(1)
+            .ok_or_else(|| "traffic spool sequence overflow".to_string())?,
+        None => 1,
     };
-    removed && sync_parent_directory(parent).is_ok()
+    let sequence = persisted_next.max(committed_next);
+    let next_sequence = sequence
+        .checked_add(1)
+        .ok_or_else(|| "traffic spool sequence overflow".to_string())?;
+
+    // Reserve BEFORE installing a batch. A crash here can only leave a gap;
+    // it can never cause an older immutable batch to be overwritten/reordered.
+    save_sequence_state_at(&spool_dir, next_sequence)?;
+    Ok((spool_dir, sequence))
 }
 
+fn validate_spool_record(
+    record: &DurableSpoolRecord,
+    node_id: &str,
+    credential_id: &str,
+) -> Result<(), String> {
+    if record.format_version != TRAFFIC_SPOOL_FORMAT_VERSION || record.sequence == 0 {
+        return Err("traffic spool record format is invalid".into());
+    }
+    validate_pending_batch(&record.batch, node_id, credential_id)?;
+    if let Some(checkpoint) = record.nginx_checkpoint.as_ref() {
+        if checkpoint.source.is_empty() || checkpoint.end_offset <= checkpoint.start_offset {
+            return Err("traffic spool Nginx checkpoint range is invalid".into());
+        }
+    }
+    Ok(())
+}
+
+fn load_spool_record_at(
+    path: &Path,
+    node_id: &str,
+    credential_id: &str,
+) -> Result<DurableSpoolRecord, String> {
+    let bytes = read_private_regular_file(path, MAX_PENDING_TRAFFIC_BYTES, "traffic spool batch")?;
+    let record: DurableSpoolRecord = serde_json::from_slice(&bytes)
+        .map_err(|_| "traffic spool batch is malformed".to_string())?;
+    validate_spool_record(&record, node_id, credential_id)?;
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "traffic spool batch filename is invalid".to_string())?;
+    if parse_spool_filename(filename) != Some(record.sequence) {
+        return Err("traffic spool batch filename/sequence mismatch".into());
+    }
+    Ok(record)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum SpoolWriteFailpoint {
+    None,
+    BeforeInstall,
+    AfterDurableInstall,
+}
+
+fn write_spool_record_at(
+    spool_dir: &Path,
+    record: &DurableSpoolRecord,
+    failpoint: SpoolWriteFailpoint,
+) -> Result<(), PendingWriteError> {
+    validate_spool_record(record, &record.batch.node_id, &record.batch.credential_id)
+        .map_err(PendingWriteError::Clean)?;
+    let bytes = serde_json::to_vec(record)
+        .map_err(|_| PendingWriteError::Clean("traffic spool batch encode failed".to_string()))?;
+    if bytes.len() as u64 > MAX_PENDING_TRAFFIC_BYTES {
+        return Err(PendingWriteError::Clean(
+            "traffic spool batch is unexpectedly large".into(),
+        ));
+    }
+    let final_path = spool_dir.join(format!(
+        "{:0width$}.json",
+        record.sequence,
+        width = TRAFFIC_SPOOL_FILENAME_WIDTH
+    ));
+    if std::fs::symlink_metadata(&final_path).is_ok() {
+        return Err(PendingWriteError::Clean(
+            "traffic spool sequence is already committed".into(),
+        ));
+    }
+    let temp = spool_dir.join(format!(
+        ".traffic-report-spool-record.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temp)
+        .map_err(|_| {
+            PendingWriteError::Clean(
+                "traffic spool temporary file could not be created".to_string(),
+            )
+        })?;
+    let pre_install = (|| -> Result<(), String> {
+        file.write_all(&bytes)
+            .map_err(|_| "traffic spool batch could not be written".to_string())?;
+        file.flush()
+            .map_err(|_| "traffic spool batch could not be flushed".to_string())?;
+        file.sync_all()
+            .map_err(|_| "traffic spool batch could not be fsynced".to_string())?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(message) = pre_install {
+        let _ = std::fs::remove_file(&temp);
+        return Err(PendingWriteError::Clean(message));
+    }
+    if failpoint == SpoolWriteFailpoint::BeforeInstall {
+        let _ = std::fs::remove_file(&temp);
+        return Err(PendingWriteError::Clean(
+            "injected failure before durable traffic spool install".into(),
+        ));
+    }
+
+    if std::fs::hard_link(&temp, &final_path).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(PendingWriteError::Clean(
+            "traffic spool batch could not be committed".into(),
+        ));
+    }
+    let _ = std::fs::remove_file(&temp);
+
+    let post_install = (|| -> Result<(), String> {
+        sync_directory(spool_dir, "traffic spool directory")?;
+        let reopened = load_spool_record_at(
+            &final_path,
+            &record.batch.node_id,
+            &record.batch.credential_id,
+        )?;
+        if reopened != *record {
+            return Err("traffic spool batch verification mismatch".into());
+        }
+        Ok(())
+    })();
+    if let Err(message) = post_install {
+        let removed = match std::fs::remove_file(&final_path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        if removed && sync_directory(spool_dir, "traffic spool directory").is_ok() {
+            return Err(PendingWriteError::Clean(message));
+        }
+        return Err(PendingWriteError::RestartRequired(format!(
+            "{message}; installed spool state could not be safely rolled back"
+        )));
+    }
+
+    if failpoint == SpoolWriteFailpoint::AfterDurableInstall {
+        return Err(PendingWriteError::RestartRequired(
+            "injected crash after durable traffic spool install".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn seal_strict_spool_batch_with_failpoint(
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+    config_revision: Option<u64>,
+    reports: Vec<TrafficEntry>,
+    nginx_checkpoint: Option<NginxTrafficCheckpoint>,
+    failpoint: SpoolWriteFailpoint,
+) -> Result<PendingTrafficBatch, PendingWriteError> {
+    if reports.is_empty() {
+        return Err(PendingWriteError::Clean(
+            "traffic spool refuses an empty batch".into(),
+        ));
+    }
+    let parent = strict_traffic_parent(auth, node_id)
+        .map_err(PendingWriteError::Clean)?
+        .ok_or_else(|| {
+            PendingWriteError::Clean("strict traffic spool requires Permanent Credential".into())
+        })?;
+    let credential_id = strict_credential_id(auth, node_id)
+        .map_err(PendingWriteError::Clean)?
+        .ok_or_else(|| {
+            PendingWriteError::Clean("strict traffic spool requires Permanent Credential".into())
+        })?;
+    let (spool_dir, sequence) =
+        reserve_spool_sequence(&parent).map_err(PendingWriteError::Clean)?;
+    let pending = PendingTrafficBatch {
+        version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+        batch_id: uuid::Uuid::new_v4().to_string(),
+        payload_sha256: traffic_batch_payload_sha256(&reports),
+        node_id: node_id.to_string(),
+        credential_id: credential_id.to_string(),
+        config_revision,
+        reports,
+    };
+    let record = DurableSpoolRecord {
+        format_version: TRAFFIC_SPOOL_FORMAT_VERSION,
+        sequence,
+        batch: pending.clone(),
+        nginx_checkpoint,
+    };
+    write_spool_record_at(&spool_dir, &record, failpoint)?;
+    Ok(pending)
+}
+
+fn seal_strict_spool_batch(
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+    config_revision: Option<u64>,
+    reports: Vec<TrafficEntry>,
+    nginx_checkpoint: Option<NginxTrafficCheckpoint>,
+) -> Result<PendingTrafficBatch, PendingWriteError> {
+    seal_strict_spool_batch_with_failpoint(
+        auth,
+        node_id,
+        config_revision,
+        reports,
+        nginx_checkpoint,
+        SpoolWriteFailpoint::None,
+    )
+}
+
+pub(crate) fn seal_nginx_traffic_batch(
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+    config_revision: Option<u64>,
+    reports: Vec<TrafficEntry>,
+    checkpoint: NginxTrafficCheckpoint,
+) -> Result<(), PendingWriteError> {
+    seal_strict_spool_batch(
+        auth,
+        node_id,
+        config_revision,
+        reports,
+        Some(checkpoint),
+    )
+    .map(|_| ())
+}
+
+fn load_spool_queue_at(
+    spool_dir: &Path,
+    node_id: &str,
+    credential_id: &str,
+) -> Result<Vec<(PathBuf, DurableSpoolRecord)>, String> {
+    let files = list_spool_files(spool_dir)?;
+    let mut queue = Vec::with_capacity(files.len());
+    for (sequence, path) in files {
+        let record = load_spool_record_at(&path, node_id, credential_id)?;
+        if record.sequence != sequence {
+            return Err("traffic spool sequence mismatch".into());
+        }
+        queue.push((path, record));
+    }
+    Ok(queue)
+}
+
+fn load_spool_queue(
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+    credential_id: &str,
+) -> Result<Vec<(PathBuf, DurableSpoolRecord)>, String> {
+    let parent = strict_traffic_parent(auth, node_id)?
+        .ok_or_else(|| "strict traffic spool requires Permanent Credential".to_string())?;
+    let Some(spool_dir) = existing_spool_dir(&parent)? else {
+        return Ok(Vec::new());
+    };
+    load_spool_queue_at(&spool_dir, node_id, credential_id)
+}
+
+fn load_legacy_pending(
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+    credential_id: &str,
+) -> Result<Option<DurableQueuedBatch>, String> {
+    let Some(path) = pending_traffic_path(auth, node_id)? else {
+        return Ok(None);
+    };
+    let Some(batch) = load_pending_traffic_at(&path, node_id, credential_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(DurableQueuedBatch {
+        location: DurableBatchLocation::Legacy(path),
+        batch,
+    }))
+}
+
+fn oldest_queue_batch(
+    queue: &[(PathBuf, DurableSpoolRecord)],
+) -> Option<DurableQueuedBatch> {
+    let (path, record) = queue.first()?;
+    Some(DurableQueuedBatch {
+        batch: record.batch.clone(),
+        location: DurableBatchLocation::Queue {
+            path: path.clone(),
+            record: record.clone(),
+        },
+    })
+}
+
+fn remove_file_and_sync_parent(path: &Path, label: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} path has no parent"))?;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("{label} vanished before ACK completion"));
+        }
+        Err(_) => return Err(format!("{label} could not be removed")),
+    }
+    sync_directory(parent, &format!("{label} parent directory"))
+}
+
+fn remove_durable_batch_at(
+    queued: &DurableQueuedBatch,
+    node_id: &str,
+    credential_id: &str,
+) -> Result<(), String> {
+    match &queued.location {
+        DurableBatchLocation::Legacy(path) => {
+            let current = load_pending_traffic_at(path, node_id, credential_id)?
+                .ok_or_else(|| "legacy traffic pending batch vanished before ACK".to_string())?;
+            if current != queued.batch {
+                return Err("legacy traffic pending batch changed before ACK".into());
+            }
+            remove_file_and_sync_parent(path, "legacy traffic pending batch")
+        }
+        DurableBatchLocation::Queue { path, record } => {
+            let current = load_spool_record_at(path, node_id, credential_id)?;
+            if current != *record || current.batch != queued.batch {
+                return Err("traffic spool batch changed before ACK".into());
+            }
+            remove_file_and_sync_parent(path, "traffic spool batch")
+        }
+    }
+}
+
+pub(crate) fn recover_nginx_checkpoint(
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+    source: &str,
+    cursor: Option<(u64, u64, u64, u64)>,
+) -> Result<Option<NginxTrafficCheckpoint>, String> {
+    let Some(credential_id) = strict_credential_id(auth, node_id)? else {
+        return Ok(None);
+    };
+    let queue = load_spool_queue(auth, node_id, credential_id)?;
+    let mut matched = None;
+    for (_, record) in queue {
+        let Some(checkpoint) = record.nginx_checkpoint else {
+            continue;
+        };
+        if checkpoint.source != source {
+            continue;
+        }
+        let cursor_matches = match cursor {
+            Some((device, inode, generation, offset)) => {
+                checkpoint.device == device
+                    && checkpoint.inode == inode
+                    && checkpoint.generation == generation
+                    && checkpoint.start_offset == offset
+            }
+            None => checkpoint.generation == 0 && checkpoint.start_offset == 0,
+        };
+        if cursor_matches {
+            if matched.is_some() {
+                return Err("multiple traffic spool checkpoints claim the same Nginx cursor".into());
+            }
+            matched = Some(checkpoint);
+        }
+    }
+    Ok(matched)
+}
+
+#[cfg(test)]
+pub(crate) fn test_read_strict_spool(
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+) -> Result<
+    Vec<(
+        String,
+        String,
+        Option<u64>,
+        Vec<TrafficEntry>,
+        Option<NginxTrafficCheckpoint>,
+        u64,
+    )>,
+    String,
+> {
+    let credential_id = strict_credential_id(auth, node_id)?
+        .ok_or_else(|| "strict traffic spool requires Permanent Credential".to_string())?;
+    let queue = load_spool_queue(auth, node_id, credential_id)?;
+    Ok(queue
+        .into_iter()
+        .map(|(_, record)| {
+            (
+                record.batch.batch_id,
+                record.batch.payload_sha256,
+                record.batch.config_revision,
+                record.batch.reports,
+                record.nginx_checkpoint,
+                record.sequence,
+            )
+        })
+        .collect())
+}
+
+#[cfg(test)]
+pub(crate) fn test_drain_strict_spool(
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+) -> Result<
+    Vec<(
+        String,
+        String,
+        Option<u64>,
+        Vec<TrafficEntry>,
+        Option<NginxTrafficCheckpoint>,
+        u64,
+    )>,
+    String,
+> {
+    let credential_id = strict_credential_id(auth, node_id)?
+        .ok_or_else(|| "strict traffic spool requires Permanent Credential".to_string())?;
+    let queue = load_spool_queue(auth, node_id, credential_id)?;
+    let mut out = Vec::with_capacity(queue.len());
+    for (path, record) in queue {
+        out.push((
+            record.batch.batch_id.clone(),
+            record.batch.payload_sha256.clone(),
+            record.batch.config_revision,
+            record.batch.reports.clone(),
+            record.nginx_checkpoint.clone(),
+            record.sequence,
+        ));
+        remove_file_and_sync_parent(&path, "traffic spool test batch")?;
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
 fn write_pending_traffic_at(
     path: &Path,
     pending: &PendingTrafficBatch,
@@ -718,7 +1409,6 @@ fn write_pending_traffic_at(
             "traffic pending batch already exists".into(),
         ));
     }
-
     let bytes = serde_json::to_vec(pending)
         .map_err(|_| PendingWriteError::Clean("traffic pending batch encode failed".to_string()))?;
     if bytes.len() as u64 > MAX_PENDING_TRAFFIC_BYTES {
@@ -730,7 +1420,6 @@ fn write_pending_traffic_at(
         ".traffic-report-pending.{}.tmp",
         uuid::Uuid::new_v4()
     ));
-
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -742,7 +1431,7 @@ fn write_pending_traffic_at(
                 "traffic pending temporary file could not be created".to_string(),
             )
         })?;
-    let pre_rename = (|| -> Result<(), String> {
+    let pre_install = (|| -> Result<(), String> {
         file.write_all(&bytes)
             .map_err(|_| "traffic pending batch could not be written".to_string())?;
         file.flush()
@@ -752,58 +1441,26 @@ fn write_pending_traffic_at(
         Ok(())
     })();
     drop(file);
-    if let Err(message) = pre_rename {
+    if let Err(message) = pre_install {
         let _ = std::fs::remove_file(&temp);
         return Err(PendingWriteError::Clean(message));
     }
-    // Same-directory hard-link install gives us atomic no-replace semantics:
-    // unlike rename(2), it cannot overwrite a pending batch created by another
-    // process between the existence check above and this commit point.
     if std::fs::hard_link(&temp, path).is_err() {
         let _ = std::fs::remove_file(&temp);
         return Err(PendingWriteError::Clean(
             "traffic pending batch could not be committed".into(),
         ));
     }
-    // The final name now references the already-fsynced complete inode. The
-    // temporary link is best-effort cleanup; it contains no Credential Secret
-    // or Group Token and remains inside the owner-only directory if unlink
-    // itself fails.
     let _ = std::fs::remove_file(&temp);
-
-    let post_rename = (|| -> Result<(), String> {
-        sync_parent_directory(parent)?;
-        let reopened = load_pending_traffic_at(path, &pending.node_id, &pending.credential_id)?
-            .ok_or_else(|| "traffic pending batch vanished after commit".to_string())?;
-        if reopened != *pending {
-            return Err("traffic pending batch verification mismatch".into());
-        }
-        Ok(())
-    })();
-    if let Err(message) = post_rename {
-        if cleanup_installed_pending(path, parent) {
-            return Err(PendingWriteError::Clean(message));
-        }
-        return Err(PendingWriteError::RestartRequired(format!(
-            "{message}; installed pending state could not be safely rolled back"
-        )));
+    if let Err(message) = sync_directory(parent, "traffic pending directory") {
+        return Err(PendingWriteError::RestartRequired(message));
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn remove_pending_traffic_at(path: &Path) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "traffic pending path has no parent".to_string())?;
-    validate_private_pending_parent(parent)?;
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err("traffic pending batch could not be removed".into()),
-    }
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| "traffic pending directory could not be fsynced".to_string())
+    remove_file_and_sync_parent(path, "traffic pending batch")
 }
 
 fn strict_ack_matches(
@@ -872,45 +1529,80 @@ async fn report_traffic_strict(
     counter: &TrafficCounter,
     node_id: &str,
     credential_id: &str,
-    pending_path: &Path,
 ) {
-    let mut pending = match load_pending_traffic_at(pending_path, node_id, credential_id) {
-        Ok(value) => value,
+    // Validate every committed queue entry before touching live counters. A
+    // corrupt later entry therefore fails closed rather than being overtaken.
+    let queue_before = match load_spool_queue(&config.auth, node_id, credential_id) {
+        Ok(queue) => queue,
         Err(error) => {
-            tracing::error!("strict traffic pending state unavailable: {}", error);
+            tracing::error!("strict traffic spool unavailable: {}", error);
             return;
         }
     };
-    if pending.is_none() {
-        let snap = counter.snapshot().await;
-        if snap.entries.is_empty() {
+    let legacy_before = match load_legacy_pending(&config.auth, node_id, credential_id) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!("strict legacy traffic pending state unavailable: {}", error);
             return;
         }
-        let reports = snap.entries.clone();
-        let sealed = PendingTrafficBatch {
-            version: TRAFFIC_BATCH_PROTOCOL_VERSION,
-            batch_id: uuid::Uuid::new_v4().to_string(),
-            payload_sha256: traffic_batch_payload_sha256(&reports),
-            node_id: node_id.to_string(),
-            credential_id: credential_id.to_string(),
-            config_revision: snap.config_revision,
-            reports,
-        };
-        if let Err(error) = write_pending_traffic_at(pending_path, &sealed) {
-            if error.restart_required() {
-                counter.strict_seal_poisoned.store(true, Ordering::Release);
-            }
-            tracing::error!(
-                "strict traffic batch could not be sealed: {}",
-                error.message()
-            );
-            return;
-        }
-        snap.commit().await;
-        pending = Some(sealed);
-    }
+    };
 
-    let pending = pending.expect("strict pending batch exists");
+    // Seal one fresh in-memory generation before attempting the oldest upload.
+    // A Panel outage can block A indefinitely while B/C still become immutable
+    // durable batches rather than living only in process RAM.
+    let snap = counter.snapshot().await;
+    let sealed_new = if snap.entries.is_empty() {
+        drop(snap);
+        false
+    } else {
+        let reports = snap.entries.clone();
+        match seal_strict_spool_batch(
+            &config.auth,
+            node_id,
+            snap.config_revision,
+            reports,
+            None,
+        ) {
+            Ok(_) => {
+                snap.commit().await;
+                true
+            }
+            Err(error) => {
+                if error.restart_required() {
+                    counter.poison_strict_reporting();
+                }
+                tracing::error!(
+                    "strict traffic batch could not be durably queued: {}",
+                    error.message()
+                );
+                return;
+            }
+        }
+    };
+
+    let queued = if let Some(legacy) = legacy_before {
+        legacy
+    } else if let Some(oldest) = oldest_queue_batch(&queue_before) {
+        oldest
+    } else if sealed_new {
+        let queue_after = match load_spool_queue(&config.auth, node_id, credential_id) {
+            Ok(queue) => queue,
+            Err(error) => {
+                tracing::error!("strict traffic spool unavailable after seal: {}", error);
+                return;
+            }
+        };
+        let Some(oldest) = oldest_queue_batch(&queue_after) else {
+            tracing::error!("strict traffic spool lost a just-sealed batch");
+            counter.poison_strict_reporting();
+            return;
+        };
+        oldest
+    } else {
+        return;
+    };
+
+    let pending = &queued.batch;
     let report = TrafficReport {
         batch: Some(TrafficBatchMetadata {
             version: pending.version,
@@ -947,11 +1639,11 @@ async fn report_traffic_strict(
             return;
         }
     };
-    if !strict_ack_matches(&pending, &response) {
+    if !strict_ack_matches(pending, &response) {
         tracing::warn!("strict report_traffic received non-matching ACK");
         return;
     }
-    if let Err(error) = remove_pending_traffic_at(pending_path) {
+    if let Err(error) = remove_durable_batch_at(&queued, node_id, credential_id) {
         tracing::error!(
             "strict traffic ACK could not be durably completed: {}",
             error
@@ -962,27 +1654,22 @@ async fn report_traffic_strict(
 }
 
 pub async fn report_traffic(config: &NodeConfig, counter: &TrafficCounter, node_id: &str) {
-    let _report_guard = counter.report_gate.lock().await;
+    let _report_guard = counter.durable_accounting_guard().await;
     if matches!(config.auth, NodeRuntimeAuth::PermanentCredential { .. })
-        && counter.strict_seal_poisoned.load(Ordering::Acquire)
+        && counter.strict_reporting_poisoned()
     {
         tracing::error!(
-            "strict traffic reporting is stopped after an uncertain local seal; restart required"
+            "strict traffic reporting is stopped after an uncertain local accounting transition; restart required"
         );
         return;
     }
-    let pending_path = match pending_traffic_path(&config.auth, node_id) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::error!("report_traffic strict identity unavailable: {}", error);
-            return;
+    match &config.auth {
+        NodeRuntimeAuth::PermanentCredential { credential_id, .. } => {
+            report_traffic_strict(config, counter, node_id, credential_id).await;
         }
-    };
-    match (&config.auth, pending_path) {
-        (NodeRuntimeAuth::PermanentCredential { credential_id, .. }, Some(path)) => {
-            report_traffic_strict(config, counter, node_id, credential_id, &path).await;
+        NodeRuntimeAuth::LegacyGroupToken { .. } => {
+            report_traffic_legacy(config, counter, node_id).await;
         }
-        _ => report_traffic_legacy(config, counter, node_id).await,
     }
 }
 
