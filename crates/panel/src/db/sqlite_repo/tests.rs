@@ -6649,6 +6649,22 @@ async fn ambiguous_dns_record_rebind_requires_complete_terminal_identity() {
     );
     db.update_dns_record_binding_observation(
         id,
+        "BOUND",
+        Some("2026-09-25 00:00:35"),
+        None,
+        "2026-09-25 00:00:35",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.rebind_ambiguous_dns_record_binding(&exact)
+            .await
+            .unwrap(),
+        0,
+        "ordinary BOUND ownership cannot use ambiguous recovery"
+    );
+    db.update_dns_record_binding_observation(
+        id,
         "ERROR",
         Some("2026-09-25 00:00:40"),
         Some("MUTATION_UNKNOWN"),
@@ -6669,8 +6685,11 @@ async fn ambiguous_dns_record_rebind_requires_complete_terminal_identity() {
         .unwrap()
         .unwrap();
     assert_eq!(recovered.id, id);
-    assert_eq!(recovered.state, "BOUND");
-    assert_eq!(recovered.last_error_category, None);
+    assert_eq!(recovered.state, "ERROR");
+    assert_eq!(
+        recovered.last_error_category.as_deref(),
+        Some("MUTATION_UNKNOWN")
+    );
     assert_eq!(
         recovered.last_observed_at.as_deref(),
         Some("2026-09-25 00:01:00")
@@ -6681,7 +6700,7 @@ async fn ambiguous_dns_record_rebind_requires_complete_terminal_identity() {
             .await
             .unwrap(),
         0,
-        "BOUND rows cannot reuse the ambiguous recovery path"
+        "the old provider identity cannot be replayed after provisional recovery"
     );
 
     sqlx::query(
