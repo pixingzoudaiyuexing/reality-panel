@@ -108,6 +108,30 @@ async fn ingest_once_inner_with_state_writer<F>(
     counter: &Arc<TrafficCounter>,
     auth: &NodeRuntimeAuth,
     node_id: &str,
+    write_state: F,
+) -> std::io::Result<usize>
+where
+    F: FnMut(&Path, &LogState) -> std::io::Result<()>,
+{
+    ingest_once_inner_with_failpoints(
+        cfg,
+        manager,
+        counter,
+        auth,
+        node_id,
+        None,
+        write_state,
+    )
+    .await
+}
+
+async fn ingest_once_inner_with_failpoints<F>(
+    cfg: &NginxSniTrafficConfig,
+    manager: &Arc<Mutex<ForwarderManager>>,
+    counter: &Arc<TrafficCounter>,
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+    read_error_after_complete_lines: Option<usize>,
     mut write_state: F,
 ) -> std::io::Result<usize>
 where
@@ -121,7 +145,16 @@ where
                     "strict traffic accounting is poisoned; restart required",
                 ));
             }
-            ingest_strict_locked(cfg, manager, counter, auth, node_id, &mut write_state).await
+            ingest_strict_locked(
+                cfg,
+                manager,
+                counter,
+                auth,
+                node_id,
+                read_error_after_complete_lines,
+                &mut write_state,
+            )
+            .await
         }
         NodeRuntimeAuth::LegacyGroupToken { .. } => {
             if !cfg.enabled {
@@ -316,6 +349,7 @@ async fn ingest_strict_locked<F>(
     counter: &TrafficCounter,
     auth: &NodeRuntimeAuth,
     node_id: &str,
+    read_error_after_complete_lines: Option<usize>,
     write_state: &mut F,
 ) -> std::io::Result<usize>
 where
@@ -354,9 +388,15 @@ where
     let mut segment_start = cursor;
     let mut active_revision: Option<u64> = None;
     let mut totals = BTreeMap::<i64, (u64, u64)>::new();
+    let mut complete_lines_read = 0usize;
     let mut line = String::new();
 
     loop {
+        if read_error_after_complete_lines == Some(complete_lines_read) {
+            return Err(std::io::Error::other(
+                "injected Nginx read error after complete records",
+            ));
+        }
         line.clear();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
@@ -418,6 +458,9 @@ where
                 .ok_or_else(|| std::io::Error::other("nginx_sni processed count overflow"))?;
         }
         cursor = line_end;
+        complete_lines_read = complete_lines_read
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("nginx_sni line count overflow"))?;
     }
 
     if let Some(revision) = active_revision {
