@@ -28,6 +28,8 @@ struct LogState {
     inode: Option<u64>,
     #[serde(default)]
     generation: u64,
+    #[serde(default)]
+    committed_spool_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,16 +251,23 @@ where
     let source = source_key(cfg);
     loop {
         let cursor = state.as_ref().and_then(cursor_tuple);
-        let checkpoint = recover_nginx_checkpoint(auth, node_id, &source, cursor)
+        let recovery = recover_nginx_checkpoint(auth, node_id, &source, cursor)
             .map_err(std::io::Error::other)?;
-        let Some(checkpoint) = checkpoint else {
+        let Some(recovery) = recovery else {
             break;
         };
+        let checkpoint = recovery.checkpoint;
         let mut recovered = state.clone().unwrap_or_default();
         recovered.device = Some(checkpoint.device);
         recovered.inode = Some(checkpoint.inode);
         recovered.generation = checkpoint.generation;
         recovered.offset = checkpoint.end_offset;
+        recovered.committed_spool_sequence = Some(
+            recovered
+                .committed_spool_sequence
+                .unwrap_or(0)
+                .max(recovery.sequence),
+        );
         if let Err(error) = write_state(&cfg.state_path, &recovered) {
             counter.poison_strict_reporting();
             return Err(error);
@@ -306,18 +315,21 @@ where
         end_offset: segment_end,
     };
 
-    if let Err(error) = seal_nginx_traffic_batch(
+    let sequence = match seal_nginx_traffic_batch(
         auth,
         node_id,
         (revision != 0).then_some(revision),
         reports,
         checkpoint,
     ) {
-        if error.restart_required() {
-            counter.poison_strict_reporting();
+        Ok(sequence) => sequence,
+        Err(error) => {
+            if error.restart_required() {
+                counter.poison_strict_reporting();
+            }
+            return Err(std::io::Error::other(error.message().to_string()));
         }
-        return Err(std::io::Error::other(error.message().to_string()));
-    }
+    };
 
     // Recoverable transition:
     //   durable source bytes -> durable immutable spool -> durable cursor.
@@ -327,6 +339,12 @@ where
     // from the immutable checkpoint before any Panel send or source re-read.
     state.offset = segment_end;
     state.set_file_identity(current_identity);
+    state.committed_spool_sequence = Some(
+        state
+            .committed_spool_sequence
+            .unwrap_or(0)
+            .max(sequence),
+    );
     if let Err(error) = write_state(&cfg.state_path, state) {
         counter.poison_strict_reporting();
         return Err(error);
