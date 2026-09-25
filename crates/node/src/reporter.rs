@@ -628,7 +628,7 @@ enum DurableBatchLocation {
     Legacy(PathBuf),
     Queue {
         path: PathBuf,
-        record: DurableSpoolRecord,
+        record: Box<DurableSpoolRecord>,
     },
 }
 
@@ -1250,7 +1250,7 @@ fn oldest_queue_batch(queue: &[(PathBuf, DurableSpoolRecord)]) -> Option<Durable
         batch: record.batch.clone(),
         location: DurableBatchLocation::Queue {
             path: path.clone(),
-            record: record.clone(),
+            record: Box::new(record.clone()),
         },
     })
 }
@@ -1285,7 +1285,7 @@ fn remove_durable_batch_at(
         }
         DurableBatchLocation::Queue { path, record } => {
             let current = load_spool_record_at(path, node_id, credential_id)?;
-            if current != *record || current.batch != queued.batch {
+            if &current != record.as_ref() || current.batch != queued.batch {
                 return Err("traffic spool batch changed before ACK".into());
             }
             remove_file_and_sync_parent(path, "traffic spool batch")
@@ -1333,20 +1333,20 @@ pub(crate) fn recover_nginx_checkpoint(
 }
 
 #[cfg(test)]
+pub(crate) type TestSpoolBatch = (
+    String,
+    String,
+    Option<u64>,
+    Vec<TrafficEntry>,
+    Option<NginxTrafficCheckpoint>,
+    u64,
+);
+
+#[cfg(test)]
 pub(crate) fn test_read_strict_spool(
     auth: &NodeRuntimeAuth,
     node_id: &str,
-) -> Result<
-    Vec<(
-        String,
-        String,
-        Option<u64>,
-        Vec<TrafficEntry>,
-        Option<NginxTrafficCheckpoint>,
-        u64,
-    )>,
-    String,
-> {
+) -> Result<Vec<TestSpoolBatch>, String> {
     let credential_id = strict_credential_id(auth, node_id)?
         .ok_or_else(|| "strict traffic spool requires Permanent Credential".to_string())?;
     let queue = load_spool_queue(auth, node_id, credential_id)?;
@@ -1369,17 +1369,7 @@ pub(crate) fn test_read_strict_spool(
 pub(crate) fn test_drain_strict_spool(
     auth: &NodeRuntimeAuth,
     node_id: &str,
-) -> Result<
-    Vec<(
-        String,
-        String,
-        Option<u64>,
-        Vec<TrafficEntry>,
-        Option<NginxTrafficCheckpoint>,
-        u64,
-    )>,
-    String,
-> {
+) -> Result<Vec<TestSpoolBatch>, String> {
     let credential_id = strict_credential_id(auth, node_id)?
         .ok_or_else(|| "strict traffic spool requires Permanent Credential".to_string())?;
     let queue = load_spool_queue(auth, node_id, credential_id)?;
