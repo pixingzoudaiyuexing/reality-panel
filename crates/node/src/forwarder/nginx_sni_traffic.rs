@@ -382,10 +382,20 @@ where
     let len = metadata.len();
     let current_identity = file_identity(&metadata);
 
-    let mut state = state.unwrap_or_default();
+    let durable_state = state;
+    let mut state = durable_state.clone().unwrap_or_default();
     prepare_state_for_file(&mut state, current_identity, len)?;
-    let mut persisted_state =
-        load_state_optional(&cfg.state_path)?.unwrap_or_else(|| state.clone());
+
+    // Persist the source-generation transition BEFORE reading or sealing any
+    // bytes from a replacement/copytruncate generation. This write never moves
+    // past new traffic (the new generation starts at offset 0, or preserves a
+    // legacy offset-only cursor), so a failure is retry-safe. More importantly,
+    // once a later spool batch is durable, restart can always match its
+    // checkpoint against a durable identity/generation/start cursor.
+    if durable_state.as_ref() != Some(&state) {
+        write_state(&cfg.state_path, &state)?;
+    }
+    let mut persisted_state = state.clone();
 
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(state.offset))?;
@@ -1186,19 +1196,30 @@ mod tests {
         let auth = paths.auth();
         let (manager, counter) = traffic_context();
 
+        let mut state_writes = 0usize;
         let error = ingest_once_inner_with_state_writer(
             &paths.config(),
             &manager,
             &counter,
             &auth,
             "NODE_T1",
-            |_path, _state| Err(std::io::Error::other("injected cursor write failure")),
+            |path, state| {
+                state_writes += 1;
+                if state_writes == 2 {
+                    Err(std::io::Error::other("injected cursor write failure"))
+                } else {
+                    save_state(path, state)
+                }
+            },
         )
         .await
         .expect_err("cursor write failure");
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert!(counter.strict_reporting_poisoned());
-        assert!(!paths.state.exists());
+        let precommit_state = load_state(&paths.state).unwrap();
+        assert_eq!(precommit_state.offset, 0);
+        assert_eq!(precommit_state.file_identity(), Some(identity_at(&paths.log)));
+        assert_eq!(precommit_state.committed_spool_sequence, None);
 
         let before = test_read_strict_spool(&auth, "NODE_T1").unwrap();
         assert_eq!(before.len(), 1);
@@ -1238,6 +1259,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_generation_cursor_failure_recovers_without_reenqueue() {
+        let paths = TestPaths::new();
+        let first = revision_line(10, 20);
+        std::fs::write(&paths.log, &first).unwrap();
+        let auth = paths.auth();
+        let (manager, counter) = traffic_context();
+
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            1
+        );
+        let _ = drain_single_spool(&paths, 20, 10);
+        let old_state = load_state(&paths.state).unwrap();
+        let old_identity = old_state.file_identity().unwrap();
+
+        let replacement = revision_line(30, 40);
+        let replacement_identity =
+            replace_file_with_distinct_inode(&paths.log, &replacement);
+        assert_ne!(replacement_identity, old_identity);
+
+        let mut state_writes = 0usize;
+        let error = ingest_once_inner_with_state_writer(
+            &paths.config(),
+            &manager,
+            &counter,
+            &auth,
+            "NODE_T1",
+            |path, state| {
+                state_writes += 1;
+                if state_writes == 2 {
+                    Err(std::io::Error::other("injected cursor write failure"))
+                } else {
+                    save_state(path, state)
+                }
+            },
+        )
+        .await
+        .expect_err("replacement cursor write failure");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(counter.strict_reporting_poisoned());
+
+        let transition_state = load_state(&paths.state).unwrap();
+        assert_eq!(transition_state.offset, 0);
+        assert_eq!(
+            transition_state.generation,
+            old_state.generation + 1
+        );
+        assert_eq!(
+            transition_state.file_identity(),
+            Some(replacement_identity)
+        );
+        let before = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        assert_eq!(before.len(), 1);
+        let before_id = before[0].0.clone();
+        let before_hash = before[0].1.clone();
+        let before_sequence = before[0].5;
+        assert_eq!(before[0].4.as_ref().unwrap().start_offset, 0);
+        assert_eq!(
+            before[0].4.as_ref().unwrap().generation,
+            transition_state.generation
+        );
+
+        let (restart_manager, restart_counter) = traffic_context();
+        assert_eq!(
+            ingest_once_inner(
+                &paths.config(),
+                &restart_manager,
+                &restart_counter,
+                &auth,
+                "NODE_T1",
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let after = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].0, before_id);
+        assert_eq!(after[0].1, before_hash);
+        let recovered = load_state(&paths.state).unwrap();
+        assert_eq!(recovered.offset, replacement.len() as u64);
+        assert_eq!(recovered.committed_spool_sequence, Some(before_sequence));
+        assert!(restart_counter.snapshot().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn copytruncate_generation_cursor_failure_recovers_without_reenqueue() {
+        let paths = TestPaths::new();
+        let old_line = revision_line(10, 20);
+        let old_contents = old_line.repeat(6);
+        std::fs::write(&paths.log, &old_contents).unwrap();
+        let auth = paths.auth();
+        let (manager, counter) = traffic_context();
+
+        assert_eq!(
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
+            6
+        );
+        let _ = drain_single_spool(&paths, 20 * 6, 10 * 6);
+        let old_state = load_state(&paths.state).unwrap();
+        let identity = old_state.file_identity().unwrap();
+
+        let replacement = revision_line(7, 11);
+        let mut log = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&paths.log)
+            .unwrap();
+        log.write_all(replacement.as_bytes()).unwrap();
+        drop(log);
+        assert_eq!(identity_at(&paths.log), identity);
+        assert!(std::fs::metadata(&paths.log).unwrap().len() < old_state.offset);
+
+        let mut state_writes = 0usize;
+        let error = ingest_once_inner_with_state_writer(
+            &paths.config(),
+            &manager,
+            &counter,
+            &auth,
+            "NODE_T1",
+            |path, state| {
+                state_writes += 1;
+                if state_writes == 2 {
+                    Err(std::io::Error::other("injected cursor write failure"))
+                } else {
+                    save_state(path, state)
+                }
+            },
+        )
+        .await
+        .expect_err("copytruncate cursor write failure");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(counter.strict_reporting_poisoned());
+
+        let transition_state = load_state(&paths.state).unwrap();
+        assert_eq!(transition_state.offset, 0);
+        assert_eq!(transition_state.generation, old_state.generation + 1);
+        assert_eq!(transition_state.file_identity(), Some(identity));
+        let before = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        assert_eq!(before.len(), 1);
+        let before_id = before[0].0.clone();
+        let before_hash = before[0].1.clone();
+        let before_sequence = before[0].5;
+        assert_eq!(
+            before[0].4.as_ref().unwrap().generation,
+            transition_state.generation
+        );
+
+        let (restart_manager, restart_counter) = traffic_context();
+        assert_eq!(
+            ingest_once_inner(
+                &paths.config(),
+                &restart_manager,
+                &restart_counter,
+                &auth,
+                "NODE_T1",
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let after = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].0, before_id);
+        assert_eq!(after[0].1, before_hash);
+        let recovered = load_state(&paths.state).unwrap();
+        assert_eq!(recovered.offset, replacement.len() as u64);
+        assert_eq!(recovered.committed_spool_sequence, Some(before_sequence));
+        assert!(restart_counter.snapshot().await.entries.is_empty());
+    }
+
+    #[tokio::test]
     async fn checkpoint_recovery_runs_even_when_ingestion_is_disabled() {
         let paths = TestPaths::new();
         let line = revision_line(10, 20);
@@ -1245,16 +1438,24 @@ mod tests {
         let auth = paths.auth();
         let (manager, counter) = traffic_context();
 
+        let mut state_writes = 0usize;
         let _ = ingest_once_inner_with_state_writer(
             &paths.config(),
             &manager,
             &counter,
             &auth,
             "NODE_T1",
-            |_path, _state| Err(std::io::Error::other("injected cursor write failure")),
+            |path, state| {
+                state_writes += 1;
+                if state_writes == 2 {
+                    Err(std::io::Error::other("injected cursor write failure"))
+                } else {
+                    save_state(path, state)
+                }
+            },
         )
         .await;
-        assert!(!paths.state.exists());
+        assert_eq!(load_state(&paths.state).unwrap().offset, 0);
 
         let mut disabled = paths.config();
         disabled.enabled = false;
