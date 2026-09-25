@@ -133,6 +133,7 @@ pub struct ForwarderManager {
     /// would also let a config change ride in on what the operator asked to be a
     /// pure restart.
     last_config: Option<NodeConfigResponse>,
+    last_config_revision: u64,
     counter: Arc<TrafficCounter>,
     connections: Arc<ConnectionTracker>,
     /// Bind/runtime errors captured from spawned listener tasks since the last
@@ -161,6 +162,7 @@ impl ForwarderManager {
             listeners: HashMap::new(),
             rule_runtime: HashMap::new(),
             last_config: None,
+            last_config_revision: 0,
             counter,
             connections,
             listener_errors: Arc::new(Mutex::new(Vec::new())),
@@ -297,8 +299,23 @@ impl ForwarderManager {
     /// data-plane prerequisite succeeded and it is safe for the caller to make
     /// this snapshot the last-known-good config.
     pub async fn apply_config(&mut self, config: &NodeConfigResponse) -> bool {
-        self.apply_config_scoped(config, &HashSet::new(), false, true)
+        self.apply_config_with_revision(config, self.last_config_revision)
             .await
+    }
+
+    pub async fn apply_config_with_revision(
+        &mut self,
+        config: &NodeConfigResponse,
+        config_revision: u64,
+    ) -> bool {
+        self.apply_config_scoped_with_revision(
+            config,
+            &HashSet::new(),
+            false,
+            true,
+            config_revision,
+        )
+        .await
     }
 
     /// Repair only the supplied managed listener keys, optionally forcing the
@@ -311,7 +328,26 @@ impl ForwarderManager {
         force_nginx: bool,
         allow_cleanup: bool,
     ) -> bool {
+        self.apply_config_scoped_with_revision(
+            config,
+            force_listener_keys,
+            force_nginx,
+            allow_cleanup,
+            self.last_config_revision,
+        )
+        .await
+    }
+
+    pub(crate) async fn apply_config_scoped_with_revision(
+        &mut self,
+        config: &NodeConfigResponse,
+        force_listener_keys: &HashSet<(u16, Protocol, NodeTransport)>,
+        force_nginx: bool,
+        allow_cleanup: bool,
+        config_revision: u64,
+    ) -> bool {
         let previous_config = self.last_config.clone();
+        let previous_config_revision = self.last_config_revision;
         let sni_listeners: Vec<ListenerConfig> = config
             .listeners
             .iter()
@@ -330,7 +366,7 @@ impl ForwarderManager {
         };
 
         let sni_plan = match self.nginx_sni_plan_from_listeners(&sni_listeners).await {
-            Ok(plan) => plan,
+            Ok(plan) => plan.with_config_revision(config_revision),
             Err(error) => {
                 tracing::error!("nginx_sni plan rejected: {}", error);
                 return false;
@@ -644,8 +680,11 @@ impl ForwarderManager {
                             rule_id,
                             port
                         );
-                        self.restore_previous_config_after_startup_failure(previous_config.clone())
-                            .await;
+                        self.restore_previous_config_after_startup_failure(
+                            previous_config.clone(),
+                            previous_config_revision,
+                        )
+                        .await;
                         return false;
                     }
                     let tgt = targets.clone();
@@ -676,7 +715,16 @@ impl ForwarderManager {
                         let v4_fut = async move {
                             if let Some(l) = v4_listener {
                                 tcp::serve_tcp_listener(
-                                    l, tgt4, sel4, rl4, ctr4, cn4, rid, ipv4_src, gate4,
+                                    l,
+                                    tgt4,
+                                    sel4,
+                                    rl4,
+                                    ctr4,
+                                    cn4,
+                                    config_revision,
+                                    rid,
+                                    ipv4_src,
+                                    gate4,
                                 )
                                 .await
                             } else {
@@ -686,7 +734,16 @@ impl ForwarderManager {
                         let v6_fut = async move {
                             if let Some(l) = v6_listener {
                                 tcp::serve_tcp_listener(
-                                    l, tgt, sel, rl, ctr, cn, rid, ipv4_src, gate6,
+                                    l,
+                                    tgt,
+                                    sel,
+                                    rl,
+                                    ctr,
+                                    cn,
+                                    config_revision,
+                                    rid,
+                                    ipv4_src,
+                                    gate6,
                                 )
                                 .await
                             } else {
@@ -756,8 +813,11 @@ impl ForwarderManager {
                             rule_id,
                             port
                         );
-                        self.restore_previous_config_after_startup_failure(previous_config.clone())
-                            .await;
+                        self.restore_previous_config_after_startup_failure(
+                            previous_config.clone(),
+                            previous_config_revision,
+                        )
+                        .await;
                         return false;
                     }
                     let tgt = targets.clone();
@@ -779,7 +839,15 @@ impl ForwarderManager {
                         let v4_fut = async move {
                             if let Some(s) = v4_sock {
                                 udp::serve_udp_listener(
-                                    s, tgt4, sel4, rl4, ctr4, cn4, rid, ipv4_src,
+                                    s,
+                                    tgt4,
+                                    sel4,
+                                    rl4,
+                                    ctr4,
+                                    cn4,
+                                    config_revision,
+                                    rid,
+                                    ipv4_src,
                                 )
                                 .await
                             } else {
@@ -788,8 +856,18 @@ impl ForwarderManager {
                         };
                         let v6_fut = async move {
                             if let Some(s) = v6_sock {
-                                udp::serve_udp_listener(s, tgt, sel, rl, ctr, cn, rid, ipv4_src)
-                                    .await
+                                udp::serve_udp_listener(
+                                    s,
+                                    tgt,
+                                    sel,
+                                    rl,
+                                    ctr,
+                                    cn,
+                                    config_revision,
+                                    rid,
+                                    ipv4_src,
+                                )
+                                .await
                             } else {
                                 std::future::pending::<SrvResult>().await
                             }
@@ -815,6 +893,7 @@ impl ForwarderManager {
                             rate_limit,
                             counter,
                             connections,
+                            config_revision,
                             rule_id,
                             ws_path,
                         )
@@ -849,6 +928,7 @@ impl ForwarderManager {
                             rate_limit,
                             counter,
                             connections,
+                            config_revision,
                             rule_id,
                             tls_acceptor,
                         )
@@ -904,6 +984,7 @@ impl ForwarderManager {
         // v1.2.0: remember the applied config so restart_rule can rebuild a
         // rule's listeners from it without a round-trip to the panel.
         self.last_config = Some(config.clone());
+        self.last_config_revision = config_revision;
         true
     }
 
@@ -1019,6 +1100,7 @@ impl ForwarderManager {
     async fn restore_previous_config_after_startup_failure(
         &mut self,
         previous_config: Option<NodeConfigResponse>,
+        previous_config_revision: u64,
     ) {
         let Some(previous_config) = previous_config else {
             return;
@@ -1030,7 +1112,9 @@ impl ForwarderManager {
 
         tracing::warn!("raw listener startup failed; attempting to restore previous config");
         self.restoring_previous_config = true;
-        let restored = Box::pin(self.apply_config(&previous_config)).await;
+        let restored =
+            Box::pin(self.apply_config_with_revision(&previous_config, previous_config_revision))
+                .await;
         self.restoring_previous_config = false;
         if !restored {
             tracing::error!("failed to restore previous config after raw listener startup failure");
@@ -2389,12 +2473,12 @@ mod tests {
         assert!(mgr.listener_info_for_rule_tcp(999).is_none());
     }
 
-    // ── v1.0.3 PR1: traffic counter poison-pill pruning ──
+    // ── Node Reuse: removed rules retain already-forwarded traffic ──
 
-    /// When a rule is deleted from the config, the counter entry for its
-    /// rule_id must be pruned so orphaned bytes don't poison future batches.
+    /// When a rule is deleted from the config, forwarding stops but bytes
+    /// already forwarded under its old config revision remain reportable.
     #[tokio::test]
-    async fn deleted_rule_prunes_traffic_counter() {
+    async fn deleted_rule_preserves_unreported_traffic_counter() {
         let counter = Arc::new(TrafficCounter::new());
         let connections = Arc::new(ConnectionTracker::new());
         let mut mgr = ForwarderManager::new(counter.clone(), connections.clone());
@@ -2444,11 +2528,15 @@ mod tests {
         })
         .await;
 
-        // Counter must be pruned.
+        // Counter must remain until a successful traffic ACK commits it.
         assert!(
-            !counter.has_rule(1).await,
-            "orphan rule_id must be pruned after rule deletion"
+            counter.has_rule(1).await,
+            "already-forwarded bytes must survive rule deletion"
         );
+        let pending = counter.snapshot().await;
+        assert_eq!(pending.entries[0].upload, 100);
+        assert_eq!(pending.entries[0].download, 50);
+        pending.commit().await;
     }
 
     /// When a tcp_udp rule is changed to tcp-only (one listener removed), the
@@ -2532,13 +2620,13 @@ mod tests {
         );
     }
 
-    /// A dead listener whose rule was also removed from the config must have
-    /// its counter pruned, same as a normally-stopped listener.
+    /// A dead listener whose rule was removed still retains bytes that were
+    /// forwarded before the removal became effective.
     ///
     /// v1.0.8: uses port 40005, dedicated to this test — see the port-collision
     /// note in `deleted_rule_prunes_traffic_counter` above.
     #[tokio::test]
-    async fn dead_listener_prunes_counter_when_rule_removed() {
+    async fn dead_listener_preserves_counter_when_rule_removed() {
         let counter = Arc::new(TrafficCounter::new());
         let connections = Arc::new(ConnectionTracker::new());
         let mut mgr = ForwarderManager::new(counter.clone(), connections.clone());
@@ -2564,9 +2652,13 @@ mod tests {
         .await;
 
         assert!(
-            !counter.has_rule(1).await,
-            "dead listener for a removed rule must prune its counter entry"
+            counter.has_rule(1).await,
+            "dead removed listener must retain already-forwarded bytes"
         );
+        let pending = counter.snapshot().await;
+        assert_eq!(pending.entries[0].upload, 50);
+        assert_eq!(pending.entries[0].download, 25);
+        pending.commit().await;
     }
 
     #[tokio::test]

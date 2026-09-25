@@ -11,7 +11,7 @@
 use super::SqliteRepository;
 use crate::db::error::DbError;
 use crate::db::repo::*;
-use crate::db::schema::SCHEMA_SQL;
+use crate::db::schema::{run_migrations, SCHEMA_SQL};
 use relay_shared::protocol::TrafficEntry;
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -1716,6 +1716,12 @@ async fn traffic_batch_idempotency_contract() {
             credential_generation: generation,
             batch_id: batch_id.into(),
             payload_sha256: relay_shared::protocol::traffic_batch_payload_sha256(entries),
+            config_revision: None,
+            rule_source_groups: entries
+                .iter()
+                .map(|entry| (entry.rule_id, home_group_id))
+                .collect(),
+            rule_owner_uids: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1972,6 +1978,241 @@ async fn traffic_batch_idempotency_contract() {
             .await
             .unwrap();
     assert_eq!(rule100_after, 44);
+
+    let mixed_entries = vec![
+        TrafficEntry {
+            rule_id: 100,
+            upload: 4,
+            download: 6,
+        },
+        TrafficEntry {
+            rule_id: 200,
+            upload: 3,
+            download: 7,
+        },
+    ];
+    let mut mixed_scope = scope(10, "cred-a", 1, "batch-mixed-groups", &mixed_entries);
+    mixed_scope.config_revision = Some(77);
+    mixed_scope.rule_source_groups = [(100_i64, 10_i64), (200, 20)].into_iter().collect();
+    assert_eq!(
+        reopened
+            .apply_idempotent_traffic_batch(&mixed_scope, &mixed_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Applied
+    );
+    assert_eq!(
+        reopened
+            .apply_idempotent_traffic_batch(&mixed_scope, &mixed_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::AlreadyApplied
+    );
+    let mixed_rules: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT id, traffic_used FROM forward_rules WHERE id IN (100,200) ORDER BY id",
+    )
+    .fetch_all(&reopened_pool)
+    .await
+    .unwrap();
+    assert_eq!(mixed_rules, vec![(100, 54), (200, 20)]);
+    let mixed_user: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=1")
+        .fetch_one(&reopened_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        mixed_user, 101,
+        "10 bytes at rate 1.5 plus 10 bytes at rate 1.0 adds 25 billed bytes"
+    );
+    let mixed_history: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT rule_id, group_id FROM traffic_history
+         WHERE rule_id IN (100,200) ORDER BY rule_id",
+    )
+    .fetch_all(&reopened_pool)
+    .await
+    .unwrap();
+    assert_eq!(mixed_history, vec![(100, 10), (200, 20)]);
+
+    // A/B: a versioned historical batch may contain a physically deleted rule
+    // and a still-live rule. The deleted rule remains billable because this
+    // delivered revision retained its uid + source Group. Both entries commit
+    // atomically, and replay is ledger-only.
+    sqlx::query("DELETE FROM forward_rules WHERE id = 200")
+        .execute(&reopened_pool)
+        .await
+        .unwrap();
+    let deleted_mixed_entries = vec![
+        TrafficEntry {
+            rule_id: 100,
+            upload: 1,
+            download: 4,
+        },
+        TrafficEntry {
+            rule_id: 200,
+            upload: 2,
+            download: 3,
+        },
+    ];
+    let mut deleted_mixed_scope = scope(
+        10,
+        "cred-a",
+        1,
+        "batch-deleted-mixed",
+        &deleted_mixed_entries,
+    );
+    deleted_mixed_scope.config_revision = Some(78);
+    deleted_mixed_scope.rule_source_groups = [(100_i64, 10_i64), (200, 20)].into_iter().collect();
+    deleted_mixed_scope.rule_owner_uids = [(100_i64, 1_i64), (200, 1)].into_iter().collect();
+    assert_eq!(
+        reopened
+            .apply_idempotent_traffic_batch(&deleted_mixed_scope, &deleted_mixed_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Applied
+    );
+    assert_eq!(
+        reopened
+            .apply_idempotent_traffic_batch(&deleted_mixed_scope, &deleted_mixed_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::AlreadyApplied
+    );
+    let user_after_deleted: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=?")
+        .bind(1_i64)
+        .fetch_one(&reopened_pool)
+        .await
+        .unwrap();
+    assert_eq!(user_after_deleted, 114);
+    let rule100_after_deleted: i64 =
+        sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id=100")
+            .fetch_one(&reopened_pool)
+            .await
+            .unwrap();
+    assert_eq!(rule100_after_deleted, 59);
+    let deleted_history: (i64, i64, i64) =
+        sqlx::query_as("SELECT uid, group_id, billed_total FROM traffic_history WHERE rule_id=?")
+            .bind(200_i64)
+            .fetch_one(&reopened_pool)
+            .await
+            .unwrap();
+    assert_eq!(deleted_history.0, 1);
+    assert_eq!(deleted_history.1, 20);
+    assert_eq!(
+        deleted_history.2, 25,
+        "existing 20 billed bytes + 5 historical deleted-rule bytes"
+    );
+
+    // C: if the id still exists but moved Groups, do not relabel old bytes to
+    // the new Group. The old entry is terminally unbillable and recorded once;
+    // the batch still reaches APPLIED so later batches are not blocked.
+    sqlx::query("UPDATE forward_rules SET device_group_in = 20 WHERE id = 100")
+        .execute(&reopened_pool)
+        .await
+        .unwrap();
+    let moved_entries = vec![TrafficEntry {
+        rule_id: 100,
+        upload: 2,
+        download: 3,
+    }];
+    let mut moved_scope = scope(10, "cred-a", 1, "batch-moved-group", &moved_entries);
+    moved_scope.config_revision = Some(79);
+    moved_scope.rule_source_groups = [(100_i64, 10_i64)].into_iter().collect();
+    moved_scope.rule_owner_uids = [(100_i64, 1_i64)].into_iter().collect();
+    assert_eq!(
+        reopened
+            .apply_idempotent_traffic_batch(&moved_scope, &moved_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Applied
+    );
+    assert_eq!(
+        reopened
+            .apply_idempotent_traffic_batch(&moved_scope, &moved_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::AlreadyApplied
+    );
+    let user_after_moved: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=?")
+        .bind(1_i64)
+        .fetch_one(&reopened_pool)
+        .await
+        .unwrap();
+    assert_eq!(user_after_moved, 114);
+    let moved_rule_traffic: i64 =
+        sqlx::query_scalar("SELECT traffic_used FROM forward_rules WHERE id=100")
+            .fetch_one(&reopened_pool)
+            .await
+            .unwrap();
+    assert_eq!(moved_rule_traffic, 59);
+    let moved_dispositions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log
+         WHERE action='traffic_historical_unbillable'
+           AND target_type='forward_rule' AND target_id='100'",
+    )
+    .fetch_one(&reopened_pool)
+    .await
+    .unwrap();
+    assert_eq!(moved_dispositions, 1);
+
+    // Pre-fix revision: exact source membership is known, but a deleted rule
+    // has no historical uid snapshot. Do not pretend it was billed; terminate
+    // it explicitly and idempotently instead of blocking the Node forever.
+    let pre_fix_entries = vec![TrafficEntry {
+        rule_id: 200,
+        upload: 6,
+        download: 4,
+    }];
+    let mut pre_fix_scope = scope(10, "cred-a", 1, "batch-prefixed-deleted", &pre_fix_entries);
+    pre_fix_scope.config_revision = Some(80);
+    pre_fix_scope.rule_source_groups = [(200_i64, 20_i64)].into_iter().collect();
+    pre_fix_scope.rule_owner_uids.clear();
+    assert_eq!(
+        reopened
+            .apply_idempotent_traffic_batch(&pre_fix_scope, &pre_fix_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Applied
+    );
+    assert_eq!(
+        reopened
+            .apply_idempotent_traffic_batch(&pre_fix_scope, &pre_fix_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::AlreadyApplied
+    );
+    let user_after_prefixed: i64 = sqlx::query_scalar("SELECT traffic_used FROM users WHERE id=?")
+        .bind(1_i64)
+        .fetch_one(&reopened_pool)
+        .await
+        .unwrap();
+    assert_eq!(user_after_prefixed, 114);
+    let deleted_dispositions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log
+         WHERE action='traffic_historical_unbillable'
+           AND target_type='forward_rule' AND target_id='200'",
+    )
+    .fetch_one(&reopened_pool)
+    .await
+    .unwrap();
+    assert_eq!(deleted_dispositions, 1);
+
+    // D at repository boundary: a versioned entry without exact-revision
+    // source attribution remains unavailable, and its tentative ledger insert
+    // rolls back rather than masquerading as a deleted historical rule.
+    let unknown_entries = vec![TrafficEntry {
+        rule_id: 999,
+        upload: 1,
+        download: 1,
+    }];
+    let mut unknown_scope = scope(10, "cred-a", 1, "batch-unknown-history", &unknown_entries);
+    unknown_scope.config_revision = Some(81);
+    unknown_scope.rule_source_groups.clear();
+    assert_eq!(
+        reopened
+            .apply_idempotent_traffic_batch(&unknown_scope, &unknown_entries)
+            .await
+            .unwrap(),
+        IdempotentTrafficBatchResult::Unavailable
+    );
 
     reopened_pool.close().await;
     let _ = std::fs::remove_file(&path);
@@ -5264,6 +5505,132 @@ async fn traffic_history_upserts_within_the_hour() {
 
 /// Owner scoping + daily aggregation. Alice must never see Bob's buckets, and
 /// the daily view must sum a day's hours into one bucket.
+
+#[tokio::test]
+async fn traffic_history_primary_key_upgrade_preserves_same_hour_group_rows() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE traffic_history (\
+             rule_id INTEGER NOT NULL,\
+             uid INTEGER NOT NULL,\
+             group_id INTEGER NOT NULL DEFAULT 0,\
+             hour_ts TEXT NOT NULL,\
+             real_upload INTEGER NOT NULL DEFAULT 0,\
+             real_download INTEGER NOT NULL DEFAULT 0,\
+             billed_total INTEGER NOT NULL DEFAULT 0,\
+             PRIMARY KEY (rule_id, hour_ts)\
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO traffic_history \
+             (rule_id, uid, group_id, hour_ts, real_upload, billed_total) \
+         VALUES (100, 1, 10, '2026-09-25 02:00:00', 10, 10)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+    run_migrations(&pool).await.unwrap();
+
+    let pk_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('traffic_history') WHERE pk > 0 ORDER BY pk",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pk_columns, vec!["rule_id", "group_id", "hour_ts"]);
+
+    sqlx::query(
+        "INSERT INTO traffic_history \
+             (rule_id, uid, group_id, hour_ts, real_upload, billed_total) \
+         VALUES (100, 1, 20, '2026-09-25 02:00:00', 5, 5)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT group_id, real_upload, billed_total \
+         FROM traffic_history WHERE rule_id = 100 ORDER BY group_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, vec![(10, 10, 10), (20, 5, 5)]);
+
+    run_migrations(&pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn traffic_history_preserves_same_hour_rows_across_group_move() {
+    let db = repo().await;
+    let uid = seed_history_fixture(&db, "hist_move", 73, 305, 1.0).await;
+    sqlx::query(
+        "INSERT INTO device_groups (id, name, group_type, token, uid, rate) \
+         VALUES (74, 'hist-move-new', 'in', 'tok-74', ?, 1.0)",
+    )
+    .bind(uid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    db.apply_traffic_batch(
+        73,
+        &[relay_shared::protocol::TrafficEntry {
+            rule_id: 305,
+            upload: 100,
+            download: 0,
+        }],
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE forward_rules SET device_group_in = 74 WHERE id = 305")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.apply_traffic_batch(
+        74,
+        &[relay_shared::protocol::TrafficEntry {
+            rule_id: 305,
+            upload: 50,
+            download: 0,
+        }],
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, String, i64, i64)> = sqlx::query_as(
+        "SELECT group_id, hour_ts, real_upload, billed_total \
+         FROM traffic_history WHERE rule_id = 305 ORDER BY group_id",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "same-hour group move must keep two history rows"
+    );
+    assert_eq!(rows[0].0, 73);
+    assert_eq!(rows[0].2, 100);
+    assert_eq!(rows[0].3, 100);
+    assert_eq!(rows[1].0, 74);
+    assert_eq!(rows[1].2, 50);
+    assert_eq!(rows[1].3, 50);
+    assert_eq!(
+        rows[0].1, rows[1].1,
+        "test must exercise a migration inside one hourly bucket"
+    );
+}
+
 #[tokio::test]
 async fn traffic_history_query_scopes_and_aggregates() {
     let db = repo().await;

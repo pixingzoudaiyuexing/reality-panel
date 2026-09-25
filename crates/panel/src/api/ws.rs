@@ -473,6 +473,7 @@ async fn handle_node_ws(
             group_id,
             node_id.as_deref(),
             verified_credential.is_some(),
+            state.config.node_reuse_runtime_enabled,
         )
         .await
         {
@@ -603,6 +604,7 @@ pub(crate) async fn build_config_snapshot_for_node(
     group_id: i64,
     node_id: Option<&str>,
     verified_concrete_node: bool,
+    runtime_enabled: bool,
 ) -> Option<NodeConfigSnapshot> {
     // v0.3.6: delegate to the shared `build_node_config` (same function
     // `get_config` uses). This fixes the v0.3.5 drift where the WS path queried
@@ -620,7 +622,7 @@ pub(crate) async fn build_config_snapshot_for_node(
         group_id,
         node_id,
         verified_concrete_node,
-        crate::service::node_config::NodeReuseRuntimeDeliveryMode::HomeOnly,
+        crate::service::node_config::runtime_delivery_mode(runtime_enabled, verified_concrete_node),
     )
     .await
     {
@@ -689,6 +691,7 @@ mod tests {
                 cors_origins: vec![],
                 geoip_enabled: false,
                 geoip_cache_ttl: 604_800,
+                node_reuse_runtime_enabled: false,
             },
             release_cache: ReleaseCache::new(),
             node_connections: NodeConnections::new(),

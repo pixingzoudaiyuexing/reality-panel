@@ -30,6 +30,7 @@ pub async fn serve_tcp_listener(
     rate_limit: RateLimit,
     counter: Arc<TrafficCounter>,
     connections: Arc<ConnectionTracker>,
+    config_revision: u64,
     rule_id: i64,
     source_ipv4: Option<Ipv4Addr>,
     gate: RuleGate,
@@ -79,7 +80,7 @@ pub async fn serve_tcp_listener(
                 // generation before spawn. A later prune can detach that
                 // generation, but this connection will never look it up again by
                 // rule_id and therefore cannot resurrect a deleted rule.
-                let traffic = counter.handle(rule_id).await;
+                let traffic = counter.handle_at(config_revision, rule_id).await;
                 // v1.0.8: disable Nagle on the accepted (client-facing) socket.
                 // See the note in outbound::tcp_connect — a relay MUST set
                 // TCP_NODELAY on both ends or small packets get buffered ~40ms
@@ -388,6 +389,7 @@ mod tests {
             RateLimit::Unlimited,
             counter.clone(),
             connections,
+            0,
             1,
             None,
             runtime.gate(None),
@@ -481,6 +483,7 @@ mod tests {
             RateLimit::Unlimited,
             Arc::new(TrafficCounter::new()),
             Arc::new(ConnectionTracker::new()),
+            0,
             1,
             None,
             runtime.gate(Some(2)),

@@ -37,6 +37,8 @@ static CONFIG_BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 struct PersistedConfigRevision {
     revision: u64,
     fingerprint: String,
+    #[serde(default)]
+    attribution_fingerprint: String,
 }
 
 #[derive(Debug)]
@@ -56,8 +58,18 @@ pub enum NodeConfigBuildError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeReuseRuntimeDeliveryMode {
     HomeOnly,
-    #[cfg(test)]
-    GuardedCandidate,
+    EffectiveConfig,
+}
+
+pub fn runtime_delivery_mode(
+    runtime_enabled: bool,
+    verified_concrete_node: bool,
+) -> NodeReuseRuntimeDeliveryMode {
+    if runtime_enabled && verified_concrete_node {
+        NodeReuseRuntimeDeliveryMode::EffectiveConfig
+    } else {
+        NodeReuseRuntimeDeliveryMode::HomeOnly
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -388,9 +400,6 @@ pub async fn build_guarded_node_config_snapshot_for_delivery(
     verified_concrete_node: bool,
     mode: NodeReuseRuntimeDeliveryMode,
 ) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
-    #[cfg(not(test))]
-    let _ = verified_concrete_node;
-
     match mode {
         NodeReuseRuntimeDeliveryMode::HomeOnly => {
             build_node_config_snapshot_for_node_inner(
@@ -401,8 +410,7 @@ pub async fn build_guarded_node_config_snapshot_for_delivery(
             )
             .await
         }
-        #[cfg(test)]
-        NodeReuseRuntimeDeliveryMode::GuardedCandidate => {
+        NodeReuseRuntimeDeliveryMode::EffectiveConfig => {
             if !verified_concrete_node {
                 return build_node_config_snapshot_for_node_inner(
                     db,
@@ -436,12 +444,19 @@ pub async fn build_guarded_node_config_snapshot_for_delivery(
                     "guarded EffectiveConfig candidate has blocking conflicts".into(),
                 ));
             }
+            let rule_sources = candidate
+                .preview
+                .listeners
+                .iter()
+                .map(|listener| (listener.rule_id, listener.source_group_id))
+                .collect::<BTreeMap<_, _>>();
             finish_snapshot_locked(
                 db,
                 Some(certificate_state_dir),
                 group_id,
                 Some(node_id),
                 candidate.config,
+                rule_sources,
             )
             .await
         }
@@ -457,7 +472,20 @@ async fn build_node_config_snapshot_for_node_inner(
     let lock = CONFIG_BUILD_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().await;
     let config = build_node_config_for_node(db, group_id, node_id).await?;
-    finish_snapshot_locked(db, certificate_state_dir, group_id, node_id, config).await
+    let rule_sources = config
+        .listeners
+        .iter()
+        .map(|listener| (listener.rule_id, group_id))
+        .collect::<BTreeMap<_, _>>();
+    finish_snapshot_locked(
+        db,
+        certificate_state_dir,
+        group_id,
+        node_id,
+        config,
+        rule_sources,
+    )
+    .await
 }
 
 async fn finish_snapshot_locked(
@@ -466,6 +494,7 @@ async fn finish_snapshot_locked(
     group_id: i64,
     node_id: Option<&str>,
     mut config: NodeConfigResponse,
+    rule_sources: BTreeMap<i64, i64>,
 ) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
     if let Some(state_dir) = certificate_state_dir {
         let mut requested = BTreeMap::<String, BTreeSet<String>>::new();
@@ -502,9 +531,41 @@ async fn finish_snapshot_locked(
             }
         }
     }
+    let mut rule_owner_uids = BTreeMap::new();
+    for (rule_id, source_group_id) in &rule_sources {
+        let rule =
+            crate::db::repo::RuleRepository::find_rule_by_id(db, *rule_id, &ResourceScope::All)
+                .await?
+                .ok_or_else(|| {
+                    NodeConfigBuildError::InvalidConfig(format!(
+                        "rule {rule_id} disappeared while config attribution was being recorded"
+                    ))
+                })?;
+        if rule.device_group_in != *source_group_id {
+            return Err(NodeConfigBuildError::InvalidConfig(format!(
+                "rule {rule_id} changed source group while config attribution was being recorded"
+            )));
+        }
+        rule_owner_uids.insert(*rule_id, rule.uid);
+    }
+
     let fingerprint = relay_shared::reconciliation::config_fingerprint(&config)
         .as_str()
         .to_string();
+    let attribution_fingerprint = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"relay-node-config-rule-attribution-v2\0");
+        for (rule_id, source_group_id) in &rule_sources {
+            hasher.update(rule_id.to_be_bytes());
+            hasher.update(source_group_id.to_be_bytes());
+            let uid = rule_owner_uids
+                .get(rule_id)
+                .expect("owner attribution exists for every delivered rule");
+            hasher.update(uid.to_be_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    };
     let key = match node_id.map(str::trim).filter(|id| !id.is_empty()) {
         Some(node_id) => format!("{REVISION_PREFIX}{group_id}:{node_id}"),
         None => format!("{REVISION_PREFIX}{group_id}"),
@@ -518,7 +579,11 @@ async fn finish_snapshot_locked(
             NodeConfigBuildError::InvalidConfig(format!("invalid revision state: {error}"))
         })?;
     let revision = match previous {
-        Some(previous) if previous.fingerprint == fingerprint && previous.revision > 0 => {
+        Some(previous)
+            if previous.fingerprint == fingerprint
+                && previous.attribution_fingerprint == attribution_fingerprint
+                && previous.revision > 0 =>
+        {
             previous.revision
         }
         Some(previous) if previous.revision > 0 => previous.revision.saturating_add(1),
@@ -527,8 +592,22 @@ async fn finish_snapshot_locked(
     let state = serde_json::to_string(&PersistedConfigRevision {
         revision,
         fingerprint: fingerprint.clone(),
+        attribution_fingerprint,
     })
     .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
+    if let Some(node_id) = node_id.map(str::trim).filter(|id| !id.is_empty()) {
+        let attribution_key = format!("node_config_rule_sources:{group_id}:{node_id}:{revision}");
+        let attribution = serde_json::to_string(&rule_sources)
+            .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
+        let owner_key = format!("node_config_rule_owners:{group_id}:{node_id}:{revision}");
+        let owners = serde_json::to_string(&rule_owner_uids)
+            .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
+        // Persist immutable settlement attribution before exposing the matching
+        // revision. An unused row after a later failure is harmless; the reverse
+        // ordering could expose a revision without source-group/owner evidence.
+        db.set(&attribution_key, &attribution).await?;
+        db.set(&owner_key, &owners).await?;
+    }
     db.set(&key, &state).await?;
     Ok(NodeConfigSnapshot {
         config_revision: revision,

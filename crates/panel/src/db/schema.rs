@@ -450,8 +450,8 @@ CREATE INDEX IF NOT EXISTS idx_redeem_codes_used_by ON redeem_codes(used_by);
 
 -- v1.2.0: hourly traffic history, written by apply_traffic_batch as an UPSERT
 -- accumulate. Nodes report every ~10s (poll-frequency), so inserting a row per
--- report would explode; one row per (rule, hour) keeps 100 rules × 35 days at
--- ~84k rows.
+-- report would explode; steady state keeps one row per (rule, group, hour).
+-- A same-hour rule migration adds one extra row instead of rewriting history.
 --
 -- `billed_total` is the SAME number charged to the user in that batch
 -- (round((up+down) × group rate)), accumulated — so the history chart and the
@@ -472,8 +472,9 @@ CREATE INDEX IF NOT EXISTS idx_redeem_codes_used_by ON redeem_codes(used_by);
 -- line" would silently drop the history of deleted rules. Same reasoning as
 -- orders.plan_name. 0 = unknown.
 --
--- The primary key does NOT change: a rule belongs to exactly one inbound
--- group, so (rule_id, hour_ts) stays unique and the row count is unaffected.
+-- group_id is part of the identity because the admin API may move a rule to a
+-- new inbound group without changing rule_id. Without it, a same-hour report
+-- after the move would merge into the old row and relabel all prior bytes.
 CREATE TABLE IF NOT EXISTS traffic_history (
     rule_id INTEGER NOT NULL,
     uid INTEGER NOT NULL,
@@ -482,7 +483,7 @@ CREATE TABLE IF NOT EXISTS traffic_history (
     real_upload INTEGER NOT NULL DEFAULT 0,
     real_download INTEGER NOT NULL DEFAULT 0,
     billed_total INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (rule_id, hour_ts)
+    PRIMARY KEY (rule_id, group_id, hour_ts)
 );
 CREATE INDEX IF NOT EXISTS idx_traffic_history_uid ON traffic_history(uid, hour_ts);
 CREATE INDEX IF NOT EXISTS idx_traffic_history_hour ON traffic_history(hour_ts);
@@ -2601,6 +2602,72 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
     .await?;
     tracing::info!("Migration 56: traffic_report_batches idempotency ledger present");
 
+    // ── Migration 57: traffic_history identity includes source group ──
+    // Rule ids survive normal admin group migration. Keeping group_id outside
+    // the key lets a same-hour post-move report collide with the pre-move row,
+    // merging bytes and overwriting its historical line attribution.
+    let history_group_in_pk: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM pragma_table_info('traffic_history') \
+         WHERE name='group_id' AND pk > 0",
+    )
+    .fetch_one(pool)
+    .await?;
+    if history_group_in_pk.0 == 0 {
+        let mut tx = pool.begin().await?;
+        sqlx::query("DROP TABLE IF EXISTS traffic_history_m57")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE traffic_history_m57 (\
+                 rule_id INTEGER NOT NULL,\
+                 uid INTEGER NOT NULL,\
+                 group_id INTEGER NOT NULL DEFAULT 0,\
+                 hour_ts TEXT NOT NULL,\
+                 real_upload INTEGER NOT NULL DEFAULT 0,\
+                 real_download INTEGER NOT NULL DEFAULT 0,\
+                 billed_total INTEGER NOT NULL DEFAULT 0,\
+                 PRIMARY KEY (rule_id, group_id, hour_ts)\
+             )",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO traffic_history_m57 \
+                 (rule_id, uid, group_id, hour_ts, real_upload, real_download, billed_total) \
+             SELECT rule_id, uid, group_id, hour_ts, real_upload, real_download, billed_total \
+             FROM traffic_history",
+        )
+        .execute(&mut *tx)
+        .await?;
+        let old_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM traffic_history")
+            .fetch_one(&mut *tx)
+            .await?;
+        let new_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM traffic_history_m57")
+            .fetch_one(&mut *tx)
+            .await?;
+        if old_count.0 != new_count.0 {
+            return Err(sqlx::Error::Protocol(format!(
+                "Migration 57 row count mismatch: old={} new={}",
+                old_count.0, new_count.0
+            )));
+        }
+        sqlx::query("DROP TABLE traffic_history")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("ALTER TABLE traffic_history_m57 RENAME TO traffic_history")
+            .execute(&mut *tx)
+            .await?;
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_traffic_history_uid ON traffic_history(uid, hour_ts)",
+            "CREATE INDEX IF NOT EXISTS idx_traffic_history_hour ON traffic_history(hour_ts)",
+            "CREATE INDEX IF NOT EXISTS idx_traffic_history_group ON traffic_history(group_id, hour_ts)",
+        ] {
+            sqlx::query(idx).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+    }
+    tracing::info!("Migration 57: traffic_history uses (rule_id, group_id, hour_ts) identity");
+
     Ok(())
 }
 
@@ -3635,6 +3702,31 @@ mod tests {
         assert_eq!(rows, 1, "existing history must not be lost");
         assert_eq!(billed, 4096);
         assert_eq!(group, 0);
+
+        let pk_cols: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('traffic_history') WHERE pk > 0 ORDER BY pk",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pk_cols, vec!["rule_id", "group_id", "hour_ts"]);
+
+        // The upgraded key must allow the same rule/hour to retain a distinct
+        // row for a later source group rather than relabeling the old row.
+        sqlx::query(
+            "INSERT INTO traffic_history \
+             (rule_id, uid, group_id, hour_ts, real_upload, billed_total) \
+             VALUES (1, 1, 2, '2026-07-21 10:00:00', 7, 7)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows_after_move: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM traffic_history WHERE rule_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows_after_move, 2);
 
         // And the whole thing is re-runnable, since it runs on every boot.
         sqlx::query(SCHEMA_SQL)

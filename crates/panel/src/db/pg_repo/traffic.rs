@@ -176,17 +176,16 @@ impl TrafficRepository for PgRepository {
                 "INSERT INTO traffic_history \
                    (rule_id, uid, group_id, hour_ts, real_upload, real_download, billed_total) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7) \
-                 ON CONFLICT (rule_id, hour_ts) DO UPDATE SET \
+                 ON CONFLICT (rule_id, group_id, hour_ts) DO UPDATE SET \
                    real_upload = traffic_history.real_upload + EXCLUDED.real_upload, \
                    real_download = traffic_history.real_download + EXCLUDED.real_download, \
-                   billed_total = traffic_history.billed_total + EXCLUDED.billed_total, \
-                   group_id = EXCLUDED.group_id",
+                   billed_total = traffic_history.billed_total + EXCLUDED.billed_total",
             )
             .bind(r.rule_id)
             .bind(r.uid)
-            // v1.2.0: the batch's group — the rule's group by construction
-            // (pass 2 verified ownership against it). Refreshed on conflict so
-            // a row the backfill left at 0 self-heals on the next report.
+            // The source group is part of the history key. If the same rule id
+            // moves groups within this hour, the new group's bytes get a separate
+            // row instead of relabeling traffic already attributed to the old one.
             .bind(group_id)
             .bind(&hour_ts)
             .bind(up)
@@ -205,7 +204,6 @@ impl TrafficRepository for PgRepository {
         scope: &TrafficBatchScope,
         entries: &[TrafficEntry],
     ) -> Result<IdempotentTrafficBatchResult, DbError> {
-        let group_id = scope.home_group_id;
         let mut tx = self.pool.begin().await?;
 
         let computed = relay_shared::protocol::traffic_batch_payload_sha256(entries);
@@ -276,27 +274,6 @@ impl TrafficRepository for PgRepository {
             return Ok(IdempotentTrafficBatchResult::IdentityUnavailable);
         }
 
-        // ── v1.0.8: read this group's billing rate once for the whole batch
-        // (every entry in a batch is for the SAME group_id). rate lives on
-        // device_groups; users are CHARGED real * rate (rounded) while
-        // forward_rules keeps real bytes. Missing group → rate=1.0 (defensive;
-        // its rules will be rejected as Unavailable below anyway). ──
-        let rate: f64 = sqlx::query_scalar("SELECT rate FROM device_groups WHERE id = $1")
-            .bind(group_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .flatten()
-            .unwrap_or(1.0);
-        if !(0.1..=100.0).contains(&rate) {
-            let _ = tx.rollback().await;
-            tracing::error!(
-                "traffic_batch: group {} has out-of-range rate {} (expected 0.1..=100)",
-                group_id,
-                rate
-            );
-            return Ok(IdempotentTrafficBatchResult::Overflow);
-        }
-
         // ── Pass 1: validate u64→i64 per entry + aggregate duplicate rule_ids
         // into one per-rule delta (so the cumulative overflow check sees the
         // true batch total, not a per-row slice). ──
@@ -324,21 +301,43 @@ impl TrafficRepository for PgRepository {
             };
         }
 
-        // ── Pass 2: ownership + existing-value resolution.
-        // SINGLE query per distinct rule_id, gated by device_group_in. A miss =
-        // "not available" (missing OR foreign); NO second existence query (that
-        // was the rule-id oracle). Reason logged server-side only.
+        // ── Pass 2: resolve exact historical attribution for this delivered revision.
+        //
+        // Legacy strict batches intentionally retain the Home-only contract.
+        // Versioned batches are authorized by the immutable exact-node revision
+        // source map. New revisions additionally retain the historical uid, so
+        // a physically deleted rule can still be billed to its original user
+        // under its original source Group.
+        //
+        // A rule that moved to another Group is never billed to that new Group.
+        // Historical bytes from the stale revision remain terminally unbillable
+        // because the live rule no longer matches the exact historical source.
+        // traffic_history itself is now keyed by (rule_id, group_id, hour_ts), so
+        // legitimate post-move traffic can coexist with pre-move history without
+        // relabeling either row. The same terminal path is used for pre-fix
+        // revisions whose physically deleted rule has no historical uid snapshot.
         struct Resolved {
             rule_id: i64,
             uid: i64,
             delta_up: u64,
             delta_down: u64,
-            /// v1.0.8: billed bytes charged to the USER = round((up+down) * rate).
-            /// Separate from delta_up/delta_down (real bytes for the rule).
             billed_delta: i64,
+            source_group_id: i64,
+            update_rule: bool,
         }
+        struct Disposition {
+            rule_id: i64,
+            source_group_id: i64,
+            historical_uid: Option<i64>,
+            delta_up: u64,
+            delta_down: u64,
+            reason: &'static str,
+        }
+
         let mut resolved: Vec<Resolved> = Vec::with_capacity(rule_delta.len());
+        let mut dispositions: Vec<Disposition> = Vec::new();
         let mut user_delta: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+
         for (rule_id, (dup, ddown)) in &rule_delta {
             let rule_delta_sum = match dup.checked_add(*ddown) {
                 Some(v) if v <= i64::MAX as u64 => v as i64,
@@ -347,34 +346,147 @@ impl TrafficRepository for PgRepository {
                     return Ok(IdempotentTrafficBatchResult::Overflow);
                 }
             };
-            // JOIN users to fetch both the rule's and the user's current totals
-            // in one round trip (same as the SQLite path).
-            let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
-                "SELECT fr.id, fr.uid, fr.traffic_used, u.traffic_used \
-                 FROM forward_rules fr \
-                 JOIN users u ON u.id = fr.uid \
-                 WHERE fr.id = $1 AND fr.device_group_in = $2",
-            )
-            .bind(rule_id)
-            .bind(group_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some((rid, uid, rule_used, user_used)) = row else {
-                tracing::warn!(
-                    "traffic_batch: rule {} not available to group {} \
-                     (missing or foreign) — rejecting batch",
-                    rule_id,
-                    group_id
-                );
+            let Some(&source_group_id) = scope.rule_source_groups.get(rule_id) else {
                 let _ = tx.rollback().await;
                 return Ok(IdempotentTrafficBatchResult::Unavailable);
             };
-            // Per-rule cumulative overflow (REAL bytes — rate does not apply).
-            if rule_used.checked_add(rule_delta_sum).is_none() {
+            let historical_uid = scope.rule_owner_uids.get(rule_id).copied();
+            let current_rule: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+                "SELECT id, uid, device_group_in, traffic_used FROM forward_rules WHERE id = $1",
+            )
+            .bind(rule_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let (uid, user_used, rule_used, update_rule, rate) = if scope.config_revision.is_some()
+            {
+                let (uid, rule_used, update_rule) = match current_rule {
+                    Some((_rid, _current_uid, current_group_id, _current_used))
+                        if current_group_id != source_group_id =>
+                    {
+                        dispositions.push(Disposition {
+                            rule_id: *rule_id,
+                            source_group_id,
+                            historical_uid,
+                            delta_up: *dup,
+                            delta_down: *ddown,
+                            reason: "rule_moved_from_historical_group",
+                        });
+                        continue;
+                    }
+                    Some((_rid, current_uid, _current_group_id, _current_used))
+                        if historical_uid.is_some() && historical_uid != Some(current_uid) =>
+                    {
+                        dispositions.push(Disposition {
+                            rule_id: *rule_id,
+                            source_group_id,
+                            historical_uid,
+                            delta_up: *dup,
+                            delta_down: *ddown,
+                            reason: "rule_owner_changed_since_historical_config",
+                        });
+                        continue;
+                    }
+                    Some((_rid, current_uid, _current_group_id, current_used)) => (
+                        historical_uid.unwrap_or(current_uid),
+                        Some(current_used),
+                        true,
+                    ),
+                    None => match historical_uid {
+                        Some(uid) => (uid, None, false),
+                        None => {
+                            dispositions.push(Disposition {
+                                rule_id: *rule_id,
+                                source_group_id,
+                                historical_uid: None,
+                                delta_up: *dup,
+                                delta_down: *ddown,
+                                reason: "rule_deleted_without_historical_owner",
+                            });
+                            continue;
+                        }
+                    },
+                };
+
+                let rate = match sqlx::query_scalar::<_, f64>(
+                    "SELECT rate FROM device_groups WHERE id = $1",
+                )
+                .bind(source_group_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                {
+                    Some(rate) => rate,
+                    None => {
+                        dispositions.push(Disposition {
+                            rule_id: *rule_id,
+                            source_group_id,
+                            historical_uid: Some(uid),
+                            delta_up: *dup,
+                            delta_down: *ddown,
+                            reason: "historical_source_group_missing",
+                        });
+                        continue;
+                    }
+                };
+                let user_used = match sqlx::query_scalar::<_, i64>(
+                    "SELECT traffic_used FROM users WHERE id = $1",
+                )
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await?
+                {
+                    Some(value) => value,
+                    None => {
+                        dispositions.push(Disposition {
+                            rule_id: *rule_id,
+                            source_group_id,
+                            historical_uid: Some(uid),
+                            delta_up: *dup,
+                            delta_down: *ddown,
+                            reason: "historical_user_missing",
+                        });
+                        continue;
+                    }
+                };
+                (uid, user_used, rule_used, update_rule, rate)
+            } else {
+                let Some((_rid, uid, current_group_id, rule_used)) = current_rule else {
+                    let _ = tx.rollback().await;
+                    return Ok(IdempotentTrafficBatchResult::Unavailable);
+                };
+                if current_group_id != source_group_id {
+                    let _ = tx.rollback().await;
+                    return Ok(IdempotentTrafficBatchResult::Unavailable);
+                }
+                let rate =
+                    sqlx::query_scalar::<_, f64>("SELECT rate FROM device_groups WHERE id = $1")
+                        .bind(source_group_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .unwrap_or(1.0);
+                let Some(user_used) =
+                    sqlx::query_scalar::<_, i64>("SELECT traffic_used FROM users WHERE id = $1")
+                        .bind(uid)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                else {
+                    let _ = tx.rollback().await;
+                    return Ok(IdempotentTrafficBatchResult::Unavailable);
+                };
+                (uid, user_used, Some(rule_used), true, rate)
+            };
+
+            if !(0.1..=100.0).contains(&rate) {
                 let _ = tx.rollback().await;
                 return Ok(IdempotentTrafficBatchResult::Overflow);
             }
-            // v1.0.8: billed delta charged to the user = round(real * rate).
+            if let Some(rule_used) = rule_used {
+                if rule_used.checked_add(rule_delta_sum).is_none() {
+                    let _ = tx.rollback().await;
+                    return Ok(IdempotentTrafficBatchResult::Overflow);
+                }
+            }
+
             let billed_raw = (rule_delta_sum as f64) * rate;
             let billed_delta = if billed_raw.is_finite() && billed_raw <= i64::MAX as f64 {
                 billed_raw.round() as i64
@@ -382,8 +494,6 @@ impl TrafficRepository for PgRepository {
                 let _ = tx.rollback().await;
                 return Ok(IdempotentTrafficBatchResult::Overflow);
             };
-            // Per-user cumulative overflow: existing total + running batch delta
-            // (BILLED bytes).
             let cur_user_delta = *user_delta.get(&uid).unwrap_or(&0);
             let new_user_delta = match cur_user_delta.checked_add(billed_delta) {
                 Some(v) => v,
@@ -398,11 +508,13 @@ impl TrafficRepository for PgRepository {
             }
             user_delta.insert(uid, new_user_delta);
             resolved.push(Resolved {
-                rule_id: rid,
+                rule_id: *rule_id,
                 uid,
                 delta_up: *dup,
                 delta_down: *ddown,
                 billed_delta,
+                source_group_id,
+                update_rule,
             });
         }
 
@@ -411,17 +523,53 @@ impl TrafficRepository for PgRepository {
         // v1.2.0: one hour bucket for the whole batch (see the SQLite impl for
         // why history accumulates per (rule, hour) rather than per report).
         let hour_ts = chrono::Utc::now().format("%Y-%m-%d %H:00:00").to_string();
+
+        for disposition in &dispositions {
+            let detail = serde_json::json!({
+                "batch_id": &scope.batch_id,
+                "config_revision": scope.config_revision,
+                "node_id": &scope.node_id,
+                "source_group_id": disposition.source_group_id,
+                "historical_uid": disposition.historical_uid,
+                "upload": disposition.delta_up,
+                "download": disposition.delta_down,
+                "reason": disposition.reason,
+                "billed": false,
+            })
+            .to_string();
+            sqlx::query(
+                "INSERT INTO audit_log
+                   (ts, actor_id, actor_name, action, target_type, target_id, detail)
+                 VALUES (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'),
+                         NULL, 'system', 'traffic_historical_unbillable',
+                         'forward_rule', $1, $2)",
+            )
+            .bind(disposition.rule_id.to_string())
+            .bind(detail)
+            .execute(&mut *tx)
+            .await?;
+        }
         for r in &resolved {
             let up = r.delta_up as i64;
             let down = r.delta_down as i64;
-            sqlx::query(
-                "UPDATE forward_rules SET traffic_used = traffic_used + $1 + $2 WHERE id = $3",
-            )
-            .bind(up)
-            .bind(down)
-            .bind(r.rule_id)
-            .execute(&mut *tx)
-            .await?;
+            if r.update_rule {
+                let updated = sqlx::query(
+                    "UPDATE forward_rules
+                     SET traffic_used = traffic_used + $1 + $2
+                     WHERE id = $3 AND uid = $4 AND device_group_in = $5",
+                )
+                .bind(up)
+                .bind(down)
+                .bind(r.rule_id)
+                .bind(r.uid)
+                .bind(r.source_group_id)
+                .execute(&mut *tx)
+                .await?;
+                if updated.rows_affected() != 1 {
+                    let _ = tx.rollback().await;
+                    return Ok(IdempotentTrafficBatchResult::Unavailable);
+                }
+            }
             sqlx::query("UPDATE users SET traffic_used = traffic_used + $1 WHERE id = $2")
                 .bind(r.billed_delta)
                 .bind(r.uid)
@@ -433,18 +581,17 @@ impl TrafficRepository for PgRepository {
                 "INSERT INTO traffic_history \
                    (rule_id, uid, group_id, hour_ts, real_upload, real_download, billed_total) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7) \
-                 ON CONFLICT (rule_id, hour_ts) DO UPDATE SET \
+                 ON CONFLICT (rule_id, group_id, hour_ts) DO UPDATE SET \
                    real_upload = traffic_history.real_upload + EXCLUDED.real_upload, \
                    real_download = traffic_history.real_download + EXCLUDED.real_download, \
-                   billed_total = traffic_history.billed_total + EXCLUDED.billed_total, \
-                   group_id = EXCLUDED.group_id",
+                   billed_total = traffic_history.billed_total + EXCLUDED.billed_total",
             )
             .bind(r.rule_id)
             .bind(r.uid)
-            // v1.2.0: the batch's group — the rule's group by construction
-            // (pass 2 verified ownership against it). Refreshed on conflict so
-            // a row the backfill left at 0 self-heals on the next report.
-            .bind(group_id)
+            // The immutable source group is part of the history key, so a
+            // later incarnation of this rule id in another group cannot overwrite
+            // or absorb bytes already attributed to this historical source.
+            .bind(r.source_group_id)
             .bind(&hour_ts)
             .bind(up)
             .bind(down)

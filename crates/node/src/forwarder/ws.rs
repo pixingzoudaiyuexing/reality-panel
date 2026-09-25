@@ -47,6 +47,7 @@ pub async fn start_ws_listener(
     rate_limit: RateLimit,
     counter: Arc<TrafficCounter>,
     connections: Arc<ConnectionTracker>,
+    config_revision: u64,
     rule_id: i64,
     ws_path: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -88,7 +89,7 @@ pub async fn start_ws_listener(
         // Acquire the immutable generation before spawn/handshake. The handler
         // never performs a later rule_id lookup, so a pruned old connection
         // cannot recreate a deleted counter entry.
-        let traffic = counter.handle(rule_id).await;
+        let traffic = counter.handle_at(config_revision, rule_id).await;
         let targets = targets.clone();
         let selector = selector.clone();
         let rate_limit = rate_limit.clone();

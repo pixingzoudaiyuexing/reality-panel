@@ -350,6 +350,11 @@ impl Reconciler {
         self.status.clone()
     }
 
+    #[cfg(test)]
+    pub fn applied_config_revision(&self) -> Option<u64> {
+        self.last_applied_revision
+    }
+
     /// A transient HTTP poll has no authority to replace a healthy state that
     /// this process already established from a validated Panel snapshot.
     pub async fn preserve_converged_after_transient(
@@ -856,7 +861,13 @@ impl Reconciler {
                 .await
             }
             AuthoritySource::LocalRecovery => {
-                poller::apply_cached_coordinated(manager, camouflage, snapshot.config()).await
+                poller::apply_cached_coordinated(
+                    manager,
+                    camouflage,
+                    snapshot.config(),
+                    snapshot.config_revision(),
+                )
+                .await
             }
         };
         let applied_fingerprint = outcome.effective.as_ref().map(config_fingerprint);
@@ -1337,6 +1348,116 @@ mod tests {
         );
 
         manager.lock().await.apply_config(&empty()).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_effective_config_lkg_restores_all_listeners_and_applied_revision_after_restart() {
+        let dir = unique_runtime_dir("reuse-full-lkg");
+        let paths = runtime_paths(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first_reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_port = first_reserve.local_addr().unwrap().port();
+        drop(first_reserve);
+        let second_reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second_port = second_reserve.local_addr().unwrap().port();
+        drop(second_reserve);
+
+        let mut config = raw_config(first_port);
+        config
+            .listeners
+            .push(raw_listener(8, second_port, Protocol::Tcp));
+        let snapshot = NodeConfigSnapshot {
+            config_revision: 9,
+            config_fingerprint: config_fingerprint(&config).as_str().to_string(),
+            config: config.clone(),
+        };
+
+        let mut first_manager = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        first_manager.set_listen_addresses_for_test("127.0.0.1", "");
+        let first_manager = Arc::new(Mutex::new(first_manager));
+        let first_camouflage = Arc::new(Mutex::new(test_camouflage_manager(&dir)));
+        let mut first_reconciler = Reconciler::new();
+        let applied = first_reconciler
+            .reconcile_with_test_paths(
+                &first_manager,
+                &first_camouflage,
+                ReconciliationInput::validated_panel_snapshot(snapshot).unwrap(),
+                paths.clone(),
+            )
+            .await;
+        assert_eq!(applied.state, ReconciliationState::Converged);
+        assert!(first_manager
+            .lock()
+            .await
+            .listener_info_for_rule_tcp(7)
+            .is_some());
+        assert!(first_manager
+            .lock()
+            .await
+            .listener_info_for_rule_tcp(8)
+            .is_some());
+        assert_eq!(first_reconciler.applied_config_revision(), Some(9));
+
+        let cached = poller::load_cache_state_at(&paths).expect("full EffectiveConfig LKG");
+        assert_eq!(cached.config_revision, 9);
+        assert_eq!(cached.config.listeners.len(), 2);
+        assert_eq!(
+            cached
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![7, 8]
+        );
+
+        first_manager.lock().await.apply_config(&empty()).await;
+        drop(first_manager);
+
+        let mut restarted_manager = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        restarted_manager.set_listen_addresses_for_test("127.0.0.1", "");
+        let restarted_manager = Arc::new(Mutex::new(restarted_manager));
+        let restarted_camouflage = Arc::new(Mutex::new(test_camouflage_manager(&dir)));
+        let mut restarted_reconciler = Reconciler::new();
+        let cached_snapshot = relay_shared::protocol::NodeConfigSnapshot {
+            config_revision: cached.config_revision,
+            config_fingerprint: cached.config_fingerprint.as_str().to_string(),
+            config: cached.config,
+        };
+        let recovered = restarted_reconciler
+            .reconcile_with_test_paths(
+                &restarted_manager,
+                &restarted_camouflage,
+                ReconciliationInput::local_recovery_snapshot(
+                    cached_snapshot,
+                    LocalRecoverySource::PrimaryLkg,
+                )
+                .unwrap(),
+                paths.clone(),
+            )
+            .await;
+        assert_eq!(recovered.state, ReconciliationState::DegradedLocalRecovery);
+        assert!(!recovered.cleanup_authorized);
+        assert!(restarted_manager
+            .lock()
+            .await
+            .listener_info_for_rule_tcp(7)
+            .is_some());
+        assert!(restarted_manager
+            .lock()
+            .await
+            .listener_info_for_rule_tcp(8)
+            .is_some());
+        assert_eq!(restarted_reconciler.applied_config_revision(), Some(9));
+
+        restarted_manager.lock().await.apply_config(&empty()).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 

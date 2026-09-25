@@ -44,6 +44,7 @@ pub async fn start_tls_listener(
     rate_limit: RateLimit,
     counter: Arc<TrafficCounter>,
     connections: Arc<ConnectionTracker>,
+    config_revision: u64,
     rule_id: i64,
     // Shared, hot-reloadable TLS acceptor. Each new connection reads the
     // current value, so a cert rotation (swapped by cert_reloader) takes
@@ -59,7 +60,7 @@ pub async fn start_tls_listener(
                 // Capture the connection's counter generation before spawn and
                 // before the TLS handshake. Failed handshakes create only a
                 // local zero state, which the next snapshot cleans after drop.
-                let traffic = counter.handle(rule_id).await;
+                let traffic = counter.handle_at(config_revision, rule_id).await;
                 let targets = targets.clone();
                 let selector = selector.clone();
                 let rate_limit = rate_limit.clone();
