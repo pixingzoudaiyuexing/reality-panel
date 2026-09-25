@@ -158,12 +158,11 @@ impl TrafficCounter {
     }
 
     /// Take a snapshot and return a guard whose `commit()` subtracts exactly
-    /// the snapshotted bytes from each counter. This is the correct pattern for
-    /// traffic reporting: the bytes captured in the snapshot are only deducted
-    /// after the panel ACKs the upload. If the upload fails the guard is
-    /// dropped without commit, so those bytes stay and are retried next cycle.
-    /// Bytes that arrive BETWEEN snapshot and commit are preserved (subtract,
-    /// not clear), so no traffic is ever lost.
+    /// the snapshotted bytes from each counter. Strict reporting commits only
+    /// after the same bytes are sealed into the crash-safe local spool; legacy
+    /// reporting commits after a successful Panel response. Dropping without
+    /// commit keeps the bytes live for retry. Bytes that arrive BETWEEN snapshot
+    /// and commit are preserved (subtract, not clear).
     pub async fn snapshot(&self) -> TrafficSnapshot<'_> {
         let snapshot_guard = self.snapshot_gate.lock().await;
         let mut map = self.data.write().await;
@@ -178,9 +177,10 @@ impl TrafficCounter {
                 || state.download.load(Ordering::Acquire) != 0
         });
 
-        // One strict batch describes exactly one delivered config revision.
-        // Drain the oldest non-empty generation first; newer generations wait
-        // until the older one has been durably ACKed.
+        // One strict batch describes exactly one config revision. Select the
+        // oldest live generation first. Once it is durably sealed into the
+        // strict spool, a later generation may be sealed even while the older
+        // batch is still waiting for its Panel ACK.
         let selected_revision = map
             .iter()
             .filter_map(|((revision, _), state)| {
