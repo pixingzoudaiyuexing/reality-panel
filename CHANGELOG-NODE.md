@@ -7,6 +7,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.25] - 2026-09-25
+
+### 新增
+
+- Node Reuse V1 的 EffectiveConfig 可同时运行 Home Group 与显式绑定到该具体 Node 的复用 Group 规则。
+- 流量计数按 `(config_revision, rule_id)` 分代，TCP、TLS、WebSocket、UDP 与 Nginx SNI 都保留产生流量时的配置版本，用于延迟上报的正确归属。
+- 已应用的完整配置继续使用现有 LKG 持久化与离线重启恢复机制，跨组规则不引入单独 TTL。
+
+### 修复
+
+- 旧配置规则退出后，已经转发但尚未 ACK 的流量仍可完成 strict pending 上报；匹配的 `Applied` / `AlreadyApplied` ACK 会清理 durable pending，并允许后续配置版本继续上报。
+- Nginx SNI 日志记录 config revision，避免配置更新后才读取旧日志时把字节归到新配置。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.24 relay-node 可升级到 v1.1.25；建议与 v1.1.25 Panel 配套升级后再进行 Node Reuse 生产启用。
+
 ## [1.1.24] - 2026-09-11
 
 统一版本发布。本次 ACME DNS-01 timeout 修复仅位于 Panel；relay-node 无功能代码变化。

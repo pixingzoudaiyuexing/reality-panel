@@ -2,7 +2,7 @@
 
 > 面向 Reality SNI 中转场景的自托管控制面板：集中管理 Relay 节点、SNI 转发、DNS、证书、伪装站与节点生命周期，同时尽量让数据面不依赖 Panel 持续在线。
 
-**当前稳定版：`v1.1.24`** · **Config Protocol：`10`** · **生产部署：Debian 12 / amd64 / systemd** · **License：AGPL-3.0**
+**当前稳定版：`v1.1.25`** · **Config Protocol：`10`** · **生产部署：Debian 12 / amd64 / systemd** · **License：AGPL-3.0**
 
 ---
 
@@ -268,7 +268,7 @@ Reality Panel 更适合下面这类结构：
 | 服务管理 | systemd |
 | 安装权限 | root |
 | Panel 默认端口 | `18888` |
-| 当前稳定版 | `v1.1.24` |
+| 当前稳定版 | `v1.1.25` |
 | Config Protocol | `10` |
 
 Docker 文件仍可能保留在仓库中作为开发 / 兼容资产，但 **Docker 已不再属于正式自动发布流程**。生产安装以 GitHub Release 的 systemd 二进制资产为准。
@@ -304,7 +304,7 @@ curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/m
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pixingzoudaiyuexing/reality-panel/main/install.sh \
-  | bash -s -- v1.1.24
+  | bash -s -- v1.1.25
 ```
 
 ### 指定 Panel 端口
@@ -408,7 +408,7 @@ reality-panel-update
 升级到指定版本：
 
 ```bash
-reality-panel-update v1.1.24
+reality-panel-update v1.1.25
 ```
 
 更新器会先验证完整 Release，再执行切换，并保留配置、数据库、证书和运行数据。
