@@ -614,6 +614,13 @@ pub(crate) struct NginxTrafficRecovery {
 
 #[derive(Debug, serde::Deserialize)]
 struct NginxCursorCommitProof {
+    offset: u64,
+    #[serde(default)]
+    device: Option<u64>,
+    #[serde(default)]
+    inode: Option<u64>,
+    #[serde(default)]
+    generation: u64,
     #[serde(default)]
     committed_spool_sequence: Option<u64>,
 }
@@ -1299,16 +1306,31 @@ fn durable_batch_send_ready(queued: &DurableQueuedBatch) -> Result<bool, String>
     };
 
     // A Nginx batch is not sendable merely because its immutable spool file is
-    // durable. Its source cursor must independently prove that it has advanced
-    // past this exact spool sequence. This prevents ACK/delete from making old
-    // log bytes replayable after a crash or a temporary state-path change.
-    let text = std::fs::read_to_string(&checkpoint.source)
-        .map_err(|_| "Nginx cursor commit proof is unavailable".to_string())?;
-    let proof: NginxCursorCommitProof = serde_json::from_str(&text)
+    // durable. Its source cursor must independently prove BOTH ordering and
+    // source progress. Sequence alone is insufficient: a well-formed but stale
+    // or mismatched cursor must not authorize ACK/delete of replayable bytes.
+    let bytes = read_private_regular_file(
+        Path::new(&checkpoint.source),
+        65_536,
+        "Nginx cursor commit proof",
+    )?;
+    let proof: NginxCursorCommitProof = serde_json::from_slice(&bytes)
         .map_err(|_| "Nginx cursor commit proof is malformed".to_string())?;
-    Ok(proof
-        .committed_spool_sequence
-        .is_some_and(|sequence| sequence >= record.sequence))
+    let Some(committed_sequence) = proof.committed_spool_sequence else {
+        return Ok(false);
+    };
+    if committed_sequence < record.sequence || proof.generation < checkpoint.generation {
+        return Ok(false);
+    }
+    if proof.generation > checkpoint.generation {
+        // Source generations are durably opened at offset 0 before any bytes
+        // are spooled. Advancing to a later generation is therefore proof that
+        // every earlier generation checkpoint was durably crossed.
+        return Ok(true);
+    }
+    Ok(proof.device == Some(checkpoint.device)
+        && proof.inode == Some(checkpoint.inode)
+        && proof.offset >= checkpoint.end_offset)
 }
 
 fn remove_durable_batch_at(
@@ -2873,6 +2895,104 @@ mod tests {
             let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn nginx_spool_send_requires_exact_durable_cursor_proof() {
+        let dir = private_test_dir("nginx-cursor-proof");
+        let config = strict_test_config("http://127.0.0.1:1".into(), &dir);
+        let source = dir.join("nginx-state.json");
+        let checkpoint = NginxTrafficCheckpoint {
+            source: source.to_string_lossy().into_owned(),
+            device: 11,
+            inode: 22,
+            generation: 3,
+            start_offset: 100,
+            end_offset: 180,
+        };
+        let (_, sequence) = seal_strict_spool_batch_with_failpoint(
+            &config.auth,
+            "NODE_T1",
+            Some(42),
+            vec![TrafficEntry {
+                rule_id: 7,
+                upload: 10,
+                download: 20,
+            }],
+            Some(checkpoint.clone()),
+            SpoolWriteFailpoint::None,
+        )
+        .unwrap();
+        let queue = load_spool_queue(&config.auth, "NODE_T1", "cred-t1-node").unwrap();
+        let queued = oldest_queue_batch(&queue).unwrap();
+
+        assert!(
+            durable_batch_send_ready(&queued).is_err(),
+            "missing cursor proof must fail closed"
+        );
+
+        let write_proof =
+            |device: u64, inode: u64, generation: u64, offset: u64, committed: u64| {
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "offset": offset,
+                    "device": device,
+                    "inode": inode,
+                    "generation": generation,
+                    "committed_spool_sequence": committed,
+                }))
+                .unwrap();
+                atomic_replace_private_file(&source, &bytes, "test Nginx cursor proof").unwrap();
+            };
+
+        write_proof(
+            checkpoint.device,
+            checkpoint.inode,
+            checkpoint.generation,
+            checkpoint.end_offset - 1,
+            sequence,
+        );
+        assert!(!durable_batch_send_ready(&queued).unwrap());
+
+        write_proof(
+            checkpoint.device,
+            checkpoint.inode + 1,
+            checkpoint.generation,
+            checkpoint.end_offset,
+            sequence,
+        );
+        assert!(!durable_batch_send_ready(&queued).unwrap());
+
+        write_proof(
+            checkpoint.device,
+            checkpoint.inode,
+            checkpoint.generation,
+            checkpoint.end_offset,
+            sequence.saturating_sub(1),
+        );
+        assert!(!durable_batch_send_ready(&queued).unwrap());
+
+        write_proof(
+            checkpoint.device,
+            checkpoint.inode,
+            checkpoint.generation,
+            checkpoint.end_offset,
+            sequence,
+        );
+        assert!(durable_batch_send_ready(&queued).unwrap());
+
+        write_proof(
+            999,
+            999,
+            checkpoint.generation + 1,
+            0,
+            sequence,
+        );
+        assert!(
+            durable_batch_send_ready(&queued).unwrap(),
+            "a later durably opened source generation proves older cursor progress"
+        );
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
