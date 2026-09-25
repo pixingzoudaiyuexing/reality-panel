@@ -339,12 +339,8 @@ where
     // from the immutable checkpoint before any Panel send or source re-read.
     state.offset = segment_end;
     state.set_file_identity(current_identity);
-    state.committed_spool_sequence = Some(
-        state
-            .committed_spool_sequence
-            .unwrap_or(0)
-            .max(sequence),
-    );
+    state.committed_spool_sequence =
+        Some(state.committed_spool_sequence.unwrap_or(0).max(sequence));
     if let Err(error) = write_state(&cfg.state_path, state) {
         counter.poison_strict_reporting();
         return Err(error);
@@ -1278,11 +1274,12 @@ mod tests {
         let recovered_state = load_state(&paths.state).unwrap();
         assert_eq!(recovered_state.offset, line.len() as u64);
         let queued = test_read_strict_spool(&auth, "NODE_T1").unwrap();
-        assert_eq!(queued.len(), 1, "recovery must not delete the durable batch");
         assert_eq!(
-            recovered_state.committed_spool_sequence,
-            Some(queued[0].5)
+            queued.len(),
+            1,
+            "recovery must not delete the durable batch"
         );
+        assert_eq!(recovered_state.committed_spool_sequence, Some(queued[0].5));
     }
 
     #[test]
