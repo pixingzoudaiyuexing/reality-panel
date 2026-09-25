@@ -1219,7 +1219,20 @@ fn load_spool_queue(
     let Some(spool_dir) = existing_spool_dir(&parent)? else {
         return Ok(Vec::new());
     };
-    load_spool_queue_at(&spool_dir, node_id, credential_id)
+    let queue = load_spool_queue_at(&spool_dir, node_id, credential_id)?;
+    let sequence_state = load_sequence_state_at(&spool_dir)?;
+    if !queue.is_empty() && sequence_state.is_none() {
+        return Err("traffic spool sequence state is missing".into());
+    }
+    if let Some(state) = sequence_state {
+        if queue
+            .last()
+            .is_some_and(|(_, record)| state.next_sequence <= record.sequence)
+        {
+            return Err("traffic spool sequence state does not advance past committed batches".into());
+        }
+    }
+    Ok(queue)
 }
 
 fn load_legacy_pending(
@@ -2535,106 +2548,136 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sealed_pending_batch_is_private_durable_and_keeps_new_traffic_separate() {
+    async fn legacy_single_pending_file_remains_readable_and_private() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let dir = private_test_dir("pending");
+        let dir = private_test_dir("legacy-pending");
         let path = dir.join(TRAFFIC_PENDING_FILENAME);
-        let counter = TrafficCounter::new();
-        counter.add(7, 10, 20).await;
-        let snapshot = counter.snapshot().await;
-        let reports = snapshot.entries.clone();
+        let reports = vec![TrafficEntry {
+            rule_id: 7,
+            upload: 10,
+            download: 20,
+        }];
         let pending = PendingTrafficBatch {
             version: TRAFFIC_BATCH_PROTOCOL_VERSION,
-            batch_id: "sealed-batch-1".into(),
+            batch_id: "legacy-pending-batch".into(),
             payload_sha256: traffic_batch_payload_sha256(&reports),
             node_id: "NODE_T1".into(),
             credential_id: "cred-t1-node".into(),
-            config_revision: None,
-            reports: reports.clone(),
+            config_revision: Some(42),
+            reports,
         };
         write_pending_traffic_at(&path, &pending).unwrap();
-        snapshot.commit().await;
 
         let metadata = std::fs::metadata(&path).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("rpn1_node_test_secret"));
-        assert!(!raw.contains("Bearer "));
-        assert!(!raw.contains("Authorization"));
-
-        // Simulated process restart: re-open the durable batch from disk with
-        // no dependency on the original TrafficSnapshot.
-        let restored = load_pending_traffic_at(&path, "NODE_T1", "cred-t1-node")
-            .unwrap()
-            .unwrap();
-        assert_eq!(restored, pending);
-        assert!(load_pending_traffic_at(&path, "NODE_T1", "another-credential").is_err());
-
-        // Bytes arriving after sealing stay in the live counter and cannot
-        // mutate the immutable pending request.
-        counter.add(7, 3, 4).await;
-        let new_only = counter.snapshot().await;
-        assert_eq!(traffic(&new_only.entries, 7), Some((3, 4)));
-        drop(new_only);
-        let restored_again = load_pending_traffic_at(&path, "NODE_T1", "cred-t1-node")
-            .unwrap()
-            .unwrap();
-        assert_eq!(restored_again.reports, reports);
-        assert_eq!(restored_again.batch_id, "sealed-batch-1");
-
-        for status in [
-            TrafficBatchAckStatus::Applied,
-            TrafficBatchAckStatus::AlreadyApplied,
-        ] {
-            let response = ApiResponse {
-                code: 0,
-                message: "ok".into(),
-                data: Some(TrafficBatchAck {
-                    version: TRAFFIC_BATCH_PROTOCOL_VERSION,
-                    batch_id: pending.batch_id.clone(),
-                    payload_sha256: pending.payload_sha256.clone(),
-                    status,
-                }),
-            };
-            assert!(strict_ack_matches(&pending, &response));
-        }
-        let wrong_ack = ApiResponse {
-            code: 0,
-            message: "ok".into(),
-            data: Some(TrafficBatchAck {
-                version: TRAFFIC_BATCH_PROTOCOL_VERSION,
-                batch_id: "other-batch".into(),
-                payload_sha256: pending.payload_sha256.clone(),
-                status: TrafficBatchAckStatus::Applied,
-            }),
-        };
-        assert!(!strict_ack_matches(&pending, &wrong_ack));
+        assert_eq!(
+            load_pending_traffic_at(&path, "NODE_T1", "cred-t1-node")
+                .unwrap()
+                .unwrap(),
+            pending
+        );
+        assert!(load_pending_traffic_at(&path, "NODE_T1", "wrong-credential").is_err());
 
         remove_pending_traffic_at(&path).unwrap();
-        assert!(!path.exists());
         std::fs::remove_dir(&dir).unwrap();
     }
 
     #[tokio::test]
-    async fn strict_report_retries_identical_batch_until_matching_ack() {
+    async fn panel_outage_allows_multiple_durable_batches_and_restart_preserves_order() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let captured = Arc::new(tokio::sync::Mutex::new(Vec::<TrafficReport>::new()));
         let captured_server = captured.clone();
         let server = tokio::spawn(async move {
-            for step in 0..6 {
+            for step in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let report = read_http_traffic_report(&mut stream).await;
+                captured_server.lock().await.push(report.clone());
+                if step < 2 {
+                    write_http_response(&mut stream, "503 Service Unavailable", b"").await;
+                } else {
+                    let body = ack_body(&report, TrafficBatchAckStatus::Applied);
+                    write_http_response(&mut stream, "200 OK", &body).await;
+                }
+            }
+        });
+
+        let dir = private_test_dir("multi-pending-restart");
+        let config = strict_test_config(format!("http://{addr}"), &dir);
+        let first_counter = TrafficCounter::new();
+        first_counter.add_at(42, 7, 10, 20).await;
+        report_traffic(&config, &first_counter, "NODE_T1").await;
+
+        first_counter.add_at(43, 7, 3, 4).await;
+        report_traffic(&config, &first_counter, "NODE_T1").await;
+        assert!(first_counter.snapshot().await.entries.is_empty());
+
+        let queued = test_read_strict_spool(&config.auth, "NODE_T1").unwrap();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].2, Some(42));
+        assert_eq!(queued[1].2, Some(43));
+        assert!(queued[0].5 < queued[1].5);
+        let first_id = queued[0].0.clone();
+        let first_hash = queued[0].1.clone();
+        let second_id = queued[1].0.clone();
+        let second_hash = queued[1].1.clone();
+
+        // Fresh in-memory counter models a process restart while A and B are
+        // both unacknowledged. The immutable queue is the only source needed.
+        let restarted_counter = TrafficCounter::new();
+        report_traffic(&config, &restarted_counter, "NODE_T1").await;
+        let after_first_ack = test_read_strict_spool(&config.auth, "NODE_T1").unwrap();
+        assert_eq!(after_first_ack.len(), 1);
+        assert_eq!(after_first_ack[0].0, second_id);
+        assert_eq!(after_first_ack[0].1, second_hash);
+        assert_eq!(after_first_ack[0].2, Some(43));
+
+        report_traffic(&config, &restarted_counter, "NODE_T1").await;
+        server.await.unwrap();
+        assert!(test_read_strict_spool(&config.auth, "NODE_T1")
+            .unwrap()
+            .is_empty());
+
+        let requests = captured.lock().await;
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].batch.as_ref().unwrap().batch_id, first_id);
+        assert_eq!(requests[0].batch.as_ref().unwrap().payload_sha256, first_hash);
+        assert_eq!(requests[1].batch.as_ref().unwrap().batch_id, first_id);
+        assert_eq!(requests[2].batch.as_ref().unwrap().batch_id, first_id);
+        assert_eq!(requests[3].batch.as_ref().unwrap().batch_id, second_id);
+        assert_eq!(
+            traffic(&requests[0].reports, 7),
+            Some((10, 20)),
+            "revision 42 total is immutable"
+        );
+        assert_eq!(
+            traffic(&requests[3].reports, 7),
+            Some((3, 4)),
+            "revision 43 total survives restart separately"
+        );
+        drop(requests);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_preserve_exact_batch_identity_until_matching_ack() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<TrafficReport>::new()));
+        let captured_server = captured.clone();
+        let server = tokio::spawn(async move {
+            for step in 0..5 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let report = read_http_traffic_report(&mut stream).await;
                 captured_server.lock().await.push(report.clone());
                 match step {
                     0 => write_http_response(&mut stream, "500 Internal Server Error", b"").await,
-                    1 => write_http_response(&mut stream, "429 Too Many Requests", b"").await,
-                    2 => write_http_response(&mut stream, "200 OK", b"{").await,
-                    3 => {
+                    1 => write_http_response(&mut stream, "200 OK", b"{").await,
+                    2 => {
                         let meta = report.batch.as_ref().unwrap();
                         let wrong = ApiResponse::success(TrafficBatchAck {
-                            version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                            version: meta.version,
                             batch_id: format!("{}-wrong", meta.batch_id),
                             payload_sha256: meta.payload_sha256.clone(),
                             status: TrafficBatchAckStatus::AlreadyApplied,
@@ -2642,11 +2685,11 @@ mod tests {
                         let body = serde_json::to_vec(&wrong).unwrap();
                         write_http_response(&mut stream, "200 OK", &body).await;
                     }
-                    4 => {
+                    3 => {
                         let body = ack_body(&report, TrafficBatchAckStatus::AlreadyApplied);
                         write_http_response(&mut stream, "200 OK", &body).await;
                     }
-                    5 => {
+                    4 => {
                         let body = ack_body(&report, TrafficBatchAckStatus::Applied);
                         write_http_response(&mut stream, "200 OK", &body).await;
                     }
@@ -2655,166 +2698,170 @@ mod tests {
             }
         });
 
-        let dir = private_test_dir("http-retry");
+        let dir = private_test_dir("retry-identity");
         let config = strict_test_config(format!("http://{addr}"), &dir);
         let counter = TrafficCounter::new();
         counter.add_at(42, 7, 10, 20).await;
 
-        report_traffic(&config, &counter, "NODE_T1").await;
-        let pending_path = dir.join(TRAFFIC_PENDING_FILENAME);
-        let first_pending = load_pending_traffic_at(&pending_path, "NODE_T1", "cred-t1-node")
-            .unwrap()
-            .unwrap();
-
-        counter.add_at(99, 7, 3, 4).await;
-        report_traffic(&config, &counter, "NODE_T1").await;
-        report_traffic(&config, &counter, "NODE_T1").await;
-        report_traffic(&config, &counter, "NODE_T1").await;
-        report_traffic(&config, &counter, "NODE_T1").await;
-        assert!(
-            !pending_path.exists(),
-            "matching AlreadyApplied ACK completes batch"
-        );
-
-        let remaining = counter.snapshot().await;
-        assert_eq!(traffic(&remaining.entries, 7), Some((3, 4)));
-        drop(remaining);
-
-        report_traffic(&config, &counter, "NODE_T1").await;
-        server.await.unwrap();
-
-        let requests = captured.lock().await;
-        assert_eq!(requests.len(), 6);
-        let first_meta = requests[0].batch.as_ref().unwrap();
-        assert_eq!(first_meta.config_revision, Some(42));
-        for request in &requests[..5] {
-            assert_eq!(request.batch.as_ref(), Some(first_meta));
-            assert_eq!(request.reports, first_pending.reports);
+        for _ in 0..4 {
+            report_traffic(&config, &counter, "NODE_T1").await;
         }
-        let next_meta = requests[5].batch.as_ref().unwrap();
-        assert_ne!(next_meta.batch_id, first_meta.batch_id);
-        assert_eq!(next_meta.config_revision, Some(99));
-        assert_eq!(
-            traffic(&requests[5].reports, 7),
-            Some((3, 4)),
-            "new bytes form a later immutable batch"
-        );
-        assert!(!pending_path.exists());
-        assert!(counter.snapshot().await.entries.is_empty());
+        assert!(test_read_strict_spool(&config.auth, "NODE_T1")
+            .unwrap()
+            .is_empty());
 
-        drop(requests);
-        std::fs::remove_dir(&dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn matching_strict_ack_clears_old_pending_and_advances_next_generation() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<TrafficReport>::new()));
-        let captured_server = captured.clone();
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let report = read_http_traffic_report(&mut stream).await;
-                captured_server.lock().await.push(report.clone());
-                let body = ack_body(&report, TrafficBatchAckStatus::Applied);
-                write_http_response(&mut stream, "200 OK", &body).await;
-            }
-        });
-
-        let dir = private_test_dir("deleted-history-ack-progress");
-        let config = strict_test_config(format!("http://{addr}"), &dir);
-        let counter = TrafficCounter::new();
-
-        // Model bytes sealed under an old applied config. A real Panel may ACK
-        // these after billing a deleted historical rule or terminally disposing
-        // an unbillable historical entry; either outcome is represented by the
-        // same strict Applied ACK contract.
-        counter.add_at(42, 7, 10, 20).await;
+        counter.add_at(43, 7, 1, 2).await;
         report_traffic(&config, &counter, "NODE_T1").await;
-        let pending_path = dir.join(TRAFFIC_PENDING_FILENAME);
-        assert!(
-            !pending_path.exists(),
-            "matching Applied ACK must clear the durable old pending batch"
-        );
-
-        // Traffic produced under the next applied config must now be free to
-        // form and send a new immutable batch rather than remaining blocked.
-        counter.add_at(43, 7, 3, 4).await;
-        report_traffic(&config, &counter, "NODE_T1").await;
-        assert!(!pending_path.exists());
-        assert!(counter.snapshot().await.entries.is_empty());
-
         server.await.unwrap();
+
         let requests = captured.lock().await;
-        assert_eq!(requests.len(), 2);
+        let first = requests[0].batch.as_ref().unwrap().clone();
+        for request in &requests[..4] {
+            assert_eq!(request.batch.as_ref(), Some(&first));
+            assert_eq!(traffic(&request.reports, 7), Some((10, 20)));
+        }
+        assert_ne!(requests[4].batch.as_ref().unwrap().batch_id, first.batch_id);
         assert_eq!(
-            requests[0].batch.as_ref().unwrap().config_revision,
-            Some(42)
-        );
-        assert_eq!(
-            requests[1].batch.as_ref().unwrap().config_revision,
+            requests[4].batch.as_ref().unwrap().config_revision,
             Some(43)
         );
-        assert_ne!(
-            requests[0].batch.as_ref().unwrap().batch_id,
-            requests[1].batch.as_ref().unwrap().batch_id
-        );
-        assert_eq!(traffic(&requests[1].reports, 7), Some((3, 4)));
-
         drop(requests);
-        std::fs::remove_dir(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn crash_before_batch_install_keeps_no_committed_queue_item() {
+        let dir = private_test_dir("before-install");
+        let config = strict_test_config("http://127.0.0.1:1".into(), &dir);
+        let reports = vec![TrafficEntry {
+            rule_id: 7,
+            upload: 10,
+            download: 20,
+        }];
+        let error = seal_strict_spool_batch_with_failpoint(
+            &config.auth,
+            "NODE_T1",
+            Some(42),
+            reports,
+            None,
+            SpoolWriteFailpoint::BeforeInstall,
+        )
+        .expect_err("injected pre-install failure");
+        assert!(!error.restart_required());
+        assert!(test_read_strict_spool(&config.auth, "NODE_T1")
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn crash_after_durable_batch_install_recovers_one_stable_batch() {
+        let dir = private_test_dir("after-install");
+        let config = strict_test_config("http://127.0.0.1:1".into(), &dir);
+        let reports = vec![TrafficEntry {
+            rule_id: 7,
+            upload: 10,
+            download: 20,
+        }];
+        let error = seal_strict_spool_batch_with_failpoint(
+            &config.auth,
+            "NODE_T1",
+            Some(42),
+            reports.clone(),
+            None,
+            SpoolWriteFailpoint::AfterDurableInstall,
+        )
+        .expect_err("injected post-install crash");
+        assert!(error.restart_required());
+
+        let first = test_read_strict_spool(&config.auth, "NODE_T1").unwrap();
+        let second = test_read_strict_spool(&config.auth, "NODE_T1").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].2, Some(42));
+        assert_eq!(first[0].3, reports);
+        assert!(valid_traffic_batch_id(&first[0].0));
+        assert!(valid_traffic_payload_sha256(&first[0].1));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
-    async fn strict_connection_failure_keeps_same_durable_pending_batch() {
+    async fn corrupt_queued_batch_fails_closed_and_later_traffic_does_not_overtake() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener); // force connection refused
-
-        let dir = private_test_dir("connect-fail");
+        let dir = private_test_dir("corrupt-spool");
         let config = strict_test_config(format!("http://{addr}"), &dir);
         let counter = TrafficCounter::new();
-        counter.add(9, 8, 6).await;
 
-        report_traffic(&config, &counter, "NODE_T1").await;
-        let path = dir.join(TRAFFIC_PENDING_FILENAME);
-        let first = load_pending_traffic_at(&path, "NODE_T1", "cred-t1-node")
-            .unwrap()
-            .unwrap();
-        report_traffic(&config, &counter, "NODE_T1").await;
-        let second = load_pending_traffic_at(&path, "NODE_T1", "cred-t1-node")
-            .unwrap()
-            .unwrap();
-        assert_eq!(first, second);
-        assert!(counter.snapshot().await.entries.is_empty());
+        // Seal two batches directly so the queue has a later valid entry behind
+        // the corrupted oldest one.
+        seal_strict_spool_batch(
+            &config.auth,
+            "NODE_T1",
+            Some(42),
+            vec![TrafficEntry {
+                rule_id: 7,
+                upload: 10,
+                download: 20,
+            }],
+            None,
+        )
+        .unwrap();
+        seal_strict_spool_batch(
+            &config.auth,
+            "NODE_T1",
+            Some(43),
+            vec![TrafficEntry {
+                rule_id: 7,
+                upload: 3,
+                download: 4,
+            }],
+            None,
+        )
+        .unwrap();
 
-        remove_pending_traffic_at(&path).unwrap();
-        std::fs::remove_dir(&dir).unwrap();
+        let spool_dir = dir.join(TRAFFIC_SPOOL_DIRNAME);
+        let oldest = list_spool_files(&spool_dir).unwrap()[0].1.clone();
+        std::fs::write(&oldest, b"{").unwrap();
+
+        counter.add_at(44, 7, 5, 6).await;
+        report_traffic(&config, &counter, "NODE_T1").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "corrupt queue must stop all sends"
+        );
+        let retained = counter.snapshot().await;
+        assert_eq!(retained.config_revision, Some(44));
+        assert_eq!(traffic(&retained.entries, 7), Some((5, 6)));
+        drop(retained);
+        assert_eq!(list_spool_files(&spool_dir).unwrap().len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
-    async fn restarted_reporter_sends_exact_durable_pending_batch_first() {
+    async fn legacy_pending_is_sent_before_new_spool_batches() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let dir = private_test_dir("restart-send");
+        let dir = private_test_dir("legacy-first");
         let config = strict_test_config(format!("http://{addr}"), &dir);
-        let path = dir.join(TRAFFIC_PENDING_FILENAME);
-        let reports = vec![TrafficEntry {
-            rule_id: 42,
-            upload: 91,
-            download: 17,
+        let legacy_path = dir.join(TRAFFIC_PENDING_FILENAME);
+        let legacy_reports = vec![TrafficEntry {
+            rule_id: 8,
+            upload: 9,
+            download: 10,
         }];
-        let pending = PendingTrafficBatch {
+        let legacy = PendingTrafficBatch {
             version: TRAFFIC_BATCH_PROTOCOL_VERSION,
-            batch_id: "restart-batch-1".into(),
-            payload_sha256: traffic_batch_payload_sha256(&reports),
+            batch_id: "legacy-first-batch".into(),
+            payload_sha256: traffic_batch_payload_sha256(&legacy_reports),
             node_id: "NODE_T1".into(),
             credential_id: "cred-t1-node".into(),
-            config_revision: None,
-            reports: reports.clone(),
+            config_revision: Some(41),
+            reports: legacy_reports.clone(),
         };
-        write_pending_traffic_at(&path, &pending).unwrap();
+        write_pending_traffic_at(&legacy_path, &legacy).unwrap();
 
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -2824,61 +2871,53 @@ mod tests {
             report
         });
 
-        // Fresh counter models a restarted process: the old in-memory snapshot
-        // is gone, so the durable pending request must be retried before any new
-        // snapshot can be sealed.
-        let restarted_counter = TrafficCounter::new();
-        report_traffic(&config, &restarted_counter, "NODE_T1").await;
+        let counter = TrafficCounter::new();
+        counter.add_at(42, 7, 1, 2).await;
+        report_traffic(&config, &counter, "NODE_T1").await;
         let sent = server.await.unwrap();
-        assert_eq!(sent.reports, reports);
-        let sent_meta = sent.batch.expect("strict batch metadata");
-        assert_eq!(sent_meta.batch_id, pending.batch_id);
-        assert_eq!(sent_meta.payload_sha256, pending.payload_sha256);
-        assert!(!path.exists());
-        assert!(restarted_counter.snapshot().await.entries.is_empty());
-        std::fs::remove_dir(&dir).unwrap();
+        assert_eq!(sent.batch.as_ref().unwrap().batch_id, legacy.batch_id);
+        assert_eq!(sent.reports, legacy_reports);
+        assert!(!legacy_path.exists());
+
+        let queue = test_read_strict_spool(&config.auth, "NODE_T1").unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].2, Some(42));
+        assert_eq!(traffic(&queue[0].3, 7), Some((1, 2)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
-    async fn uncertain_local_seal_poison_fails_closed_without_network_or_resnapshot() {
+    async fn uncertain_accounting_transition_poison_fails_closed() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let dir = private_test_dir("seal-poison");
         let config = strict_test_config(format!("http://{addr}"), &dir);
         let counter = TrafficCounter::new();
         counter.add(77, 13, 9).await;
-        counter.strict_seal_poisoned.store(true, Ordering::Release);
+        counter.poison_strict_reporting();
 
         report_traffic(&config, &counter, "NODE_T1").await;
         assert!(
             tokio::time::timeout(Duration::from_millis(50), listener.accept())
                 .await
-                .is_err(),
-            "poisoned strict reporter must not make a network request"
+                .is_err()
         );
-        assert!(
-            !dir.join(TRAFFIC_PENDING_FILENAME).exists(),
-            "poisoned reporter must not attempt a new seal"
-        );
+        assert!(test_read_strict_spool(&config.auth, "NODE_T1")
+            .unwrap()
+            .is_empty());
         let retained = counter.snapshot().await;
         assert_eq!(traffic(&retained.entries, 77), Some((13, 9)));
         drop(retained);
-        std::fs::remove_dir(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
-    async fn concurrent_report_calls_seal_and_send_only_one_batch() {
+    async fn concurrent_report_calls_do_not_duplicate_a_batch() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<TrafficReport>::new()));
-        let captured_server = captured.clone();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let report = read_http_traffic_report(&mut stream).await;
-            captured_server.lock().await.push(report.clone());
-            // Keep the first caller in flight briefly so the second caller is
-            // guaranteed to contend on report_gate rather than simply starting
-            // after completion.
             tokio::time::sleep(Duration::from_millis(30)).await;
             let body = ack_body(&report, TrafficBatchAckStatus::Applied);
             write_http_response(&mut stream, "200 OK", &body).await;
@@ -2889,17 +2928,17 @@ mod tests {
         let counter = TrafficCounter::new();
         counter.add(71, 12, 8).await;
 
-        let (left, right) = tokio::join!(
+        tokio::join!(
             report_traffic(&config, &counter, "NODE_T1"),
             report_traffic(&config, &counter, "NODE_T1"),
         );
-        let _ = (left, right);
         server.await.unwrap();
 
-        assert_eq!(captured.lock().await.len(), 1);
         assert!(counter.snapshot().await.entries.is_empty());
-        assert!(!dir.join(TRAFFIC_PENDING_FILENAME).exists());
-        std::fs::remove_dir(&dir).unwrap();
+        assert!(test_read_strict_spool(&config.auth, "NODE_T1")
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
