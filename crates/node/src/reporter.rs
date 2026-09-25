@@ -658,8 +658,7 @@ fn strict_traffic_parent(auth: &NodeRuntimeAuth, node_id: &str) -> Result<Option
 }
 
 fn pending_traffic_path(auth: &NodeRuntimeAuth, node_id: &str) -> Result<Option<PathBuf>, String> {
-    Ok(strict_traffic_parent(auth, node_id)?
-        .map(|parent| parent.join(TRAFFIC_PENDING_FILENAME)))
+    Ok(strict_traffic_parent(auth, node_id)?.map(|parent| parent.join(TRAFFIC_PENDING_FILENAME)))
 }
 
 fn strict_credential_id<'a>(
@@ -768,9 +767,7 @@ fn read_private_regular_file(path: &Path, max_bytes: u64, label: &str) -> Result
         || (metadata.mode() & 0o777) != 0o600
         || metadata.len() > max_bytes
     {
-        return Err(format!(
-            "{label} must be owner-only mode 0600 regular file"
-        ));
+        return Err(format!("{label} must be owner-only mode 0600 regular file"));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.read_to_end(&mut bytes)
@@ -1182,14 +1179,7 @@ pub(crate) fn seal_nginx_traffic_batch(
     reports: Vec<TrafficEntry>,
     checkpoint: NginxTrafficCheckpoint,
 ) -> Result<(), PendingWriteError> {
-    seal_strict_spool_batch(
-        auth,
-        node_id,
-        config_revision,
-        reports,
-        Some(checkpoint),
-    )
-    .map(|_| ())
+    seal_strict_spool_batch(auth, node_id, config_revision, reports, Some(checkpoint)).map(|_| ())
 }
 
 fn load_spool_queue_at(
@@ -1229,7 +1219,9 @@ fn load_spool_queue(
             .last()
             .is_some_and(|(_, record)| state.next_sequence <= record.sequence)
         {
-            return Err("traffic spool sequence state does not advance past committed batches".into());
+            return Err(
+                "traffic spool sequence state does not advance past committed batches".into(),
+            );
         }
     }
     Ok(queue)
@@ -1252,9 +1244,7 @@ fn load_legacy_pending(
     }))
 }
 
-fn oldest_queue_batch(
-    queue: &[(PathBuf, DurableSpoolRecord)],
-) -> Option<DurableQueuedBatch> {
+fn oldest_queue_batch(queue: &[(PathBuf, DurableSpoolRecord)]) -> Option<DurableQueuedBatch> {
     let (path, record) = queue.first()?;
     Some(DurableQueuedBatch {
         batch: record.batch.clone(),
@@ -1332,7 +1322,9 @@ pub(crate) fn recover_nginx_checkpoint(
         };
         if cursor_matches {
             if matched.is_some() {
-                return Err("multiple traffic spool checkpoints claim the same Nginx cursor".into());
+                return Err(
+                    "multiple traffic spool checkpoints claim the same Nginx cursor".into(),
+                );
             }
             matched = Some(checkpoint);
         }
@@ -1569,13 +1561,7 @@ async fn report_traffic_strict(
         false
     } else {
         let reports = snap.entries.clone();
-        match seal_strict_spool_batch(
-            &config.auth,
-            node_id,
-            snap.config_revision,
-            reports,
-            None,
-        ) {
+        match seal_strict_spool_batch(&config.auth, node_id, snap.config_revision, reports, None) {
             Ok(_) => {
                 snap.commit().await;
                 true
@@ -2642,7 +2628,10 @@ mod tests {
         let requests = captured.lock().await;
         assert_eq!(requests.len(), 4);
         assert_eq!(requests[0].batch.as_ref().unwrap().batch_id, first_id);
-        assert_eq!(requests[0].batch.as_ref().unwrap().payload_sha256, first_hash);
+        assert_eq!(
+            requests[0].batch.as_ref().unwrap().payload_sha256,
+            first_hash
+        );
         assert_eq!(requests[1].batch.as_ref().unwrap().batch_id, first_id);
         assert_eq!(requests[2].batch.as_ref().unwrap().batch_id, first_id);
         assert_eq!(requests[3].batch.as_ref().unwrap().batch_id, second_id);
@@ -2818,8 +2807,11 @@ mod tests {
         let spool_mode = std::fs::metadata(&spool_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(spool_mode, 0o700);
         let sequence_path = spool_dir.join(TRAFFIC_SPOOL_SEQUENCE_FILENAME);
-        let sequence_mode =
-            std::fs::metadata(&sequence_path).unwrap().permissions().mode() & 0o777;
+        let sequence_mode = std::fs::metadata(&sequence_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(sequence_mode, 0o600);
 
         let files = list_spool_files(&spool_dir).unwrap();
