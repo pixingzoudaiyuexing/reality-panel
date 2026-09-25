@@ -1,8 +1,13 @@
 use super::ForwarderManager;
-use crate::reporter::TrafficCounter;
+use crate::config::NodeRuntimeAuth;
+use crate::reporter::{
+    recover_nginx_checkpoint, seal_nginx_traffic_batch, NginxTrafficCheckpoint, TrafficCounter,
+};
+use relay_shared::protocol::TrafficEntry;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -14,13 +19,15 @@ pub struct NginxSniTrafficConfig {
     pub state_path: PathBuf,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct LogState {
     offset: u64,
     #[serde(default)]
     device: Option<u64>,
     #[serde(default)]
     inode: Option<u64>,
+    #[serde(default)]
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +47,17 @@ impl LogState {
     fn set_file_identity(&mut self, identity: FileIdentity) {
         self.device = Some(identity.device);
         self.inode = Some(identity.inode);
+    }
+
+    fn begin_new_generation(&mut self) -> std::io::Result<()> {
+        self.generation = self.generation.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "nginx_sni traffic generation overflow",
+            )
+        })?;
+        self.offset = 0;
+        Ok(())
     }
 }
 
@@ -64,11 +82,10 @@ pub async fn ingest_once(
     cfg: &NginxSniTrafficConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     counter: &Arc<TrafficCounter>,
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
 ) {
-    if !cfg.enabled {
-        return;
-    }
-    match ingest_once_inner(cfg, manager, counter).await {
+    match ingest_once_inner(cfg, manager, counter, auth, node_id).await {
         Ok(n) if n > 0 => tracing::info!("nginx_sni traffic: ingested {} log line(s)", n),
         Ok(_) => {}
         Err(e) => tracing::warn!("nginx_sni traffic ingest failed: {}", e),
@@ -79,76 +96,422 @@ async fn ingest_once_inner(
     cfg: &NginxSniTrafficConfig,
     manager: &Arc<Mutex<ForwarderManager>>,
     counter: &Arc<TrafficCounter>,
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
 ) -> std::io::Result<usize> {
-    let mut state = load_state(&cfg.state_path).unwrap_or_default();
+    ingest_once_inner_with_state_writer(cfg, manager, counter, auth, node_id, save_state).await
+}
+
+async fn ingest_once_inner_with_state_writer<F>(
+    cfg: &NginxSniTrafficConfig,
+    manager: &Arc<Mutex<ForwarderManager>>,
+    counter: &Arc<TrafficCounter>,
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+    mut write_state: F,
+) -> std::io::Result<usize>
+where
+    F: FnMut(&Path, &LogState) -> std::io::Result<()>,
+{
+    let _accounting_guard = counter.durable_accounting_guard().await;
+    match auth {
+        NodeRuntimeAuth::PermanentCredential { .. } => {
+            if counter.strict_reporting_poisoned() {
+                return Err(std::io::Error::other(
+                    "strict traffic accounting is poisoned; restart required",
+                ));
+            }
+            ingest_strict_locked(cfg, manager, counter, auth, node_id, &mut write_state).await
+        }
+        NodeRuntimeAuth::LegacyGroupToken { .. } => {
+            if !cfg.enabled {
+                return Ok(0);
+            }
+            ingest_legacy_locked(cfg, manager, counter, &mut write_state).await
+        }
+    }
+}
+
+fn prepare_state_for_file(
+    state: &mut LogState,
+    current_identity: FileIdentity,
+    len: u64,
+) -> std::io::Result<()> {
+    match state.file_identity() {
+        Some(persisted) if persisted != current_identity => {
+            state.begin_new_generation()?;
+            state.set_file_identity(current_identity);
+        }
+        _ if state.offset > len => {
+            // copytruncate preserves dev+inode. Bump the logical generation so
+            // old offset-0 checkpoints can never collide with the new contents.
+            state.begin_new_generation()?;
+            state.set_file_identity(current_identity);
+        }
+        _ => {
+            // Legacy offset-only state is trusted once. Identity is recorded on
+            // the next successful durable state write.
+            state.set_file_identity(current_identity);
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_attribution(
+    parsed: &ParsedLogLine,
+    manager: &Arc<Mutex<ForwarderManager>>,
+) -> Option<(u64, i64)> {
+    if let (Some(revision), Some(rule_id)) = (parsed.config_revision, parsed.rule_id) {
+        return Some((revision, rule_id));
+    }
+    let current_rule_id = {
+        let mgr = manager.lock().await;
+        mgr.nginx_sni_rule_id_for(parsed.port, &parsed.sni)
+    };
+    match (parsed.rule_id, current_rule_id) {
+        (Some(logged), Some(current)) if logged == current => Some((0, current)),
+        (None, Some(current)) => Some((0, current)),
+        _ => None,
+    }
+}
+
+fn add_segment_traffic(
+    totals: &mut BTreeMap<i64, (u64, u64)>,
+    rule_id: i64,
+    upload: u64,
+    download: u64,
+) -> std::io::Result<()> {
+    let entry = totals.entry(rule_id).or_insert((0, 0));
+    entry.0 = entry.0.checked_add(upload).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "nginx_sni upload accounting overflow",
+        )
+    })?;
+    entry.1 = entry.1.checked_add(download).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "nginx_sni download accounting overflow",
+        )
+    })?;
+    Ok(())
+}
+
+fn source_key(cfg: &NginxSniTrafficConfig) -> String {
+    cfg.state_path.to_string_lossy().into_owned()
+}
+
+fn cursor_tuple(state: &LogState) -> Option<(u64, u64, u64, u64)> {
+    let identity = state.file_identity()?;
+    Some((
+        identity.device,
+        identity.inode,
+        state.generation,
+        state.offset,
+    ))
+}
+
+fn recover_committed_checkpoints<F>(
+    cfg: &NginxSniTrafficConfig,
+    counter: &TrafficCounter,
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+    state: &mut Option<LogState>,
+    write_state: &mut F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&Path, &LogState) -> std::io::Result<()>,
+{
+    let source = source_key(cfg);
+    loop {
+        let cursor = state.as_ref().and_then(cursor_tuple);
+        let checkpoint =
+            recover_nginx_checkpoint(auth, node_id, &source, cursor).map_err(std::io::Error::other)?;
+        let Some(checkpoint) = checkpoint else {
+            break;
+        };
+        let mut recovered = state.clone().unwrap_or_default();
+        recovered.device = Some(checkpoint.device);
+        recovered.inode = Some(checkpoint.inode);
+        recovered.generation = checkpoint.generation;
+        recovered.offset = checkpoint.end_offset;
+        if let Err(error) = write_state(&cfg.state_path, &recovered) {
+            counter.poison_strict_reporting();
+            return Err(error);
+        }
+        *state = Some(recovered);
+    }
+    Ok(())
+}
+
+async fn flush_strict_segment<F>(
+    cfg: &NginxSniTrafficConfig,
+    counter: &TrafficCounter,
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+    current_identity: FileIdentity,
+    state: &mut LogState,
+    persisted_state: &mut LogState,
+    segment_start: u64,
+    segment_end: u64,
+    revision: u64,
+    totals: &BTreeMap<i64, (u64, u64)>,
+    write_state: &mut F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&Path, &LogState) -> std::io::Result<()>,
+{
+    if totals.is_empty() || segment_end <= segment_start {
+        return Ok(());
+    }
+    let reports = totals
+        .iter()
+        .map(|(rule_id, (upload, download))| TrafficEntry {
+            rule_id: *rule_id,
+            upload: *upload,
+            download: *download,
+        })
+        .collect::<Vec<_>>();
+    let checkpoint = NginxTrafficCheckpoint {
+        source: source_key(cfg),
+        device: current_identity.device,
+        inode: current_identity.inode,
+        generation: state.generation,
+        start_offset: segment_start,
+        end_offset: segment_end,
+    };
+
+    if let Err(error) = seal_nginx_traffic_batch(
+        auth,
+        node_id,
+        (revision != 0).then_some(revision),
+        reports,
+        checkpoint,
+    ) {
+        if error.restart_required() {
+            counter.poison_strict_reporting();
+        }
+        return Err(std::io::Error::other(error.message().to_string()));
+    }
+
+    // Recoverable transition:
+    //   durable source bytes -> durable immutable spool -> durable cursor.
+    // The cursor never advances before the spool is complete+fsynced. If the
+    // cursor write fails, the process is poisoned before reporting can delete
+    // the batch. On restart recover_committed_checkpoints() advances the cursor
+    // from the immutable checkpoint before any Panel send or source re-read.
+    state.offset = segment_end;
+    state.set_file_identity(current_identity);
+    if let Err(error) = write_state(&cfg.state_path, state) {
+        counter.poison_strict_reporting();
+        return Err(error);
+    }
+    *persisted_state = state.clone();
+    Ok(())
+}
+
+async fn ingest_strict_locked<F>(
+    cfg: &NginxSniTrafficConfig,
+    manager: &Arc<Mutex<ForwarderManager>>,
+    counter: &TrafficCounter,
+    auth: &NodeRuntimeAuth,
+    node_id: &str,
+    write_state: &mut F,
+) -> std::io::Result<usize>
+where
+    F: FnMut(&Path, &LogState) -> std::io::Result<()>,
+{
+    // Existing malformed/unreadable state fails closed; genuine NotFound is the
+    // only case allowed to begin with a default cursor.
+    let mut state = load_state_optional(&cfg.state_path)?;
+    recover_committed_checkpoints(cfg, counter, auth, node_id, &mut state, write_state)?;
+
+    // Recovery is intentionally performed even when ingestion is disabled or
+    // the access log is temporarily absent, so a spool->cursor half-transition
+    // cannot be ACKed/deleted by the reporter while an old cursor remains.
+    if !cfg.enabled {
+        return Ok(0);
+    }
+
     let file = match std::fs::File::open(&cfg.access_log_path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e),
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
     };
     let metadata = file.metadata()?;
     let len = metadata.len();
     let current_identity = file_identity(&metadata);
 
-    // Legacy state files contain only an offset. Trust that offset for the
-    // first post-upgrade read so already-accounted traffic is not replayed and
-    // double-counted; this successful ingest records identity for future polls.
-    if state
-        .file_identity()
-        .is_some_and(|persisted| persisted != current_identity)
-    {
-        state.offset = 0;
-    }
-    // A matching inode can still be copy-truncated, so retain the existing
-    // length-shrink protection independently of file replacement detection.
-    if state.offset > len {
-        state.offset = 0;
-    }
+    let mut state = state.unwrap_or_default();
+    prepare_state_for_file(&mut state, current_identity, len)?;
+    let mut persisted_state = load_state_optional(&cfg.state_path)?.unwrap_or_else(|| state.clone());
 
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(state.offset))?;
 
     let mut processed = 0usize;
-    let mut new_offset = state.offset;
+    let mut cursor = state.offset;
+    let mut segment_start = cursor;
+    let mut active_revision: Option<u64> = None;
+    let mut totals = BTreeMap::<i64, (u64, u64)>::new();
     let mut line = String::new();
+
     loop {
         line.clear();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
             break;
         }
-        new_offset = new_offset.saturating_add(bytes as u64);
-        let Some(parsed) = parse_log_line(&line) else {
-            continue;
-        };
-        let attributed =
-            if let (Some(revision), Some(rule_id)) = (parsed.config_revision, parsed.rule_id) {
-                Some((revision, rule_id))
-            } else {
-                let current_rule_id = {
-                    let mgr = manager.lock().await;
-                    mgr.nginx_sni_rule_id_for(parsed.port, &parsed.sni)
-                };
-                match (parsed.rule_id, current_rule_id) {
-                    (Some(logged), Some(current)) if logged == current => Some((0, current)),
-                    (None, Some(current)) => Some((0, current)),
-                    _ => None,
-                }
-            };
-        if let Some((revision, rule_id)) = attributed {
-            // Nginx stream: bytes_received = client -> proxy (upload),
-            // bytes_sent = proxy -> client (download).
-            counter
-                .add_at(revision, rule_id, parsed.bytes_received, parsed.bytes_sent)
-                .await;
-            processed += 1;
+        if !line.ends_with('\n') {
+            // read_line may return a final partial record at EOF. It stays
+            // entirely before the durable cursor until its terminating newline.
+            break;
         }
+        let line_start = cursor;
+        let line_end = cursor
+            .checked_add(bytes as u64)
+            .ok_or_else(|| std::io::Error::other("nginx_sni cursor overflow"))?;
+
+        let attributed = match parse_log_line(&line) {
+            Some(parsed) => resolve_attribution(&parsed, manager)
+                .await
+                .map(|(revision, rule_id)| {
+                    (
+                        revision,
+                        rule_id,
+                        parsed.bytes_received,
+                        parsed.bytes_sent,
+                    )
+                }),
+            None => None,
+        };
+
+        if let Some((revision, _, _, _)) = attributed {
+            if active_revision.is_some_and(|active| active != revision) {
+                let previous_revision = active_revision.expect("active revision");
+                flush_strict_segment(
+                    cfg,
+                    counter,
+                    auth,
+                    node_id,
+                    current_identity,
+                    &mut state,
+                    &mut persisted_state,
+                    segment_start,
+                    line_start,
+                    previous_revision,
+                    &totals,
+                    write_state,
+                )
+                .await?;
+                segment_start = line_start;
+                totals.clear();
+                active_revision = None;
+            }
+        }
+
+        if let Some((revision, rule_id, upload, download)) = attributed {
+            active_revision.get_or_insert(revision);
+            add_segment_traffic(&mut totals, rule_id, upload, download)?;
+            processed = processed
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("nginx_sni processed count overflow"))?;
+        }
+        cursor = line_end;
     }
 
-    state.offset = new_offset;
-    state.set_file_identity(current_identity);
-    save_state(&cfg.state_path, &state)?;
+    if let Some(revision) = active_revision {
+        flush_strict_segment(
+            cfg,
+            counter,
+            auth,
+            node_id,
+            current_identity,
+            &mut state,
+            &mut persisted_state,
+            segment_start,
+            cursor,
+            revision,
+            &totals,
+            write_state,
+        )
+        .await?;
+    } else if cursor != state.offset {
+        // Complete malformed/unattributable lines carry no billable traffic, so
+        // advancing past them does not need a traffic batch.
+        state.offset = cursor;
+        state.set_file_identity(current_identity);
+    }
+
+    if state != persisted_state {
+        write_state(&cfg.state_path, &state)?;
+    }
     Ok(processed)
+}
+
+async fn ingest_legacy_locked<F>(
+    cfg: &NginxSniTrafficConfig,
+    manager: &Arc<Mutex<ForwarderManager>>,
+    counter: &TrafficCounter,
+    write_state: &mut F,
+) -> std::io::Result<usize>
+where
+    F: FnMut(&Path, &LogState) -> std::io::Result<()>,
+{
+    let mut state = load_state_optional(&cfg.state_path)?.unwrap_or_default();
+    let file = match std::fs::File::open(&cfg.access_log_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    let len = metadata.len();
+    let current_identity = file_identity(&metadata);
+    prepare_state_for_file(&mut state, current_identity, len)?;
+
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(state.offset))?;
+    let mut cursor = state.offset;
+    let mut additions = Vec::<(u64, i64, u64, u64)>::new();
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        if !line.ends_with('\n') {
+            break;
+        }
+        let line_end = cursor
+            .checked_add(bytes as u64)
+            .ok_or_else(|| std::io::Error::other("nginx_sni cursor overflow"))?;
+        if let Some(parsed) = parse_log_line(&line) {
+            if let Some((revision, rule_id)) = resolve_attribution(&parsed, manager).await {
+                additions.push((
+                    revision,
+                    rule_id,
+                    parsed.bytes_received,
+                    parsed.bytes_sent,
+                ));
+            }
+        }
+        cursor = line_end;
+    }
+
+    // Legacy group-token mode lacks the strict idempotent Panel contract. This
+    // path keeps legacy semantics but still fails closed on malformed state and
+    // refuses to consume an incomplete trailing record.
+    for (revision, rule_id, upload, download) in &additions {
+        counter
+            .add_at(*revision, *rule_id, *upload, *download)
+            .await;
+    }
+    state.offset = cursor;
+    state.set_file_identity(current_identity);
+    write_state(&cfg.state_path, &state)?;
+    Ok(additions.len())
 }
 
 fn parse_log_line(line: &str) -> Option<ParsedLogLine> {
@@ -183,18 +546,76 @@ fn parse_log_line(line: &str) -> Option<ParsedLogLine> {
     })
 }
 
+fn load_state_optional(path: &Path) -> std::io::Result<Option<LogState>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 fn load_state(path: &Path) -> std::io::Result<LogState> {
-    let text = std::fs::read_to_string(path)?;
-    serde_json::from_str(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    load_state_optional(path)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "nginx_sni traffic state does not exist",
+        )
+    })
 }
 
 fn save_state(path: &Path, state: &LogState) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "nginx_sni traffic state path has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let bytes = serde_json::to_vec(state)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "nginx_sni traffic state filename is invalid",
+            )
+        })?;
+    let temp = parent.join(format!(".{filename}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&temp)?;
+    let pre_rename = (|| -> std::io::Result<()> {
+        file.write_all(&bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = pre_rename {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
     }
-    let text = serde_json::to_string(state)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, text)
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    std::fs::File::open(parent)?.sync_all()?;
+    let reopened = load_state(path)?;
+    if reopened != *state {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "nginx_sni traffic state verification mismatch",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
