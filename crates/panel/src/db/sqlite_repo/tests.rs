@@ -11,7 +11,7 @@
 use super::SqliteRepository;
 use crate::db::error::DbError;
 use crate::db::repo::*;
-use crate::db::schema::SCHEMA_SQL;
+use crate::db::schema::{run_migrations, SCHEMA_SQL};
 use relay_shared::protocol::TrafficEntry;
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -5505,6 +5505,69 @@ async fn traffic_history_upserts_within_the_hour() {
 
 /// Owner scoping + daily aggregation. Alice must never see Bob's buckets, and
 /// the daily view must sum a day's hours into one bucket.
+
+#[tokio::test]
+async fn traffic_history_primary_key_upgrade_preserves_same_hour_group_rows() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE traffic_history (\
+             rule_id INTEGER NOT NULL,\
+             uid INTEGER NOT NULL,\
+             group_id INTEGER NOT NULL DEFAULT 0,\
+             hour_ts TEXT NOT NULL,\
+             real_upload INTEGER NOT NULL DEFAULT 0,\
+             real_download INTEGER NOT NULL DEFAULT 0,\
+             billed_total INTEGER NOT NULL DEFAULT 0,\
+             PRIMARY KEY (rule_id, hour_ts)\
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO traffic_history \
+             (rule_id, uid, group_id, hour_ts, real_upload, billed_total) \
+         VALUES (100, 1, 10, '2026-09-25 02:00:00', 10, 10)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+    run_migrations(&pool).await.unwrap();
+
+    let pk_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('traffic_history') WHERE pk > 0 ORDER BY pk",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pk_columns, vec!["rule_id", "group_id", "hour_ts"]);
+
+    sqlx::query(
+        "INSERT INTO traffic_history \
+             (rule_id, uid, group_id, hour_ts, real_upload, billed_total) \
+         VALUES (100, 1, 20, '2026-09-25 02:00:00', 5, 5)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT group_id, real_upload, billed_total \
+         FROM traffic_history WHERE rule_id = 100 ORDER BY group_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, vec![(10, 10, 10), (20, 5, 5)]);
+
+    run_migrations(&pool).await.unwrap();
+}
 
 #[tokio::test]
 async fn traffic_history_preserves_same_hour_rows_across_group_move() {
