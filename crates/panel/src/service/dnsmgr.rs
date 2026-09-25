@@ -348,8 +348,7 @@ pub(crate) async fn discover_records(
         Ok(inventory) => inventory,
         Err(error) => return RecordDiscovery::UpstreamFailure(error),
     };
-    let filtered_result =
-        classify_records(zone, expected_type, expected_line, filtered.records);
+    let filtered_result = classify_records(zone, expected_type, expected_line, filtered.records);
     if !matches!(filtered_result, RecordDiscovery::NoRecord) {
         return if filtered.complete {
             filtered_result
@@ -403,12 +402,10 @@ async fn fetch_record_inventory(
             .await?;
         let count = page.rows.len();
         let page_end = u64::from(offset).saturating_add(count as u64);
-        let contradictory_empty =
-            page.authoritative_total && count == 0 && page_end < page.total;
+        let contradictory_empty = page.authoritative_total && count == 0 && page_end < page.total;
         records.extend(page.rows);
         let reached_total = page.authoritative_total && page_end >= page.total;
-        let inferred_complete =
-            !page.authoritative_total && count < DISCOVERY_PAGE_LIMIT as usize;
+        let inferred_complete = !page.authoritative_total && count < DISCOVERY_PAGE_LIMIT as usize;
         if contradictory_empty {
             break;
         }
@@ -3570,7 +3567,6 @@ mod tests {
         assert_eq!(result, RecordDiscovery::NoRecord);
     }
 
-
     #[tokio::test]
     async fn zone_resolution_reads_complete_authoritative_inventory() {
         let router = Router::new().route(
@@ -4035,7 +4031,6 @@ mod tests {
             Some("MUTATION_UNKNOWN")
         );
     }
-
 
     #[tokio::test]
     async fn carrier_preflight_recovery_rejects_multiple_claimed_and_bound_replacements() {
