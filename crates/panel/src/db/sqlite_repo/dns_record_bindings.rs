@@ -1,8 +1,8 @@
 use super::SqliteRepository;
 use crate::db::error::DbError;
 use crate::db::repo::{
-    DetachedDnsRecordBindingAdoption, DnsRecordBinding, DnsRecordBindingRepository,
-    NewDnsRecordBinding,
+    AmbiguousDnsRecordBindingRebind, DetachedDnsRecordBindingAdoption, DnsRecordBinding,
+    DnsRecordBindingRepository, NewDnsRecordBinding,
 };
 use async_trait::async_trait;
 
@@ -112,6 +112,37 @@ impl DnsRecordBindingRepository for SqliteRepository {
         .bind(observed_at)
         .bind(updated_at)
         .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    async fn rebind_ambiguous_dns_record_binding(
+        &self,
+        rebind: &AmbiguousDnsRecordBindingRebind,
+    ) -> Result<u64, DbError> {
+        Ok(sqlx::query(
+            "UPDATE dns_record_bindings SET record_id = ?, state = 'BOUND', \
+                 last_observed_at = ?, last_error_category = NULL, updated_at = ? \
+             WHERE id = ? AND rule_id = ? AND fqdn = ? AND zone_id = ? \
+               AND zone_name = ? AND host = ? AND record_type = ? AND line = ? \
+               AND line_key = ? AND record_id = ? AND desired_value = ? \
+               AND state = 'ERROR' AND last_error_category = 'MUTATION_UNKNOWN'",
+        )
+        .bind(&rebind.replacement_record_id)
+        .bind(&rebind.observed_at)
+        .bind(&rebind.updated_at)
+        .bind(rebind.binding_id)
+        .bind(rebind.rule_id)
+        .bind(&rebind.fqdn)
+        .bind(rebind.zone_id)
+        .bind(&rebind.zone_name)
+        .bind(&rebind.host)
+        .bind(&rebind.record_type)
+        .bind(&rebind.line)
+        .bind(&rebind.line_key)
+        .bind(&rebind.previous_record_id)
+        .bind(&rebind.desired_value)
         .execute(&self.pool)
         .await?
         .rows_affected())
