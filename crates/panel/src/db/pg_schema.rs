@@ -2216,11 +2216,9 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     // primary key cannot encounter duplicates and preserves every row verbatim.
     if current < 41 {
         let mut tx = pool.begin().await?;
-        sqlx::query(
-            "ALTER TABLE traffic_history DROP CONSTRAINT IF EXISTS traffic_history_pkey",
-        )
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("ALTER TABLE traffic_history DROP CONSTRAINT IF EXISTS traffic_history_pkey")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "ALTER TABLE traffic_history ADD CONSTRAINT traffic_history_pkey \
              PRIMARY KEY (rule_id, group_id, hour_ts)",

@@ -5775,7 +5775,6 @@ async fn pg_traffic_history_upserts_within_the_hour() {
     cleanup(&db).await;
 }
 
-
 #[tokio::test]
 async fn pg_traffic_history_preserves_same_hour_rows_across_group_move() {
     let Some(db) = repo("th_move").await else {
@@ -5823,7 +5822,11 @@ async fn pg_traffic_history_preserves_same_hour_rows_across_group_move() {
     .fetch_all(&db.pool)
     .await
     .unwrap();
-    assert_eq!(rows.len(), 2, "same-hour group move must keep two history rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "same-hour group move must keep two history rows"
+    );
     assert_eq!(rows[0].0, 73);
     assert_eq!(rows[0].2, 100);
     assert_eq!(rows[0].3, 100);
