@@ -664,8 +664,11 @@ fn save_state(path: &Path, state: &LogState) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reporter::ConnectionTracker;
+    use crate::reporter::{
+        test_drain_strict_spool, test_read_strict_spool, ConnectionTracker,
+    };
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt as _;
     use uuid::Uuid;
 
     struct TestPaths {
@@ -680,7 +683,8 @@ mod tests {
                 "reality-panel-nginx-sni-traffic-{}",
                 Uuid::new_v4()
             ));
-            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             Self {
                 log: dir.join("access.log"),
                 state: dir.join("state.json"),
@@ -693,6 +697,15 @@ mod tests {
                 enabled: true,
                 access_log_path: self.log.clone(),
                 state_path: self.state.clone(),
+            }
+        }
+
+        fn auth(&self) -> NodeRuntimeAuth {
+            NodeRuntimeAuth::PermanentCredential {
+                credential_id: "cred-nginx-test".into(),
+                secret: "rpn1_node_nginx_test_secret".into(),
+                secret_file: self.dir.join("node-credential.secret"),
+                state_node_id: "NODE_T1".into(),
             }
         }
     }
@@ -717,12 +730,34 @@ mod tests {
         format!("1723550000.123|443|OP1.Example.COM|12|9|{bytes_sent}|{bytes_received}|1.2\n")
     }
 
-    async fn assert_only_traffic(counter: &Arc<TrafficCounter>, upload: u64, download: u64) {
-        let entries = counter.drain().await;
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].rule_id, 12);
-        assert_eq!(entries[0].upload, upload);
-        assert_eq!(entries[0].download, download);
+    async fn ingest_test_once(
+        paths: &TestPaths,
+        manager: &Arc<Mutex<ForwarderManager>>,
+        counter: &Arc<TrafficCounter>,
+    ) -> std::io::Result<usize> {
+        ingest_once_inner(
+            &paths.config(),
+            manager,
+            counter,
+            &paths.auth(),
+            "NODE_T1",
+        )
+        .await
+    }
+
+    fn drain_single_spool(
+        paths: &TestPaths,
+        upload: u64,
+        download: u64,
+    ) -> NginxTrafficCheckpoint {
+        let batches = test_drain_strict_spool(&paths.auth(), "NODE_T1").unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].2, Some(9));
+        assert_eq!(batches[0].3.len(), 1);
+        assert_eq!(batches[0].3[0].rule_id, 12);
+        assert_eq!(batches[0].3[0].upload, upload);
+        assert_eq!(batches[0].3[0].download, download);
+        batches[0].4.clone().expect("Nginx checkpoint")
     }
 
     fn identity_at(path: &Path) -> FileIdentity {
@@ -774,17 +809,15 @@ mod tests {
     #[tokio::test]
     async fn same_file_append_counts_only_new_lines_and_keeps_identity() {
         let paths = TestPaths::new();
-        let cfg = paths.config();
         let first = revision_line(10, 20);
         std::fs::write(&paths.log, &first).unwrap();
         let original_identity = identity_at(&paths.log);
         let (manager, counter) = traffic_context();
 
-        assert_eq!(
-            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
-            1
-        );
-        assert_only_traffic(&counter, 20, 10).await;
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        let first_checkpoint = drain_single_spool(&paths, 20, 10);
+        assert_eq!(first_checkpoint.start_offset, 0);
+        assert_eq!(first_checkpoint.end_offset, first.len() as u64);
         let first_state = load_state(&paths.state).unwrap();
         assert_eq!(first_state.offset, first.len() as u64);
         assert_eq!(first_state.file_identity(), Some(original_identity));
@@ -797,33 +830,32 @@ mod tests {
         log.write_all(second.as_bytes()).unwrap();
         drop(log);
 
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        let second_checkpoint = drain_single_spool(&paths, 40, 30);
+        assert_eq!(second_checkpoint.start_offset, first.len() as u64);
         assert_eq!(
-            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
-            1
+            second_checkpoint.end_offset,
+            (first.len() + second.len()) as u64
         );
-        assert_only_traffic(&counter, 40, 30).await;
         let second_state = load_state(&paths.state).unwrap();
         assert_eq!(second_state.offset, (first.len() + second.len()) as u64);
         assert_eq!(second_state.file_identity(), Some(original_identity));
+        assert!(counter.snapshot().await.entries.is_empty());
     }
 
     #[tokio::test]
-    async fn same_inode_truncation_resets_offset_and_counts_new_content() {
+    async fn same_inode_copytruncate_starts_new_generation_and_counts_new_content() {
         let paths = TestPaths::new();
-        let cfg = paths.config();
         let old_line = revision_line(10, 20);
         let old_contents = old_line.repeat(8);
         std::fs::write(&paths.log, &old_contents).unwrap();
         let original_identity = identity_at(&paths.log);
         let (manager, counter) = traffic_context();
 
-        assert_eq!(
-            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
-            8
-        );
-        let _ = counter.drain().await;
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 8);
+        let old_checkpoint = drain_single_spool(&paths, 20 * 8, 10 * 8);
+        assert_eq!(old_checkpoint.generation, 0);
         let old_state = load_state(&paths.state).unwrap();
-        assert_eq!(old_state.offset, old_contents.len() as u64);
 
         let new_line = revision_line(7, 11);
         let mut log = std::fs::OpenOptions::new()
@@ -836,13 +868,12 @@ mod tests {
 
         assert_eq!(identity_at(&paths.log), original_identity);
         assert!(std::fs::metadata(&paths.log).unwrap().len() < old_state.offset);
-
-        assert_eq!(
-            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
-            1
-        );
-        assert_only_traffic(&counter, 11, 7).await;
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        let new_checkpoint = drain_single_spool(&paths, 11, 7);
+        assert_eq!(new_checkpoint.generation, 1);
+        assert_eq!(new_checkpoint.start_offset, 0);
         let state = load_state(&paths.state).unwrap();
+        assert_eq!(state.generation, 1);
         assert_eq!(state.offset, new_line.len() as u64);
         assert_eq!(state.file_identity(), Some(original_identity));
     }
@@ -850,17 +881,13 @@ mod tests {
     #[tokio::test]
     async fn replacement_file_is_read_from_zero_even_when_new_length_exceeds_old_offset() {
         let paths = TestPaths::new();
-        let cfg = paths.config();
         let old_line = revision_line(10, 20);
         let old_contents = old_line.repeat(6);
         std::fs::write(&paths.log, &old_contents).unwrap();
         let (manager, counter) = traffic_context();
 
-        assert_eq!(
-            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
-            6
-        );
-        let _ = counter.drain().await;
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 6);
+        let _ = drain_single_spool(&paths, 20 * 6, 10 * 6);
         let old_state = load_state(&paths.state).unwrap();
         let old_identity = old_state.file_identity().unwrap();
         let old_offset = old_state.offset;
@@ -871,16 +898,19 @@ mod tests {
             replacement_contents.push_str(&replacement_line);
         }
         let replacement_lines = replacement_contents.lines().count() as u64;
-        assert!(replacement_contents.len() as u64 >= old_offset);
         let replacement_identity =
             replace_file_with_distinct_inode(&paths.log, &replacement_contents);
         assert_ne!(replacement_identity, old_identity);
+        assert!(replacement_contents.len() as u64 >= old_offset);
 
         assert_eq!(
-            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
+            ingest_test_once(&paths, &manager, &counter).await.unwrap(),
             replacement_lines as usize
         );
-        assert_only_traffic(&counter, 17 * replacement_lines, 13 * replacement_lines).await;
+        let checkpoint =
+            drain_single_spool(&paths, 17 * replacement_lines, 13 * replacement_lines);
+        assert_eq!(checkpoint.start_offset, 0);
+        assert_eq!(checkpoint.generation, old_state.generation + 1);
         let state = load_state(&paths.state).unwrap();
         assert_eq!(state.offset, replacement_contents.len() as u64);
         assert_eq!(state.file_identity(), Some(replacement_identity));
@@ -889,7 +919,6 @@ mod tests {
     #[tokio::test]
     async fn legacy_offset_only_state_is_trusted_once_then_identity_is_persisted() {
         let paths = TestPaths::new();
-        let cfg = paths.config();
         let already_accounted = revision_line(10, 20);
         let new_line = revision_line(30, 40);
         let contents = format!("{already_accounted}{new_line}");
@@ -904,33 +933,33 @@ mod tests {
         let legacy = load_state(&paths.state).unwrap();
         assert_eq!(legacy.offset, already_accounted.len() as u64);
         assert_eq!(legacy.file_identity(), None);
+        assert_eq!(legacy.generation, 0);
 
-        assert_eq!(
-            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
-            1
-        );
-        assert_only_traffic(&counter, 40, 30).await;
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        let checkpoint = drain_single_spool(&paths, 40, 30);
+        assert_eq!(checkpoint.start_offset, already_accounted.len() as u64);
+        assert_eq!(checkpoint.generation, 0);
 
         let upgraded = load_state(&paths.state).unwrap();
         assert_eq!(upgraded.offset, contents.len() as u64);
         assert_eq!(upgraded.file_identity(), Some(identity_at(&paths.log)));
+        assert_eq!(upgraded.generation, 0);
     }
 
     #[tokio::test]
     async fn persisted_state_resumes_after_restart_and_still_detects_replacement() {
         let paths = TestPaths::new();
-        let cfg = paths.config();
         let first = revision_line(10, 20);
         std::fs::write(&paths.log, &first).unwrap();
 
         let (first_manager, first_counter) = traffic_context();
         assert_eq!(
-            ingest_once_inner(&cfg, &first_manager, &first_counter)
+            ingest_test_once(&paths, &first_manager, &first_counter)
                 .await
                 .unwrap(),
             1
         );
-        assert_only_traffic(&first_counter, 20, 10).await;
+        let _ = drain_single_spool(&paths, 20, 10);
         drop(first_manager);
         drop(first_counter);
 
@@ -944,12 +973,12 @@ mod tests {
 
         let (second_manager, second_counter) = traffic_context();
         assert_eq!(
-            ingest_once_inner(&cfg, &second_manager, &second_counter)
+            ingest_test_once(&paths, &second_manager, &second_counter)
                 .await
                 .unwrap(),
             1
         );
-        assert_only_traffic(&second_counter, 40, 30).await;
+        let _ = drain_single_spool(&paths, 40, 30);
         let before_replacement = load_state(&paths.state).unwrap();
         drop(second_manager);
         drop(second_counter);
@@ -965,22 +994,229 @@ mod tests {
 
         let (third_manager, third_counter) = traffic_context();
         assert_eq!(
-            ingest_once_inner(&cfg, &third_manager, &third_counter)
+            ingest_test_once(&paths, &third_manager, &third_counter)
                 .await
                 .unwrap(),
             replacement_lines as usize
         );
-        assert_only_traffic(
-            &third_counter,
+        let _ = drain_single_spool(
+            &paths,
             60 * replacement_lines,
             50 * replacement_lines,
-        )
-        .await;
+        );
         let after_replacement = load_state(&paths.state).unwrap();
         assert_eq!(
             after_replacement.file_identity(),
             Some(replacement_identity)
         );
         assert_eq!(after_replacement.offset, replacement_contents.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn malformed_existing_state_fails_closed_without_replay() {
+        let paths = TestPaths::new();
+        std::fs::write(&paths.log, revision_line(10, 20)).unwrap();
+        std::fs::write(&paths.state, "{").unwrap();
+        let (manager, counter) = traffic_context();
+
+        let error = ingest_test_once(&paths, &manager, &counter)
+            .await
+            .expect_err("malformed existing state must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(test_read_strict_spool(&paths.auth(), "NODE_T1")
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read_to_string(&paths.state).unwrap(), "{");
+        assert!(counter.snapshot().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_state_is_supported_on_first_boot() {
+        let paths = TestPaths::new();
+        let line = revision_line(10, 20);
+        std::fs::write(&paths.log, &line).unwrap();
+        let (manager, counter) = traffic_context();
+        assert!(!paths.state.exists());
+
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        let checkpoint = drain_single_spool(&paths, 20, 10);
+        assert_eq!(checkpoint.start_offset, 0);
+        let state = load_state(&paths.state).unwrap();
+        assert_eq!(state.offset, line.len() as u64);
+        assert_eq!(state.file_identity(), Some(identity_at(&paths.log)));
+    }
+
+    #[tokio::test]
+    async fn incomplete_final_line_stays_before_cursor_until_newline_arrives() {
+        let paths = TestPaths::new();
+        let first = revision_line(10, 20);
+        let second = revision_line(30, 40);
+        let partial = second.trim_end_matches('\n');
+        std::fs::write(&paths.log, format!("{first}{partial}")).unwrap();
+        let (manager, counter) = traffic_context();
+
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        let _ = drain_single_spool(&paths, 20, 10);
+        assert_eq!(load_state(&paths.state).unwrap().offset, first.len() as u64);
+
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&paths.log)
+            .unwrap();
+        log.write_all(b"\n").unwrap();
+        drop(log);
+
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 1);
+        let checkpoint = drain_single_spool(&paths, 40, 30);
+        assert_eq!(checkpoint.start_offset, first.len() as u64);
+        assert_eq!(
+            load_state(&paths.state).unwrap().offset,
+            (first.len() + second.len()) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_read_error_leaves_source_retryable_and_retry_converges_once() {
+        let paths = TestPaths::new();
+        let first = revision_line(10, 20);
+        let second = revision_line(30, 40);
+        std::fs::write(&paths.log, format!("{first}{second}")).unwrap();
+        let (manager, counter) = traffic_context();
+        let auth = paths.auth();
+
+        let error = ingest_once_inner_with_failpoints(
+            &paths.config(),
+            &manager,
+            &counter,
+            &auth,
+            "NODE_T1",
+            Some(1),
+            save_state,
+        )
+        .await
+        .expect_err("injected read error");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(!paths.state.exists());
+        assert!(test_read_strict_spool(&auth, "NODE_T1").unwrap().is_empty());
+        assert!(counter.snapshot().await.entries.is_empty());
+
+        assert_eq!(ingest_test_once(&paths, &manager, &counter).await.unwrap(), 2);
+        let checkpoint = drain_single_spool(&paths, 60, 40);
+        assert_eq!(checkpoint.start_offset, 0);
+        assert_eq!(checkpoint.end_offset, (first.len() + second.len()) as u64);
+        assert_eq!(
+            load_state(&paths.state).unwrap().offset,
+            (first.len() + second.len()) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_write_failure_after_durable_spool_recovers_without_duplicate_enqueue() {
+        let paths = TestPaths::new();
+        let line = revision_line(10, 20);
+        std::fs::write(&paths.log, &line).unwrap();
+        let auth = paths.auth();
+        let (manager, counter) = traffic_context();
+
+        let error = ingest_once_inner_with_state_writer(
+            &paths.config(),
+            &manager,
+            &counter,
+            &auth,
+            "NODE_T1",
+            |_path, _state| Err(std::io::Error::other("injected cursor write failure")),
+        )
+        .await
+        .expect_err("cursor write failure");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(counter.strict_reporting_poisoned());
+        assert!(!paths.state.exists());
+
+        let before = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].2, Some(9));
+        assert_eq!(before[0].3[0].upload, 20);
+        assert_eq!(before[0].3[0].download, 10);
+        let before_id = before[0].0.clone();
+        let before_hash = before[0].1.clone();
+
+        // Fresh process: checkpoint recovery persists the cursor first, then the
+        // same source is already at EOF and cannot create a second queue item.
+        let (restart_manager, restart_counter) = traffic_context();
+        assert_eq!(
+            ingest_once_inner(
+                &paths.config(),
+                &restart_manager,
+                &restart_counter,
+                &auth,
+                "NODE_T1",
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let after = test_read_strict_spool(&auth, "NODE_T1").unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].0, before_id);
+        assert_eq!(after[0].1, before_hash);
+        assert_eq!(load_state(&paths.state).unwrap().offset, line.len() as u64);
+        assert!(restart_counter.snapshot().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_recovery_runs_even_when_ingestion_is_disabled() {
+        let paths = TestPaths::new();
+        let line = revision_line(10, 20);
+        std::fs::write(&paths.log, &line).unwrap();
+        let auth = paths.auth();
+        let (manager, counter) = traffic_context();
+
+        let _ = ingest_once_inner_with_state_writer(
+            &paths.config(),
+            &manager,
+            &counter,
+            &auth,
+            "NODE_T1",
+            |_path, _state| Err(std::io::Error::other("injected cursor write failure")),
+        )
+        .await;
+        assert!(!paths.state.exists());
+
+        let mut disabled = paths.config();
+        disabled.enabled = false;
+        let (restart_manager, restart_counter) = traffic_context();
+        assert_eq!(
+            ingest_once_inner(
+                &disabled,
+                &restart_manager,
+                &restart_counter,
+                &auth,
+                "NODE_T1",
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(load_state(&paths.state).unwrap().offset, line.len() as u64);
+        assert_eq!(
+            test_read_strict_spool(&auth, "NODE_T1").unwrap().len(),
+            1,
+            "recovery must not delete the durable batch"
+        );
+    }
+
+    #[test]
+    fn atomic_state_write_is_owner_only_and_round_trips() {
+        let paths = TestPaths::new();
+        let state = LogState {
+            offset: 42,
+            device: Some(1),
+            inode: Some(2),
+            generation: 3,
+        };
+        save_state(&paths.state, &state).unwrap();
+        let metadata = std::fs::metadata(&paths.state).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(load_state(&paths.state).unwrap(), state);
     }
 }
