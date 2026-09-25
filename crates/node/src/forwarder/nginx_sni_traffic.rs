@@ -250,16 +250,10 @@ mod tests {
     }
 
     fn revision_line(bytes_sent: u64, bytes_received: u64) -> String {
-        format!(
-            "1723550000.123|443|OP1.Example.COM|12|9|{bytes_sent}|{bytes_received}|1.2\n"
-        )
+        format!("1723550000.123|443|OP1.Example.COM|12|9|{bytes_sent}|{bytes_received}|1.2\n")
     }
 
-    async fn assert_only_traffic(
-        counter: &Arc<TrafficCounter>,
-        upload: u64,
-        download: u64,
-    ) {
+    async fn assert_only_traffic(counter: &Arc<TrafficCounter>, upload: u64, download: u64) {
         let entries = counter.drain().await;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].rule_id, 12);
@@ -322,7 +316,10 @@ mod tests {
         let original_identity = identity_at(&paths.log);
         let (manager, counter) = traffic_context();
 
-        assert_eq!(ingest_once_inner(&cfg, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
+            1
+        );
         assert_only_traffic(&counter, 20, 10).await;
         let first_state = load_state(&paths.state).unwrap();
         assert_eq!(first_state.offset, first.len() as u64);
@@ -336,7 +333,10 @@ mod tests {
         log.write_all(second.as_bytes()).unwrap();
         drop(log);
 
-        assert_eq!(ingest_once_inner(&cfg, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
+            1
+        );
         assert_only_traffic(&counter, 40, 30).await;
         let second_state = load_state(&paths.state).unwrap();
         assert_eq!(second_state.offset, (first.len() + second.len()) as u64);
@@ -353,7 +353,10 @@ mod tests {
         let original_identity = identity_at(&paths.log);
         let (manager, counter) = traffic_context();
 
-        assert_eq!(ingest_once_inner(&cfg, &manager, &counter).await.unwrap(), 8);
+        assert_eq!(
+            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
+            8
+        );
         let _ = counter.drain().await;
         let old_state = load_state(&paths.state).unwrap();
         assert_eq!(old_state.offset, old_contents.len() as u64);
@@ -370,7 +373,10 @@ mod tests {
         assert_eq!(identity_at(&paths.log), original_identity);
         assert!(std::fs::metadata(&paths.log).unwrap().len() < old_state.offset);
 
-        assert_eq!(ingest_once_inner(&cfg, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
+            1
+        );
         assert_only_traffic(&counter, 11, 7).await;
         let state = load_state(&paths.state).unwrap();
         assert_eq!(state.offset, new_line.len() as u64);
@@ -386,7 +392,10 @@ mod tests {
         std::fs::write(&paths.log, &old_contents).unwrap();
         let (manager, counter) = traffic_context();
 
-        assert_eq!(ingest_once_inner(&cfg, &manager, &counter).await.unwrap(), 6);
+        assert_eq!(
+            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
+            6
+        );
         let _ = counter.drain().await;
         let old_state = load_state(&paths.state).unwrap();
         let old_identity = old_state.file_identity().unwrap();
@@ -407,12 +416,7 @@ mod tests {
             ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
             replacement_lines as usize
         );
-        assert_only_traffic(
-            &counter,
-            17 * replacement_lines,
-            13 * replacement_lines,
-        )
-        .await;
+        assert_only_traffic(&counter, 17 * replacement_lines, 13 * replacement_lines).await;
         let state = load_state(&paths.state).unwrap();
         assert_eq!(state.offset, replacement_contents.len() as u64);
         assert_eq!(state.file_identity(), Some(replacement_identity));
@@ -437,7 +441,10 @@ mod tests {
         assert_eq!(legacy.offset, already_accounted.len() as u64);
         assert_eq!(legacy.file_identity(), None);
 
-        assert_eq!(ingest_once_inner(&cfg, &manager, &counter).await.unwrap(), 1);
+        assert_eq!(
+            ingest_once_inner(&cfg, &manager, &counter).await.unwrap(),
+            1
+        );
         assert_only_traffic(&counter, 40, 30).await;
 
         let upgraded = load_state(&paths.state).unwrap();
@@ -506,7 +513,10 @@ mod tests {
         )
         .await;
         let after_replacement = load_state(&paths.state).unwrap();
-        assert_eq!(after_replacement.file_identity(), Some(replacement_identity));
+        assert_eq!(
+            after_replacement.file_identity(),
+            Some(replacement_identity)
+        );
         assert_eq!(after_replacement.offset, replacement_contents.len() as u64);
     }
 }
