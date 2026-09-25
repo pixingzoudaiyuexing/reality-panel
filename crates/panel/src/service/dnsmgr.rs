@@ -2021,6 +2021,7 @@ fn ambiguous_binding_matches_replacement(
         && binding_still_owns_exact_value(Some(binding), record_type, record)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn recover_ambiguous_binding_replacement(
     db: &dyn Repository,
     client: &DnsMgrClient,
