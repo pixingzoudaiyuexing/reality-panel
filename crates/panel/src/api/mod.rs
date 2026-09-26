@@ -169,12 +169,21 @@ pub fn routes() -> Router<AppState> {
                 .layer(axum::extract::DefaultBodyLimit::max(4096)),
         )
         .route(
+            "/admin/node-reuse/bindings/preview",
+            axum::routing::post(admin::preview_candidate_binding)
+                .layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
             "/admin/node-reuse/bindings/{reusing_group_id}/{home_group_id}/{node_id}",
             axum::routing::get(admin::get_binding).delete(admin::delete_binding),
         )
         .route(
             "/admin/node-reuse/nodes/{home_group_id}/{node_id}/bindings",
             axum::routing::get(admin::list_bindings_for_node),
+        )
+        .route(
+            "/admin/node-reuse/nodes/{home_group_id}/{node_id}/runtime-status",
+            axum::routing::get(admin::runtime_status_for_node),
         )
         .route(
             "/admin/node-reuse/groups/{reusing_group_id}/nodes",

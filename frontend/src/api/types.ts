@@ -686,9 +686,67 @@ export interface ReconciliationStatus {
   desired_fingerprint?: string | null;
   applied_fingerprint?: string | null;
   observed_fingerprint?: string | null;
+  desired_config_revision?: number | null;
+  applied_config_revision?: number | null;
   last_success_at?: string | null;
   last_error?: string | null;
   recovery_source: ReconciliationRecoverySource;
+}
+
+export interface NodeReuseBindingStatus {
+  binding: {
+    reusing_group_id: number;
+    home_group_id: number;
+    node_id: string;
+    created_at: string;
+  };
+  current_active_credential: boolean;
+  home_group_inbound: boolean;
+  reusing_group_inbound: boolean;
+  preview_eligible: boolean;
+  blockers: string[];
+}
+
+export interface NodeReusePreview {
+  home_group_id: number;
+  node_id: string;
+  source_group_ids: number[];
+  sources: {
+    group_id: number;
+    is_home: boolean;
+    rule_ids: number[];
+    listener_count: number;
+    camouflage_site_count: number;
+  }[];
+  listeners: {
+    source_group_id: number;
+    rule_id: number;
+    port: number;
+    protocol: string;
+  }[];
+  conflicts: {
+    kind: string;
+    source_group_id: number;
+    rule_id: number | null;
+    other_source_group_id: number | null;
+    other_rule_id: number | null;
+    message: string;
+  }[];
+  known_runtime_prerequisites_satisfied: boolean;
+}
+
+export type NodeReuseSyncState =
+  | 'NOT_READY' | 'WAITING' | 'SYNCED' | 'OFFLINE'
+  | 'CONFLICT' | 'APPLY_FAILED' | 'DEGRADED';
+
+export interface NodeReuseRuntimeStatus {
+  ready: boolean;
+  bindings: NodeReuseBindingStatus[];
+  sync_state: NodeReuseSyncState;
+  expected_fingerprint: string | null;
+  expected_revision: number | null;
+  preview: NodeReusePreview | null;
+  blockers: string[];
 }
 
 export interface NodeStatus {

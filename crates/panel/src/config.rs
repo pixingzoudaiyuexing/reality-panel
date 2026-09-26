@@ -60,8 +60,8 @@ pub struct Config {
     /// blocks node status or forwarding.
     pub geoip_enabled: bool,
     pub geoip_cache_ttl: u64,
-    /// Opt-in functional Node Reuse runtime. Default false keeps existing
-    /// deployments Home-only until an operator explicitly enables it.
+    /// Built-in Node Reuse runtime. Explicit 0/false is an emergency opt-out;
+    /// legacy Group Token nodes remain Home-only regardless of this setting.
     pub node_reuse_runtime_enabled: bool,
 }
 
@@ -111,7 +111,7 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(604_800); // 7 days
         let node_reuse_runtime_enabled =
-            parse_feature_enabled(std::env::var("NODE_REUSE_RUNTIME_ENABLED").ok());
+            parse_node_reuse_runtime_enabled(std::env::var("NODE_REUSE_RUNTIME_ENABLED").ok());
 
         let cfg = Self {
             database_path,
@@ -177,8 +177,8 @@ fn configured_jwt_secret(raw: Option<String>) -> String {
     raw.unwrap_or_else(|| INSECURE_JWT_SECRET.into())
 }
 
-fn parse_feature_enabled(raw: Option<String>) -> bool {
-    raw.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+fn parse_node_reuse_runtime_enabled(raw: Option<String>) -> bool {
+    !raw.is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
 }
 
 /// v0.4.16: parse `GEOIP_ENABLED` into a boolean. Extracted as a pure function
@@ -204,7 +204,7 @@ fn parse_geoip_enabled(raw: Option<String>) -> bool {
 mod tests {
     use super::{
         certificate_check_interval_secs, configured_jwt_secret, parse_geoip_enabled,
-        INSECURE_JWT_SECRET,
+        parse_node_reuse_runtime_enabled, INSECURE_JWT_SECRET,
     };
 
     #[test]
@@ -247,5 +247,28 @@ mod tests {
         // A typo must NOT silently disable GeoIP (default-on intent).
         assert!(parse_geoip_enabled(Some("ttru".into())));
         assert!(parse_geoip_enabled(Some("".into())));
+    }
+
+    #[test]
+    fn node_reuse_is_default_on_with_explicit_emergency_opt_out() {
+        use crate::service::node_config::{runtime_delivery_mode, NodeReuseRuntimeDeliveryMode};
+
+        assert!(parse_node_reuse_runtime_enabled(None));
+        assert!(parse_node_reuse_runtime_enabled(Some("1".into())));
+        assert!(parse_node_reuse_runtime_enabled(Some("true".into())));
+        assert!(!parse_node_reuse_runtime_enabled(Some("0".into())));
+        assert!(!parse_node_reuse_runtime_enabled(Some("FALSE".into())));
+        assert_eq!(
+            runtime_delivery_mode(parse_node_reuse_runtime_enabled(None), true),
+            NodeReuseRuntimeDeliveryMode::EffectiveConfig
+        );
+        assert_eq!(
+            runtime_delivery_mode(parse_node_reuse_runtime_enabled(None), false),
+            NodeReuseRuntimeDeliveryMode::HomeOnly
+        );
+        assert_eq!(
+            runtime_delivery_mode(parse_node_reuse_runtime_enabled(Some("0".into())), true),
+            NodeReuseRuntimeDeliveryMode::HomeOnly
+        );
     }
 }

@@ -31,6 +31,7 @@ The repository currently contains support for:
 - node lifecycle/update;
 - Lite-node related behavior;
 - GitHub Release based publishing.
+- exact-concrete-node Node Reuse with admin preflight and guarded runtime delivery (unreleased completion branch; independent review pending).
 
 ## Non-goals / boundaries
 
@@ -46,7 +47,7 @@ The repository currently contains support for:
 
 - Config Protocol is currently 10.
 - Lifecycle Protocol is currently 1.
-- Stable release at the adoption baseline is `v1.1.24`.
+- Released baseline for this work is `v1.1.25`; the Node Reuse product completion is not released or deployed.
 - Production release artifacts are built and published from the tagged checkout.
 - Existing SQLite deployment remains supported; PostgreSQL support is also present.
 - Project-level decisions proposed by Codex require Primary acceptance before becoming canonical project knowledge.

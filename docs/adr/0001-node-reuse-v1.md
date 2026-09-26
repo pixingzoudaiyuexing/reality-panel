@@ -1,6 +1,6 @@
 # ADR 0001 — Node Reuse V1
 
-Status: **APPROVED / PHASED IMPLEMENTATION**
+Status: **APPROVED BOUNDARY / UNRELEASED PRODUCT COMPLETION PENDING REVIEW**
 
 ## Context
 
@@ -83,7 +83,7 @@ The existing relay-node persistent node ID remains the node identity mechanism.
 
 ## Technical consequences
 
-- Effective configuration generation will eventually need to merge active rules from the Home Group and all Groups that explicitly reuse the concrete node.
+- Effective configuration generation merges active rules from the Home Group and only Groups that explicitly reuse the authenticated concrete node. Legacy Group Token Nodes remain Home-only.
 - The merge must preserve the existing LKG and monotonic config-revision safety model.
 - Node-specific behavior must remain keyed to the concrete node identity.
 - Existing ForwardRule rows must not be copied merely to achieve reuse.
@@ -93,8 +93,4 @@ The existing relay-node persistent node ID remains the node identity mechanism.
 
 ## Implementation status
 
-Slice 1 is merged as an inert foundation: explicit concrete-node reuse bindings, dual-backend Repository access, and pure resolver helpers. It does not activate runtime reuse.
-
-S2-A1 adds another inert foundation: a strict Node-Reuse-only node-id type plus an algorithm-neutral concrete-node credential verifier registry. A credential row is not proof that a Node has been claimed, authenticated, or granted Reuse authority.
-
-Credential issuance/claim/verification, management APIs, wire-protocol changes, EffectiveConfig merge, traffic/billing, certificate scope, routing, LKG/revocation behavior, and production activation remain deferred to separately authorized and reviewed tasks.
+The released `v1.1.25` source includes concrete-node credential verification, exact-node management APIs, guarded EffectiveConfig merge, and Node-side LKG/failure isolation. The unreleased product-completion branch makes reuse available by default for verified concrete Nodes, adds read-only prospective Preflight and independently guarded Create, and exposes conservative, exact-snapshot synchronization status in the Node detail UI. A Binding save is not proof of Node application; offline removal cannot immediately stop remote traffic. Formal independent review and Primary acceptance remain pending. This status is not a claim of release or production activation.

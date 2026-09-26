@@ -1,9 +1,4 @@
-//! Node Reuse V1 exact-node management and S4-A read-only preview.
-//!
-//! A persisted Binding is admin authorization history only. Every preview
-//! revalidates the concrete Home identity's current ACTIVE Credential and every
-//! source Group. Nothing in this module is wired into the live Node config
-//! delivery paths; S4-A preview is intentionally read-only.
+//! Exact-node Node Reuse management and read-only config candidates.
 
 use crate::db::error::DbError;
 use crate::db::repo::{
@@ -12,7 +7,10 @@ use crate::db::repo::{
 };
 use crate::node_identity::{ReuseEligibleNodeId, ReuseEligibleNodeIdError};
 use crate::service::node_config::NodeConfigBuildError;
-use relay_shared::protocol::{NodeConfigResponse, NodeTransport, Protocol};
+use relay_shared::protocol::{
+    NodeConfigResponse, NodeTransport, Protocol, ReconciliationRecoverySource,
+    ReconciliationStatus, ReconciliationStatusState,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,6 +28,7 @@ pub enum NodeReuseServiceError {
     BindingChangedDuringRead,
     InvalidStoredSource { group_id: i64, reason: &'static str },
     PreviewSourceConfigInvalid { group_id: i64, reason: String },
+    CandidateConflicts(Vec<EffectiveConfigPreviewConflict>),
 }
 
 impl From<DbError> for NodeReuseServiceError {
@@ -66,6 +65,29 @@ pub struct NodeReuseBindingStatus {
     pub home_group_inbound: bool,
     pub reusing_group_inbound: bool,
     pub preview_eligible: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NodeReuseSyncState {
+    NotReady,
+    Waiting,
+    Synced,
+    Offline,
+    Conflict,
+    ApplyFailed,
+    Degraded,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NodeReuseRuntimeStatus {
+    pub ready: bool,
+    pub bindings: Vec<NodeReuseBindingStatus>,
+    pub sync_state: NodeReuseSyncState,
+    pub expected_fingerprint: Option<String>,
+    pub expected_revision: Option<u64>,
+    pub preview: Option<EffectiveConfigPreview>,
     pub blockers: Vec<String>,
 }
 
@@ -119,17 +141,11 @@ pub struct EffectiveConfigPreview {
     pub camouflage_sites: Vec<EffectiveConfigPreviewCamouflage>,
     pub conflicts: Vec<EffectiveConfigPreviewConflict>,
     pub known_runtime_prerequisites_satisfied: bool,
-    /// Always false in S4-A. The preview is not a runtime config source.
+    /// A preview never grants delivery authority, even when runtime is enabled.
     pub runtime_delivery_enabled: bool,
 }
 
-/// Read-only S4-B foundation: the exact config payload produced from the same
-/// source reads used to build EffectiveConfigPreview.
-///
-/// This is deliberately a candidate, not runtime authority. Callers must
-/// inspect preview.known_runtime_prerequisites_satisfied, and live HTTP/WS
-/// delivery remains Home-only while traffic replay and offline-LKG revocation
-/// contracts are unresolved.
+/// Read-only config candidate built with the same source reads as delivery.
 #[derive(Debug, Clone)]
 pub struct EffectiveConfigCandidate {
     pub preview: EffectiveConfigPreview,
@@ -193,6 +209,12 @@ pub async fn create_binding(
     let node_id =
         ReuseEligibleNodeId::parse(node_id).map_err(NodeReuseIdentityError::InvalidNodeId)?;
 
+    let preview =
+        preview_candidate_binding(db, reusing_group_id, home_group_id, node_id.as_str()).await?;
+    if !preview.known_runtime_prerequisites_satisfied {
+        return Err(NodeReuseServiceError::CandidateConflicts(preview.conflicts));
+    }
+
     match db
         .create_node_reuse_binding_if_active(reusing_group_id, home_group_id, &node_id)
         .await?
@@ -209,6 +231,19 @@ pub async fn create_binding(
             Err(NodeReuseServiceError::AdmissionRejected(reason))
         }
     }
+}
+
+pub async fn preview_candidate_binding(
+    db: &dyn Repository,
+    reusing_group_id: i64,
+    home_group_id: i64,
+    node_id: &str,
+) -> Result<EffectiveConfigPreview, NodeReuseServiceError> {
+    validate_binding_identity(reusing_group_id, home_group_id, node_id)?;
+    let (preview, _) =
+        collect_effective_config_for_node(db, home_group_id, node_id, Some(reusing_group_id))
+            .await?;
+    Ok(preview)
 }
 
 pub async fn delete_binding(
@@ -343,6 +378,177 @@ pub async fn list_bindings_for_reusing_group(
         };
         result.push(status_for_binding(db, binding).await?);
     }
+    Ok(result)
+}
+
+pub async fn runtime_status_for_node(
+    db: &dyn Repository,
+    certificate_state_dir: &std::path::Path,
+    runtime_enabled: bool,
+    home_group_id: i64,
+    node_id: &str,
+    status_raw: Option<&str>,
+    online: bool,
+) -> Result<NodeReuseRuntimeStatus, NodeReuseServiceError> {
+    ReuseEligibleNodeId::parse(node_id).map_err(NodeReuseIdentityError::InvalidNodeId)?;
+    let bindings = list_bindings_for_node(db, home_group_id, node_id).await?;
+    let mut result = NodeReuseRuntimeStatus {
+        ready: false,
+        bindings,
+        sync_state: NodeReuseSyncState::NotReady,
+        expected_fingerprint: None,
+        expected_revision: None,
+        preview: None,
+        blockers: Vec::new(),
+    };
+    if !runtime_enabled {
+        result.blockers.push("RUNTIME_DISABLED".into());
+        return Ok(result);
+    }
+    let node_id =
+        ReuseEligibleNodeId::parse(node_id).map_err(NodeReuseIdentityError::InvalidNodeId)?;
+    if db
+        .find_current_active_node_credential_for_identity(home_group_id, &node_id)
+        .await?
+        .is_none()
+    {
+        result.blockers.push("ACTIVE_CREDENTIAL_MISSING".into());
+        return Ok(result);
+    }
+    if online
+        && status_raw
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|value| {
+                value
+                    .get("verified_concrete_node")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            == Some(false)
+    {
+        result
+            .blockers
+            .push("NODE_NOT_VERIFIED_IN_LAST_REPORT".into());
+        return Ok(result);
+    }
+    result.ready = true;
+    let source_groups_before = effective_source_groups(db, home_group_id, node_id.as_str()).await?;
+    let candidate = match build_effective_config_candidate_for_node(
+        db,
+        home_group_id,
+        node_id.as_str(),
+    )
+    .await
+    {
+        Ok(candidate) => candidate,
+        Err(NodeReuseServiceError::Database(error)) => {
+            return Err(NodeReuseServiceError::Database(error))
+        }
+        Err(error) => {
+            tracing::warn!(
+                home_group_id,
+                node_id = node_id.as_str(),
+                "node reuse status candidate unavailable: {error:?}"
+            );
+            result.sync_state = NodeReuseSyncState::Conflict;
+            result.blockers.push("CURRENT_CONFIG_UNAVAILABLE".into());
+            return Ok(result);
+        }
+    };
+    if !candidate.preview.known_runtime_prerequisites_satisfied {
+        result.sync_state = NodeReuseSyncState::Conflict;
+        result.preview = Some(candidate.preview);
+        return Ok(result);
+    }
+    result.preview = Some(candidate.preview);
+    let snapshot =
+        match crate::service::node_config::build_guarded_node_config_snapshot_for_delivery(
+            db,
+            certificate_state_dir,
+            home_group_id,
+            Some(node_id.as_str()),
+            true,
+            crate::service::node_config::NodeReuseRuntimeDeliveryMode::EffectiveConfig,
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(NodeConfigBuildError::Database(error)) => {
+                return Err(NodeReuseServiceError::Database(error))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    home_group_id,
+                    node_id = node_id.as_str(),
+                    "node reuse status snapshot unavailable: {error}"
+                );
+                result.sync_state = NodeReuseSyncState::Conflict;
+                result.blockers.push("CURRENT_CONFIG_UNAVAILABLE".into());
+                return Ok(result);
+            }
+        };
+    let source_groups_after = effective_source_groups(db, home_group_id, node_id.as_str()).await?;
+    if source_groups_before != source_groups_after {
+        result.sync_state = NodeReuseSyncState::Waiting;
+        return Ok(result);
+    }
+    if db
+        .find_current_active_node_credential_for_identity(home_group_id, &node_id)
+        .await?
+        .is_none()
+    {
+        result.ready = false;
+        result.sync_state = NodeReuseSyncState::NotReady;
+        result.blockers.push("ACTIVE_CREDENTIAL_MISSING".into());
+        return Ok(result);
+    }
+    result.expected_fingerprint = Some(snapshot.config_fingerprint.clone());
+    result.expected_revision = Some(snapshot.config_revision);
+    if !online {
+        result.sync_state = NodeReuseSyncState::Offline;
+        return Ok(result);
+    }
+    let status = status_raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    let verified = status
+        .as_ref()
+        .and_then(|value| value.get("verified_concrete_node"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let reconciliation = status
+        .as_ref()
+        .and_then(|value| value.get("reconciliation"))
+        .and_then(|value| serde_json::from_value::<ReconciliationStatus>(value.clone()).ok());
+    if !verified {
+        result.sync_state = NodeReuseSyncState::Waiting;
+        return Ok(result);
+    }
+    let Some(reconciliation) = reconciliation else {
+        result.sync_state = NodeReuseSyncState::Waiting;
+        return Ok(result);
+    };
+    let matches_current = reconciliation.desired_fingerprint.as_deref()
+        == Some(snapshot.config_fingerprint.as_str())
+        && reconciliation.desired_config_revision == Some(snapshot.config_revision);
+    result.sync_state = if !matches_current {
+        NodeReuseSyncState::Waiting
+    } else {
+        match reconciliation.state {
+            ReconciliationStatusState::ApplyFailed => NodeReuseSyncState::ApplyFailed,
+            ReconciliationStatusState::DegradedLocalRecovery => NodeReuseSyncState::Degraded,
+            ReconciliationStatusState::Converged
+                if reconciliation.applied_fingerprint.as_deref()
+                    == Some(snapshot.config_fingerprint.as_str())
+                    && reconciliation.applied_config_revision == Some(snapshot.config_revision)
+                    && reconciliation
+                        .observed_fingerprint
+                        .as_ref()
+                        .is_some_and(|value| !value.is_empty())
+                    && reconciliation.recovery_source == ReconciliationRecoverySource::Panel =>
+            {
+                NodeReuseSyncState::Synced
+            }
+            _ => NodeReuseSyncState::Waiting,
+        }
+    };
     Ok(result)
 }
 
@@ -502,6 +708,7 @@ async fn collect_effective_config_for_node(
     db: &dyn Repository,
     home_group_id: i64,
     node_id: &str,
+    candidate_group_id: Option<i64>,
 ) -> Result<(EffectiveConfigPreview, NodeConfigResponse), NodeReuseServiceError> {
     let node_id =
         ReuseEligibleNodeId::parse(node_id).map_err(NodeReuseIdentityError::InvalidNodeId)?;
@@ -509,12 +716,22 @@ async fn collect_effective_config_for_node(
     let home = crate::db::repo::GroupRepository::find_by_id(db, home_group_id, &ResourceScope::All)
         .await?;
     let Some(home) = home else {
+        if candidate_group_id.is_some() {
+            return Err(NodeReuseServiceError::AdmissionRejected(
+                NodeReuseBindingCreateRejection::HomeGroupMissing,
+            ));
+        }
         return Err(NodeReuseServiceError::InvalidStoredSource {
             group_id: home_group_id,
             reason: "HOME_GROUP_MISSING",
         });
     };
     if home.group_type != "in" {
+        if candidate_group_id.is_some() {
+            return Err(NodeReuseServiceError::AdmissionRejected(
+                NodeReuseBindingCreateRejection::HomeGroupNotInbound,
+            ));
+        }
         return Err(NodeReuseServiceError::InvalidStoredSource {
             group_id: home_group_id,
             reason: "HOME_GROUP_NOT_INBOUND",
@@ -530,7 +747,14 @@ async fn collect_effective_config_for_node(
         ));
     }
 
-    let source_group_ids = effective_source_groups(db, home_group_id, node_id.as_str()).await?;
+    let existing_group_ids = effective_source_groups(db, home_group_id, node_id.as_str()).await?;
+    let mut source_group_ids = existing_group_ids.clone();
+    if let Some(candidate_group_id) = candidate_group_id {
+        if !source_group_ids.contains(&candidate_group_id) {
+            source_group_ids.push(candidate_group_id);
+            source_group_ids[1..].sort_unstable();
+        }
+    }
     let mut sources = Vec::with_capacity(source_group_ids.len());
     let mut listeners = Vec::new();
     let mut camouflage_sites = Vec::new();
@@ -542,18 +766,29 @@ async fn collect_effective_config_for_node(
             crate::db::repo::GroupRepository::find_by_id(db, source_group_id, &ResourceScope::All)
                 .await?;
         let Some(source) = source else {
+            if candidate_group_id == Some(source_group_id) {
+                return Err(NodeReuseServiceError::AdmissionRejected(
+                    NodeReuseBindingCreateRejection::ReusingGroupMissing,
+                ));
+            }
             return Err(NodeReuseServiceError::InvalidStoredSource {
                 group_id: source_group_id,
                 reason: "GROUP_MISSING",
             });
         };
         if source.group_type != "in" {
+            if candidate_group_id == Some(source_group_id) {
+                return Err(NodeReuseServiceError::AdmissionRejected(
+                    NodeReuseBindingCreateRejection::ReusingGroupNotInbound,
+                ));
+            }
             return Err(NodeReuseServiceError::InvalidStoredSource {
                 group_id: source_group_id,
                 reason: "GROUP_NOT_INBOUND",
             });
         }
-        if source_group_id != home_group_id
+        if existing_group_ids.contains(&source_group_id)
+            && source_group_id != home_group_id
             && db
                 .find_node_reuse_binding(source_group_id, home_group_id, node_id.as_str())
                 .await?
@@ -646,7 +881,7 @@ async fn collect_effective_config_for_node(
             NodeReuseBindingCreateRejection::ActiveCredentialMissing,
         ));
     }
-    for source_group_id in source_group_ids.iter().copied() {
+    for source_group_id in existing_group_ids.iter().copied() {
         if source_group_id != home_group_id
             && db
                 .find_node_reuse_binding(source_group_id, home_group_id, node_id.as_str())
@@ -655,6 +890,9 @@ async fn collect_effective_config_for_node(
         {
             return Err(NodeReuseServiceError::BindingChangedDuringRead);
         }
+    }
+    if effective_source_groups(db, home_group_id, node_id.as_str()).await? != existing_group_ids {
+        return Err(NodeReuseServiceError::BindingChangedDuringRead);
     }
 
     let preview = EffectiveConfigPreview {
@@ -691,19 +929,15 @@ pub async fn preview_effective_config_for_node(
         })
 }
 
-/// Build the exact-node EffectiveConfig candidate using the same source reads
-/// and conflict checks as the S4-A preview.
-///
-/// The returned config MUST NOT be sent to a live Node solely because this
-/// function succeeds. runtime_delivery_enabled remains false and the broader
-/// S4-B activation gate is intentionally blocked until traffic-report
-/// idempotency and offline-LKG revocation semantics are approved.
+/// Build the exact-node EffectiveConfig candidate. Live delivery must still
+/// check conflicts and authenticated concrete-node authority.
 pub async fn build_effective_config_candidate_for_node(
     db: &dyn Repository,
     home_group_id: i64,
     node_id: &str,
 ) -> Result<EffectiveConfigCandidate, NodeReuseServiceError> {
-    let (preview, config) = collect_effective_config_for_node(db, home_group_id, node_id).await?;
+    let (preview, config) =
+        collect_effective_config_for_node(db, home_group_id, node_id, None).await?;
     Ok(EffectiveConfigCandidate { preview, config })
 }
 

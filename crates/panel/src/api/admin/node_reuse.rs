@@ -63,6 +63,17 @@ fn error_response(error: NodeReuseServiceError) -> Response {
             409,
             "BINDING_CHANGED_DURING_READ".to_string(),
         ),
+        NodeReuseServiceError::CandidateConflicts(conflicts) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiResponse {
+                    code: 409,
+                    message: "CONFIG_CONFLICT".into(),
+                    data: Some(conflicts),
+                }),
+            )
+                .into_response();
+        }
         NodeReuseServiceError::InvalidStoredSource { group_id, reason } => (
             StatusCode::CONFLICT,
             409,
@@ -113,6 +124,59 @@ pub async fn create_binding(
             };
             success_response(status, result)
         }
+        Err(error) => error_response(error),
+    }
+}
+
+pub async fn preview_candidate_binding(
+    _admin: AdminOnly,
+    State(state): State<AppState>,
+    Json(request): Json<CreateNodeReuseBindingRequest>,
+) -> Response {
+    match node_reuse::preview_candidate_binding(
+        state.db.as_ref(),
+        request.reusing_group_id,
+        request.home_group_id,
+        &request.node_id,
+    )
+    .await
+    {
+        Ok(preview) => success_response(StatusCode::OK, preview),
+        Err(error) => error_response(error),
+    }
+}
+
+pub async fn runtime_status_for_node(
+    _admin: AdminOnly,
+    State(state): State<AppState>,
+    Path((home_group_id, node_id)): Path<(i64, String)>,
+) -> Response {
+    if let Err(error) = crate::node_identity::ReuseEligibleNodeId::parse(&node_id) {
+        return error_response(NodeReuseServiceError::Identity(
+            NodeReuseIdentityError::InvalidNodeId(error),
+        ));
+    }
+    let key = format!("node_status:{home_group_id}:{node_id}");
+    let raw = match state.db.get(&key).await {
+        Ok(raw) => raw,
+        Err(error) => return error_response(NodeReuseServiceError::Database(error)),
+    };
+    let online = raw
+        .as_deref()
+        .is_some_and(|value| crate::api::stats::status_is_online(value, chrono::Utc::now()));
+    let certificate_state_dir = std::path::PathBuf::from(state.config.certificate_state_dir());
+    match node_reuse::runtime_status_for_node(
+        state.db.as_ref(),
+        &certificate_state_dir,
+        state.config.node_reuse_runtime_enabled,
+        home_group_id,
+        &node_id,
+        raw.as_deref(),
+        online,
+    )
+    .await
+    {
+        Ok(status) => success_response(StatusCode::OK, status),
         Err(error) => error_response(error),
     }
 }
@@ -606,6 +670,312 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn candidate_preflight_is_read_only_and_create_rejects_conflict() {
+        let (state, pool) = test_state().await;
+        for (id, group_id) in [(100_i64, 10_i64), (200, 20)] {
+            sqlx::query(
+                "INSERT INTO forward_rules
+                 (id, name, uid, listen_port, device_group_in, target_addr, target_port)
+                 VALUES (?, ?, 101, 21000, ?, '127.0.0.1', 81)",
+            )
+            .bind(id)
+            .bind(format!("rule-{id}"))
+            .bind(group_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let (_connection_id, mut config_rx) = state
+            .node_connections
+            .register(10, Some("NODE_A".into()))
+            .await;
+        let admin = format!("Bearer {}", token(101, true));
+        let app = crate::api::routes().with_state(state.clone());
+        let candidate = r#"{"reusing_group_id":20,"home_group_id":10,"node_id":"NODE_A"}"#;
+        let safe = r#"{"reusing_group_id":30,"home_group_id":10,"node_id":"NODE_A"}"#;
+        let regular = format!("Bearer {}", token(102, false));
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/admin/node-reuse/bindings/preview")
+                        .header("Authorization", &regular)
+                        .header("content-type", "application/json")
+                        .body(Body::from(candidate))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/node-reuse/nodes/10/NODE_A/runtime-status")
+                        .header("Authorization", &regular)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(create_request(Some(&admin), safe.into()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_reuse_bindings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/node-reuse/bindings/preview")
+                    .header("Authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(candidate))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["data"]["source_group_ids"],
+            serde_json::json!([10, 20, 30])
+        );
+        assert_eq!(body["data"]["known_runtime_prerequisites_satisfied"], false);
+        assert!(!body["data"]["conflicts"].as_array().unwrap().is_empty());
+        assert!(state
+            .db
+            .get("node_config_revision:10:NODE_A")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM node_reuse_bindings")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            before
+        );
+        assert!(config_rx.try_recv().is_err());
+
+        let response = app
+            .clone()
+            .oneshot(create_request(Some(&admin), candidate.into()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["message"], "CONFIG_CONFLICT");
+        assert!(!body["data"].as_array().unwrap().is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM node_reuse_bindings")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            before
+        );
+        assert!(state
+            .db
+            .find_node_reuse_binding(30, 10, "NODE_A")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(config_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_status_requires_exact_fresh_verified_revision_even_for_empty_binding() {
+        let (state, pool) = test_state().await;
+        let admin = format!("Bearer {}", token(101, true));
+        let app = crate::api::routes().with_state(AppState {
+            config: Config {
+                node_reuse_runtime_enabled: true,
+                ..state.config.clone()
+            },
+            ..state.clone()
+        });
+        let uri = "/admin/node-reuse/nodes/10/NODE_A/runtime-status";
+        let read = |app: axum::Router| async {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("Authorization", &admin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice::<serde_json::Value>(
+                &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap()
+        };
+        let initial = read(app.clone()).await;
+        assert_eq!(initial["data"]["sync_state"], "OFFLINE");
+        let old_revision = initial["data"]["expected_revision"].as_u64().unwrap();
+        let old_fingerprint = initial["data"]["expected_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(
+            app.clone()
+                .oneshot(create_request(
+                    Some(&admin),
+                    r#"{"reusing_group_id":20,"home_group_id":10,"node_id":"NODE_A"}"#.into()
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        let after_create = read(app.clone()).await;
+        assert_eq!(
+            after_create["data"]["bindings"].as_array().unwrap().len(),
+            1
+        );
+        let revision = after_create["data"]["expected_revision"].as_u64().unwrap();
+        let fingerprint = after_create["data"]["expected_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            fingerprint, old_fingerprint,
+            "empty Binding leaves config bytes unchanged"
+        );
+        assert!(
+            revision > old_revision,
+            "source membership must advance revision"
+        );
+
+        let status = |verified: bool, reported_revision: u64, state_name: &str| {
+            serde_json::json!({
+                "last_seen": chrono::Utc::now().to_rfc3339(),
+                "verified_concrete_node": verified,
+                "reconciliation": {
+                    "state": state_name,
+                    "desired_fingerprint": fingerprint,
+                    "applied_fingerprint": fingerprint,
+                    "observed_fingerprint": "runtime-observed",
+                    "desired_config_revision": reported_revision,
+                    "applied_config_revision": reported_revision,
+                    "recovery_source": "PANEL"
+                }
+            })
+        };
+        state
+            .db
+            .set(
+                "node_status:10:NODE_A",
+                &status(true, old_revision, "CONVERGED").to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read(app.clone()).await["data"]["sync_state"], "WAITING");
+        state
+            .db
+            .set(
+                "node_status:10:NODE_A",
+                &status(false, revision, "CONVERGED").to_string(),
+            )
+            .await
+            .unwrap();
+        let legacy = read(app.clone()).await;
+        assert_eq!(legacy["data"]["sync_state"], "NOT_READY");
+        assert_eq!(legacy["data"]["ready"], false);
+        assert_eq!(
+            legacy["data"]["blockers"],
+            serde_json::json!(["NODE_NOT_VERIFIED_IN_LAST_REPORT"])
+        );
+        let mut wrong_applied = status(true, revision, "CONVERGED");
+        wrong_applied["reconciliation"]["applied_fingerprint"] = serde_json::json!("b".repeat(64));
+        state
+            .db
+            .set("node_status:10:NODE_A", &wrong_applied.to_string())
+            .await
+            .unwrap();
+        assert_eq!(read(app.clone()).await["data"]["sync_state"], "WAITING");
+        let mut local_recovery = status(true, revision, "CONVERGED");
+        local_recovery["reconciliation"]["recovery_source"] = serde_json::json!("LKG_PRIMARY");
+        state
+            .db
+            .set("node_status:10:NODE_A", &local_recovery.to_string())
+            .await
+            .unwrap();
+        assert_eq!(read(app.clone()).await["data"]["sync_state"], "WAITING");
+        state
+            .db
+            .set(
+                "node_status:10:NODE_A",
+                &status(true, revision, "APPLY_FAILED").to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read(app.clone()).await["data"]["sync_state"],
+            "APPLY_FAILED"
+        );
+        state
+            .db
+            .set(
+                "node_status:10:NODE_A",
+                &status(true, revision, "CONVERGED").to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read(app.clone()).await["data"]["sync_state"], "SYNCED");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/node-reuse/bindings/20/10/NODE_A")
+                    .header("Authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let after_delete = read(app).await;
+        assert!(after_delete["data"]["bindings"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(after_delete["data"]["sync_state"], "WAITING");
+        assert!(after_delete["data"]["expected_revision"].as_u64().unwrap() > revision);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM node_reuse_bindings")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

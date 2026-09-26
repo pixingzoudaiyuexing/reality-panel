@@ -4,6 +4,7 @@ import { DeleteOutlined } from '@ant-design/icons';
 import { formatPercent, formatBytes, formatBps, formatUptime } from '../../utils/format';
 import { useI18n } from '../../i18n/context';
 import { CountryFlag } from './CountryFlag';
+import { NodeReusePanel } from './NodeReusePanel';
 import type { NodeDisplayRow, ReconciliationState } from '../../api/types';
 import api from '../../api/client';
 
@@ -69,7 +70,7 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
   const v6 = row?.public_ipv6;
 
   return (
-    <Drawer title={row?.group_name || t('resourceDetails')} open={open} onClose={onClose} size={440}>
+    <Drawer title={row?.group_name || t('resourceDetails')} open={open} onClose={onClose} width="min(100vw, 560px)">
       {row && (
         <Descriptions column={1} size="small" bordered>
           <Descriptions.Item label={t('status')}>
@@ -172,6 +173,9 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
         </Descriptions>
 
       )}
+      {isAdmin && row?.node_id && /^[A-Za-z0-9_-]{1,128}$/.test(row.node_id) ? (
+        <NodeReusePanel homeGroupId={row.group_id} nodeId={row.node_id} open={open} />
+      ) : null}
       {isAdmin && row && row.online === false && (
         <div style={{ marginTop: 16 }}>
           <Popconfirm title={t('nodeStatusDeleteConfirm')} onConfirm={handleDelete}>

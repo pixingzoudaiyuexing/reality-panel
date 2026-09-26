@@ -671,6 +671,7 @@ pub async fn report_status(
             "active_listener_rule_ids": req.active_listener_rule_ids,
             "provisioning_capabilities": req.provisioning_capabilities,
             "reconciliation": req.reconciliation,
+            "verified_concrete_node": identity.verified().is_some(),
         });
         // Status persistence is best-effort: the original used .ok() to swallow
         // any DB error so a transient failure never broke the report cycle.
@@ -2289,6 +2290,33 @@ mod tests {
             vec![100],
             "Legacy Group Token remains Home-only even when runtime reuse is enabled"
         );
+        let concrete_revision_before_legacy = state
+            .db
+            .get("node_config_revision:10:node-a")
+            .await
+            .unwrap()
+            .expect("verified concrete revision");
+        let legacy_again = get_config(
+            State(state.clone()),
+            config_headers_for_node("tok-A", "node-a"),
+        )
+        .await;
+        assert_eq!(legacy_again.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .db
+                .get("node_config_revision:10:node-a")
+                .await
+                .unwrap(),
+            Some(concrete_revision_before_legacy),
+            "self-reported legacy node ID must not mutate concrete revision authority"
+        );
+        assert!(state
+            .db
+            .get("node_config_revision:legacy:10:node-a")
+            .await
+            .unwrap()
+            .is_some());
 
         let old_revision = snapshot.config_revision;
         let old_attribution_key = format!("node_config_rule_sources:10:node-a:{old_revision}");
@@ -2334,6 +2362,62 @@ mod tests {
             state.db.get(&old_attribution_key).await.unwrap().is_some(),
             "old applied revision attribution must remain available for delayed traffic"
         );
+
+        // A now-invalid reused source must fail closed for Node A without
+        // poisoning the sibling or the legacy Home-only delivery path.
+        sqlx::query(
+            "INSERT INTO node_reuse_bindings (reusing_group_id, home_group_id, node_id)
+             VALUES (20, 10, 'node-a')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE device_groups SET group_type = 'out' WHERE id = 20")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_config(
+                State(state.clone()),
+                credential_config_headers("cred-runtime-a", &secret_a, "node-a"),
+            )
+            .await
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(
+            crate::api::ws::build_config_snapshot_for_node(
+                state.db.as_ref(),
+                &certificate_state_dir,
+                10,
+                Some("node-a"),
+                true,
+                true,
+            )
+            .await
+            .is_none(),
+            "WS must skip unsafe effective config"
+        );
+        for headers in [
+            credential_config_headers("cred-runtime-f", &secret_f, "node-f"),
+            config_headers_for_node("tok-A", "node-a"),
+        ] {
+            let response = get_config(State(state.clone()), headers).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let snapshot: NodeConfigSnapshot = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                snapshot
+                    .config
+                    .listeners
+                    .iter()
+                    .map(|listener| listener.rule_id)
+                    .collect::<Vec<_>>(),
+                vec![100]
+            );
+        }
     }
 
     /// WebSocket upgrade with NO Authorization header → real HTTP 401 (the one

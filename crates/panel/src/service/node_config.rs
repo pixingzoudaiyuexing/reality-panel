@@ -39,6 +39,8 @@ struct PersistedConfigRevision {
     fingerprint: String,
     #[serde(default)]
     attribution_fingerprint: String,
+    #[serde(default)]
+    source_group_ids: Vec<i64>,
 }
 
 #[derive(Debug)]
@@ -49,12 +51,7 @@ pub enum NodeConfigBuildError {
     InvalidConfig(String),
 }
 
-/// Live delivery is deliberately Home-only in production while the S4-B
-/// traffic-replay and offline-LKG revocation contracts remain unresolved.
-///
-/// Tests may explicitly request GuardedCandidate so the exact same delivery
-/// snapshot/revision path can exercise an EffectiveConfig candidate without
-/// making that activation mode available in a production binary.
+/// Only authenticated concrete nodes may select EffectiveConfig delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeReuseRuntimeDeliveryMode {
     HomeOnly,
@@ -374,7 +371,7 @@ pub async fn build_node_config_snapshot_for_node(
     group_id: i64,
     node_id: Option<&str>,
 ) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
-    build_node_config_snapshot_for_node_inner(db, None, group_id, node_id).await
+    build_node_config_snapshot_for_node_inner(db, None, group_id, node_id, false).await
 }
 
 pub async fn build_node_config_snapshot_for_node_with_certificate_inventory(
@@ -383,15 +380,17 @@ pub async fn build_node_config_snapshot_for_node_with_certificate_inventory(
     group_id: i64,
     node_id: Option<&str>,
 ) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
-    build_node_config_snapshot_for_node_inner(db, Some(certificate_state_dir), group_id, node_id)
-        .await
+    build_node_config_snapshot_for_node_inner(
+        db,
+        Some(certificate_state_dir),
+        group_id,
+        node_id,
+        false,
+    )
+    .await
 }
 
-/// Canonical live-delivery entry used by both HTTP and WebSocket configuration
-/// paths. Production callers can only select HomeOnly. The test-only
-/// GuardedCandidate branch validates the future S4-B composition through the
-/// same certificate/revision/fingerprint machinery without enabling runtime
-/// cross-group delivery in shipped binaries.
+/// Canonical live-delivery entry used by both HTTP and WebSocket paths.
 pub async fn build_guarded_node_config_snapshot_for_delivery(
     db: &dyn Repository,
     certificate_state_dir: &Path,
@@ -407,6 +406,7 @@ pub async fn build_guarded_node_config_snapshot_for_delivery(
                 Some(certificate_state_dir),
                 group_id,
                 node_id,
+                !verified_concrete_node,
             )
             .await
         }
@@ -417,6 +417,7 @@ pub async fn build_guarded_node_config_snapshot_for_delivery(
                     Some(certificate_state_dir),
                     group_id,
                     node_id,
+                    true,
                 )
                 .await;
             }
@@ -457,6 +458,8 @@ pub async fn build_guarded_node_config_snapshot_for_delivery(
                 Some(node_id),
                 candidate.config,
                 rule_sources,
+                candidate.preview.source_group_ids,
+                false,
             )
             .await
         }
@@ -468,6 +471,7 @@ async fn build_node_config_snapshot_for_node_inner(
     certificate_state_dir: Option<&Path>,
     group_id: i64,
     node_id: Option<&str>,
+    legacy_revision_namespace: bool,
 ) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
     let lock = CONFIG_BUILD_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().await;
@@ -484,10 +488,13 @@ async fn build_node_config_snapshot_for_node_inner(
         node_id,
         config,
         rule_sources,
+        vec![group_id],
+        legacy_revision_namespace,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // Keep revision authority and source membership explicit at the commit boundary.
 async fn finish_snapshot_locked(
     db: &dyn Repository,
     certificate_state_dir: Option<&Path>,
@@ -495,6 +502,8 @@ async fn finish_snapshot_locked(
     node_id: Option<&str>,
     mut config: NodeConfigResponse,
     rule_sources: BTreeMap<i64, i64>,
+    source_group_ids: Vec<i64>,
+    legacy_revision_namespace: bool,
 ) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
     if let Some(state_dir) = certificate_state_dir {
         let mut requested = BTreeMap::<String, BTreeSet<String>>::new();
@@ -559,20 +568,35 @@ async fn finish_snapshot_locked(
         for (rule_id, source_group_id) in &rule_sources {
             hasher.update(rule_id.to_be_bytes());
             hasher.update(source_group_id.to_be_bytes());
-            let uid = rule_owner_uids
-                .get(rule_id)
-                .expect("owner attribution exists for every delivered rule");
+            let uid = rule_owner_uids.get(rule_id).ok_or_else(|| {
+                NodeConfigBuildError::InvalidConfig(format!(
+                    "owner attribution missing for delivered rule {rule_id}"
+                ))
+            })?;
             hasher.update(uid.to_be_bytes());
         }
         format!("{:x}", hasher.finalize())
     };
-    let key = match node_id.map(str::trim).filter(|id| !id.is_empty()) {
+    let concrete_key = match node_id.map(str::trim).filter(|id| !id.is_empty()) {
         Some(node_id) => format!("{REVISION_PREFIX}{group_id}:{node_id}"),
         None => format!("{REVISION_PREFIX}{group_id}"),
     };
-    let previous = db
-        .get(&key)
-        .await?
+    let key = if legacy_revision_namespace {
+        node_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| format!("{REVISION_PREFIX}legacy:{group_id}:{id}"))
+            .unwrap_or_else(|| concrete_key.clone())
+    } else {
+        concrete_key.clone()
+    };
+    let mut previous_raw = db.get(&key).await?;
+    if previous_raw.is_none() && key != concrete_key {
+        // An upgraded legacy Node must not reject its first isolated revision
+        // as stale. Seed only the revision number from the former shared key.
+        previous_raw = db.get(&concrete_key).await?;
+    }
+    let previous = previous_raw
         .map(|raw| serde_json::from_str::<PersistedConfigRevision>(&raw))
         .transpose()
         .map_err(|error| {
@@ -582,6 +606,7 @@ async fn finish_snapshot_locked(
         Some(previous)
             if previous.fingerprint == fingerprint
                 && previous.attribution_fingerprint == attribution_fingerprint
+                && previous.source_group_ids == source_group_ids
                 && previous.revision > 0 =>
         {
             previous.revision
@@ -593,20 +618,24 @@ async fn finish_snapshot_locked(
         revision,
         fingerprint: fingerprint.clone(),
         attribution_fingerprint,
+        source_group_ids,
     })
     .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
-    if let Some(node_id) = node_id.map(str::trim).filter(|id| !id.is_empty()) {
-        let attribution_key = format!("node_config_rule_sources:{group_id}:{node_id}:{revision}");
-        let attribution = serde_json::to_string(&rule_sources)
-            .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
-        let owner_key = format!("node_config_rule_owners:{group_id}:{node_id}:{revision}");
-        let owners = serde_json::to_string(&rule_owner_uids)
-            .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
-        // Persist immutable settlement attribution before exposing the matching
-        // revision. An unused row after a later failure is harmless; the reverse
-        // ordering could expose a revision without source-group/owner evidence.
-        db.set(&attribution_key, &attribution).await?;
-        db.set(&owner_key, &owners).await?;
+    if !legacy_revision_namespace {
+        if let Some(node_id) = node_id.map(str::trim).filter(|id| !id.is_empty()) {
+            let attribution_key =
+                format!("node_config_rule_sources:{group_id}:{node_id}:{revision}");
+            let attribution = serde_json::to_string(&rule_sources)
+                .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
+            let owner_key = format!("node_config_rule_owners:{group_id}:{node_id}:{revision}");
+            let owners = serde_json::to_string(&rule_owner_uids)
+                .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
+            // Persist immutable settlement attribution before exposing the matching
+            // revision. An unused row after a later failure is harmless; the reverse
+            // ordering could expose a revision without source-group/owner evidence.
+            db.set(&attribution_key, &attribution).await?;
+            db.set(&owner_key, &owners).await?;
+        }
     }
     db.set(&key, &state).await?;
     Ok(NodeConfigSnapshot {

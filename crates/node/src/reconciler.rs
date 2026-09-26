@@ -695,7 +695,10 @@ impl Reconciler {
         if self
             .pending
             .as_ref()
-            .map(|pending| pending.desired_fingerprint == *snapshot.fingerprint())
+            .map(|pending| {
+                pending.desired_fingerprint == *snapshot.fingerprint()
+                    && pending.finalization.config_revision == snapshot.config_revision()
+            })
             .unwrap_or(false)
         {
             let mut pending = self.pending.take().expect("pending apply checked above");
@@ -755,7 +758,8 @@ impl Reconciler {
             let effective_fingerprint = config_fingerprint(&effective);
             let panel_unchanged = snapshot.source() == AuthoritySource::ValidatedPanel
                 && self.last_panel_desired.as_ref() == Some(snapshot.fingerprint())
-                && self.last_applied.as_ref() == Some(&effective_fingerprint);
+                && self.last_applied.as_ref() == Some(&effective_fingerprint)
+                && self.last_applied_revision == Some(snapshot.config_revision());
             let local_recovery = snapshot.source() == AuthoritySource::LocalRecovery;
             let withheld_dependency_ready = panel_unchanged
                 && effective_fingerprint != *snapshot.fingerprint()
@@ -1458,6 +1462,197 @@ mod tests {
         assert_eq!(restarted_reconciler.applied_config_revision(), Some(9));
 
         restarted_manager.lock().await.apply_config(&empty()).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_reused_listener_apply_keeps_home_reuse_runtime_and_lkg() {
+        let dir = unique_runtime_dir("reuse-apply-failure");
+        let paths = runtime_paths(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let home_reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let reuse_reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let blocked_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let home_port = home_reserve.local_addr().unwrap().port();
+        let reuse_port = reuse_reserve.local_addr().unwrap().port();
+        let next_port = blocked_port.local_addr().unwrap().port();
+        drop(home_reserve);
+        drop(reuse_reserve);
+
+        let mut manager = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        manager.set_listen_addresses_for_test("127.0.0.1", "");
+        let manager = Arc::new(Mutex::new(manager));
+        let camouflage = Arc::new(Mutex::new(test_camouflage_manager(&dir)));
+        let mut reconciler = Reconciler::new();
+        let old = NodeConfigResponse {
+            listeners: vec![
+                raw_listener(7, home_port, Protocol::Tcp),
+                raw_listener(8, reuse_port, Protocol::Tcp),
+            ],
+            camouflage_sites: vec![],
+        };
+        let old_snapshot = NodeConfigSnapshot {
+            config_revision: 12,
+            config_fingerprint: config_fingerprint(&old).to_string(),
+            config: old,
+        };
+        assert_eq!(
+            reconciler
+                .reconcile_with_test_paths(
+                    &manager,
+                    &camouflage,
+                    ReconciliationInput::validated_panel_snapshot(old_snapshot).unwrap(),
+                    paths.clone(),
+                )
+                .await
+                .state,
+            ReconciliationState::Converged
+        );
+        let lkg_before = std::fs::read(&paths.primary).unwrap();
+
+        let proposed = NodeConfigResponse {
+            listeners: vec![
+                raw_listener(7, home_port, Protocol::Tcp),
+                raw_listener(9, next_port, Protocol::Tcp),
+            ],
+            camouflage_sites: vec![],
+        };
+        let proposed_snapshot = NodeConfigSnapshot {
+            config_revision: 13,
+            config_fingerprint: config_fingerprint(&proposed).to_string(),
+            config: proposed,
+        };
+        let failed = reconciler
+            .reconcile_with_test_paths(
+                &manager,
+                &camouflage,
+                ReconciliationInput::validated_panel_snapshot(proposed_snapshot).unwrap(),
+                paths.clone(),
+            )
+            .await;
+        assert_eq!(failed.state, ReconciliationState::ApplyFailed);
+        assert!(manager.lock().await.listener_info_for_rule_tcp(7).is_some());
+        assert!(manager.lock().await.listener_info_for_rule_tcp(8).is_some());
+        assert!(manager.lock().await.listener_info_for_rule_tcp(9).is_none());
+        assert_eq!(std::fs::read(&paths.primary).unwrap(), lkg_before);
+        assert_eq!(
+            poller::load_cache_state_at(&paths).unwrap().config_revision,
+            12
+        );
+        assert_eq!(reconciler.applied_config_revision(), Some(12));
+
+        drop(blocked_port);
+        manager.lock().await.apply_config(&empty()).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unchanged_config_with_new_reuse_revision_is_acknowledged_and_committed() {
+        let dir = unique_runtime_dir("reuse-membership-revision");
+        let paths = runtime_paths(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+        let mut manager = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        manager.set_listen_addresses_for_test("127.0.0.1", "");
+        let manager = Arc::new(Mutex::new(manager));
+        let camouflage = Arc::new(Mutex::new(test_camouflage_manager(&dir)));
+        let mut reconciler = Reconciler::new();
+        let config = raw_config(port);
+        let fingerprint = config_fingerprint(&config).to_string();
+
+        for revision in [1, 2] {
+            let result = reconciler
+                .reconcile_with_test_paths(
+                    &manager,
+                    &camouflage,
+                    ReconciliationInput::validated_panel_snapshot(NodeConfigSnapshot {
+                        config_revision: revision,
+                        config_fingerprint: fingerprint.clone(),
+                        config: config.clone(),
+                    })
+                    .unwrap(),
+                    paths.clone(),
+                )
+                .await;
+            assert_eq!(result.state, ReconciliationState::Converged);
+            assert_eq!(reconciler.applied_config_revision(), Some(revision));
+            assert_eq!(
+                poller::load_cache_state_at(&paths).unwrap().config_revision,
+                revision
+            );
+            assert!(manager.lock().await.listener_info_for_rule_tcp(7).is_some());
+        }
+        let reported = reconciler.status_snapshot();
+        assert_eq!(reported.desired_config_revision, Some(2));
+        assert_eq!(reported.applied_config_revision, Some(2));
+
+        manager.lock().await.apply_config(&empty()).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_old_revision_cannot_acknowledge_new_same_fingerprint_revision() {
+        let dir = unique_runtime_dir("reuse-pending-revision");
+        let paths = runtime_paths(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(&paths.tmp).unwrap();
+        let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reserve.local_addr().unwrap().port();
+        drop(reserve);
+        let mut manager = ForwarderManager::new(
+            Arc::new(crate::reporter::TrafficCounter::new()),
+            Arc::new(crate::reporter::ConnectionTracker::new()),
+        );
+        manager.set_listen_addresses_for_test("127.0.0.1", "");
+        let manager = Arc::new(Mutex::new(manager));
+        let camouflage = Arc::new(Mutex::new(test_camouflage_manager(&dir)));
+        let mut reconciler = Reconciler::new();
+        let config = raw_config(port);
+        let fingerprint = config_fingerprint(&config).to_string();
+        let snapshot = |revision| NodeConfigSnapshot {
+            config_revision: revision,
+            config_fingerprint: fingerprint.clone(),
+            config: config.clone(),
+        };
+        assert_eq!(
+            reconciler
+                .reconcile_with_test_paths(
+                    &manager,
+                    &camouflage,
+                    ReconciliationInput::validated_panel_snapshot(snapshot(5)).unwrap(),
+                    paths.clone(),
+                )
+                .await
+                .state,
+            ReconciliationState::ApplyFailed
+        );
+        assert!(!paths.primary.exists());
+        std::fs::remove_dir(&paths.tmp).unwrap();
+
+        let next = reconciler
+            .reconcile_with_test_paths(
+                &manager,
+                &camouflage,
+                ReconciliationInput::validated_panel_snapshot(snapshot(6)).unwrap(),
+                paths.clone(),
+            )
+            .await;
+        assert_eq!(next.state, ReconciliationState::Converged);
+        assert_eq!(reconciler.applied_config_revision(), Some(6));
+        assert_eq!(
+            poller::load_cache_state_at(&paths).unwrap().config_revision,
+            6
+        );
+
+        manager.lock().await.apply_config(&empty()).await;
         std::fs::remove_dir_all(dir).unwrap();
     }
 

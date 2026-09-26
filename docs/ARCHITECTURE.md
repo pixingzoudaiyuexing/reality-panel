@@ -1,6 +1,6 @@
 # Reality Panel — Current Architecture
 
-This document describes the current implementation verified at adoption baseline `a5a4e24f333f0b80bb37a1871e825ee7466a4a9e`.
+This document describes the current source design, including the unreleased Node Reuse product completion based on `v1.1.25`. Independent review is pending.
 
 ## Control plane and data plane
 
@@ -20,9 +20,13 @@ Lifecycle operations use a separate long-lived control protocol, currently `LIFE
 
 ## Node configuration and LKG
 
-The Panel builds node configuration from an inbound group and its active rules. The current builder is group-scoped and can additionally receive a concrete `node_id` for node-specific details such as camouflage public-IP resolution.
+The Panel builds node configuration from an inbound group and its active rules. For an authenticated, verified concrete Node, Node Reuse merges Home Group rules with only that Node's explicit reuse Bindings. Legacy Group Token Nodes remain Home-only even when they report an `X-Node-ID` matching a concrete Node. Node-specific details such as camouflage public-IP resolution retain the Home Group identity namespace.
 
-Config snapshots include a durable monotonic revision and semantic fingerprint. Revision state is keyed by group and, when a node ID is present, by concrete node. Nodes reject stale config delivery so transport arrival order cannot roll runtime/LKG state backward.
+Config snapshots include a durable monotonic revision and semantic fingerprint. Revision state is keyed by group and, when a node ID is present, by concrete node. Legacy self-reported node IDs use a separate revision namespace and cannot modify verified concrete-node revision authority. EffectiveConfig revisions also track source-group membership, so adding or removing a zero-rule Binding still advances the revision. Nodes reject stale config delivery so transport arrival order cannot roll runtime/LKG state backward.
+
+Node Reuse is enabled by default in the unreleased completion branch. `NODE_REUSE_RUNTIME_ENABLED=0` (or `false`) is an emergency opt-out, not a normal setup step or UI toggle. Prospective Preflight is read-only and uses the same source collector/conflict semantics as delivery; Binding creation independently repeats validation. A failed EffectiveConfig build returns unavailable for HTTP and skips unsafe WS snapshots rather than authorizing an empty config. Binding mutations rely on normal Node polling, not a global config broadcast.
+
+The admin runtime-status projection rebuilds the exact intended delivery snapshot and compares its fingerprint and revision with a fresh, verified Node reconciliation report. A generic `CONVERGED` report or stale revision alone cannot prove Node Reuse sync. Offline, conflict, apply failure, and local recovery remain separate states. The Node's guarded apply preserves working listeners and LKG when a new desired configuration fails.
 
 The LKG boundary is intentional:
 - missing or invalid auth does not become an authoritative empty config;

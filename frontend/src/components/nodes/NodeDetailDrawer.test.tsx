@@ -1,11 +1,13 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import type { NodeDisplayRow, ReconciliationState } from '../../api/types';
+
+const { mockGet } = vi.hoisted(() => ({ mockGet: vi.fn() }));
 
 // NodeDetailDrawer calls api.delete on the admin "delete status" action, so the
 // client must be mocked before importing the component.
 vi.mock('../../api/client', () => ({
-  default: { delete: vi.fn().mockResolvedValue({ code: 0 }) },
+  default: { get: mockGet, delete: vi.fn().mockResolvedValue({ code: 0 }) },
 }));
 
 import { NodeDetailDrawer } from './NodeDetailDrawer';
@@ -22,6 +24,16 @@ const baseRow: NodeDisplayRow = {
 };
 
 describe('NodeDetailDrawer desensitization', () => {
+  beforeEach(() => {
+    mockGet.mockReset();
+    mockGet.mockImplementation((url: string) => Promise.resolve({
+      code: 0,
+      data: url === '/groups' ? [] : {
+        ready: false, bindings: [], sync_state: 'NOT_READY',
+        expected_fingerprint: null, expected_revision: null, preview: null, blockers: [],
+      },
+    }));
+  });
   it('shows admin-only sensitive fields when isAdmin is true', () => {
     render(<NodeDetailDrawer row={baseRow} open onClose={vi.fn()} isAdmin={true} panelProtocol={2} />);
     // node_id value + admin-only labels are present
@@ -67,6 +79,7 @@ describe('NodeDetailDrawer desensitization', () => {
     expect(screen.queryByText('nodeStatusDelete')).not.toBeInTheDocument();
     expect(screen.queryByText('reconciliationState_APPLY_FAILED')).not.toBeInTheDocument();
     expect(screen.queryByText('runtime reconciliation failed')).not.toBeInTheDocument();
+    expect(mockGet).not.toHaveBeenCalled();
     // safe metrics are still rendered (sanity: the drawer did open)
     expect(screen.getByText('nodeVersion')).toBeInTheDocument();
   });

@@ -1,32 +1,31 @@
 # Reality Panel — Status
 
-Last verified: 2026-09-22
+Last verified in source: 2026-09-27
 
 ## Current phase
 
-Node Reuse V1 phased implementation. Slice 1 has merged as the inert binding/resolver foundation. S2-A1 is limited to strict Reuse-eligible node identity parsing plus an inert concrete-node credential verifier registry. No credential is issued or verified, and no Node Reuse runtime or public management surface is enabled.
+Node Reuse product completion is implemented and locally validated on an isolated, unreleased branch. The `v1.1.25` baseline already contains concrete-node credentials, exact-node Bindings and guarded runtime delivery. This branch adds default availability, prospective Preflight, independent Create validation, server-proven status, and Node-detail management. Formal independent review remains required before acceptance/integration.
 
 ## Git baseline
 
 - Repository: https://github.com/pixingzoudaiyuexing/reality-panel
 - Baseline branch: `main`
-- Verified baseline commit: `651f3d120e0f6df0f7e8915c13fdec2c2625dc6f`
-- Slice 1 merge: PR #16
-- S2-A1 branch: `feature/node-reuse-v1-s2-a1-identity-foundation`
-- Stable release: `v1.1.24`
+- Verified base commit: `28a5ea505ee0e7bf6beb81b34afa6cccbc7dffb0`
+- Implementation branch: `codex/node-reuse-product-completion`
+- Released baseline: `v1.1.25`; completion branch is not released
 - Config Protocol: `10`
 - Lifecycle Protocol: `1`
 
-S2-A1 is based on the exact merged Slice 1 `main` commit above in an isolated worktree. The original Slice 1 checkout and its unrelated untracked `.DS_Store` are not part of S2-A1.
+The branch is based on the exact released `main` commit above. The implementation commit and validation evidence are supplied in the accompanying Review Pack.
 
 ## Production state
 
-No production mutation is part of RP-NR-V1-S2-A1. Production runtime and production databases are not accessed or changed.
+No production mutation, server access, database migration, deployment or release is part of this completion task.
 
 ## Current review gate
 
-S2-A1 is High Risk because it introduces credential-related persistence identity and dual-backend migrations. It requires automated evidence, Reality Panel Primary review, and an independent Gemini Identity / Credential Schema / SQLite-PG parity review before merge.
+This task is High Risk because it changes default runtime activation and exact-node configuration delivery/status. Independent Gemini Code Review and Primary acceptance are required before integration.
 
 ## Next stage
 
-S2-A1 does not authorize credential issuance, claim, rotation, authentication, Verified Node runtime authority, Binding management APIs, EffectiveConfig merge, traffic/billing, certificate/ACME, routing, LKG changes, frontend work, release, or deployment. Each requires a later Primary-authorized task.
+Next: Primary verifies the exact-HEAD evidence and routes the Review Pack to Gemini. Do not merge, release, or deploy before the formal review gate is accepted.
