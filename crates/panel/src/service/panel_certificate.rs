@@ -581,10 +581,43 @@ pub(crate) async fn resolve_managed_certificate_scopes(
     state_dir: &Path,
     scopes: Vec<GroupCertificateScope>,
 ) -> Result<Vec<GroupCertificateScope>, String> {
+    resolve_managed_certificate_scopes_inner(state_dir, scopes, false).await
+}
+
+pub(crate) async fn resolve_managed_certificate_scopes_read_only(
+    state_dir: &Path,
+    scopes: Vec<GroupCertificateScope>,
+) -> Result<Vec<GroupCertificateScope>, String> {
+    resolve_managed_certificate_scopes_inner(state_dir, scopes, true).await
+}
+
+async fn resolve_managed_certificate_scopes_inner(
+    state_dir: &Path,
+    scopes: Vec<GroupCertificateScope>,
+    read_only: bool,
+) -> Result<Vec<GroupCertificateScope>, String> {
     let state_dir = state_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        migrate_legacy_certificates(&state_dir)?;
-        let inventory = managed_certificate_inventory(&state_dir)?;
+        let inventory = if read_only {
+            let mut by_domain = managed_certificate_inventory(&state_dir, true)?
+                .into_iter()
+                .map(|current| (current.domain.clone(), current))
+                .collect::<BTreeMap<_, _>>();
+            if !legacy_migration_completed(&state_dir)? {
+                for candidate in legacy_certificate_candidates(&state_dir)?.into_values() {
+                    if legacy_candidate_should_import(
+                        by_domain.get(&candidate.current.domain),
+                        &candidate.current,
+                    )? {
+                        by_domain.insert(candidate.current.domain.clone(), candidate.current);
+                    }
+                }
+            }
+            by_domain.into_values().collect()
+        } else {
+            migrate_legacy_certificates(&state_dir)?;
+            managed_certificate_inventory(&state_dir, false)?
+        };
         let mut resolved = BTreeMap::<String, BTreeSet<String>>::new();
         for scope in scopes {
             for sni in scope.snis {
@@ -603,6 +636,28 @@ pub(crate) async fn resolve_managed_certificate_scopes(
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn legacy_migration_completed(state_dir: &Path) -> Result<bool, String> {
+    let Some(storage) = CERTIFICATE_STORAGE_STATE.get() else {
+        return Ok(false);
+    };
+    Ok(storage
+        .lock()
+        .map_err(|_| "certificate storage lock is unavailable".to_string())?
+        .migrated_state_dirs
+        .contains(state_dir))
+}
+
+fn legacy_candidate_should_import(
+    current: Option<&CurrentCertificate>,
+    legacy: &CurrentCertificate,
+) -> Result<bool, String> {
+    match current {
+        Some(current) if current.fingerprint == legacy.fingerprint => Ok(false),
+        Some(current) => Ok(certificate_expiry(legacy)? > certificate_expiry(current)?),
+        None => Ok(true),
+    }
 }
 
 #[derive(Clone)]
@@ -630,12 +685,7 @@ fn migrate_legacy_certificates(state_dir: &Path) -> Result<(), String> {
     for candidate in candidates.into_values() {
         let root = scope_root(state_dir, &candidate.current.domain);
         let global_current = recover_current(&root, &candidate.current.domain)?;
-        let legacy_expiry = certificate_expiry(&candidate.current)?;
-        let import = match global_current.as_ref() {
-            Some(current) if current.fingerprint == candidate.current.fingerprint => false,
-            Some(current) => legacy_expiry > certificate_expiry(current)?,
-            None => true,
-        };
+        let import = legacy_candidate_should_import(global_current.as_ref(), &candidate.current)?;
         if import
             && publish_candidate_at_root(
                 &root,
@@ -747,7 +797,10 @@ fn certificate_expiry(current: &CurrentCertificate) -> Result<DateTime<Utc>, Str
         .map_err(|_| "invalid current certificate expiry".to_string())
 }
 
-fn managed_certificate_inventory(state_dir: &Path) -> Result<Vec<CurrentCertificate>, String> {
+fn managed_certificate_inventory(
+    state_dir: &Path,
+    read_only: bool,
+) -> Result<Vec<CurrentCertificate>, String> {
     let scopes_root = state_dir.join("scopes");
     let entries = match fs::read_dir(&scopes_root) {
         Ok(entries) => entries,
@@ -780,7 +833,12 @@ fn managed_certificate_inventory(state_dir: &Path) -> Result<Vec<CurrentCertific
         let Some(domain) = domain else {
             continue;
         };
-        if let Some(current) = recover_current(&root, &domain)? {
+        let current = if read_only {
+            recover_current_read_only(&root, &domain)?
+        } else {
+            recover_current(&root, &domain)?
+        };
+        if let Some(current) = current {
             inventory.push(current);
         }
     }
@@ -1062,6 +1120,21 @@ fn normalize_pem(value: &[u8]) -> Vec<u8> {
 }
 
 fn recover_current(root: &Path, domain: &str) -> Result<Option<CurrentCertificate>, String> {
+    recover_current_inner(root, domain, false)
+}
+
+fn recover_current_read_only(
+    root: &Path,
+    domain: &str,
+) -> Result<Option<CurrentCertificate>, String> {
+    recover_current_inner(root, domain, true)
+}
+
+fn recover_current_inner(
+    root: &Path,
+    domain: &str,
+    read_only: bool,
+) -> Result<Option<CurrentCertificate>, String> {
     match read_and_validate_current(root, &root.join("current.json"), domain) {
         Ok(current) => return Ok(Some(current)),
         Err(error) if error == "missing" => {}
@@ -1069,7 +1142,9 @@ fn recover_current(root: &Path, domain: &str) -> Result<Option<CurrentCertificat
     }
     match read_and_validate_current(root, &root.join("current.backup.json"), domain) {
         Ok(backup) => {
-            write_json_private(&root.join("current.json"), &backup)?;
+            if !read_only {
+                write_json_private(&root.join("current.json"), &backup)?;
+            }
             Ok(Some(backup))
         }
         Err(error) if error == "missing" => Ok(None),
@@ -1805,6 +1880,66 @@ chmod 600 "$RELAY_PANEL_CERTIFICATE_AUTHORIZATION_RECEIPT"
         assert_eq!(manifest.response.certificates[0].domain, "*.example.com");
         assert!(manifest.response.missing_domains.is_empty());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn status_scope_resolution_predicts_delivery_without_import_or_backup_repair() {
+        let legacy_dir = unique_dir("status-legacy-read-only");
+        let wildcard = candidate(&legacy_dir, "legacy", "*.example.com", 90);
+        let legacy_root = legacy_scope_root(&legacy_dir, 10, "*.example.com");
+        publish_candidate_at_root(
+            &legacy_root,
+            "*.example.com",
+            &wildcard.0,
+            &wildcard.1,
+            false,
+        )
+        .unwrap();
+        let requested = vec![scope("b.example.com", "b.example.com")];
+        let expected = vec![scope("*.example.com", "b.example.com")];
+        let global_current = scope_root(&legacy_dir, "*.example.com").join("current.json");
+        assert_eq!(
+            resolve_managed_certificate_scopes_read_only(&legacy_dir, requested.clone())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert!(
+            !global_current.exists(),
+            "status lookup must not import a legacy certificate"
+        );
+        assert_eq!(
+            resolve_managed_certificate_scopes(&legacy_dir, requested.clone())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert!(global_current.exists());
+        let _ = fs::remove_dir_all(legacy_dir);
+
+        let backup_dir = unique_dir("status-backup-read-only");
+        let wildcard = candidate(&backup_dir, "global", "*.example.com", 90);
+        publish_candidate(&backup_dir, "*.example.com", &wildcard.0, &wildcard.1).unwrap();
+        let root = scope_root(&backup_dir, "*.example.com");
+        fs::rename(root.join("current.json"), root.join("current.backup.json")).unwrap();
+        assert_eq!(
+            resolve_managed_certificate_scopes_read_only(&backup_dir, requested.clone())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert!(
+            !root.join("current.json").exists(),
+            "status lookup must not repair the primary pointer"
+        );
+        assert_eq!(
+            resolve_managed_certificate_scopes(&backup_dir, requested)
+                .await
+                .unwrap(),
+            expected
+        );
+        assert!(root.join("current.json").exists());
+        let _ = fs::remove_dir_all(backup_dir);
     }
 
     #[tokio::test]

@@ -460,32 +460,30 @@ pub async fn runtime_status_for_node(
         return Ok(result);
     }
     result.preview = Some(candidate.preview);
-    let snapshot =
-        match crate::service::node_config::build_guarded_node_config_snapshot_for_delivery(
-            db,
-            certificate_state_dir,
-            home_group_id,
-            Some(node_id.as_str()),
-            true,
-            crate::service::node_config::NodeReuseRuntimeDeliveryMode::EffectiveConfig,
-        )
-        .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(NodeConfigBuildError::Database(error)) => {
-                return Err(NodeReuseServiceError::Database(error))
-            }
-            Err(error) => {
-                tracing::warn!(
-                    home_group_id,
-                    node_id = node_id.as_str(),
-                    "node reuse status snapshot unavailable: {error}"
-                );
-                result.sync_state = NodeReuseSyncState::Conflict;
-                result.blockers.push("CURRENT_CONFIG_UNAVAILABLE".into());
-                return Ok(result);
-            }
-        };
+    let planned = match crate::service::node_config::plan_effective_config_snapshot_for_status(
+        db,
+        certificate_state_dir,
+        home_group_id,
+        node_id.as_str(),
+    )
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(NodeConfigBuildError::Database(error)) => {
+            return Err(NodeReuseServiceError::Database(error))
+        }
+        Err(error) => {
+            tracing::warn!(
+                home_group_id,
+                node_id = node_id.as_str(),
+                "node reuse status snapshot unavailable: {error}"
+            );
+            result.sync_state = NodeReuseSyncState::Conflict;
+            result.blockers.push("CURRENT_CONFIG_UNAVAILABLE".into());
+            return Ok(result);
+        }
+    };
+    let snapshot = planned.snapshot;
     let source_groups_after = effective_source_groups(db, home_group_id, node_id.as_str()).await?;
     if source_groups_before != source_groups_after {
         result.sync_state = NodeReuseSyncState::Waiting;
@@ -505,6 +503,10 @@ pub async fn runtime_status_for_node(
     result.expected_revision = Some(snapshot.config_revision);
     if !online {
         result.sync_state = NodeReuseSyncState::Offline;
+        return Ok(result);
+    }
+    if !planned.authority_committed {
+        result.sync_state = NodeReuseSyncState::Waiting;
         return Ok(result);
     }
     let status = status_raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());

@@ -3228,6 +3228,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_to_verified_revision_transition_passes_node_stale_guard() {
+        let home = empty();
+        let legacy = TrustedSnapshot::validated_panel_snapshot(NodeConfigSnapshot {
+            config_revision: 20,
+            config_fingerprint: config_fingerprint(&home).to_string(),
+            config: home.clone(),
+        })
+        .unwrap();
+        let same = TrustedSnapshot::validated_panel_snapshot(NodeConfigSnapshot {
+            config_revision: 20,
+            config_fingerprint: config_fingerprint(&home).to_string(),
+            config: home,
+        })
+        .unwrap();
+        let reused = raw_config(32001);
+        let changed = TrustedSnapshot::validated_panel_snapshot(NodeConfigSnapshot {
+            config_revision: 21,
+            config_fingerprint: config_fingerprint(&reused).to_string(),
+            config: reused,
+        })
+        .unwrap();
+        assert_eq!(
+            panel_snapshot_order(Some(&legacy), 20, &same),
+            PanelSnapshotOrder::Accept
+        );
+        assert_eq!(
+            panel_snapshot_order(Some(&legacy), 20, &changed),
+            PanelSnapshotOrder::Accept
+        );
+    }
+
     #[tokio::test]
     async fn duplicate_and_out_of_order_panel_snapshots_keep_latest_revision_active() {
         let dir = unique_runtime_dir("fault-config-order");

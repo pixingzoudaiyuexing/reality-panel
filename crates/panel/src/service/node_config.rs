@@ -43,6 +43,35 @@ struct PersistedConfigRevision {
     source_group_ids: Vec<i64>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotPurpose {
+    Delivery,
+    StatusRead,
+}
+
+struct SnapshotPlan {
+    snapshot: NodeConfigSnapshot,
+    revision_key: String,
+    revision_state: String,
+    attribution: Option<(String, String, String, String)>,
+    authority_committed: bool,
+}
+
+pub struct PlannedNodeConfigSnapshot {
+    pub snapshot: NodeConfigSnapshot,
+    pub authority_committed: bool,
+}
+
+struct SnapshotBuild<'a> {
+    certificate_state_dir: Option<&'a Path>,
+    group_id: i64,
+    node_id: Option<&'a str>,
+    config: NodeConfigResponse,
+    rule_sources: BTreeMap<i64, i64>,
+    source_group_ids: Vec<i64>,
+    legacy_revision_namespace: bool,
+}
+
 #[derive(Debug)]
 pub enum NodeConfigBuildError {
     Database(DbError),
@@ -371,7 +400,15 @@ pub async fn build_node_config_snapshot_for_node(
     group_id: i64,
     node_id: Option<&str>,
 ) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
-    build_node_config_snapshot_for_node_inner(db, None, group_id, node_id, false).await
+    build_node_config_snapshot_for_node_inner(
+        db,
+        None,
+        group_id,
+        node_id,
+        false,
+        SnapshotPurpose::Delivery,
+    )
+    .await
 }
 
 pub async fn build_node_config_snapshot_for_node_with_certificate_inventory(
@@ -386,6 +423,7 @@ pub async fn build_node_config_snapshot_for_node_with_certificate_inventory(
         group_id,
         node_id,
         false,
+        SnapshotPurpose::Delivery,
     )
     .await
 }
@@ -399,17 +437,61 @@ pub async fn build_guarded_node_config_snapshot_for_delivery(
     verified_concrete_node: bool,
     mode: NodeReuseRuntimeDeliveryMode,
 ) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
+    build_guarded_node_config_snapshot(
+        db,
+        certificate_state_dir,
+        group_id,
+        node_id,
+        verified_concrete_node,
+        mode,
+        SnapshotPurpose::Delivery,
+    )
+    .await
+    .map(|planned| planned.snapshot)
+}
+
+pub async fn plan_effective_config_snapshot_for_status(
+    db: &dyn Repository,
+    certificate_state_dir: &Path,
+    group_id: i64,
+    node_id: &str,
+) -> Result<PlannedNodeConfigSnapshot, NodeConfigBuildError> {
+    build_guarded_node_config_snapshot(
+        db,
+        certificate_state_dir,
+        group_id,
+        Some(node_id),
+        true,
+        NodeReuseRuntimeDeliveryMode::EffectiveConfig,
+        SnapshotPurpose::StatusRead,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // Keep identity, delivery mode and authority purpose explicit.
+async fn build_guarded_node_config_snapshot(
+    db: &dyn Repository,
+    certificate_state_dir: &Path,
+    group_id: i64,
+    node_id: Option<&str>,
+    verified_concrete_node: bool,
+    mode: NodeReuseRuntimeDeliveryMode,
+    purpose: SnapshotPurpose,
+) -> Result<PlannedNodeConfigSnapshot, NodeConfigBuildError> {
     match mode {
-        NodeReuseRuntimeDeliveryMode::HomeOnly => {
-            build_node_config_snapshot_for_node_inner(
-                db,
-                Some(certificate_state_dir),
-                group_id,
-                node_id,
-                !verified_concrete_node,
-            )
-            .await
-        }
+        NodeReuseRuntimeDeliveryMode::HomeOnly => build_node_config_snapshot_for_node_inner(
+            db,
+            Some(certificate_state_dir),
+            group_id,
+            node_id,
+            !verified_concrete_node,
+            purpose,
+        )
+        .await
+        .map(|snapshot| PlannedNodeConfigSnapshot {
+            snapshot,
+            authority_committed: purpose == SnapshotPurpose::Delivery,
+        }),
         NodeReuseRuntimeDeliveryMode::EffectiveConfig => {
             if !verified_concrete_node {
                 return build_node_config_snapshot_for_node_inner(
@@ -418,8 +500,13 @@ pub async fn build_guarded_node_config_snapshot_for_delivery(
                     group_id,
                     node_id,
                     true,
+                    purpose,
                 )
-                .await;
+                .await
+                .map(|snapshot| PlannedNodeConfigSnapshot {
+                    snapshot,
+                    authority_committed: purpose == SnapshotPurpose::Delivery,
+                });
             }
             let node_id = node_id
                 .map(str::trim)
@@ -453,13 +540,16 @@ pub async fn build_guarded_node_config_snapshot_for_delivery(
                 .collect::<BTreeMap<_, _>>();
             finish_snapshot_locked(
                 db,
-                Some(certificate_state_dir),
-                group_id,
-                Some(node_id),
-                candidate.config,
-                rule_sources,
-                candidate.preview.source_group_ids,
-                false,
+                SnapshotBuild {
+                    certificate_state_dir: Some(certificate_state_dir),
+                    group_id,
+                    node_id: Some(node_id),
+                    config: candidate.config,
+                    rule_sources,
+                    source_group_ids: candidate.preview.source_group_ids,
+                    legacy_revision_namespace: false,
+                },
+                purpose,
             )
             .await
         }
@@ -472,6 +562,7 @@ async fn build_node_config_snapshot_for_node_inner(
     group_id: i64,
     node_id: Option<&str>,
     legacy_revision_namespace: bool,
+    purpose: SnapshotPurpose,
 ) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
     let lock = CONFIG_BUILD_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().await;
@@ -483,28 +574,50 @@ async fn build_node_config_snapshot_for_node_inner(
         .collect::<BTreeMap<_, _>>();
     finish_snapshot_locked(
         db,
+        SnapshotBuild {
+            certificate_state_dir,
+            group_id,
+            node_id,
+            config,
+            rule_sources,
+            source_group_ids: vec![group_id],
+            legacy_revision_namespace,
+        },
+        purpose,
+    )
+    .await
+    .map(|planned| planned.snapshot)
+}
+
+async fn finish_snapshot_locked(
+    db: &dyn Repository,
+    build: SnapshotBuild<'_>,
+    purpose: SnapshotPurpose,
+) -> Result<PlannedNodeConfigSnapshot, NodeConfigBuildError> {
+    let plan = plan_snapshot_locked(db, build, purpose).await?;
+    if purpose == SnapshotPurpose::Delivery {
+        commit_snapshot_plan(db, &plan).await?;
+    }
+    Ok(PlannedNodeConfigSnapshot {
+        snapshot: plan.snapshot,
+        authority_committed: purpose == SnapshotPurpose::Delivery || plan.authority_committed,
+    })
+}
+
+async fn plan_snapshot_locked(
+    db: &dyn Repository,
+    build: SnapshotBuild<'_>,
+    purpose: SnapshotPurpose,
+) -> Result<SnapshotPlan, NodeConfigBuildError> {
+    let SnapshotBuild {
         certificate_state_dir,
         group_id,
         node_id,
-        config,
+        mut config,
         rule_sources,
-        vec![group_id],
+        source_group_ids,
         legacy_revision_namespace,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)] // Keep revision authority and source membership explicit at the commit boundary.
-async fn finish_snapshot_locked(
-    db: &dyn Repository,
-    certificate_state_dir: Option<&Path>,
-    group_id: i64,
-    node_id: Option<&str>,
-    mut config: NodeConfigResponse,
-    rule_sources: BTreeMap<i64, i64>,
-    source_group_ids: Vec<i64>,
-    legacy_revision_namespace: bool,
-) -> Result<NodeConfigSnapshot, NodeConfigBuildError> {
+    } = build;
     if let Some(state_dir) = certificate_state_dir {
         let mut requested = BTreeMap::<String, BTreeSet<String>>::new();
         for site in &config.camouflage_sites {
@@ -520,10 +633,20 @@ async fn finish_snapshot_locked(
                 snis: snis.into_iter().collect(),
             })
             .collect();
-        let resolved = crate::service::panel_certificate::resolve_managed_certificate_scopes(
-            state_dir, scopes,
-        )
-        .await
+        let resolved = match purpose {
+            SnapshotPurpose::Delivery => {
+                crate::service::panel_certificate::resolve_managed_certificate_scopes(
+                    state_dir, scopes,
+                )
+                .await
+            }
+            SnapshotPurpose::StatusRead => {
+                crate::service::panel_certificate::resolve_managed_certificate_scopes_read_only(
+                    state_dir, scopes,
+                )
+                .await
+            }
+        }
         .map_err(NodeConfigBuildError::InvalidConfig)?;
         let domains_by_sni = resolved
             .into_iter()
@@ -590,30 +713,38 @@ async fn finish_snapshot_locked(
     } else {
         concrete_key.clone()
     };
-    let mut previous_raw = db.get(&key).await?;
-    if previous_raw.is_none() && key != concrete_key {
-        // An upgraded legacy Node must not reject its first isolated revision
-        // as stale. Seed only the revision number from the former shared key.
-        previous_raw = db.get(&concrete_key).await?;
-    }
-    let previous = previous_raw
-        .map(|raw| serde_json::from_str::<PersistedConfigRevision>(&raw))
-        .transpose()
-        .map_err(|error| {
-            NodeConfigBuildError::InvalidConfig(format!("invalid revision state: {error}"))
-        })?;
-    let revision = match previous {
-        Some(previous)
-            if previous.fingerprint == fingerprint
-                && previous.attribution_fingerprint == attribution_fingerprint
-                && previous.source_group_ids == source_group_ids
-                && previous.revision > 0 =>
-        {
-            previous.revision
-        }
-        Some(previous) if previous.revision > 0 => previous.revision.saturating_add(1),
-        Some(_) | None => 1,
+    let legacy_key = node_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("{REVISION_PREFIX}legacy:{group_id}:{id}"));
+    let counterpart_key = if key == concrete_key {
+        legacy_key.as_deref()
+    } else {
+        Some(concrete_key.as_str())
     };
+    let current = read_persisted_revision(db, &key).await?;
+    let counterpart = match counterpart_key {
+        Some(counterpart_key) if counterpart_key != key => {
+            read_persisted_revision(db, counterpart_key).await?
+        }
+        _ => None,
+    };
+    let revision = plan_config_revision(
+        current.as_ref(),
+        counterpart.as_ref(),
+        &fingerprint,
+        &attribution_fingerprint,
+        &source_group_ids,
+    )?;
+    let authority_committed = current.as_ref().is_some_and(|state| {
+        state.revision == revision
+            && matches_revision_identity(
+                state,
+                &fingerprint,
+                &attribution_fingerprint,
+                &source_group_ids,
+            )
+    });
     let state = serde_json::to_string(&PersistedConfigRevision {
         revision,
         fingerprint: fingerprint.clone(),
@@ -621,28 +752,110 @@ async fn finish_snapshot_locked(
         source_group_ids,
     })
     .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
-    if !legacy_revision_namespace {
+    let attribution = if !legacy_revision_namespace {
         if let Some(node_id) = node_id.map(str::trim).filter(|id| !id.is_empty()) {
-            let attribution_key =
-                format!("node_config_rule_sources:{group_id}:{node_id}:{revision}");
-            let attribution = serde_json::to_string(&rule_sources)
-                .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
-            let owner_key = format!("node_config_rule_owners:{group_id}:{node_id}:{revision}");
-            let owners = serde_json::to_string(&rule_owner_uids)
-                .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?;
-            // Persist immutable settlement attribution before exposing the matching
-            // revision. An unused row after a later failure is harmless; the reverse
-            // ordering could expose a revision without source-group/owner evidence.
-            db.set(&attribution_key, &attribution).await?;
-            db.set(&owner_key, &owners).await?;
+            Some((
+                format!("node_config_rule_sources:{group_id}:{node_id}:{revision}"),
+                serde_json::to_string(&rule_sources)
+                    .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?,
+                format!("node_config_rule_owners:{group_id}:{node_id}:{revision}"),
+                serde_json::to_string(&rule_owner_uids)
+                    .map_err(|error| NodeConfigBuildError::InvalidConfig(error.to_string()))?,
+            ))
+        } else {
+            None
         }
-    }
-    db.set(&key, &state).await?;
-    Ok(NodeConfigSnapshot {
-        config_revision: revision,
-        config_fingerprint: fingerprint,
-        config,
+    } else {
+        None
+    };
+    Ok(SnapshotPlan {
+        snapshot: NodeConfigSnapshot {
+            config_revision: revision,
+            config_fingerprint: fingerprint,
+            config,
+        },
+        revision_key: key,
+        revision_state: state,
+        attribution,
+        authority_committed,
     })
+}
+
+async fn read_persisted_revision(
+    db: &dyn Repository,
+    key: &str,
+) -> Result<Option<PersistedConfigRevision>, NodeConfigBuildError> {
+    db.get(key)
+        .await?
+        .map(|raw| serde_json::from_str::<PersistedConfigRevision>(&raw))
+        .transpose()
+        .map_err(|error| {
+            NodeConfigBuildError::InvalidConfig(format!("invalid revision state: {error}"))
+        })
+}
+
+fn plan_config_revision(
+    current: Option<&PersistedConfigRevision>,
+    counterpart: Option<&PersistedConfigRevision>,
+    fingerprint: &str,
+    attribution_fingerprint: &str,
+    source_group_ids: &[i64],
+) -> Result<u64, NodeConfigBuildError> {
+    let states = [current, counterpart]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if states.iter().any(|state| state.revision == 0) {
+        return Err(NodeConfigBuildError::InvalidConfig(
+            "invalid zero config revision state".into(),
+        ));
+    }
+    let highest = states.iter().map(|state| state.revision).max().unwrap_or(0);
+    if highest == 0 {
+        return Ok(1);
+    }
+    let same_at_highest = states
+        .iter()
+        .filter(|state| state.revision == highest)
+        .all(|state| {
+            matches_revision_identity(
+                state,
+                fingerprint,
+                attribution_fingerprint,
+                source_group_ids,
+            )
+        });
+    if same_at_highest {
+        Ok(highest)
+    } else {
+        highest
+            .checked_add(1)
+            .ok_or_else(|| NodeConfigBuildError::InvalidConfig("config revision exhausted".into()))
+    }
+}
+
+fn matches_revision_identity(
+    state: &PersistedConfigRevision,
+    fingerprint: &str,
+    attribution_fingerprint: &str,
+    source_group_ids: &[i64],
+) -> bool {
+    state.fingerprint == fingerprint
+        && state.attribution_fingerprint == attribution_fingerprint
+        && state.source_group_ids == source_group_ids
+}
+
+async fn commit_snapshot_plan(
+    db: &dyn Repository,
+    plan: &SnapshotPlan,
+) -> Result<(), NodeConfigBuildError> {
+    if let Some((source_key, sources, owner_key, owners)) = &plan.attribution {
+        // Attribution must be durable before exposing the matching revision.
+        db.set(source_key, sources).await?;
+        db.set(owner_key, owners).await?;
+    }
+    db.set(&plan.revision_key, &plan.revision_state).await?;
+    Ok(())
 }
 
 async fn expected_camouflage_public_ipv4(
@@ -852,6 +1065,45 @@ mod tests {
     /// the same way the real callers (get_config, build_config_snapshot) do.
     fn repo(pool: &SqlitePool) -> SqliteRepository {
         SqliteRepository::new(pool.clone())
+    }
+
+    #[test]
+    fn revision_planner_does_not_reuse_a_conflicting_highest_identity_or_overflow() {
+        let concrete = PersistedConfigRevision {
+            revision: 20,
+            fingerprint: "a".repeat(64),
+            attribution_fingerprint: "b".repeat(64),
+            source_group_ids: vec![10],
+        };
+        let legacy = PersistedConfigRevision {
+            revision: 20,
+            fingerprint: "c".repeat(64),
+            attribution_fingerprint: "b".repeat(64),
+            source_group_ids: vec![10],
+        };
+        assert_eq!(
+            plan_config_revision(
+                Some(&concrete),
+                Some(&legacy),
+                &concrete.fingerprint,
+                &concrete.attribution_fingerprint,
+                &[10]
+            )
+            .unwrap(),
+            21
+        );
+        let exhausted = PersistedConfigRevision {
+            revision: u64::MAX,
+            ..legacy
+        };
+        assert!(plan_config_revision(
+            Some(&concrete),
+            Some(&exhausted),
+            &concrete.fingerprint,
+            &concrete.attribution_fingerprint,
+            &[10]
+        )
+        .is_err());
     }
 
     async fn add_user(pool: &SqlitePool, id: i64) {

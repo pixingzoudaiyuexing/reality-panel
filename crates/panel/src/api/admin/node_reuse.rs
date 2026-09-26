@@ -374,6 +374,309 @@ mod tests {
         builder.body(Body::from(body)).unwrap()
     }
 
+    async fn config_authority_rows(state: &AppState) -> Vec<(String, String)> {
+        let mut rows = Vec::new();
+        for prefix in [
+            "node_config_revision:",
+            "node_config_rule_sources:",
+            "node_config_rule_owners:",
+        ] {
+            rows.extend(state.db.scan_prefix(prefix).await.unwrap());
+        }
+        rows.sort();
+        rows
+    }
+
+    async fn verified_snapshot(state: &AppState) -> relay_shared::protocol::NodeConfigSnapshot {
+        crate::service::node_config::build_guarded_node_config_snapshot_for_delivery(
+            state.db.as_ref(),
+            &std::path::PathBuf::from(state.config.certificate_state_dir()),
+            10,
+            Some("NODE_A"),
+            true,
+            crate::service::node_config::NodeReuseRuntimeDeliveryMode::EffectiveConfig,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn revision_authority_survives_legacy_verified_and_reverse_transitions() {
+        let (state, _) = test_state().await;
+        let initial = verified_snapshot(&state).await;
+        assert_eq!(initial.config_revision, 1);
+        let concrete_key = "node_config_revision:10:NODE_A";
+        let legacy_key = "node_config_revision:legacy:10:NODE_A";
+        let mut lower: serde_json::Value =
+            serde_json::from_str(&state.db.get(concrete_key).await.unwrap().unwrap()).unwrap();
+        lower["revision"] = serde_json::json!(15);
+        state
+            .db
+            .set(concrete_key, &lower.to_string())
+            .await
+            .unwrap();
+        let mut higher = lower.clone();
+        higher["revision"] = serde_json::json!(20);
+        state.db.set(legacy_key, &higher.to_string()).await.unwrap();
+
+        let before_plan = config_authority_rows(&state).await;
+        let predicted_same =
+            crate::service::node_config::plan_effective_config_snapshot_for_status(
+                state.db.as_ref(),
+                &std::path::PathBuf::from(state.config.certificate_state_dir()),
+                10,
+                "NODE_A",
+            )
+            .await
+            .unwrap();
+        assert_eq!(predicted_same.snapshot.config_revision, 20);
+        assert!(!predicted_same.authority_committed);
+        assert_eq!(config_authority_rows(&state).await, before_plan);
+        let same = verified_snapshot(&state).await;
+        assert_eq!(
+            same.config_revision, 20,
+            "same semantics may reuse the highest legacy revision"
+        );
+        assert_eq!(same.config_fingerprint, initial.config_fingerprint);
+
+        node_reuse::create_binding(state.db.as_ref(), 20, 10, "NODE_A")
+            .await
+            .unwrap();
+        let before_changed_plan = config_authority_rows(&state).await;
+        let predicted_changed =
+            crate::service::node_config::plan_effective_config_snapshot_for_status(
+                state.db.as_ref(),
+                &std::path::PathBuf::from(state.config.certificate_state_dir()),
+                10,
+                "NODE_A",
+            )
+            .await
+            .unwrap();
+        assert_eq!(predicted_changed.snapshot.config_revision, 21);
+        assert!(!predicted_changed.authority_committed);
+        assert_eq!(config_authority_rows(&state).await, before_changed_plan);
+        let changed = verified_snapshot(&state).await;
+        assert_eq!(changed.config_fingerprint, same.config_fingerprint);
+        assert_eq!(
+            changed.config_revision, 21,
+            "membership-only change must exceed legacy high water mark"
+        );
+
+        let legacy = crate::service::node_config::build_guarded_node_config_snapshot_for_delivery(
+            state.db.as_ref(),
+            &std::path::PathBuf::from(state.config.certificate_state_dir()),
+            10,
+            Some("NODE_A"),
+            false,
+            crate::service::node_config::NodeReuseRuntimeDeliveryMode::HomeOnly,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            legacy.config_revision, 22,
+            "reverse transition must also remain monotonic"
+        );
+        assert_eq!(verified_snapshot(&state).await.config_revision, 23);
+    }
+
+    #[tokio::test]
+    async fn revision_authority_handles_single_namespace_and_rejects_corrupt_counterpart() {
+        let (state, _) = test_state().await;
+        let concrete_key = "node_config_revision:10:NODE_A";
+        let legacy_key = "node_config_revision:legacy:10:NODE_A";
+        assert_eq!(verified_snapshot(&state).await.config_revision, 1);
+        let concrete_raw = state.db.get(concrete_key).await.unwrap().unwrap();
+        assert_eq!(verified_snapshot(&state).await.config_revision, 1);
+
+        let mut legacy_state: serde_json::Value = serde_json::from_str(&concrete_raw).unwrap();
+        legacy_state["revision"] = serde_json::json!(20);
+        state.db.delete(concrete_key).await.unwrap();
+        state
+            .db
+            .set(legacy_key, &legacy_state.to_string())
+            .await
+            .unwrap();
+        assert_eq!(verified_snapshot(&state).await.config_revision, 20);
+
+        state.db.set(legacy_key, "not-json").await.unwrap();
+        assert!(
+            crate::service::node_config::build_guarded_node_config_snapshot_for_delivery(
+                state.db.as_ref(),
+                &std::path::PathBuf::from(state.config.certificate_state_dir()),
+                10,
+                Some("NODE_A"),
+                true,
+                crate::service::node_config::NodeReuseRuntimeDeliveryMode::EffectiveConfig,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_status_reads_do_not_commit_authority_and_predict_next_delivery() {
+        let (state, pool) = test_state().await;
+        let admin = format!("Bearer {}", token(101, true));
+        let app = crate::api::routes().with_state(AppState {
+            config: Config {
+                node_reuse_runtime_enabled: true,
+                ..state.config.clone()
+            },
+            ..state.clone()
+        });
+        let read = |app: axum::Router| async {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/node-reuse/nodes/10/NODE_A/runtime-status")
+                        .header("Authorization", &admin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        };
+        let bindings_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_reuse_bindings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let status_before = state.db.get("node_status:10:NODE_A").await.unwrap();
+        let authority_before = config_authority_rows(&state).await;
+        let mut predicted = None;
+        for _ in 0..3 {
+            let response = read(app.clone()).await;
+            assert_eq!(response["data"]["sync_state"], "OFFLINE");
+            assert_eq!(config_authority_rows(&state).await, authority_before);
+            assert_eq!(
+                state.db.get("node_status:10:NODE_A").await.unwrap(),
+                status_before
+            );
+            predicted = Some(response);
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM node_reuse_bindings")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            bindings_before
+        );
+        let predicted = predicted.unwrap();
+        let delivered = verified_snapshot(&state).await;
+        assert_eq!(
+            predicted["data"]["expected_revision"],
+            delivered.config_revision
+        );
+        assert_eq!(
+            predicted["data"]["expected_fingerprint"],
+            delivered.config_fingerprint
+        );
+        let committed = config_authority_rows(&state).await;
+        assert_ne!(committed, authority_before);
+        let after_delivery = read(app.clone()).await;
+        assert_eq!(
+            after_delivery["data"]["expected_revision"],
+            delivered.config_revision
+        );
+        assert_eq!(config_authority_rows(&state).await, committed);
+
+        node_reuse::create_binding(state.db.as_ref(), 20, 10, "NODE_A")
+            .await
+            .unwrap();
+        let before_membership_read = config_authority_rows(&state).await;
+        let membership_plan = read(app.clone()).await;
+        assert_eq!(
+            membership_plan["data"]["expected_fingerprint"],
+            delivered.config_fingerprint
+        );
+        assert!(
+            membership_plan["data"]["expected_revision"]
+                .as_u64()
+                .unwrap()
+                > delivered.config_revision
+        );
+        assert_eq!(config_authority_rows(&state).await, before_membership_read);
+        let membership_delivery = verified_snapshot(&state).await;
+        assert_eq!(
+            membership_plan["data"]["expected_revision"],
+            membership_delivery.config_revision
+        );
+        assert_eq!(
+            membership_plan["data"]["expected_fingerprint"],
+            membership_delivery.config_fingerprint
+        );
+        let after_membership_delivery = config_authority_rows(&state).await;
+        assert_eq!(
+            read(app).await["data"]["expected_revision"],
+            membership_delivery.config_revision
+        );
+        assert_eq!(
+            config_authority_rows(&state).await,
+            after_membership_delivery
+        );
+    }
+
+    #[tokio::test]
+    async fn uncommitted_status_prediction_cannot_claim_node_synchronized() {
+        let (state, _) = test_state().await;
+        let admin = format!("Bearer {}", token(101, true));
+        let app = crate::api::routes().with_state(AppState {
+            config: Config {
+                node_reuse_runtime_enabled: true,
+                ..state.config.clone()
+            },
+            ..state.clone()
+        });
+        let read = |app: axum::Router| async {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/admin/node-reuse/nodes/10/NODE_A/runtime-status")
+                        .header("Authorization", &admin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice::<serde_json::Value>(
+                &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap()
+        };
+        let predicted = read(app.clone()).await;
+        let revision = predicted["data"]["expected_revision"].as_u64().unwrap();
+        let fingerprint = predicted["data"]["expected_fingerprint"].as_str().unwrap();
+        state
+            .db
+            .set(
+                "node_status:10:NODE_A",
+                &serde_json::json!({
+                    "last_seen": chrono::Utc::now().to_rfc3339(),
+                    "verified_concrete_node": true,
+                    "reconciliation": {
+                        "state": "CONVERGED",
+                        "desired_fingerprint": fingerprint,
+                        "applied_fingerprint": fingerprint,
+                        "observed_fingerprint": "runtime-observed",
+                        "desired_config_revision": revision,
+                        "applied_config_revision": revision,
+                        "recovery_source": "PANEL"
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read(app.clone()).await["data"]["sync_state"], "WAITING");
+        let delivered = verified_snapshot(&state).await;
+        assert_eq!(delivered.config_revision, revision);
+        assert_eq!(delivered.config_fingerprint, fingerprint);
+        assert_eq!(read(app).await["data"]["sync_state"], "SYNCED");
+    }
+
     #[tokio::test]
     async fn admin_router_auth_and_exact_binding_lifecycle_contract() {
         let (state, pool) = test_state().await;
@@ -841,6 +1144,9 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+        let initial_delivery = verified_snapshot(&state).await;
+        assert_eq!(initial_delivery.config_revision, old_revision);
+        assert_eq!(initial_delivery.config_fingerprint, old_fingerprint);
 
         assert_eq!(
             app.clone()
@@ -871,6 +1177,9 @@ mod tests {
             revision > old_revision,
             "source membership must advance revision"
         );
+        let membership_delivery = verified_snapshot(&state).await;
+        assert_eq!(membership_delivery.config_revision, revision);
+        assert_eq!(membership_delivery.config_fingerprint, fingerprint);
 
         let status = |verified: bool, reported_revision: u64, state_name: &str| {
             serde_json::json!({
