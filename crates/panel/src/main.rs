@@ -75,6 +75,10 @@ async fn main() {
 
     let db = open_database(&config).await;
 
+    if let Err(error) = service::node_pool::reconcile_metadata(db.as_ref()).await {
+        tracing::warn!("node pool metadata reconciliation deferred: {error}");
+    }
+
     match service::site::migrate_legacy_default_name(db.as_ref()).await {
         Ok(true) => tracing::info!("migrated legacy default site name to RealityPanel"),
         Ok(false) => {}

@@ -10,9 +10,9 @@ use relay_shared::models::{DeviceGroup, SharedGroupSummary};
 impl GroupRepository for SqliteRepository {
     async fn list_groups(&self, scope: &ResourceScope) -> Result<Vec<DeviceGroup>, DbError> {
         let groups: Vec<DeviceGroup> = match scope.owner_id() {
-            None => sqlx::query_as("SELECT * FROM device_groups ORDER BY id"),
+            None => sqlx::query_as("SELECT * FROM device_groups WHERE id NOT IN (SELECT group_id FROM node_pool_system_anchor) ORDER BY id"),
             Some(uid) => {
-                sqlx::query_as("SELECT * FROM device_groups WHERE uid = ? ORDER BY id").bind(uid)
+                sqlx::query_as("SELECT * FROM device_groups WHERE uid = ? AND id NOT IN (SELECT group_id FROM node_pool_system_anchor) ORDER BY id").bind(uid)
             }
         }
         .fetch_all(&self.pool)
@@ -43,7 +43,7 @@ impl GroupRepository for SqliteRepository {
              FROM device_groups g \
              JOIN users u ON u.id = g.uid \
              WHERE g.uid != ? AND u.admin = 1 AND g.group_type = 'in' \
-             ORDER BY g.id",
+             AND g.id NOT IN (SELECT group_id FROM node_pool_system_anchor) ORDER BY g.id",
         )
         .bind(uid)
         .fetch_all(&self.pool)
@@ -270,7 +270,7 @@ impl GroupRepository for SqliteRepository {
 
     async fn list_all_inbound_group_ids(&self) -> Result<Vec<i64>, DbError> {
         let rows: Vec<(i64,)> =
-            sqlx::query_as("SELECT id FROM device_groups WHERE group_type = 'in' ORDER BY id")
+            sqlx::query_as("SELECT id FROM device_groups WHERE group_type = 'in' AND id NOT IN (SELECT group_id FROM node_pool_system_anchor) ORDER BY id")
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())

@@ -87,6 +87,9 @@ pub async fn create_group(
 /// didn't exist (the handler maps that to 404). The connection teardown
 /// (`close_group`) + broadcast stay in the handler.
 pub async fn rotate_group_token(db: &dyn Repository, id: i64) -> Result<Option<String>, DbError> {
+    if db.node_pool_system_group_id().await? == Some(id) {
+        return Ok(None);
+    }
     // v0.4.12 PR1: admin-only. Scope All — an admin operates on any group.
     let new_token = uuid::Uuid::new_v4().to_string();
     match db
@@ -112,6 +115,14 @@ pub async fn update_group(
     rate: Option<f64>,
     hidden: Option<bool>,
 ) -> Result<(), UpdateGroupError> {
+    if db
+        .node_pool_system_group_id()
+        .await
+        .map_err(UpdateGroupError::Database)?
+        == Some(id)
+    {
+        return Err(UpdateGroupError::NotFound);
+    }
     if name.is_none()
         && group_type.is_none()
         && connect_host.is_none()
@@ -187,6 +198,9 @@ pub async fn delete_group(
     db: &dyn Repository,
     id: i64,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if db.node_pool_system_group_id().await? == Some(id) {
+        return Ok(false);
+    }
     let count = db.count_rules_by_group(id).await?;
     if count > 0 {
         return Err(Box::new(GroupInUseError {

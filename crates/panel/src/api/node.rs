@@ -359,6 +359,20 @@ pub async fn report_traffic(
         Err(_) => return traffic_business_error(401, "Invalid token"),
     };
 
+    let system_anchor = match state.db.node_pool_system_group_id().await {
+        Ok(anchor) => anchor,
+        Err(_) => return traffic_business_error(500, "database error"),
+    };
+    if system_anchor == Some(identity.group_id())
+        && req
+            .batch
+            .as_ref()
+            .and_then(|batch| batch.config_revision)
+            .is_none()
+    {
+        return traffic_business_error(403, "Pool traffic requires exact config attribution");
+    }
+
     if let Some(batch) = req.batch.as_ref() {
         // Strict idempotency is intentionally available only to a cryptographically
         // authenticated concrete Node. A legacy Bearer token's X-Node-ID remains
@@ -378,7 +392,42 @@ pub async fn report_traffic(
             return traffic_business_error(409, "traffic batch identity or payload conflict");
         }
 
-        let (rule_source_groups, rule_owner_uids) = if let Some(revision) = batch.config_revision {
+        let mut accounting_revision = batch.config_revision;
+        if let Some(revision) = accounting_revision {
+            let concrete_key = format!(
+                "node_config_rule_sources:{}:{}:{revision}",
+                verified.home_group_id,
+                verified.node_id.as_str()
+            );
+            match state.db.get(&concrete_key).await {
+                Ok(None) => {
+                    let legacy_key = format!(
+                        "node_config_revision:legacy:{}:{}",
+                        verified.home_group_id,
+                        verified.node_id.as_str()
+                    );
+                    match state.db.get(&legacy_key).await {
+                        Ok(Some(raw)) => {
+                            let high = serde_json::from_str::<serde_json::Value>(&raw)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("revision").and_then(serde_json::Value::as_u64)
+                                });
+                            if high.is_some_and(|high| revision > 0 && revision <= high) {
+                                // Preserve Legacy Home-only accounting for connections
+                                // that remain alive across credential migration.
+                                accounting_revision = None;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => return traffic_business_error(500, "database error"),
+                    }
+                }
+                Ok(Some(_)) => {}
+                Err(_) => return traffic_business_error(500, "database error"),
+            }
+        }
+        let (rule_source_groups, rule_owner_uids) = if let Some(revision) = accounting_revision {
             let key = format!(
                 "node_config_rule_sources:{}:{}:{}",
                 verified.home_group_id,
@@ -463,7 +512,7 @@ pub async fn report_traffic(
             credential_generation: verified.generation,
             batch_id: batch.batch_id.clone(),
             payload_sha256: batch.payload_sha256.clone(),
-            config_revision: batch.config_revision,
+            config_revision: accounting_revision,
             rule_source_groups,
             rule_owner_uids,
         };
@@ -672,6 +721,7 @@ pub async fn report_status(
             "provisioning_capabilities": req.provisioning_capabilities,
             "reconciliation": req.reconciliation,
             "verified_concrete_node": identity.verified().is_some(),
+            "auth_reload_supported": headers.get("X-Node-Auth-Reload").is_some_and(|value| value == "1"),
         });
         // Status persistence is best-effort: the original used .ok() to swallow
         // any DB error so a transient failure never broke the report cycle.
@@ -682,7 +732,14 @@ pub async fn report_status(
                 false
             }
         };
-        if status_persisted && g.group_type == "in" {
+        let business_group = match state.db.node_pool_system_group_id().await {
+            Ok(anchor) => anchor != Some(g.id),
+            Err(error) => {
+                tracing::warn!("report_status: pool anchor lookup failed: {error}");
+                false
+            }
+        };
+        if status_persisted && g.group_type == "in" && business_group {
             if let Err(error) = crate::service::relay_preference::ensure_preference_initialized(
                 state.db.as_ref(),
                 &state.node_connections,
@@ -1163,6 +1220,167 @@ mod tests {
         assert!(legacy.data.is_none());
         assert_eq!(rule_traffic(&pool, 100).await, 45);
         assert_eq!(user_traffic(&pool, 2).await, 45);
+    }
+
+    #[tokio::test]
+    async fn legacy_revision_traffic_survives_exact_credential_transition() {
+        let (state, pool) = seeded_state().await;
+        let secret =
+            install_active_runtime_credential(&pool, "transition-credential", 10, "NODE_T1", 0xa2)
+                .await;
+        let headers = credential_config_headers("transition-credential", &secret, "NODE_T1");
+        let app = crate::api::routes().with_state(state.clone());
+        let entries = vec![TrafficEntry {
+            rule_id: 100,
+            upload: 7,
+            download: 3,
+        }];
+        let make_report = |batch_id: &str, revision: u64| TrafficReport {
+            batch: Some(TrafficBatchMetadata {
+                version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                batch_id: batch_id.into(),
+                payload_sha256: traffic_batch_payload_sha256(&entries),
+                config_revision: Some(revision),
+            }),
+            reports: entries.clone(),
+        };
+        let old = make_report("transition-old", 8);
+        assert_eq!(
+            router_post_traffic(app.clone(), headers.clone(), &old)
+                .await
+                .code,
+            403
+        );
+        state
+            .db
+            .set(
+                "node_config_revision:legacy:10:NODE_T1",
+                r#"{"revision":8}"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            router_post_traffic(app.clone(), headers.clone(), &old)
+                .await
+                .code,
+            0
+        );
+        assert_eq!(rule_traffic(&pool, 100).await, 10);
+        assert_eq!(
+            router_post_traffic(app.clone(), headers.clone(), &old)
+                .await
+                .data
+                .unwrap()
+                .status,
+            TrafficBatchAckStatus::AlreadyApplied
+        );
+        assert_eq!(rule_traffic(&pool, 100).await, 10);
+        assert_eq!(
+            router_post_traffic(
+                app.clone(),
+                headers.clone(),
+                &make_report("transition-future", 9)
+            )
+            .await
+            .code,
+            403
+        );
+        state
+            .db
+            .set("node_config_rule_sources:10:NODE_T1:8", r#"{"100":20}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            router_post_traffic(app, headers, &make_report("transition-concrete", 8))
+                .await
+                .code,
+            0
+        );
+        assert_eq!(
+            rule_traffic(&pool, 100).await,
+            10,
+            "concrete attribution must win over legacy fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_native_traffic_requires_revision_and_bills_business_source_only() {
+        let (state, pool) = seeded_state().await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-traffic-token")
+            .await
+            .unwrap();
+        let secret = install_active_runtime_credential(
+            &pool,
+            "pool-traffic-credential",
+            anchor.id,
+            "POOL_A",
+            0xb2,
+        )
+        .await;
+        let app = crate::api::routes().with_state(state.clone());
+        let entries = vec![TrafficEntry {
+            rule_id: 100,
+            upload: 7,
+            download: 3,
+        }];
+        let old = TrafficReport {
+            batch: None,
+            reports: entries.clone(),
+        };
+        assert_eq!(
+            router_post_traffic(app.clone(), auth_headers(&anchor.token), &old)
+                .await
+                .code,
+            403
+        );
+        let headers = credential_config_headers("pool-traffic-credential", &secret, "POOL_A");
+        let strict = |revision: Option<u64>| TrafficReport {
+            batch: Some(TrafficBatchMetadata {
+                version: TRAFFIC_BATCH_PROTOCOL_VERSION,
+                batch_id: format!("pool-traffic-{}", revision.unwrap_or(0)),
+                payload_sha256: traffic_batch_payload_sha256(&entries),
+                config_revision: revision,
+            }),
+            reports: entries.clone(),
+        };
+        assert_eq!(
+            router_post_traffic(app.clone(), headers.clone(), &strict(None))
+                .await
+                .code,
+            403
+        );
+        state
+            .db
+            .set(
+                &format!("node_config_rule_sources:{}:POOL_A:7", anchor.id),
+                r#"{"100":10}"#,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .set(
+                &format!("node_config_rule_owners:{}:POOL_A:7", anchor.id),
+                r#"{"100":2}"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            router_post_traffic(app, headers, &strict(Some(7)))
+                .await
+                .code,
+            0
+        );
+        assert_eq!(rule_traffic(&pool, 100).await, 10);
+        assert_eq!(user_traffic(&pool, 2).await, 10);
+        let source_groups: Vec<i64> =
+            sqlx::query_scalar("SELECT DISTINCT group_id FROM traffic_history WHERE rule_id = 100")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(source_groups, vec![10]);
     }
 
     #[tokio::test]
@@ -2540,6 +2758,44 @@ mod tests {
             Some("systemd"),
             "install_method must be persisted so the upgrade UI can offer a self-upgrade"
         );
+    }
+
+    #[tokio::test]
+    async fn system_pool_status_never_initializes_business_relay_preference() {
+        let (state, pool) = seeded_state().await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-test-token")
+            .await
+            .unwrap();
+        let secret = install_active_runtime_credential(
+            &pool,
+            "pool-test-credential",
+            anchor.id,
+            "POOL_A",
+            0xb1,
+        )
+        .await;
+        let mut headers = credential_config_headers("pool-test-credential", &secret, "POOL_A");
+        headers.insert("X-Node-Auth-Reload", "1".parse().unwrap());
+        let Json(response) =
+            report_status(State(state.clone()), headers, Json(ready_status("POOL_A"))).await;
+        assert_eq!(response.code, 0);
+        assert!(state
+            .db
+            .get(&format!("relay_preference:{}", anchor.id))
+            .await
+            .unwrap()
+            .is_none());
+        let status = state
+            .db
+            .get(&format!("node_status:{}:POOL_A", anchor.id))
+            .await
+            .unwrap()
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(status["verified_concrete_node"], true);
+        assert_eq!(status["auth_reload_supported"], true);
     }
 
     #[tokio::test]

@@ -370,6 +370,16 @@ async fn validate_admin_owned_inbound_group(
     gid: i64,
     context: &str,
 ) -> Result<(), CreateRuleError> {
+    if db
+        .node_pool_system_group_id()
+        .await
+        .map_err(CreateRuleError::Database)?
+        == Some(gid)
+    {
+        return Err(CreateRuleError::BadRequest(
+            "device_group_in not found".into(),
+        ));
+    }
     match GroupRepository::find_by_id(db, gid, &ResourceScope::All).await {
         Ok(Some(g)) => {
             let owner_is_admin = match db.is_admin(g.uid).await {
@@ -402,6 +412,16 @@ async fn validate_owner_outbound_group(
     owner_scope: &ResourceScope,
     context: &str,
 ) -> Result<(), CreateRuleError> {
+    if db
+        .node_pool_system_group_id()
+        .await
+        .map_err(CreateRuleError::Database)?
+        == Some(gid_out)
+    {
+        return Err(CreateRuleError::BadRequest(
+            "system Pool is not a business group".into(),
+        ));
+    }
     match GroupRepository::find_by_id(db, gid_out, owner_scope).await {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(CreateRuleError::BadRequest(

@@ -15,6 +15,101 @@ use crate::db::error::DbError;
 use crate::db::pg_schema::{apply_pg_schema, run_pg_migrations};
 use crate::db::repo::*;
 use relay_shared::protocol::TrafficEntry;
+
+#[tokio::test]
+async fn pg_node_pool_metadata_contract() {
+    let Some(db) = repo("node_pool_metadata_contract").await else {
+        return;
+    };
+    seed_group(&db, 71).await;
+    db.register_node_pool_identity(71, "POOL_A").await.unwrap();
+    db.register_node_pool_identity(71, "POOL_A").await.unwrap();
+    assert_eq!(
+        db.rename_node_pool_node(71, "POOL_A", "Relay A")
+            .await
+            .unwrap(),
+        1
+    );
+    run_pg_migrations(&db.pool).await.unwrap();
+    run_pg_migrations(&db.pool).await.unwrap();
+    let records = db.list_node_pool_records().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].display_name, "Relay A");
+    let anchor = db
+        .ensure_node_pool_system_group(1, "pool-anchor-test")
+        .await
+        .unwrap();
+    assert_eq!(
+        db.ensure_node_pool_system_group(1, "ignored-token")
+            .await
+            .unwrap()
+            .id,
+        anchor.id
+    );
+    assert_eq!(
+        db.node_pool_system_group_id().await.unwrap(),
+        Some(anchor.id)
+    );
+    assert!(db
+        .list_groups(&ResourceScope::All)
+        .await
+        .unwrap()
+        .iter()
+        .all(|g| g.id != anchor.id));
+    assert!(db
+        .list_all_inbound_group_ids()
+        .await
+        .unwrap()
+        .iter()
+        .all(|id| *id != anchor.id));
+    assert!(db.scan_prefix("node_config_").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn pg_node_pool_upgrade_is_additive_and_idempotent() {
+    let Some(pool) = fresh_pool("node_pool_upgrade42").await else {
+        return;
+    };
+    sqlx::query("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO schema_version(version) VALUES (41)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE device_groups (id BIGINT PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO device_groups(id) VALUES (7)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    run_pg_migrations(&pool).await.unwrap();
+    run_pg_migrations(&pool).await.unwrap();
+    let version: i32 = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 42);
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_pool_nodes")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    let anchor_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_pool_system_anchor")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(anchor_rows, 0);
+    let groups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM device_groups")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(groups, 1);
+    pool.close().await;
+}
 use sqlx::postgres::PgPoolOptions;
 
 /// Read TEST_PG_URL. Returns None if unset → tests skip.
@@ -425,6 +520,7 @@ async fn pg_traffic_history_primary_key_upgrade_preserves_same_hour_group_rows()
     for statement in [
         "CREATE TABLE schema_version (version INTEGER PRIMARY KEY)",
         "INSERT INTO schema_version (version) VALUES (40)",
+        "CREATE TABLE device_groups (id BIGINT PRIMARY KEY)",
         "CREATE TABLE traffic_history (\
              rule_id BIGINT NOT NULL,\
              uid BIGINT NOT NULL,\

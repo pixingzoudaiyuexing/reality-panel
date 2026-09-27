@@ -138,6 +138,13 @@ pub async fn create_plan(
     State(state): State<AppState>,
     Json(req): Json<CreatePlanRequest>,
 ) -> Json<ApiResponse<i64>> {
+    match state.db.node_pool_system_group_id().await {
+        Ok(Some(anchor)) if req.device_group_ids.contains(&anchor) => {
+            return Json(err(400, "系统节点池不能用于套餐分配"))
+        }
+        Err(_) => return Json(err(500, "数据库错误")),
+        _ => {}
+    }
     let canonical_price = match validate_plan_fields(
         Some(&req.name),
         Some(req.max_rules),
@@ -186,6 +193,18 @@ pub async fn update_plan(
     Path(id): Path<i64>,
     Json(req): Json<UpdatePlanRequest>,
 ) -> Json<ApiResponse<()>> {
+    match state.db.node_pool_system_group_id().await {
+        Ok(Some(anchor))
+            if req
+                .device_group_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&anchor)) =>
+        {
+            return Json(err(400, "系统节点池不能用于套餐分配"))
+        }
+        Err(_) => return Json(err(500, "数据库错误")),
+        _ => {}
+    }
     if req.name.is_none()
         && req.max_rules.is_none()
         && req.traffic.is_none()

@@ -715,6 +715,11 @@ async fn collect_effective_config_for_node(
     let node_id =
         ReuseEligibleNodeId::parse(node_id).map_err(NodeReuseIdentityError::InvalidNodeId)?;
 
+    if candidate_group_id.is_some() && candidate_group_id == db.node_pool_system_group_id().await? {
+        return Err(NodeReuseServiceError::AdmissionRejected(
+            NodeReuseBindingCreateRejection::ReusingGroupNotInbound,
+        ));
+    }
     let home = crate::db::repo::GroupRepository::find_by_id(db, home_group_id, &ResourceScope::All)
         .await?;
     let Some(home) = home else {

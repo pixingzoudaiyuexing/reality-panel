@@ -120,6 +120,9 @@ pub async fn get_relay_preference(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
 ) -> Response {
+    if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
+        return response;
+    }
     match GroupRepository::find_by_id(state.db.as_ref(), group_id, &ResourceScope::All).await {
         Ok(Some(group)) if group.group_type == "in" => {}
         Ok(Some(_)) | Ok(None) => {
@@ -151,6 +154,9 @@ pub async fn get_routing_mode(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
 ) -> Response {
+    if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
+        return response;
+    }
     match crate::service::relay_preference::get_routing_mode(state.db.as_ref(), group_id).await {
         Ok(view) => Json(ApiResponse::success(view)).into_response(),
         Err(crate::service::relay_preference::RelayPreferenceError::Database(
@@ -173,6 +179,9 @@ pub async fn set_routing_mode(
     Path(group_id): Path<i64>,
     Json(request): Json<SetRoutingModeRequest>,
 ) -> Response {
+    if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
+        return response;
+    }
     use crate::service::relay_preference::RoutingModeTransitionError;
     match crate::service::relay_preference::transition_routing_mode(
         state.db.as_ref(),
@@ -242,6 +251,9 @@ pub async fn apply_routing(
     Path(group_id): Path<i64>,
     Json(request): Json<crate::service::relay_preference::RoutingApplyRequest>,
 ) -> Response {
+    if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
+        return response;
+    }
     let target_mode = request.target_mode();
     match crate::service::relay_preference::apply_routing_configuration(
         state.db.as_ref(),
@@ -307,6 +319,9 @@ pub async fn set_relay_preference(
     Path(group_id): Path<i64>,
     Json(request): Json<SetRelayPreferenceRequest>,
 ) -> Response {
+    if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
+        return response;
+    }
     use crate::service::relay_preference::{StartRelaySwitchError, StartRelaySwitchOutcome};
 
     let outcome = match crate::service::relay_preference::start_relay_switch(
@@ -425,6 +440,9 @@ pub async fn get_carrier_affinity(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
 ) -> Response {
+    if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
+        return response;
+    }
     match crate::service::relay_preference::get_carrier_affinity(
         state.db.as_ref(),
         &state.node_connections,
@@ -453,6 +471,9 @@ pub async fn set_carrier_affinity(
     Path(group_id): Path<i64>,
     Json(request): Json<SetCarrierAffinityRequest>,
 ) -> Response {
+    if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
+        return response;
+    }
     use crate::service::relay_preference::CarrierPolicyApplyError;
     let policy = crate::service::relay_preference::CarrierPolicy {
         default_node_id: request.default_node_id,

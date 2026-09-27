@@ -19,6 +19,7 @@ mod kvs;
 mod node_claims;
 mod node_credential_deliveries;
 mod node_credentials;
+mod node_pool;
 mod node_reuse;
 mod orders;
 mod profiles;

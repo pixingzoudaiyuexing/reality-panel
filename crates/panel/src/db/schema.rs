@@ -97,6 +97,20 @@ CREATE TABLE IF NOT EXISTS device_groups (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Node Pool V1 metadata does not grant runtime authority.
+CREATE TABLE IF NOT EXISTS node_pool_nodes (
+    identity_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL CHECK (length(node_id) BETWEEN 1 AND 128 AND node_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+    display_name TEXT NOT NULL DEFAULT '' CHECK (length(display_name) <= 128),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (identity_group_id, node_id)
+);
+CREATE TABLE IF NOT EXISTS node_pool_system_anchor (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    group_id INTEGER NOT NULL UNIQUE REFERENCES device_groups(id) ON DELETE RESTRICT
+);
+
 -- Node Reuse V1 Slice 1: inert runtime-reuse authorization. A concrete node is
 -- identified by its Home Group plus persistent node_id; there is intentionally no
 -- node FK because the current architecture has no persistent node master table.
@@ -2667,6 +2681,12 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         tx.commit().await?;
     }
     tracing::info!("Migration 57: traffic_history uses (rule_id, group_id, hour_ts) identity");
+
+    // Pool registration is metadata-only; no identity or runtime rows are rewritten.
+    sqlx::raw_sql(include_str!("node_pool_sqlite.sql"))
+        .execute(pool)
+        .await?;
+    tracing::info!("Migration 58: Node Pool metadata tables present");
 
     Ok(())
 }

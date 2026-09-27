@@ -97,6 +97,18 @@ CREATE TABLE IF NOT EXISTS device_groups (
 -- Node Reuse V1 Slice 1: inert runtime-reuse authorization. Concrete node
 -- identity is (home_group_id, node_id); no node FK is created because there is no
 -- persistent node master table in the current architecture.
+CREATE TABLE IF NOT EXISTS node_pool_nodes (
+    identity_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL CHECK (char_length(node_id) BETWEEN 1 AND 128 AND node_id !~ '[^A-Za-z0-9_-]'),
+    display_name TEXT NOT NULL DEFAULT '' CHECK (char_length(display_name) <= 128),
+    created_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    updated_at TEXT NOT NULL DEFAULT (to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')),
+    PRIMARY KEY (identity_group_id, node_id)
+);
+CREATE TABLE IF NOT EXISTS node_pool_system_anchor (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    group_id BIGINT NOT NULL UNIQUE REFERENCES device_groups(id) ON DELETE RESTRICT
+);
 CREATE TABLE IF NOT EXISTS node_reuse_bindings (
     reusing_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
     home_group_id BIGINT NOT NULL REFERENCES device_groups(id) ON DELETE RESTRICT,
@@ -655,7 +667,7 @@ INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING
 /// The schema revision this build's baseline `PG_SCHEMA_SQL` represents. When a
 /// future release adds a column/table, bump this and add a matching arm in
 /// `run_pg_migrations`. `apply_pg_schema` seeds `schema_version` with revision 1.
-pub const PG_SCHEMA_VERSION: i32 = 41;
+pub const PG_SCHEMA_VERSION: i32 = 42;
 
 /// Apply PG_SCHEMA_SQL to a pool. PostgreSQL's prepared-statement protocol
 /// rejects multi-statement strings ("cannot insert multiple commands into a
@@ -2246,6 +2258,16 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
             "PG migration 41: traffic_history uses (rule_id, group_id, hour_ts) identity"
         );
     }
+    if current < 42 {
+        let mut tx = pool.begin().await?;
+        sqlx::raw_sql(include_str!("node_pool_pg.sql"))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO schema_version (version) VALUES (42) ON CONFLICT DO NOTHING")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+    }
     Ok(())
 }
 
@@ -2306,7 +2328,7 @@ mod tests {
 
     #[test]
     fn pg_schema_version_matches_latest_migration() {
-        assert_eq!(PG_SCHEMA_VERSION, 41);
+        assert_eq!(PG_SCHEMA_VERSION, 42);
         assert!(PG_SCHEMA_SQL.contains("PRIMARY KEY (rule_id, group_id, hour_ts)"));
     }
 

@@ -64,7 +64,7 @@ impl DeviceGroupAuthRepository for PgRepository {
         };
         if is_admin || all {
             let all_in: Vec<(i64,)> =
-                sqlx::query_as("SELECT id FROM device_groups WHERE group_type = 'in' ORDER BY id")
+                sqlx::query_as("SELECT id FROM device_groups WHERE group_type = 'in' AND id NOT IN (SELECT group_id FROM node_pool_system_anchor) ORDER BY id")
                     .fetch_all(&self.pool)
                     .await?;
             return Ok(all_in.into_iter().map(|(id,)| id).collect());
@@ -74,7 +74,7 @@ impl DeviceGroupAuthRepository for PgRepository {
         let rows: Vec<(i64,)> = sqlx::query_as(
             "SELECT dg.id FROM device_groups dg \
              JOIN user_device_groups udg ON udg.device_group_id = dg.id \
-             WHERE udg.user_id = $1 AND dg.group_type = 'in' \
+             WHERE udg.user_id = $1 AND dg.group_type = 'in' AND dg.id NOT IN (SELECT group_id FROM node_pool_system_anchor) \
              ORDER BY dg.id",
         )
         .bind(user_id)

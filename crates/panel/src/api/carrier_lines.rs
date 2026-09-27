@@ -12,6 +12,9 @@ pub async fn get_group_carrier_lines(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
 ) -> Response {
+    if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
+        return response;
+    }
     match crate::service::carrier_lines::group_catalog(state.db.as_ref(), group_id).await {
         Ok(catalog) => Json(ApiResponse::success(catalog)).into_response(),
         Err(CarrierLineCatalogError::GroupNotFound) => (

@@ -21,6 +21,7 @@ pub mod node_credential_delivery;
 pub mod node_deploy;
 pub mod node_enrollment;
 pub mod node_ops;
+pub mod node_pool;
 pub mod notify;
 mod provisioning;
 pub mod reapply;
@@ -56,6 +57,48 @@ pub struct AppState {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/node/identity",
+            axum::routing::get(node_pool::node_identity),
+        )
+        .route(
+            "/admin/node-pool/nodes/{identity_group_id}/{node_id}/migration",
+            axum::routing::post(node_pool::start_migration).layer(axum::middleware::from_fn(
+                node_claim::claim_response_headers,
+            )),
+        )
+        .route(
+            "/node-pool/migrate.py",
+            axum::routing::get(node_pool::migration_script),
+        )
+        .route(
+            "/node-pool/credential-state.py",
+            axum::routing::get(node_pool::credential_state_script),
+        )
+        .route(
+            "/admin/node-pool/nodes",
+            axum::routing::get(node_pool::list_nodes),
+        )
+        .route(
+            "/admin/node-pool/nodes/{identity_group_id}/{node_id}",
+            axum::routing::patch(node_pool::rename_node),
+        )
+        .route(
+            "/admin/groups/{group_id}/pool-nodes",
+            axum::routing::get(node_pool::group_nodes),
+        )
+        .route(
+            "/admin/groups/{group_id}/nodes/preview",
+            axum::routing::post(node_pool::preview_member),
+        )
+        .route(
+            "/admin/groups/{group_id}/nodes",
+            axum::routing::post(node_pool::add_member),
+        )
+        .route(
+            "/admin/groups/{group_id}/nodes/{identity_group_id}/{node_id}",
+            axum::routing::delete(node_pool::remove_member),
+        )
         // Auth
         .route("/auth/login", axum::routing::post(auth::login))
         .route("/auth/register", axum::routing::post(auth::register))

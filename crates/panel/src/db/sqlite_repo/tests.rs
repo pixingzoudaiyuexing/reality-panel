@@ -13,6 +13,84 @@ use crate::db::error::DbError;
 use crate::db::repo::*;
 use crate::db::schema::{run_migrations, SCHEMA_SQL};
 use relay_shared::protocol::TrafficEntry;
+
+#[tokio::test]
+async fn node_pool_metadata_contract() {
+    let db = repo().await;
+    seed_group(&db, 71).await;
+    db.register_node_pool_identity(71, "POOL_A").await.unwrap();
+    db.register_node_pool_identity(71, "POOL_A").await.unwrap();
+    assert_eq!(
+        db.rename_node_pool_node(71, "POOL_A", "Relay A")
+            .await
+            .unwrap(),
+        1
+    );
+    run_migrations(&db.pool).await.unwrap();
+    run_migrations(&db.pool).await.unwrap();
+    let records = db.list_node_pool_records().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].display_name, "Relay A");
+    let anchor = db
+        .ensure_node_pool_system_group(1, "pool-anchor-test")
+        .await
+        .unwrap();
+    assert_eq!(
+        db.ensure_node_pool_system_group(1, "ignored-token")
+            .await
+            .unwrap()
+            .id,
+        anchor.id
+    );
+    assert_eq!(
+        db.node_pool_system_group_id().await.unwrap(),
+        Some(anchor.id)
+    );
+    assert!(db
+        .list_groups(&ResourceScope::All)
+        .await
+        .unwrap()
+        .iter()
+        .all(|g| g.id != anchor.id));
+    assert!(db
+        .list_all_inbound_group_ids()
+        .await
+        .unwrap()
+        .iter()
+        .all(|id| *id != anchor.id));
+    assert!(db.scan_prefix("node_config_").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn node_pool_upgrade_is_additive_and_idempotent() {
+    let db = repo().await;
+    seed_group(&db, 71).await;
+    sqlx::query("DROP TABLE node_pool_nodes")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE node_pool_system_anchor")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    run_migrations(&db.pool).await.unwrap();
+    run_migrations(&db.pool).await.unwrap();
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_pool_nodes")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    let anchor_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_pool_system_anchor")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(anchor_rows, 0);
+    assert!(GroupRepository::find_by_id(&db, 71, &ResourceScope::All)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(db.scan_prefix("node_config_").await.unwrap().is_empty());
+}
 use sqlx::sqlite::SqlitePoolOptions;
 
 /// Build a fresh in-memory DB wrapped in a SqliteRepository. The schema is

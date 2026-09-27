@@ -42,6 +42,11 @@ pub async fn create(
     State(state): State<AppState>,
     Json(request): Json<CreateRelayScheduleRequest>,
 ) -> Response {
+    if let Err(response) =
+        crate::api::node_pool::require_business_group(&state, request.group_id).await
+    {
+        return response;
+    }
     match relay_schedule::create_schedule(state.db.as_ref(), &state.node_connections, request).await
     {
         Ok(schedule) => Json(ApiResponse::success(schedule)).into_response(),

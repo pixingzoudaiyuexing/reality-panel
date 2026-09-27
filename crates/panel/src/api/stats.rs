@@ -279,6 +279,7 @@ pub async fn get_node_status(
     // endpoint uses, so the admin /nodes board and the user /nodes/shared board
     // never disagree about who's online. The frontend must NOT recompute it.
     let now = chrono::Utc::now();
+    let system_group = state.db.node_pool_system_group_id().await.ok().flatten();
     for (key, value) in &rows {
         let (group_id, node_id_from_key) = match parse_status_key(key) {
             Some(parsed) => parsed,
@@ -308,8 +309,11 @@ pub async fn get_node_status(
         };
 
         status["group_id"] = serde_json::json!(group_id);
-        status["group_name"] =
-            serde_json::json!(group_name.unwrap_or_else(|| format!("Group {}", group_id)));
+        status["group_name"] = serde_json::json!(if system_group == Some(group_id) {
+            "节点池".to_string()
+        } else {
+            group_name.unwrap_or_else(|| format!("Group {}", group_id))
+        });
         // Surface the node identity so the frontend can render multiple nodes
         // per group distinctly. Prefer the JSON field the node sent (canonical);
         // fall back to the key segment for older status rows that predate it.

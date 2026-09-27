@@ -163,6 +163,18 @@ pub async fn update_user(
     Path(id): Path<i64>,
     Json(req): Json<UpdateUserRequest>,
 ) -> Json<ApiResponse<()>> {
+    match state.db.node_pool_system_group_id().await {
+        Ok(Some(anchor))
+            if req
+                .device_group_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&anchor)) =>
+        {
+            return Json(err(400, "系统节点池不能用于用户分配"))
+        }
+        Err(_) => return Json(err(500, "数据库错误")),
+        _ => {}
+    }
     // v1.0.7: device-group authorization (all_device_groups / device_group_ids)
     // is handled ALONGSIDE the other fields (not early-return, which would drop
     // any balance/quota/banned submitted in the same request). All fields

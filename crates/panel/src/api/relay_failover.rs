@@ -46,6 +46,9 @@ pub async fn get(
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
 ) -> Response {
+    if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
+        return response;
+    }
     match relay_failover::get_view(state.db.as_ref(), &state.node_connections, group_id).await {
         Ok(view) => Json(ApiResponse::success(view)).into_response(),
         Err(error) => error_response(error),
@@ -58,6 +61,9 @@ pub async fn update(
     Path(group_id): Path<i64>,
     Json(request): Json<UpdateRelayFailoverRequest>,
 ) -> Response {
+    if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
+        return response;
+    }
     if let Err(error) = relay_failover::update_policy(
         state.db.as_ref(),
         group_id,
@@ -93,6 +99,9 @@ pub async fn reinclude(
     Path(group_id): Path<i64>,
     Json(request): Json<ReincludeRelayNodeRequest>,
 ) -> Response {
+    if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
+        return response;
+    }
     let node_id = request.node_id.trim();
     if node_id.is_empty() {
         return error_response(RelayFailoverError::InvalidInput(

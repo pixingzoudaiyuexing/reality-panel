@@ -673,6 +673,38 @@ pub trait NodeReuseRepository: Send + Sync {
     ) -> Result<u64, DbError>;
 }
 
+#[derive(Debug, Clone, Serialize, sqlx::FromRow, PartialEq, Eq)]
+pub struct NodePoolRecord {
+    pub identity_group_id: i64,
+    pub node_id: String,
+    pub display_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[async_trait]
+pub trait NodePoolRepository: Send + Sync {
+    async fn list_node_pool_records(&self) -> Result<Vec<NodePoolRecord>, DbError>;
+    async fn discover_node_pool_identities(&self) -> Result<Vec<ConcreteNodeIdentity>, DbError>;
+    async fn register_node_pool_identity(
+        &self,
+        group_id: i64,
+        node_id: &str,
+    ) -> Result<(), DbError>;
+    async fn rename_node_pool_node(
+        &self,
+        group_id: i64,
+        node_id: &str,
+        name: &str,
+    ) -> Result<u64, DbError>;
+    async fn node_pool_system_group_id(&self) -> Result<Option<i64>, DbError>;
+    async fn ensure_node_pool_system_group(
+        &self,
+        admin_id: i64,
+        token: &str,
+    ) -> Result<DeviceGroup, DbError>;
+}
+
 // ── Node Reuse V1 concrete-node credential registry ──
 
 /// Persisted verifier material for one concrete Node credential generation.
@@ -2514,6 +2546,7 @@ pub trait Repository:
     + DnsRecordBindingRepository
     + DnsRecordSyncRepository
     + NodeReuseRepository
+    + NodePoolRepository
     + NodeCredentialRepository
     + NodeCredentialClaimRepository
     + NodeCredentialDeliveryRepository
