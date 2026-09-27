@@ -72,6 +72,7 @@ export default function MainLayout() {
     { key: '/audit-log', label: t('auditLog') },
   ];
   const adminOnlyItems = [
+    { key: '/node-pool', icon: <CloudServerOutlined />, label: t('nodePool') },
     { key: '/groups', icon: <CloudServerOutlined />, label: t('deviceGroups') },
     { key: '/node-bootstrap', icon: <CloudUploadOutlined />, label: t('nodeBootstrapTitle') },
     {

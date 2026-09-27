@@ -1,6 +1,6 @@
 # Reality Panel — Current Architecture
 
-This document describes the current source design, including the Node Reuse product completion released in `v1.1.26` after independent review and Primary acceptance. Production deployment has not occurred.
+This document describes the current source design. Node Reuse product completion was released in `v1.1.26` after independent review and Primary acceptance. The Owner reports that release deployed to production; this task has not independently verified the deployment. Node Pool V1 remains unreleased source work pending independent review.
 
 ## Control plane and data plane
 
@@ -19,6 +19,8 @@ Configuration compatibility is guarded by `CONFIG_PROTOCOL_VERSION = 10`. A mism
 Lifecycle operations use a separate long-lived control protocol, currently `LIFECYCLE_PROTOCOL_VERSION = 1`, so config protocol evolution does not remove the node's upgrade path.
 
 ## Node configuration and LKG
+
+Node Pool V1 adds a metadata registry and admin membership projection over the existing exact-node identity and Node Reuse Bindings. Existing Nodes keep their original identity Group. New Nodes use a hidden internal Pool anchor and receive an exact credential during provisioning. The anchor has no business rules; traffic remains attributed to each rule's actual source Group. Legacy Nodes require one administrator-authorized exact-node credential migration before first cross-group assignment. The upgraded Node can replace control-plane authentication after verifying a durable credential without restarting forwarding listeners. See [ADR 0002](adr/0002-node-pool-v1.md).
 
 The Panel builds node configuration from an inbound group and its active rules. For an authenticated, verified concrete Node, Node Reuse merges Home Group rules with only that Node's explicit reuse Bindings. Legacy Group Token Nodes remain Home-only even when they report an `X-Node-ID` matching a concrete Node. Node-specific details such as camouflage public-IP resolution retain the Home Group identity namespace.
 

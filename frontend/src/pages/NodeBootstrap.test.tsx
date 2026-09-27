@@ -30,9 +30,9 @@ beforeEach(() => {
 });
 
 describe('Node Bootstrap deployment modes', () => {
-  it('keeps the SSH form available with the Device Group preselected', async () => {
+  it('deploys into the pool without requiring a business group', async () => {
     renderPage();
-    await waitFor(() => expect(screen.getAllByText('relay-group').length).toBeGreaterThan(0));
+    expect(screen.queryByText('relay-group')).not.toBeInTheDocument();
     expect(screen.getByLabelText('nodeBootstrapHost 1')).toBeInTheDocument();
     expect(screen.getByText('nodeBootstrapSshRecommended')).toBeInTheDocument();
   });
@@ -45,7 +45,7 @@ describe('Node Bootstrap deployment modes', () => {
       return Promise.reject(new Error(`unexpected ${url}`));
     });
     renderPage();
-    await waitFor(() => expect(screen.getAllByText('relay-group').length).toBeGreaterThan(0));
+    expect(screen.queryByLabelText('nodeBootstrapGroup 1')).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: /nodeBootstrapAddServer/ }));
     await user.type(screen.getByLabelText('nodeBootstrapHost 1'), 'node-a');
     await user.type(screen.getByLabelText('nodeBootstrapPassword 1'), 'secret-a');
@@ -70,7 +70,7 @@ describe('Node Bootstrap deployment modes', () => {
       return Promise.reject(new Error(`unexpected ${url}`));
     });
     renderPage();
-    await waitFor(() => expect(screen.getAllByText('relay-group').length).toBeGreaterThan(0));
+    expect(screen.queryByLabelText('nodeBootstrapGroup 1')).not.toBeInTheDocument();
     await user.click(screen.getByText('nodeBootstrapInstallLite'));
     await user.type(screen.getByLabelText('nodeBootstrapHost 1'), 'node-lite');
     await user.type(screen.getByLabelText('nodeBootstrapPassword 1'), 'secret');
@@ -91,7 +91,7 @@ describe('Node Bootstrap deployment modes', () => {
     await user.click(await screen.findByRole('tab', { name: 'manualBootstrapTab' }));
     await user.click(screen.getByRole('button', { name: /manualBootstrapCreate/ }));
 
-    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-enrollments', { group_id: 7, profile: 'reality_camouflage' }));
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-enrollments', { profile: 'reality_camouflage' }));
     expect(screen.getByDisplayValue('one-time-enrollment-secret')).toBeInTheDocument();
     const command = screen.getByDisplayValue(/manual-bootstrap-launcher\.sh/);
     expect(command).not.toHaveValue(expect.stringContaining('one-time-enrollment-secret'));

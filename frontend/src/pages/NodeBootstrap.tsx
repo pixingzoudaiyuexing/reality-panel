@@ -1,9 +1,8 @@
-import { Alert, Button, Descriptions, Input, InputNumber, Segmented, Select, Space, Tabs, Tag, Typography, message } from 'antd';
+import { Alert, Button, Descriptions, Input, InputNumber, Segmented, Space, Tabs, Tag, Typography, message } from 'antd';
 import { CloudUploadOutlined, CopyOutlined, DeleteOutlined, PlusOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
 import { useEffect, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
 import api, { type ApiEnvelope } from '../api/client';
-import type { DeviceGroup, ProvisioningCapabilities } from '../api/types';
+import type { ProvisioningCapabilities } from '../api/types';
 import { useI18n } from '../i18n/context';
 import type { Dict } from '../i18n/zh-CN';
 import { copyText } from '../utils/clipboard';
@@ -30,28 +29,15 @@ function errorText(error: unknown, fallback: string) {
 
 export default function NodeBootstrap() {
   const { t } = useI18n();
-  const [searchParams] = useSearchParams();
-  const requestedGroupId = Number(searchParams.get('group_id'));
   const nextId = useRef(2);
-  const [groups, setGroups] = useState<DeviceGroup[]>([]);
-  const [rows, setRows] = useState<SshRow[]>([newRow(1, Number.isSafeInteger(requestedGroupId) ? requestedGroupId : undefined)]);
+  const [rows, setRows] = useState<SshRow[]>([newRow(1)]);
   const [batchBusy, setBatchBusy] = useState(false);
-  const [manualGroupId, setManualGroupId] = useState<number | undefined>(Number.isSafeInteger(requestedGroupId) ? requestedGroupId : undefined);
   const [creatingEnrollment, setCreatingEnrollment] = useState(false);
   const [manualResult, setManualResult] = useState<CreatedEnrollment | null>(null);
   const [secretVisible, setSecretVisible] = useState(false);
   const [mode, setMode] = useState('ssh');
   const [liteMode, setLiteMode] = useState(false);
 
-  useEffect(() => {
-    api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups').then((response) => {
-      const inbound = (response.data ?? []).filter((group) => group.group_type === 'in');
-      setGroups(inbound);
-      const preferred = Number.isSafeInteger(requestedGroupId) && inbound.some((group) => group.id === requestedGroupId) ? requestedGroupId : inbound[0]?.id;
-      setRows((current) => current.map((row) => row.values.group_id ? row : { ...row, values: { ...row.values, group_id: preferred } }));
-      setManualGroupId((current) => current ?? preferred);
-    }).catch(() => message.error(t('nodeBootstrapLoadFailed')));
-  }, [requestedGroupId, t]);
 
   useEffect(() => {
     if (!rows.some((row) => row.deployment && !['SUCCESS', 'FAILED'].includes(row.deployment.status))) return;
@@ -89,7 +75,7 @@ export default function NodeBootstrap() {
   }, [manualResult]);
 
   const updateRow = (id: number, patch: Partial<Values>) => setRows((current) => current.map((row) => row.id === id ? { ...row, values: { ...row.values, ...patch }, state: 'WAITING', probe: null, deployment: null, logs: [], error: null } : row));
-  const rowValid = (row: SshRow) => Boolean(row.values.group_id && row.values.host.trim() && row.values.username.trim() && row.values.password && row.values.port >= 1 && row.values.port <= 65535);
+  const rowValid = (row: SshRow) => Boolean(row.values.host.trim() && row.values.username.trim() && row.values.password && row.values.port >= 1 && row.values.port <= 65535);
   const rowsLocked = batchBusy || rows.some((row) => row.state === 'DEPLOYING');
 
   const testAll = async () => {
@@ -131,10 +117,9 @@ export default function NodeBootstrap() {
   };
 
   const createEnrollment = async () => {
-    if (!manualGroupId) return;
     setCreatingEnrollment(true);
     try {
-      const response = await api.post<unknown, ApiEnvelope<CreatedEnrollment>>('/admin/node-enrollments', { group_id: manualGroupId, profile: 'reality_camouflage' });
+      const response = await api.post<unknown, ApiEnvelope<CreatedEnrollment>>('/admin/node-enrollments', { profile: 'reality_camouflage' });
       if (!response.data) throw new Error(response.message);
       setManualResult(response.data); setSecretVisible(true); message.success(t('manualBootstrapCreated'));
     } catch (error) { message.error(errorText(error, t('manualBootstrapCreateFailed'))); }
@@ -169,7 +154,6 @@ export default function NodeBootstrap() {
         <InputNumber disabled={rowsLocked} aria-label={`${t('nodeBootstrapPort')} ${index + 1}`} min={1} max={65535} value={row.values.port} onChange={(value) => updateRow(row.id, { port: value ?? 22 })} />
         <Input disabled={rowsLocked} aria-label={`${t('nodeBootstrapUser')} ${index + 1}`} value={row.values.username} onChange={(event) => updateRow(row.id, { username: event.target.value })} />
         <Input.Password disabled={rowsLocked} aria-label={`${t('nodeBootstrapPassword')} ${index + 1}`} value={row.values.password} autoComplete="new-password" onChange={(event) => updateRow(row.id, { password: event.target.value })} />
-        <Select disabled={rowsLocked} aria-label={`${t('nodeBootstrapGroup')} ${index + 1}`} value={row.values.group_id} options={groups.map((group) => ({ value: group.id, label: group.name }))} onChange={(group_id) => updateRow(row.id, { group_id })} />
         <Space size={4}><Tag color={rowColor[row.state]}>{t(`nodeBootstrapRow${row.state}` as keyof Dict)}</Tag>{rows.length > 1 ? <Button disabled={rowsLocked} type="text" danger icon={<DeleteOutlined />} aria-label={`${t('delete')} ${index + 1}`} onClick={() => setRows((current) => current.filter((item) => item.id !== row.id))} /> : null}</Space>
         {row.error ? <Text type="danger" className="rp-ssh-row-message">{row.error}</Text> : row.deployment ? <Text className="rp-ssh-row-message">{row.deployment.message}</Text> : row.probe ? <Text type="secondary" className="rp-ssh-row-message">{row.probe.os} · {row.probe.architecture} · {row.probe.fingerprint}</Text> : null}
       </div>)}
@@ -184,7 +168,7 @@ export default function NodeBootstrap() {
   const enrollmentTag = (state: EnrollmentState) => <Tag color={state === 'SUCCESS' ? 'green' : state === 'FAILED' || state === 'EXPIRED' ? 'red' : state === 'LOCAL_COMMITTED' ? 'gold' : 'blue'}>{t(enrollmentStateLabel[state])}</Tag>;
   const manualContent = <>
     <Alert type="info" showIcon message={t('manualBootstrapDescription')} description={t('manualBootstrapNoSsh')} style={{ marginBottom: 16 }} />
-    {!manualResult ? <Space orientation="vertical" style={{ width: '100%' }}><Select aria-label={t('nodeBootstrapGroup')} value={manualGroupId} options={groups.map((group) => ({ value: group.id, label: group.name }))} onChange={setManualGroupId} /><Button type="primary" icon={<CloudUploadOutlined />} loading={creatingEnrollment} onClick={() => void createEnrollment()}>{t('manualBootstrapCreate')}</Button></Space> : <section><Descriptions size="small" column={1} items={[{ key: 'state', label: t('status'), children: enrollmentTag(manualResult.enrollment.state) }, { key: 'expires', label: t('manualBootstrapExpiresAt'), children: manualResult.enrollment.expires_at }, ...(manualResult.enrollment.node_id ? [{ key: 'node', label: t('nodeStatus'), children: manualResult.enrollment.node_id }] : []), ...(manualResult.enrollment.last_error_category ? [{ key: 'error', label: t('manualBootstrapLastError'), children: manualResult.enrollment.last_error_category }] : [])]} />
+    {!manualResult ? <Space orientation="vertical" style={{ width: '100%' }}><Button type="primary" icon={<CloudUploadOutlined />} loading={creatingEnrollment} onClick={() => void createEnrollment()}>{t('manualBootstrapCreate')}</Button></Space> : <section><Descriptions size="small" column={1} items={[{ key: 'state', label: t('status'), children: enrollmentTag(manualResult.enrollment.state) }, { key: 'expires', label: t('manualBootstrapExpiresAt'), children: manualResult.enrollment.expires_at }, ...(manualResult.enrollment.node_id ? [{ key: 'node', label: t('nodeStatus'), children: manualResult.enrollment.node_id }] : []), ...(manualResult.enrollment.last_error_category ? [{ key: 'error', label: t('manualBootstrapLastError'), children: manualResult.enrollment.last_error_category }] : [])]} />
       {manualResult.enrollment.state === 'LOCAL_COMMITTED' ? <Alert type="warning" showIcon message={t('manualBootstrapLocalCommitted')} style={{ marginTop: 12 }} /> : null}
       {secretVisible ? <Alert type="warning" showIcon message={t('manualBootstrapSecretOnceTitle')} description={<Space orientation="vertical" size={8} style={{ width: '100%' }}><Text>{t('manualBootstrapSecretOnceDescription')}</Text><Input.Password value={manualResult.enrollment_secret} readOnly visibilityToggle /><Button onClick={() => setSecretVisible(false)}>{t('manualBootstrapSecretAcknowledged')}</Button></Space>} style={{ marginTop: 12 }} /> : null}
       <div style={{ marginTop: 16 }}><Text strong>{t('manualBootstrapLauncherCommand')}</Text></div><Alert type="info" showIcon message={t('manualBootstrapLauncherHint')} style={{ margin: '8px 0' }} /><Input.TextArea value={manualResult.launcher_command} readOnly autoSize={{ minRows: 3, maxRows: 5 }} style={{ fontFamily: 'var(--rp-font-mono)', fontSize: 12 }} /><Button style={{ marginTop: 8 }} icon={<CopyOutlined />} onClick={() => void copyLauncher()}>{t('manualBootstrapCopyLauncher')}</Button>

@@ -4,7 +4,7 @@ Last verified in source: 2026-09-27
 
 ## Current phase
 
-Node Reuse product completion is integrated, accepted, and published in the stable `v1.1.26` Release. It has not been deployed to production.
+Node Reuse product completion is integrated, accepted, and published in stable `v1.1.26`. The Owner reports it is deployed to production. Node Pool V1 is being implemented on an isolated branch and requires independent review before integration.
 
 ## Git baseline
 
@@ -22,12 +22,12 @@ The implementation was a fast-forward from the exact released `main` base above.
 
 ## Production state
 
-The `v1.1.26` GitHub Release is published. No production access, database migration, deployment or production mutation has occurred.
+The `v1.1.26` GitHub Release is published. The Owner reports production deployment; it was not independently verified here. This Node Pool task has made no production access, database migration, deployment or production mutation.
 
 ## Current review gate
 
-This task was High Risk because it changes default runtime activation and exact-node configuration delivery/status. Independent Gemini Code Review passed and Primary acceptance was recorded before integration.
+The earlier Node Reuse release passed independent Gemini Code Review and Primary acceptance. Node Pool V1 is a separate High-Risk implementation and its exact final HEAD still requires independent Gemini review.
 
 ## Next stage
 
-Next: Production deployment requires a separate explicit task and authorization.
+Next: finish Node Pool V1 validation and independent review. Merge, release and deployment require separate authorization.

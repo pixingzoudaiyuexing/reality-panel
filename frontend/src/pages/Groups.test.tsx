@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 const { mockGet, mockPost, mockPut } = vi.hoisted(() => ({
@@ -36,13 +36,37 @@ beforeEach(() => {
 });
 
 describe('group list credential boundary', () => {
-  it('renders without a group token and sends Add Node to Bootstrap with its group selected', async () => {
+  it('projects one reused physical Node with canonical name, IP and version', async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/groups') return Promise.resolve(ok([group()]));
+      if (url === '/nodes') return Promise.resolve(ok([{ group_id: 1, node_id: 'SAME', online: true }]));
+      if (url === '/admin/node-pool/nodes') return Promise.resolve(ok([{
+        identity_group_id: 10, node_id: 'SAME', display_name: 'Shared relay',
+        public_ipv4: '203.0.113.50', public_ipv6: null, online: false,
+        node_version: '1.1.26', last_seen: '2026-09-27T00:00:00Z',
+        credential_ready: true, migration_required: false, auth_reload_supported: true,
+        memberships: [{ group_id: 1, group_name: 'g1', native: false }],
+      }]));
+      return Promise.resolve(ok([]));
+    });
+    const { container } = render(<Groups />);
+    expect(await screen.findByText('0/1')).toBeInTheDocument();
+    const expand = container.querySelector('.ant-table-row-expand-icon');
+    expect(expand).not.toBeNull();
+    fireEvent.click(expand!);
+    expect(await screen.findByText('Shared relay')).toBeInTheDocument();
+    expect(screen.getByText('203.0.113.50')).toBeInTheDocument();
+    expect(screen.getByText('1.1.26')).toBeInTheDocument();
+  });
+  it('renders without a group token and opens the pool selector', async () => {
+    const user = userEvent.setup();
     render(<Groups />);
 
     await waitFor(() => expect(screen.getByText('g1')).toBeInTheDocument());
     expect(screen.queryByText('nodeToken')).toBeNull();
-    const addNode = screen.getByRole('link', { name: 'addNode' });
-    expect(addNode).toHaveAttribute('href', '/node-bootstrap?group_id=1');
+    expect(screen.queryByRole('link', { name: 'addNode' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'addNode' }));
+    expect(await screen.findByLabelText('poolChooseNode')).toBeInTheDocument();
   });
 
   it('keeps token rotation behind an explicit destructive re-enrollment warning', async () => {

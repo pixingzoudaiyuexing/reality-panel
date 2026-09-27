@@ -2,9 +2,11 @@ import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message,
 import { PlusOutlined, ReloadOutlined, EditOutlined, CloudServerOutlined, ApiOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useState } from 'react';
 import api from '../api/client';
-import type { ApiEnvelope, DeviceGroup, User, NodeStatus } from '../api/types';
+import type { ApiEnvelope, DeviceGroup, User, NodeDisplayRow as NodeStatus, PoolNode } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
+import { GroupPoolPicker } from '../components/nodes/GroupPoolPicker';
+import { poolNodeName, poolNodeKey } from '../components/nodes/poolNodeName';
 
 const { Text } = Typography;
 
@@ -27,6 +29,10 @@ export default function Groups() {
   const [groups, setGroups] = useState<DeviceGroup[]>([]);
   const [users, setUsers] = useState<User[]>([]);
   const [nodes, setNodes] = useState<NodeStatus[]>([]);
+  const [poolNodes, setPoolNodes] = useState<PoolNode[]>([]);
+  const [poolFailed, setPoolFailed] = useState(false);
+  const [poolOpen, setPoolOpen] = useState(false);
+  const [poolGroup, setPoolGroup] = useState<DeviceGroup | null>(null);
   const [loading, setLoading] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
@@ -68,6 +74,12 @@ export default function Groups() {
           const n = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes');
           setNodes(n.data || []);
         } catch { setNodes([]); }
+        try {
+          const pool = await api.get<unknown, ApiEnvelope<PoolNode[]>>('/admin/node-pool/nodes');
+          if (pool.code !== 0 || !pool.data) throw new Error();
+          setPoolNodes(pool.data || []);
+          setPoolFailed(false);
+        } catch { setPoolFailed(true); }
       } else {
         setUsers([]);
         try {
@@ -82,8 +94,21 @@ export default function Groups() {
 
   // ── Node helpers ──
   const nodesByGroup = useCallback((groupId: number): NodeStatus[] => {
+    if (isAdmin) return poolNodes.filter(n => n.memberships.some(m => m.group_id === groupId)).map(n => ({
+      ...n, group_id: groupId, last_seen: n.last_seen || '',
+    } as NodeStatus));
     return nodes.filter(n => n.group_id === groupId);
-  }, [nodes]);
+  }, [isAdmin, nodes, poolNodes]);
+
+  const openPool = (group: DeviceGroup) => { setPoolGroup(group); setPoolOpen(true); };
+  const removeMember = async (groupId: number, node: PoolNode) => {
+    try {
+      const response = await api.delete<unknown, ApiEnvelope<unknown>>(`/admin/groups/${groupId}/nodes/${node.identity_group_id}/${encodeURIComponent(node.node_id)}`);
+      if (response.code !== 0) throw new Error();
+      message.info(t(node.online ? 'nodeReuseRemovedWaiting' : 'nodeReuseRemovedOffline'));
+      await load();
+    } catch { message.error(t('nodeReuseRemoveFailed')); }
+  };
 
   const nodeCount = useCallback((groupId: number) => nodesByGroup(groupId).length, [nodesByGroup]);
   const onlineCount = useCallback((groupId: number) => nodesByGroup(groupId).filter(n => n.online).length, [nodesByGroup]);
@@ -284,7 +309,7 @@ export default function Groups() {
         <Space size={0}>
           {isAdmin && (
             <Tooltip title={t('addNode')}>
-              <Button size="small" type="text" icon={<ApiOutlined />} href={`/node-bootstrap?group_id=${g.id}`} aria-label={t('addNode')} />
+              {g.group_type === 'in' && <Button size="small" type="text" icon={<ApiOutlined />} onClick={() => openPool(g)} aria-label={t('addNode')} />}
             </Tooltip>
           )}
           <Button size="small" type="text" icon={<EditOutlined />} onClick={() => handleEdit(g)}>{t('edit')}</Button>
@@ -312,7 +337,7 @@ export default function Groups() {
       return (
         <div style={{ padding: '8px 0', color: 'var(--rp-text-tertiary)', fontSize: 13 }}>
           {t('noNodesInGroup')}
-          {isAdmin && <Button size="small" type="link" icon={<ApiOutlined />} style={{ marginLeft: 12 }} href={`/node-bootstrap?group_id=${g.id}`}>{t('addNode')}</Button>}
+          {isAdmin && g.group_type === 'in' && <Button size="small" type="link" icon={<ApiOutlined />} style={{ marginLeft: 12 }} onClick={() => openPool(g)}>{t('addNode')}</Button>}
         </div>
       );
     }
@@ -320,18 +345,26 @@ export default function Groups() {
       <div style={{ padding: 4 }}>
         <div style={{ marginBottom: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <Text type="secondary" style={{ fontSize: 12 }}>{t('nodesInGroup')} ({groupNodes.length})</Text>
-          {isAdmin && <Button size="small" icon={<ApiOutlined />} href={`/node-bootstrap?group_id=${g.id}`}>{t('addNode')}</Button>}
+          {isAdmin && g.group_type === 'in' && <Button size="small" icon={<ApiOutlined />} onClick={() => openPool(g)}>{t('addNode')}</Button>}
         </div>
         <Table
           dataSource={groupNodes}
-          rowKey={(n: NodeStatus) => n.node_id ?? `${n.public_ipv4 ?? n.public_ip}-${n.last_seen}`}
+          rowKey={(n: NodeStatus) => 'identity_group_id' in n ? poolNodeKey(n as unknown as PoolNode) : n.node_id ?? `${n.public_ipv4 ?? n.public_ip}-${n.last_seen}`}
           pagination={false}
           size="small"
           columns={[
-            { title: 'ID', dataIndex: 'node_id', key: 'node_id', width: 120, render: (v: string | undefined) => v ? <Text code style={{ fontSize: 11 }}>{v.slice(0, 8)}...{v.slice(-4)}</Text> : '-' },
+            { title: t('poolNodeName'), key: 'name', width: 150, render: (_: unknown, n: NodeStatus) => isAdmin ? poolNodeName(n as unknown as PoolNode) : n.public_ipv4 || n.public_ipv6 || '-' },
+            { title: 'IP', key: 'ip', render: (_: unknown, n: NodeStatus) => <Space orientation="vertical" size={0}><span>{n.public_ipv4 || n.public_ip || '-'}</span><span>{n.public_ipv6}</span></Space> },
             { title: t('status'), dataIndex: 'online', key: 'online', width: 80, render: (v: boolean) => <Tag color={v ? 'green' : 'default'}>{v ? t('online') : t('offline')}</Tag> },
             { title: t('nodeVersion'), dataIndex: 'node_version', key: 'version', width: 90, render: (v: string | undefined) => v ? <span className="rp-mono" style={{ fontSize: 12 }}>{v}</span> : '-' },
             { title: t('lastSeen'), dataIndex: 'last_seen', key: 'last_seen', width: 120, render: (v: string | undefined) => v ? <span style={{ fontSize: 12 }}>{v}</span> : '-' },
+            ...(isAdmin ? [{ title: t('action'), key: 'remove', render: (_: unknown, n: NodeStatus) => {
+              const node = n as unknown as PoolNode;
+              if (node.identity_group_id === g.id) return null;
+              return <Popconfirm title={t('nodeReuseRemoveConfirm')} description={t(node.online ? 'nodeReuseRemoveImpact' : 'nodeReuseRemovedOffline')} onConfirm={() => removeMember(g.id, node)}>
+                <Button danger size="small">{t('nodeReuseRemove')}</Button>
+              </Popconfirm>;
+            } }] : []),
           ]}
         />
       </div>
@@ -340,6 +373,8 @@ export default function Groups() {
 
   return (
     <>
+      {isAdmin && poolFailed && <Alert type="error" showIcon title={t('poolLoadFailed')} />}
+      {isAdmin && poolGroup && poolOpen && <GroupPoolPicker group={poolGroup} onClose={() => setPoolOpen(false)} onChanged={load} />}
       <div className="rp-page-header">
         <h2 className="rp-page-title"><CloudServerOutlined /> {t('deviceGroups')}</h2>
         <Space>

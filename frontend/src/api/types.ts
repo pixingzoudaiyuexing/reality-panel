@@ -707,6 +707,23 @@ export interface NodeReuseBindingStatus {
   blockers: string[];
 }
 
+export interface PoolNode {
+  identity_group_id: number;
+  node_id: string;
+  display_name: string;
+  public_ipv4: string | null;
+  public_ipv6: string | null;
+  online: boolean;
+  node_version: string | null;
+  last_seen: string | null;
+  credential_ready: boolean;
+  migration_required: boolean;
+  migration_pending?: boolean;
+  migration_claim_id?: string | null;
+  auth_reload_supported: boolean;
+  memberships: { group_id: number; group_name: string; native: boolean }[];
+}
+
 export interface NodeReusePreview {
   home_group_id: number;
   node_id: string;

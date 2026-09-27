@@ -4,7 +4,7 @@ import { DeleteOutlined } from '@ant-design/icons';
 import { formatPercent, formatBytes, formatBps, formatUptime } from '../../utils/format';
 import { useI18n } from '../../i18n/context';
 import { CountryFlag } from './CountryFlag';
-import { NodeReusePanel } from './NodeReusePanel';
+import { GroupMembershipSummary } from './GroupMembershipSummary';
 import type { NodeDisplayRow, ReconciliationState } from '../../api/types';
 import api from '../../api/client';
 
@@ -174,7 +174,7 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
 
       )}
       {isAdmin && row?.node_id && /^[A-Za-z0-9_-]{1,128}$/.test(row.node_id) ? (
-        <NodeReusePanel homeGroupId={row.group_id} nodeId={row.node_id} open={open} />
+        <GroupMembershipSummary key={`${row.group_id}:${row.node_id}`} homeGroupId={row.group_id} nodeId={row.node_id} open={open} />
       ) : null}
       {isAdmin && row && row.online === false && (
         <div style={{ marginTop: 16 }}>
