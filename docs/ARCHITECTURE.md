@@ -1,6 +1,6 @@
 # Reality Panel — Current Architecture
 
-This document describes the current source design, including the unreleased Node Reuse product completion based on `v1.1.25`. Independent review is pending.
+This document describes the current source design, including the Node Reuse product completion integrated at `555558f17218540211c59b9c08bd767d68e294a9` after independent review and Primary acceptance. The feature has not been released or deployed.
 
 ## Control plane and data plane
 
@@ -24,7 +24,7 @@ The Panel builds node configuration from an inbound group and its active rules. 
 
 Config snapshots include a durable monotonic revision and semantic fingerprint. Revision state is keyed by group and, when a node ID is present, by concrete node. Legacy self-reported node IDs use a separate revision namespace and cannot modify verified concrete-node revision authority. Both namespaces are read when planning the next revision for that identity, so switching authentication modes cannot move the delivered revision backward. EffectiveConfig revisions also track source-group membership, so adding or removing a zero-rule Binding after delivery advances the revision. Nodes reject stale config delivery so transport arrival order cannot roll runtime/LKG state backward.
 
-Node Reuse is enabled by default in the unreleased completion branch. `NODE_REUSE_RUNTIME_ENABLED=0` (or `false`) is an emergency opt-out, not a normal setup step or UI toggle. Prospective Preflight is read-only and uses the same source collector/conflict semantics as delivery; Binding creation independently repeats validation. A failed EffectiveConfig build returns unavailable for HTTP and skips unsafe WS snapshots rather than authorizing an empty config. Binding mutations rely on normal Node polling, not a global config broadcast.
+Node Reuse is enabled by default in the integrated source. `NODE_REUSE_RUNTIME_ENABLED=0` (or `false`) is an emergency opt-out, not a normal setup step or UI toggle. Prospective Preflight is read-only and uses the same source collector/conflict semantics as delivery; Binding creation independently repeats validation. A failed EffectiveConfig build returns unavailable for HTTP and skips unsafe WS snapshots rather than authorizing an empty config. Binding mutations rely on normal Node polling, not a global config broadcast.
 
 The admin runtime-status projection read-only plans the exact intended delivery snapshot without committing revision, attribution, certificate migration or certificate backup repair. The actual HTTP/WS delivery path uses the same revision planner and then persists authority. Status requires that the planned revision has already been committed for the concrete Node before comparing its fingerprint and revision with a fresh, verified Node reconciliation report. A generic `CONVERGED` report, uncommitted prediction or stale revision alone cannot prove Node Reuse sync. Offline, conflict, apply failure, and local recovery remain separate states. The Node's guarded apply preserves working listeners and LKG when a new desired configuration fails.
 

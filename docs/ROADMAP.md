@@ -1,10 +1,10 @@
 # Reality Panel — Roadmap
 
-## Current stage: Node Reuse product completion review
+## Current stage: Node Reuse product completion integrated
 
-The `v1.1.25` source baseline already includes concrete-node credentials, exact-node Bindings, guarded EffectiveConfig delivery, and Node-side LKG protection. The unreleased completion branch adds default availability, prospective Preflight, server-enforced safe creation, server-proven sync status, and Node-detail management UI.
+The implementation based on `v1.1.25` adds default availability, prospective Preflight, server-enforced safe creation, server-proven sync status, and Node-detail management UI. It is integrated on `main` at `555558f17218540211c59b9c08bd767d68e294a9`. Independent Gemini review passed and Primary accepted the implementation.
 
-This work is not accepted for integration until the exact implementation HEAD receives the required independent code review. No release or production deployment is part of this stage.
+No release or production deployment has occurred as part of this work.
 
 ## Explicitly deferred / excluded from Node Reuse V1
 
