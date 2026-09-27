@@ -43,6 +43,56 @@ impl std::fmt::Debug for NodeRuntimeAuth {
 }
 
 impl NodeRuntimeAuth {
+    pub fn load_reload_descriptor(node_id: &str) -> Result<(Self, i64), String> {
+        let descriptor = read_private_file(
+            Path::new("/var/lib/relay-panel/node-claims/runtime-auth.json"),
+            "runtime authentication descriptor",
+        )?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Descriptor {
+            identity_group_id: i64,
+            node_id: String,
+            credential_id: String,
+            secret_file: PathBuf,
+        }
+        let descriptor: Descriptor = serde_json::from_slice(&descriptor)
+            .map_err(|_| "invalid runtime authentication descriptor".to_string())?;
+        if descriptor.identity_group_id <= 0
+            || descriptor.node_id != node_id
+            || !valid_credential_id(&descriptor.credential_id)
+        {
+            return Err("runtime authentication identity mismatch".into());
+        }
+        let state_file = descriptor
+            .secret_file
+            .parent()
+            .ok_or("credential parent missing")?
+            .join(CREDENTIAL_STATE_FILENAME);
+        validate_credential_storage_paths(&descriptor.secret_file, &state_file)?;
+        let state: serde_json::Value =
+            serde_json::from_slice(&read_private_file(&state_file, "Credential state")?)
+                .map_err(|_| "invalid Credential state".to_string())?;
+        if state["phase"] != "ACTIVE_CONFIRMED"
+            || state["node_id"] != descriptor.node_id
+            || state["credential_id"] != descriptor.credential_id
+            || state["home_group_id"] != descriptor.identity_group_id
+            || state["secret_file"].as_str()
+                != descriptor.secret_file.file_name().and_then(|s| s.to_str())
+        {
+            return Err("runtime authentication is not durably confirmed".into());
+        }
+        Ok((
+            Self::PermanentCredential {
+                credential_id: descriptor.credential_id,
+                secret: read_private_credential_secret(&descriptor.secret_file)?,
+                secret_file: descriptor.secret_file,
+                state_node_id: descriptor.node_id,
+            },
+            descriptor.identity_group_id,
+        ))
+    }
+
     pub fn load() -> Result<Self, String> {
         match std::env::var("NODE_AUTH_MODE")
             .unwrap_or_else(|_| "group-token".into())

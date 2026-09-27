@@ -10,7 +10,6 @@ use crate::api::provisioning::{
     reported_capabilities, ProvisioningArtifact, ProvisioningBundle, ProvisioningProfile,
 };
 use crate::api::AppState;
-use crate::db::repo::{GroupRepository, ResourceScope};
 use async_trait::async_trait;
 use axum::extract::{Path, State};
 use axum::Json;
@@ -48,6 +47,7 @@ pub struct TestSshRequest {
 
 #[derive(Deserialize)]
 pub struct StartDeploymentRequest {
+    #[serde(default)]
     pub group_id: i64,
     pub host: String,
     #[serde(default = "default_port")]
@@ -267,6 +267,7 @@ trait DeploymentRunner: Send + Sync {
         panel_url: &str,
         token: &str,
         lite_mode: bool,
+        pool_config: &str,
     ) -> Result<(), DeployError>;
     async fn verify(
         &self,
@@ -349,11 +350,13 @@ impl DeploymentRunner for SystemSshRunner {
         panel_url: &str,
         token: &str,
         lite_mode: bool,
+        pool_config: &str,
     ) -> Result<(), DeployError> {
         let input = ssh.clone_without_secret_debug();
         let fingerprint = fingerprint.to_string();
         let task_id = task_id.to_string();
-        let bundle = ProvisioningBundle::new(panel_url, token, artifact.clone(), lite_mode);
+        let mut bundle = ProvisioningBundle::new(panel_url, token, artifact.clone(), lite_mode);
+        bundle.config.push_str(pool_config);
         tokio::task::spawn_blocking(move || {
             let mut session = connect(&input, Some(&fingerprint))?;
             authenticate(&mut session, &input)?;
@@ -581,6 +584,9 @@ pub async fn start_deployment(
     State(state): State<AppState>,
     Json(req): Json<StartDeploymentRequest>,
 ) -> Json<ApiResponse<DeploymentStatus>> {
+    if req.group_id != 0 {
+        return error(400, "新节点自动进入节点池，无需选择业务分组");
+    }
     let ssh = match validate_ssh(req.host, req.port, req.username, req.password) {
         Ok(value) => value,
         Err(message) => return error(400, message),
@@ -589,23 +595,25 @@ pub async fn start_deployment(
         Ok(value) => value,
         Err(message) => return error(400, message),
     };
-    let group =
-        match GroupRepository::find_by_id(state.db.as_ref(), req.group_id, &ResourceScope::All)
-            .await
-        {
-            Ok(Some(group)) if group.group_type == "in" => group,
-            Ok(Some(_)) => return error(400, "selected device group must be inbound"),
-            Ok(None) => return error(404, "device group not found"),
-            Err(err) => {
-                tracing::error!("node deployment group lookup failed: {err}");
-                return error(500, "database error");
-            }
-        };
     let Some(panel_url) = effective_public_panel_url(&state).await else {
         return error(
             409,
             "请先在站点设置中配置有效的面板公网地址，或设置 PUBLIC_PANEL_URL",
         );
+    };
+    if !panel_url.starts_with("https://") {
+        return error(409, "新节点安全认证需要 HTTPS 面板地址");
+    }
+    let group = match state
+        .db
+        .ensure_node_pool_system_group(admin.user_id, &uuid::Uuid::new_v4().to_string())
+        .await
+    {
+        Ok(group) => group,
+        Err(err) => {
+            tracing::error!("node deployment group lookup failed: {err}");
+            return error(500, "database error");
+        }
     };
     let status = state
         .deployments
@@ -727,6 +735,24 @@ async fn run_task(
             .runner
             .artifact(&preflight.architecture)
             .await?;
+        let pool_config = if state
+            .db
+            .node_pool_system_group_id()
+            .await
+            .map_err(|_| DeployError::new("DATABASE_FAILED", "pool unavailable"))?
+            == Some(group_id)
+        {
+            super::provisioning::pool_credential_bootstrap_config(&state, &id, group_id, actor_id)
+                .await
+                .map_err(|_| {
+                    DeployError::new(
+                        "CREDENTIAL_FAILED",
+                        "node credential authorization unavailable",
+                    )
+                })?
+        } else {
+            String::new()
+        };
         state
             .deployments
             .update(
@@ -751,6 +777,7 @@ async fn run_task(
                 &panel_url,
                 &token,
                 lite_mode,
+                &pool_config,
             )
             .await?;
         state
@@ -789,6 +816,12 @@ async fn run_task(
             .map(|task| task.profile)
             .unwrap_or_default();
         let required = profile.required_capabilities();
+        if !pool_config.is_empty() && verified.node_id != id {
+            return Err(DeployError::new(
+                "IDENTITY_MISMATCH",
+                "provisioned node identity mismatch",
+            ));
+        }
         if !capabilities_satisfy(verified.capabilities, required) {
             return Err(DeployError::new(
                 "CAPABILITY_FAILED",
@@ -921,8 +954,21 @@ async fn wait_for_node_capabilities(
             saw_online = true;
             let key = format!("node_status:{group_id}:{node_id}");
             if let Ok(Some(raw)) = state.db.get(&key).await {
+                let credential_confirmed = match state.db.node_pool_system_group_id().await {
+                    Ok(Some(anchor)) if anchor == group_id => {
+                        serde_json::from_str::<serde_json::Value>(&raw)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("verified_concrete_node")
+                                    .and_then(serde_json::Value::as_bool)
+                            })
+                            == Some(true)
+                    }
+                    Ok(_) => true,
+                    Err(_) => false,
+                };
                 if let Some(capabilities) = reported_capabilities(&raw) {
-                    if capabilities_satisfy(capabilities, required) {
+                    if credential_confirmed && capabilities_satisfy(capabilities, required) {
                         return Ok(capabilities);
                     }
                 }
@@ -1277,6 +1323,7 @@ mod tests {
     struct FakeRunner {
         behavior: FakeBehavior,
         install_calls: Arc<AtomicUsize>,
+        pool_config_seen: Arc<Mutex<Option<String>>>,
         commit_calls: Arc<AtomicUsize>,
         rollback_calls: Arc<AtomicUsize>,
     }
@@ -1286,6 +1333,7 @@ mod tests {
             Self {
                 behavior,
                 install_calls: Arc::new(AtomicUsize::new(0)),
+                pool_config_seen: Arc::new(Mutex::new(None)),
                 commit_calls: Arc::new(AtomicUsize::new(0)),
                 rollback_calls: Arc::new(AtomicUsize::new(0)),
             }
@@ -1340,8 +1388,10 @@ mod tests {
             _panel_url: &str,
             _token: &str,
             _lite_mode: bool,
+            pool_config: &str,
         ) -> Result<(), DeployError> {
             self.install_calls.fetch_add(1, Ordering::SeqCst);
+            *self.pool_config_seen.lock().await = Some(pool_config.to_string());
             match self.behavior {
                 FakeBehavior::SlowInstall => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1935,6 +1985,56 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
         )
         .await;
         state.deployments.status(&task.id).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn ssh_pool_bootstrap_receives_exact_credential_and_rejects_wrong_node_identity() {
+        let runner = Arc::new(FakeRunner::new(FakeBehavior::Success));
+        let state = test_state(test_registry(
+            runner.clone(),
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        ))
+        .await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-token")
+            .await
+            .unwrap();
+        let task = state
+            .deployments
+            .insert(
+                anchor.id,
+                "node.example".into(),
+                ProvisioningProfile::RealityCamouflage,
+                false,
+            )
+            .await;
+        run_task(
+            state.clone(),
+            task.id.clone(),
+            ssh_input(),
+            "SHA256:confirmed".into(),
+            anchor.token,
+            "https://panel.test".into(),
+            1,
+        )
+        .await;
+        let status = state.deployments.status(&task.id).await.unwrap();
+        assert_eq!(status.stage, DeploymentStage::Failed);
+        assert!(status.message.starts_with("IDENTITY_MISMATCH:"));
+        let pool_config = runner.pool_config_seen.lock().await.clone().unwrap();
+        assert!(pool_config.contains(&format!("POOL_NODE_ID='{}'", task.id)));
+        assert!(pool_config.contains(&format!("POOL_GROUP_ID={}", anchor.id)));
+        let claim = state
+            .db
+            .find_node_credential_claim(&task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.node_id, task.id);
+        assert_eq!(claim.home_group_id, anchor.id);
+        assert_eq!(runner.commit_calls.load(Ordering::SeqCst), 0);
     }
 
     async fn seed_node_capabilities(state: &AppState, capabilities: ProvisioningCapabilities) {

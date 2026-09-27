@@ -93,5 +93,15 @@ fi
 printf 'lite\n' > "$mode_root/etc/relay-panel/lite-mode"
 test "$(bash "$SCRIPT" --test-lite-mode "$mode_root" 0)" = 1
 
+printf '%s\n' "PANEL_URL='https://old.example'" "NODE_TOKEN='old-token'" \
+  "NODE_AUTH_MODE=credential" "NODE_CREDENTIAL_ID='existing-credential'" \
+  "NODE_CREDENTIAL_SECRET_FILE='/var/lib/relay-panel/node-claims/existing/node-credential.secret'" \
+  > "$TMP/existing-credential.env"
+bash "$SCRIPT" --test-env-filter "$TMP/existing-credential.env" "$TMP/filtered.env"
+! grep -q '^NODE_TOKEN=' "$TMP/filtered.env"
+grep -Fxq 'NODE_AUTH_MODE=credential' "$TMP/filtered.env"
+grep -Fxq "NODE_CREDENTIAL_ID='existing-credential'" "$TMP/filtered.env"
+grep -Fxq "NODE_CREDENTIAL_SECRET_FILE='/var/lib/relay-panel/node-claims/existing/node-credential.secret'" "$TMP/filtered.env"
+
 bash -n "$SCRIPT"
 printf 'relay-node HTTPS redirect bootstrap contract: PASS\n'

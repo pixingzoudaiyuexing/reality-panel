@@ -1,4 +1,5 @@
 mod acme_dns01;
+mod auth_reload;
 mod bbr;
 mod config;
 mod diagnose;
@@ -492,6 +493,12 @@ async fn run() {
         eprintln!("FATAL: invalid permanent Credential identity: {error}");
         std::process::exit(1);
     }
+    let (auth_sender, auth_receiver) = tokio::sync::watch::channel(config.clone());
+    tokio::spawn(auth_reload::watch_auth(
+        config.clone(),
+        node_id.clone(),
+        auth_sender,
+    ));
     let panel_certificate_sync = Arc::new(Mutex::new(
         panel_certificate::PanelCertificateSync::new()
             .expect("failed to initialize Panel certificate HTTP client"),
@@ -500,6 +507,7 @@ async fn run() {
     // --- Fork 1: WebSocket control channel (real-time config push) ---
     {
         let config_ws = config.clone();
+        let auth_ws = auth_receiver.clone();
         let manager_ws = manager.clone();
         let camouflage_ws = camouflage_sites.clone();
         let reconciler_ws = reconciler.clone();
@@ -513,6 +521,7 @@ async fn run() {
                 &reconciler_ws,
                 &panel_certificate_sync_ws,
                 &node_id_ws,
+                auth_ws,
             )
             .await;
         });
@@ -533,6 +542,8 @@ async fn run() {
     let mut in_mismatch_backoff = false;
     loop {
         interval.tick().await;
+
+        let config = auth_receiver.borrow().clone();
 
         match poller::fetch_config(&config, &node_id).await {
             poller::FetchResult::Ok(resp) => {

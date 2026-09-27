@@ -60,6 +60,64 @@ pub(crate) struct ProvisioningBundle {
     pub(crate) config: String,
 }
 
+pub(crate) async fn pool_credential_bootstrap_config(
+    state: &AppState,
+    enrollment_id: &str,
+    group_id: i64,
+    admin_id: i64,
+) -> Result<String, String> {
+    use crate::db::repo::{NewNodeCredentialClaim, NodeCredentialClaimCreateResult};
+    use crate::node_claim::{NodeClaimSecret, NodeClaimSecretVerifier};
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    let node_id = crate::node_identity::ReuseEligibleNodeId::parse(enrollment_id)
+        .map_err(|_| "invalid provisioning identity")?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(state.config.jwt_secret.as_bytes())
+        .map_err(|_| "invalid provisioning key")?;
+    mac.update(b"node-pool-bootstrap-claim/v1\0");
+    mac.update(enrollment_id.as_bytes());
+    mac.update(&group_id.to_be_bytes());
+    let wire = format!(
+        "rpc1_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    );
+    let secret = NodeClaimSecret::parse(&wire).map_err(|_| "invalid derived enrollment")?;
+    let now = chrono::Utc::now();
+    let claim = NewNodeCredentialClaim {
+        claim_id: enrollment_id.into(),
+        home_group_id: group_id,
+        node_id: node_id.clone(),
+        secret_verifier: NodeClaimSecretVerifier::derive(
+            enrollment_id,
+            group_id,
+            &node_id,
+            &secret,
+        ),
+        approved_by: admin_id,
+        approval_ref: format!("node-pool-bootstrap:{enrollment_id}"),
+        created_at: now,
+        expires_at: now + chrono::Duration::seconds(bootstrap_session_lifetime_secs()),
+    };
+    match state
+        .db
+        .create_node_credential_claim(&claim)
+        .await
+        .map_err(|_| "could not authorize node bootstrap")?
+    {
+        NodeCredentialClaimCreateResult::Created(_)
+        | NodeCredentialClaimCreateResult::Existing(_) => {}
+        NodeCredentialClaimCreateResult::Rejected => {
+            return Err("node bootstrap identity unavailable".into())
+        }
+    }
+    Ok(format!(
+        "POOL_NODE_ID={}\nPOOL_GROUP_ID={}\nPOOL_CLAIM_SECRET={}\n",
+        shell_quote(enrollment_id),
+        group_id,
+        shell_quote(&wire)
+    ))
+}
+
 impl ProvisioningBundle {
     pub(crate) fn new(
         panel_url: &str,

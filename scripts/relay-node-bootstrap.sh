@@ -961,6 +961,11 @@ acquire_transaction_lock || fail "TRANSACTION_BUSY: another bootstrap transactio
 
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
+
+# Pool bootstrap never re-anchors an existing persistent identity.
+if [ -n "${POOL_NODE_ID:-}" ] && [ -e /opt/relay-node/node-id ]; then
+  [ "$(cat /opt/relay-node/node-id)" = "$POOL_NODE_ID" ] || fail "existing Node identity cannot be reassigned during Pool bootstrap"
+fi
 resolve_lite_mode "${LITE_MODE:-0}" ""
 load_existing_managed_settings
 
@@ -989,6 +994,9 @@ apt-get update -y -qq
 # claim a managed port. This keeps the conflict check fail-closed on minimal OS
 # images without treating a freshly-installed Nginx listener as pre-existing.
 apt-get install -y -qq ca-certificates curl iproute2
+if [ -n "${POOL_NODE_ID:-}" ]; then
+  apt-get install -y -qq python3
+fi
 preflight_managed_ports
 # Docker 在启用 AppArmor 的精简系统上不会总是自动补齐解析器；显式安装，
 # 避免 daemon 正常但容器启动时报 docker-default profile 无法加载。
@@ -1060,6 +1068,10 @@ if [ -f /opt/relay-node/node-id ]; then
   [ "$(stat -c '%a' /opt/relay-node/node-id)" = 600 ] \
     || chmod 0600 /opt/relay-node/node-id
 fi
+if [ -n "${POOL_NODE_ID:-}" ] && [ ! -e /opt/relay-node/node-id ]; then
+  printf '%s' "$POOL_NODE_ID" > /opt/relay-node/node-id
+  chmod 0600 /opt/relay-node/node-id
+fi
 
 if [ -f /etc/relay-node/relay-node.env ]; then
   filter_unmanaged_env \
@@ -1100,6 +1112,30 @@ else
 fi
 
 install -d -m 0700 "$TRANSACTION_DIR/candidate"
+if [ -n "${POOL_NODE_ID:-}" ]; then
+  command -v python3 >/dev/null || fail "python3 is required for Pool credential bootstrap"
+  printf '%s' "$POOL_CLAIM_SECRET" > "$TRANSACTION_DIR/candidate/pool-secret"
+  chmod 0600 "$TRANSACTION_DIR/candidate/pool-secret"
+  curl --proto '=https' -fsS "$PANEL_URL/api/v1/node-pool/migrate.py" > "$TRANSACTION_DIR/candidate/migrate.py"
+  python3 "$TRANSACTION_DIR/candidate/migrate.py" --claim-id "$POOL_NODE_ID" --identity-group-id "$POOL_GROUP_ID" --node-id "$POOL_NODE_ID" --secret-file "$TRANSACTION_DIR/candidate/pool-secret" \
+    || fail "Pool credential bootstrap failed"
+  rm -f "$TRANSACTION_DIR/candidate/pool-secret"
+  credential_state="/var/lib/relay-panel/node-claims/$POOL_NODE_ID/credential-pending.json"
+  credential_id="$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1], encoding="utf-8")); assert s["phase"] == "ACTIVE_CONFIRMED"; print(s["credential_id"])' "$credential_state")" \
+    || fail "Pool credential confirmation is unavailable"
+  case "$credential_id" in
+    ''|*[!A-Za-z0-9_-]*) fail "Pool credential identity is invalid" ;;
+  esac
+  awk -F= '$1 != "NODE_TOKEN" && $1 != "NODE_AUTH_MODE" && $1 != "NODE_CREDENTIAL_ID" && $1 != "NODE_CREDENTIAL_SECRET_FILE" && $1 != "NODE_CREDENTIAL_STATE_FILE" { print }' \
+    /etc/relay-node/relay-node.env > /etc/relay-node/relay-node.env.new
+  cat >> /etc/relay-node/relay-node.env.new <<EOF
+NODE_AUTH_MODE=credential
+NODE_CREDENTIAL_ID='$credential_id'
+NODE_CREDENTIAL_SECRET_FILE='/var/lib/relay-panel/node-claims/$POOL_NODE_ID/node-credential.secret'
+EOF
+  chmod 0600 /etc/relay-node/relay-node.env.new
+  mv -f /etc/relay-node/relay-node.env.new /etc/relay-node/relay-node.env
+fi
 if [ "$EFFECTIVE_LITE_MODE" = 1 ]; then
   relay_after='network-online.target nginx.service'
 else

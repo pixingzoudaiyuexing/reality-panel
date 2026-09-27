@@ -67,6 +67,7 @@ pub async fn run_ws_loop(
     reconciler: &Arc<Mutex<Reconciler>>,
     panel_certificate_sync: &Arc<Mutex<PanelCertificateSync>>,
     node_id: &str,
+    mut auth_updates: tokio::sync::watch::Receiver<NodeConfig>,
 ) {
     let ws_url = derive_ws_url(&config.panel_url);
     let mut backoff = 1u64;
@@ -78,14 +79,17 @@ pub async fn run_ws_loop(
     loop {
         tracing::info!("websocket connecting to {} ...", ws_url);
 
+        let current_config = auth_updates.borrow_and_update().clone();
+
         let exit = connect_and_run(
             &ws_url,
-            config,
+            &current_config,
             manager,
             camouflage,
             reconciler,
             panel_certificate_sync,
             node_id,
+            &mut auth_updates,
         )
         .await;
         match exit {
@@ -99,7 +103,11 @@ pub async fn run_ws_loop(
                     "websocket disconnected, reconnecting in {} seconds",
                     backoff
                 );
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                if wait_backoff_or_auth_change(&mut auth_updates, backoff).await {
+                    backoff = 1;
+                    last_permanent_msg = None;
+                    continue;
+                }
                 backoff = (backoff * 2).min(30);
                 last_permanent_msg = None;
             }
@@ -115,7 +123,11 @@ pub async fn run_ws_loop(
                     );
                     last_permanent_msg = Some(msg);
                 }
-                tokio::time::sleep(Duration::from_secs(PERMANENT_BACKOFF_SECS)).await;
+                if wait_backoff_or_auth_change(&mut auth_updates, PERMANENT_BACKOFF_SECS).await {
+                    backoff = 1;
+                    last_permanent_msg = None;
+                    continue;
+                }
                 // Don't touch `backoff` — it's for transient errors only.
             }
             WsExit::Error(e) => {
@@ -124,11 +136,29 @@ pub async fn run_ws_loop(
                     e,
                     backoff
                 );
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                if wait_backoff_or_auth_change(&mut auth_updates, backoff).await {
+                    backoff = 1;
+                    last_permanent_msg = None;
+                    continue;
+                }
                 backoff = (backoff * 2).min(30);
                 last_permanent_msg = None;
             }
         }
+    }
+}
+
+async fn wait_backoff_or_auth_change<T: Clone>(
+    updates: &mut tokio::sync::watch::Receiver<T>,
+    seconds: u64,
+) -> bool {
+    if updates.has_changed().is_err() {
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+        return false;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(seconds)) => false,
+        changed = updates.changed() => changed.is_ok(),
     }
 }
 
@@ -189,6 +219,7 @@ async fn connect_and_run(
     reconciler: &Arc<Mutex<Reconciler>>,
     panel_certificate_sync: &Arc<Mutex<PanelCertificateSync>>,
     node_id: &str,
+    auth_updates: &mut tokio::sync::watch::Receiver<NodeConfig>,
 ) -> WsExit {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::connect_async;
@@ -318,6 +349,13 @@ async fn connect_and_run(
 
     loop {
         tokio::select! {
+            changed = auth_updates.changed() => {
+                if changed.is_ok() {
+                    let _ = ws_stream.close(None).await;
+                    return WsExit::ConfigChanged;
+                }
+                return WsExit::Disconnected;
+            }
             // ── Incoming messages ──
             msg_result = ws_stream.next() => {
                 let Some(msg_result) = msg_result else {
@@ -683,7 +721,10 @@ async fn apply_snapshot_at(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_snapshot_at, boot_confirmation_ack, derive_ws_url, spawn_lifecycle_work};
+    use super::{
+        apply_snapshot_at, boot_confirmation_ack, derive_ws_url, spawn_lifecycle_work,
+        wait_backoff_or_auth_change,
+    };
     use crate::forwarder::ForwarderManager;
     use crate::poller::{self, CachePaths};
     use crate::reporter::{ConnectionTracker, TrafficCounter};
@@ -694,6 +735,18 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn authentication_change_wakes_permanent_ws_backoff() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(0_u8);
+        let wait =
+            tokio::spawn(async move { wait_backoff_or_auth_change(&mut receiver, 300).await });
+        sender.send(1).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .unwrap()
+            .unwrap());
+    }
 
     /// v0.4.16: the WSS control-channel URL is derived from PANEL_URL. The
     /// https→wss mapping is the half that crosses the TLS provider, so pin it

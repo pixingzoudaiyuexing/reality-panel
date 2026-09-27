@@ -65,6 +65,7 @@ impl EnrollmentState {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateEnrollmentRequest {
+    #[serde(default)]
     pub group_id: i64,
     #[serde(default)]
     pub profile: ProvisioningProfile,
@@ -206,23 +207,28 @@ pub async fn create_enrollment(
     State(state): State<AppState>,
     Json(req): Json<CreateEnrollmentRequest>,
 ) -> Json<ApiResponse<CreatedEnrollment>> {
-    let group =
-        match GroupRepository::find_by_id(state.db.as_ref(), req.group_id, &ResourceScope::All)
-            .await
-        {
-            Ok(Some(group)) if group.group_type == "in" => group,
-            Ok(Some(_)) => return api_error(400, "target device group must be inbound"),
-            Ok(None) => return api_error(404, "device group not found"),
-            Err(error) => {
-                tracing::error!("manual enrollment group lookup failed: {error}");
-                return api_error(500, "database error");
-            }
-        };
+    if req.group_id != 0 {
+        return api_error(400, "新节点自动进入节点池，无需选择业务分组");
+    }
     let Some(panel_url) = effective_public_panel_url(&state).await else {
         return api_error(
             409,
             "请先在站点设置中配置有效的面板公网地址，或设置 PUBLIC_PANEL_URL",
         );
+    };
+    if !panel_url.starts_with("https://") {
+        return api_error(409, "新节点安全认证需要 HTTPS 面板地址");
+    }
+    let group = match state
+        .db
+        .ensure_node_pool_system_group(admin.user_id, &random_token())
+        .await
+    {
+        Ok(group) => group,
+        Err(error) => {
+            tracing::error!("manual enrollment group lookup failed: {error}");
+            return api_error(500, "database error");
+        }
     };
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -324,7 +330,24 @@ pub async fn enrollment_bundle(
             "请先在站点设置中配置有效的面板公网地址，或设置 PUBLIC_PANEL_URL",
         );
     };
-    let bundle = ProvisioningBundle::new(&panel_url, &group.token, artifact, false);
+    let mut bundle = ProvisioningBundle::new(&panel_url, &group.token, artifact, false);
+    let system_group = match state.db.node_pool_system_group_id().await {
+        Ok(value) => value,
+        Err(_) => return bundle_error(503, "node pool is unavailable"),
+    };
+    if system_group == Some(group.id) {
+        match super::provisioning::pool_credential_bootstrap_config(
+            &state,
+            &id,
+            group.id,
+            enrollment.created_by,
+        )
+        .await
+        {
+            Ok(config) => bundle.config.push_str(&config),
+            Err(_) => return bundle_error(503, "could not authorize node credential bootstrap"),
+        }
+    }
     match render_bundle(
         &id,
         enrollment.group_id,
@@ -733,6 +756,19 @@ async fn verify_node_state(
             "node observed state is invalid",
         )
     })?;
+    if state.db.node_pool_system_group_id().await.map_err(|_| {
+        (
+            VerificationErrorCategory::InvalidObservedState,
+            "pool state unavailable",
+        )
+    })? == Some(enrollment.group_id)
+        && (value["verified_concrete_node"] != true || node_id != enrollment.id)
+    {
+        return Err((
+            VerificationErrorCategory::InvalidObservedState,
+            "Pool node credential is not confirmed",
+        ));
+    }
     let observed_architecture = value
         .get("architecture")
         .and_then(|value| value.as_str())
@@ -1188,17 +1224,91 @@ mod tests {
     }
 
     async fn create_test_enrollment(state: &AppState) -> CreatedEnrollment {
+        // Existing persisted enrollments must retain their pre-Pool lifecycle.
+        let id = uuid::Uuid::new_v4().to_string();
+        let secret = random_token();
+        let now = chrono::Utc::now();
+        state
+            .db
+            .create_manual_bootstrap_enrollment(&NewManualBootstrapEnrollment {
+                id: id.clone(),
+                secret_verifier: secret_verifier(state, &id, &secret),
+                group_id: 7,
+                profile: "reality_camouflage".into(),
+                created_by: 1,
+                created_at: now.to_rfc3339(),
+                expires_at: (now + chrono::Duration::seconds(ENROLLMENT_CLAIM_WINDOW_SECS))
+                    .to_rfc3339(),
+            })
+            .await
+            .unwrap();
+        let record = state
+            .db
+            .find_manual_bootstrap_enrollment(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        CreatedEnrollment {
+            enrollment: enrollment_view(&record),
+            enrollment_secret: secret,
+            launcher_command: launcher_command(&state.config.public_panel_url, &id),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_enrollment_uses_hidden_pool_and_requires_https() {
+        let (state, _) = test_state().await;
         let Json(response) = create_enrollment(
             AdminOnly { user_id: 1 },
             State(state.clone()),
             Json(CreateEnrollmentRequest {
-                group_id: 7,
+                group_id: 0,
                 profile: ProvisioningProfile::RealityCamouflage,
             }),
         )
         .await;
-        assert_eq!(response.code, 0, "{}", response.message);
-        response.data.unwrap()
+        assert_eq!(response.code, 0);
+        let created = response.data.unwrap();
+        assert_eq!(
+            Some(created.enrollment.group_id),
+            state.db.node_pool_system_group_id().await.unwrap()
+        );
+        assert!(!state
+            .db
+            .list_groups(&ResourceScope::All)
+            .await
+            .unwrap()
+            .iter()
+            .any(|g| g.id == created.enrollment.group_id));
+        let config = super::super::provisioning::pool_credential_bootstrap_config(
+            &state,
+            &created.enrollment.id,
+            created.enrollment.group_id,
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(config.contains(&format!("POOL_NODE_ID='{}'", created.enrollment.id)));
+        let claim = state
+            .db
+            .find_node_credential_claim(&created.enrollment.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.node_id, created.enrollment.id);
+        assert_eq!(claim.home_group_id, created.enrollment.group_id);
+        let mut http = state;
+        http.config.public_panel_url = "http://panel.test".into();
+        let Json(response) = create_enrollment(
+            AdminOnly { user_id: 1 },
+            State(http),
+            Json(CreateEnrollmentRequest {
+                group_id: 0,
+                profile: ProvisioningProfile::RealityCamouflage,
+            }),
+        )
+        .await;
+        assert_eq!(response.code, 409);
     }
 
     async fn claim(

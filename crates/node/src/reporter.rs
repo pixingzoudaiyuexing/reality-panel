@@ -2385,6 +2385,7 @@ pub async fn report_status(
         .apply_reqwest(client.post(&url))
         .header("X-Node-ID", node_id)
         .json(&report)
+        .header("X-Node-Auth-Reload", "1")
         .send()
         .await
     {
