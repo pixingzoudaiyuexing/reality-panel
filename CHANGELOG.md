@@ -7,6 +7,28 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.1.26] - 2026-09-27
+
+### 新增 / 改进
+
+- 在“节点状态 → 具体节点详情”中新增管理员 Node Reuse 管理面板，可查看复用资格、已绑定分组和同步状态。
+- 新增候选分组安全预检查，按当前 Home、已有绑定与候选分组共同检查配置影响和冲突；创建 Binding 时服务端会独立再次校验。
+- Node Reuse 对通过具体节点凭据验证的 Node 默认可用；`NODE_REUSE_RUNTIME_ENABLED=0` 或 `false` 仅作为紧急关闭选项，不是日常设置或界面开关。
+
+### 安全 / 修复
+
+- Legacy Group Token Node 继续只接收 Home Group 配置；复用权限仍精确绑定到已验证的具体 Node。
+- 配置不可用或存在冲突时，Panel 不会把空配置当作权威配置发送；Node 应用失败时保留原有可用配置和 LKG。
+- 只有在服务端确认当前配置修订已提交，并收到具体 Node 对该配置的应用证据后，状态才显示“已同步”。状态查询不写入配置修订或归属记录。
+- 修复 Legacy Group Token 与具体节点凭据切换时的配置修订连续性，避免有效新配置被 Node 当作旧修订拒绝。
+
+### 兼容性
+
+- 无数据库 migration；Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
+- v1.1.25 可直接升级到 v1.1.26；本版本同时包含 Panel 与 relay-node 变更。
+- 复用仍要求具体节点身份验证、当前有效凭据和显式 Binding；Legacy Group Token Node 仍为 Home-only。
+- 本条目描述 Release Candidate 内容，不代表已创建 Release 或已部署到生产。
+
 ## [1.1.25] - 2026-09-25
 
 ### 新增

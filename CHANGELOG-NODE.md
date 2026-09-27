@@ -7,6 +7,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.1.26] - 2026-09-27
+
+### 修复 / 改进
+
+- 当配置内容指纹不变但权威配置修订更新时，Node 会确认并持久化新修订，避免 Node Reuse 关系变更后的同步状态停留在旧修订。
+- 待完成的 LKG 提交与配置修订绑定，旧修订的恢复不能被误认为较新配置已收敛。
+- 配置应用失败时仍保留原有可用监听和 LKG；旧修订以及同修订不同配置指纹的拒绝保护保持不变。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`；无数据库 migration。
+- v1.1.25 relay-node 可直接升级到 v1.1.26。完成 Node Reuse 产品流程时，建议与 v1.1.26 Panel 配套使用。
+
 ## [1.1.25] - 2026-09-25
 
 ### 新增

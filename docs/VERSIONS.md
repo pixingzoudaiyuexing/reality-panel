@@ -1,8 +1,9 @@
 # Release Contract
 
 Reality Panel uses one release tag and one compatibility version for the Panel
-and Node. The current stable release is `v1.1.25`. The wire protocol remains
-`CONFIG_PROTOCOL_VERSION = 10`.
+and Node. The current stable release is `v1.1.25`; the current release
+candidate is `v1.1.26`. Config Protocol remains `10` and Lifecycle Protocol
+remains `1`.
 
 ## Release assets
 
@@ -37,7 +38,7 @@ part of the automatic release workflow.
 Run before tagging:
 
 ```bash
-bash scripts/release-check.sh 1.1.25
+bash scripts/release-check.sh 1.1.26
 ```
 
 The default updater resolves the latest non-prerelease `v*` Release. An
