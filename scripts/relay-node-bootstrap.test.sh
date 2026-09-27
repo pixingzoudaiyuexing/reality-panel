@@ -15,6 +15,7 @@ fi
 grep -Fq 'command -v apparmor_parser' "$SCRIPT"
 grep -Fq 'set -euo pipefail' "$SCRIPT"
 grep -Fq '/opt/relay-node/relay-node --prepare-host-runtime' "$SCRIPT"
+grep -Fq 'migrate.py" --bootstrap --claim-id' "$SCRIPT"
 grep -Fq 'proxy_pass http://127.0.0.1:5245;' "$SCRIPT"
 grep -Fq 'if [ "$EFFECTIVE_LITE_MODE" = 0 ]; then' "$SCRIPT"
 grep -Fq 'refusing to convert an existing Standard node to Lite mode' "$SCRIPT"

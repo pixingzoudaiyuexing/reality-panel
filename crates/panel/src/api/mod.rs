@@ -62,6 +62,12 @@ pub fn routes() -> Router<AppState> {
             axum::routing::get(node_pool::node_identity),
         )
         .route(
+            "/node-pool/migrations/{claim_id}/complete",
+            axum::routing::post(node_pool::complete_migration).layer(axum::middleware::from_fn(
+                node_claim::claim_response_headers,
+            )),
+        )
+        .route(
             "/admin/node-pool/nodes/{identity_group_id}/{node_id}/migration",
             axum::routing::post(node_pool::start_migration).layer(axum::middleware::from_fn(
                 node_claim::claim_response_headers,

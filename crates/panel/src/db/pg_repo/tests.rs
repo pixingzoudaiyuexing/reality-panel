@@ -63,6 +63,18 @@ async fn pg_node_pool_metadata_contract() {
         .iter()
         .all(|id| *id != anchor.id));
     assert!(db.scan_prefix("node_config_").await.unwrap().is_empty());
+    db.set(
+        "node_pool_migration_completion:71:POOL_A",
+        r#"{"claim_id":"claim-a","credential_id":"credential-a"}"#,
+    )
+    .await
+    .unwrap();
+    assert!(db
+        .get("node_pool_migration_completion:71:POOL_A")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(db.scan_prefix("node_config_").await.unwrap().is_empty());
 }
 
 #[tokio::test]

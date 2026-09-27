@@ -16,6 +16,8 @@ const node = (over: Partial<PoolNode> = {}): PoolNode => ({
   identity_group_id: 10, node_id: 'NODE_LONG_IDENTIFIER', display_name: '',
   public_ipv4: '203.0.113.10', public_ipv6: '2001:db8::10', online: false,
   node_version: '1.1.26', last_seen: null, credential_ready: true,
+  credential_active: true, safe_to_add: true, migration_incomplete: false,
+  recovery_available: false, runtime_verified: false,
   migration_required: false, auth_reload_supported: true, memberships: [], ...over,
 });
 
@@ -54,7 +56,7 @@ describe('GroupPoolPicker', () => {
   });
 
   it('shows legacy upgrade gate in the add flow and never creates a membership', async () => {
-    mockGet.mockResolvedValue(ok([node({ credential_ready: false, migration_required: true, auth_reload_supported: false })]));
+    mockGet.mockResolvedValue(ok([node({ credential_ready: false, credential_active: false, safe_to_add: false, migration_required: true, auth_reload_supported: false })]));
     render(<GroupPoolPicker group={group} onClose={vi.fn()} onChanged={vi.fn()} />);
     await chooseNode();
     expect(screen.getByText('poolUpgradeRequired')).toBeInTheDocument();
@@ -64,7 +66,7 @@ describe('GroupPoolPicker', () => {
   });
 
   it('shows an existing migration authorization without creating another', async () => {
-    mockGet.mockResolvedValue(ok([node({ credential_ready: false, migration_required: true,
+    mockGet.mockResolvedValue(ok([node({ credential_ready: false, credential_active: false, safe_to_add: false, migration_required: true,
       migration_pending: true, migration_claim_id: 'claim-a' })]));
     render(<GroupPoolPicker group={group} onClose={vi.fn()} onChanged={vi.fn()} />);
     await chooseNode();
@@ -74,12 +76,29 @@ describe('GroupPoolPicker', () => {
   });
 
   it('does not offer legacy migration for a pool-native node with unavailable credential', async () => {
-    mockGet.mockResolvedValue(ok([node({ credential_ready: false, migration_required: false })]));
+    mockGet.mockResolvedValue(ok([node({ credential_ready: false, credential_active: false, safe_to_add: false, migration_required: false })]));
     render(<GroupPoolPicker group={group} onClose={vi.fn()} onChanged={vi.fn()} />);
     await chooseNode();
     expect(screen.getByText('poolCredentialUnavailable')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'poolStartMigration' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /nodeReuseCheck/ })).toBeDisabled();
+  });
+
+  it('keeps active-but-incomplete migration recoverable without enabling Add', async () => {
+    mockGet.mockResolvedValue(ok([node({ credential_ready: false, credential_active: true,
+      safe_to_add: false, migration_required: true, migration_incomplete: true,
+      recovery_available: true, migration_pending: true, migration_claim_id: 'claim-a' })]));
+    mockPost.mockResolvedValue(ok({ claim: { claim_id: 'claim-a' }, claim_secret: null,
+      command: 'python3 migrate.py --claim-id claim-a', recovery: true }));
+    render(<GroupPoolPicker group={group} onClose={vi.fn()} onChanged={vi.fn()} />);
+    await chooseNode();
+    expect(screen.getByText('poolMigrationIncomplete')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /nodeReuseCheck/ })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'poolContinueMigration' }));
+    expect(await screen.findByText('python3 migrate.py --claim-id claim-a')).toBeInTheDocument();
+    expect(screen.queryByLabelText('poolMigrationSecret')).not.toBeInTheDocument();
+    expect(mockPost).toHaveBeenCalledWith('/admin/node-pool/nodes/10/NODE_LONG_IDENTIFIER/migration');
+    expect(mockPost).toHaveBeenCalledTimes(1);
   });
 
   it('does not add a node after conflicting prospective preflight', async () => {

@@ -610,6 +610,7 @@ pub enum NodeReuseBindingCreateRejection {
     ReusingGroupNotInbound,
     HomeGroupNotInbound,
     ActiveCredentialMissing,
+    MigrationIncomplete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

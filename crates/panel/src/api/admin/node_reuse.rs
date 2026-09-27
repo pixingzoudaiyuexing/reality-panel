@@ -57,6 +57,11 @@ fn error_response(error: NodeReuseServiceError) -> Response {
                 409,
                 "CURRENT_ACTIVE_CREDENTIAL_REQUIRED".to_string(),
             ),
+            NodeReuseBindingCreateRejection::MigrationIncomplete => (
+                StatusCode::CONFLICT,
+                409,
+                "NODE_POOL_MIGRATION_INCOMPLETE".to_string(),
+            ),
         },
         NodeReuseServiceError::BindingChangedDuringRead => (
             StatusCode::CONFLICT,
@@ -323,6 +328,11 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query("INSERT INTO kvs(key,value) VALUES ('node_status:10:NODE_A', ?)")
+            .bind(r#"{"verified_concrete_node":true}"#)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let state = AppState {
             db: Arc::new(SqliteRepository::new(pool.clone())),
@@ -706,6 +716,22 @@ mod tests {
             .await
             .unwrap();
         }
+        state
+            .db
+            .set(
+                "node_status:10:NODE_CURRENT",
+                r#"{"verified_concrete_node":true}"#,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .set(
+                "node_status:10:NODE_DB",
+                r#"{"verified_concrete_node":true}"#,
+            )
+            .await
+            .unwrap();
         state
             .db
             .set(

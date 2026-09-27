@@ -28,6 +28,8 @@ The `v1.1.26` GitHub Release is published. The Owner reports production deployme
 
 The earlier Node Reuse release passed independent Gemini Code Review and Primary acceptance. Node Pool V1 is a separate High-Risk implementation and its exact final HEAD still requires independent Gemini review.
 
+Primary pre-review finding P-001 separates ACTIVE credentials from durable legacy migration completion. The fix adds an authenticated, idempotent completion handshake and server-enforced membership admission, with recovery through the same Claim and local credential. Formal Gemini review has not started; the previous `d3cef8d` Review Pack must not be used as the final pack after this fix.
+
 ## Next stage
 
 Next: finish Node Pool V1 validation and independent review. Merge, release and deployment require separate authorization.

@@ -717,6 +717,11 @@ export interface PoolNode {
   node_version: string | null;
   last_seen: string | null;
   credential_ready: boolean;
+  credential_active: boolean;
+  safe_to_add: boolean;
+  migration_incomplete: boolean;
+  recovery_available: boolean;
+  runtime_verified: boolean;
   migration_required: boolean;
   migration_pending?: boolean;
   migration_claim_id?: string | null;

@@ -753,6 +753,15 @@ async fn collect_effective_config_for_node(
             NodeReuseBindingCreateRejection::ActiveCredentialMissing,
         ));
     }
+    if candidate_group_id.is_some()
+        && !crate::service::node_pool::admission_state(db, home_group_id, &node_id)
+            .await?
+            .safe_to_add
+    {
+        return Err(NodeReuseServiceError::AdmissionRejected(
+            NodeReuseBindingCreateRejection::MigrationIncomplete,
+        ));
+    }
 
     let existing_group_ids = effective_source_groups(db, home_group_id, node_id.as_str()).await?;
     let mut source_group_ids = existing_group_ids.clone();
@@ -886,6 +895,15 @@ async fn collect_effective_config_for_node(
     {
         return Err(NodeReuseServiceError::AdmissionRejected(
             NodeReuseBindingCreateRejection::ActiveCredentialMissing,
+        ));
+    }
+    if candidate_group_id.is_some()
+        && !crate::service::node_pool::admission_state(db, home_group_id, &node_id)
+            .await?
+            .safe_to_add
+    {
+        return Err(NodeReuseServiceError::AdmissionRejected(
+            NodeReuseBindingCreateRejection::MigrationIncomplete,
         ));
     }
     for source_group_id in existing_group_ids.iter().copied() {
@@ -1044,6 +1062,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+            sqlx::query("INSERT INTO kvs(key,value) VALUES (?, ?)")
+                .bind(format!("node_status:10:{node_id}"))
+                .bind(r#"{"verified_concrete_node":true}"#)
+                .execute(&pool)
+                .await
+                .unwrap();
         }
 
         (SqliteRepository::new(pool.clone()), pool)

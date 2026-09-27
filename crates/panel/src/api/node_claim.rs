@@ -326,13 +326,31 @@ pub async fn create_claim(
             "Concrete Node Claim requires the configured trusted HTTPS ingress",
         );
     }
-    create_claim_after_transport(admin, state, req).await
+    create_claim_after_transport(admin, state, req, "admin-api").await
+}
+
+pub(crate) async fn create_pool_migration_claim(
+    admin: AdminOnly,
+    state: AppState,
+    peer: SocketAddr,
+    headers: HeaderMap,
+    request: CreateNodeClaimRequest,
+) -> Response {
+    if !production_claim_transport_allowed(&state, peer, &headers).await {
+        return sensitive_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            503,
+            "Concrete Node Claim requires the configured trusted HTTPS ingress",
+        );
+    }
+    create_claim_after_transport(admin, state, request, "node-pool-migration").await
 }
 
 async fn create_claim_after_transport(
     admin: AdminOnly,
     state: AppState,
     req: CreateNodeClaimRequest,
+    purpose: &str,
 ) -> Response {
     let node_id = match ReuseEligibleNodeId::parse(&req.node_id) {
         Ok(value) => value,
@@ -387,7 +405,7 @@ async fn create_claim_after_transport(
         node_id,
         secret_verifier,
         approved_by: admin.user_id,
-        approval_ref: format!("admin-api:{claim_id}"),
+        approval_ref: format!("{purpose}:{claim_id}"),
         created_at,
         expires_at,
     };
@@ -934,6 +952,7 @@ mod tests {
                     home_group_id: group_id,
                     node_id: node_id.to_string(),
                 },
+                "admin-api",
             )
             .await,
         )
@@ -1539,6 +1558,7 @@ mod tests {
                 home_group_id: 7,
                 node_id: "Admin_Race".into(),
             },
+            "admin-api",
         );
         let b = create_claim_after_transport(
             AdminOnly { user_id: 3 },
@@ -1547,6 +1567,7 @@ mod tests {
                 home_group_id: 7,
                 node_id: "Admin_Race".into(),
             },
+            "admin-api",
         );
         let (a, b) = tokio::join!(a, b);
         let (sa, _, va) = response_json(a).await;
@@ -1559,6 +1580,33 @@ mod tests {
         let conflict = if sa == StatusCode::CONFLICT { va } else { vb };
         assert_eq!(conflict["code"], 409);
         assert!(conflict["data"].get("claim_secret").is_none());
+    }
+
+    #[tokio::test]
+    async fn pool_migration_claim_is_distinguishable_from_prior_admin_claims() {
+        let (state, _) = test_state().await;
+        let response = create_claim_after_transport(
+            AdminOnly { user_id: 1 },
+            state.clone(),
+            CreateNodeClaimRequest {
+                home_group_id: 7,
+                node_id: "Pool_Migrate".into(),
+            },
+            "node-pool-migration",
+        )
+        .await;
+        let (_, _, value) = response_json(response).await;
+        let claim_id = value["data"]["claim"]["claim_id"].as_str().unwrap();
+        let record = state
+            .db
+            .find_node_credential_claim(claim_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.approval_ref,
+            format!("node-pool-migration:{claim_id}")
+        );
     }
 
     #[test]

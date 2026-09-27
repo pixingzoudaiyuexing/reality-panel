@@ -37,6 +37,8 @@ export const enUS: Dict = {
   poolStartMigration: 'Create secure migration command',
   poolMigrationPending: 'Run this command as root on the selected node and enter the one-time secret when prompted.',
   poolMigrationExistingPending: 'A migration authorization is already pending. Continue it or cancel and generate a new one.',
+  poolMigrationIncomplete: 'Identity migration is incomplete. Existing forwarding remains active.',
+  poolContinueMigration: 'Continue migration',
   poolCredentialUnavailable: 'The node credential is unavailable. This node cannot be added to a group.',
   poolMigrationSecret: 'One-time migration secret',
   poolMigrationFailed: 'Migration authorization was not created. Check connectivity and existing authorization, then retry.',

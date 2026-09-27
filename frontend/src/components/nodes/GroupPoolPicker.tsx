@@ -6,7 +6,7 @@ import type { ApiEnvelope, DeviceGroup, NodeReusePreview, NodeReuseRuntimeStatus
 import { useI18n } from '../../i18n/context';
 import { poolNodeKey, poolNodeName } from './poolNodeName';
 
-type Migration = { claim: { claim_id: string; expires_at: string }; claim_secret: string; command: string };
+type Migration = { claim: { claim_id: string; expires_at?: string }; claim_secret?: string | null; command: string; recovery?: boolean };
 export function GroupPoolPicker({ group, onClose, onChanged }: { group: DeviceGroup; onClose: () => void; onChanged: () => void }) {
   const { t } = useI18n();
   const [nodes, setNodes] = useState<PoolNode[]>([]);
@@ -30,7 +30,7 @@ export function GroupPoolPicker({ group, onClose, onChanged }: { group: DeviceGr
   }, [t]);
   useEffect(() => { void load(); return () => { generation.current += 1; }; }, [load]);
   useEffect(() => {
-    if (!identityGroupId || !nodeId || (!migration && !saved) || (migration && node?.credential_ready && !saved)) return;
+    if (!identityGroupId || !nodeId || (!migration && !saved) || (migration && node?.safe_to_add && !saved)) return;
     let active = true;
     const refresh = async () => {
       if (migration && !saved) await load();
@@ -42,7 +42,7 @@ export function GroupPoolPicker({ group, onClose, onChanged }: { group: DeviceGr
     void refresh();
     const timer = window.setInterval(() => void refresh(), 5000);
     return () => { active = false; window.clearInterval(timer); };
-  }, [identityGroupId, nodeId, node?.credential_ready, migration, saved, load]);
+  }, [identityGroupId, nodeId, node?.safe_to_add, migration, saved, load]);
   const check = async () => {
     if (!node) return;
     const request = ++generation.current;
@@ -55,7 +55,7 @@ export function GroupPoolPicker({ group, onClose, onChanged }: { group: DeviceGr
     finally { if (request === generation.current) setBusy(false); }
   };
   const add = async () => {
-    if (!node || !preview?.known_runtime_prerequisites_satisfied || preview.conflicts.length) return;
+    if (!node?.safe_to_add || !preview?.known_runtime_prerequisites_satisfied || preview.conflicts.length) return;
     setBusy(true); setError(null);
     try {
       const response = await api.post<unknown, ApiEnvelope<unknown>>(`/admin/groups/${group.id}/nodes`, { identity_group_id: node.identity_group_id, node_id: node.node_id });
@@ -70,7 +70,7 @@ export function GroupPoolPicker({ group, onClose, onChanged }: { group: DeviceGr
     setBusy(true); setError(null);
     try {
       const response = await api.post<unknown, ApiEnvelope<Migration>>(`/admin/node-pool/nodes/${node.identity_group_id}/${encodeURIComponent(node.node_id)}/migration`);
-      if (response.code !== 0 || !response.data?.claim_secret) throw new Error();
+      if (response.code !== 0 || !response.data?.command) throw new Error();
       if (request === generation.current) setMigration(response.data);
     } catch { if (request === generation.current) setError(t('poolMigrationFailed')); }
     finally { if (request === generation.current) setBusy(false); }
@@ -100,24 +100,28 @@ export function GroupPoolPicker({ group, onClose, onChanged }: { group: DeviceGr
           return !!n && [n.display_name, n.public_ipv4, n.public_ipv6, n.node_id].some(v => v?.toLowerCase().includes(input.toLowerCase()));
         }} />
       {!saved && node?.migration_required && <>
-        <Alert type="info" showIcon title={t('poolMigrationRequired')} description={!node.auth_reload_supported ? t('poolUpgradeRequired') : undefined} />
-        {!migration && !node.migration_pending && <Button disabled={!node.auth_reload_supported} loading={busy} onClick={() => void migrate()}>{t('poolStartMigration')}</Button>}
-        {!migration && node.migration_pending && <Alert type="info" title={t('poolMigrationExistingPending')} />}
-        {(migration || node.migration_pending) && <Button loading={busy} onClick={() => void cancelMigration()}>{t('cancel')}</Button>}
+        <Alert type="info" showIcon title={t(node.migration_incomplete ? 'poolMigrationIncomplete' : 'poolMigrationRequired')}
+          description={!node.auth_reload_supported && !node.recovery_available ? t('poolUpgradeRequired') : undefined} />
+        {!migration && (node.recovery_available || !node.migration_pending) && <Button
+          disabled={!node.recovery_available && !node.auth_reload_supported} loading={busy} onClick={() => void migrate()}>
+          {t(node.recovery_available ? 'poolContinueMigration' : 'poolStartMigration')}
+        </Button>}
+        {!migration && node.migration_pending && !node.recovery_available && <Alert type="info" title={t('poolMigrationExistingPending')} />}
+        {!node.credential_active && (migration || node.migration_pending) && <Button loading={busy} onClick={() => void cancelMigration()}>{t('cancel')}</Button>}
         {migration && <>
           <Typography.Text>{t('poolMigrationPending')}</Typography.Text>
           <Typography.Paragraph copyable={{ text: command }}><code style={{ overflowWrap: 'anywhere' }}>{command}</code></Typography.Paragraph>
-          <Input.Password readOnly value={migration.claim_secret} aria-label={t('poolMigrationSecret')} />
+          {migration.claim_secret && <Input.Password readOnly value={migration.claim_secret} aria-label={t('poolMigrationSecret')} />}
           <Typography.Text type="secondary">{migration.claim.expires_at}</Typography.Text>
         </>}
       </>}
-      {!saved && node && !node.credential_ready && !node.migration_required && <Alert type="error" showIcon title={t('poolCredentialUnavailable')} />}
-      {!saved && <Button icon={<SafetyCertificateOutlined />} disabled={!node?.credential_ready} loading={busy} onClick={() => void check()}>{t('nodeReuseCheck')}</Button>}
+      {!saved && node && !node.safe_to_add && !node.migration_required && <Alert type="error" showIcon title={t('poolCredentialUnavailable')} />}
+      {!saved && <Button icon={<SafetyCertificateOutlined />} disabled={!node?.safe_to_add} loading={busy} onClick={() => void check()}>{t('nodeReuseCheck')}</Button>}
       {!saved && preview && <>
         <Alert type={preview.conflicts.length ? 'error' : 'success'} showIcon
           title={t(preview.conflicts.length ? 'nodeReuseCheckBlocked' : 'nodeReuseCheckPassed')}
           description={preview.conflicts.length ? t('nodeReuseNoChangeNext') : t('nodeReuseImpact').replace('{groups}', String(preview.sources.length)).replace('{rules}', String(preview.sources.reduce((n, s) => n + s.rule_ids.length, 0)))} />
-        <Button type="primary" disabled={!preview.known_runtime_prerequisites_satisfied || !!preview.conflicts.length} loading={busy} onClick={() => void add()}>{t('addNode')}</Button>
+        <Button type="primary" disabled={!node?.safe_to_add || !preview.known_runtime_prerequisites_satisfied || !!preview.conflicts.length} loading={busy} onClick={() => void add()}>{t('addNode')}</Button>
       </>}
       {saved && <Alert type={sync?.sync_state === 'SYNCED' ? 'success' : 'info'} showIcon title={t('nodeReuseBindingSaved')}
         description={t(`nodeReuseState_${sync?.sync_state || 'WAITING'}`)} />}

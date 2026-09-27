@@ -36,6 +36,8 @@ export const zhCN = {
   poolStartMigration: '生成安全迁移命令',
   poolMigrationPending: '在目标节点以 root 运行此命令，并在提示时输入一次性密钥。',
   poolMigrationExistingPending: '此节点已有进行中的安全迁移授权。请继续原操作，或取消后重新生成。',
+  poolMigrationIncomplete: '身份迁移尚未完成。原有转发仍在运行。',
+  poolContinueMigration: '继续完成迁移',
   poolCredentialUnavailable: '节点凭据不可用，无法添加到分组。',
   poolMigrationSecret: '一次性迁移密钥',
   poolMigrationFailed: '迁移授权未创建。请检查连接及已有授权后重试。',

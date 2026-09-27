@@ -2,7 +2,7 @@
 use crate::db::error::DbError;
 use crate::db::repo::{ConcreteNodeIdentity, GroupRepository, Repository, ResourceScope};
 use crate::node_identity::ReuseEligibleNodeId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Serialize)]
@@ -23,11 +23,208 @@ pub struct PoolNode {
     pub node_version: Option<String>,
     pub last_seen: Option<String>,
     pub credential_ready: bool,
+    pub credential_active: bool,
+    pub safe_to_add: bool,
+    pub migration_incomplete: bool,
+    pub recovery_available: bool,
+    pub runtime_verified: bool,
     pub migration_required: bool,
     pub migration_pending: bool,
     pub migration_claim_id: Option<String>,
     pub auth_reload_supported: bool,
     pub memberships: Vec<PoolMembership>,
+}
+
+const MIGRATION_CLAIM_PREFIX: &str = "node-pool-migration:";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationCompletion {
+    claim_id: String,
+    credential_id: String,
+}
+
+fn completion_key(group_id: i64, node_id: &str) -> String {
+    format!("node_pool_migration_completion:{group_id}:{node_id}")
+}
+
+pub struct NodePoolAdmission {
+    pub credential_active: bool,
+    pub safe_to_add: bool,
+    pub migration_incomplete: bool,
+    pub migration_pending: bool,
+    pub migration_claim_id: Option<String>,
+    pub recovery_available: bool,
+}
+
+pub async fn admission_state(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: &ReuseEligibleNodeId,
+) -> Result<NodePoolAdmission, DbError> {
+    let active = db
+        .find_current_active_node_credential_for_identity(group_id, node_id)
+        .await?;
+    let credential_active = active.is_some();
+    if db.node_pool_system_group_id().await? == Some(group_id) {
+        return Ok(NodePoolAdmission {
+            credential_active,
+            safe_to_add: credential_active,
+            migration_incomplete: false,
+            migration_pending: false,
+            migration_claim_id: None,
+            recovery_available: false,
+        });
+    }
+    let claims = db
+        .list_node_credential_claims_for_identity(group_id, node_id)
+        .await?;
+    let pool_claims: Vec<_> = claims
+        .iter()
+        .filter(|claim| claim.approval_ref == format!("{MIGRATION_CLAIM_PREFIX}{}", claim.claim_id))
+        .collect();
+    let prior_verified = db
+        .get(&format!("node_status:{group_id}:{}", node_id.as_str()))
+        .await?
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|status| {
+            status
+                .get("verified_concrete_node")
+                .and_then(serde_json::Value::as_bool)
+        })
+        == Some(true)
+        || db
+            .get(&format!(
+                "node_config_revision:{group_id}:{}",
+                node_id.as_str()
+            ))
+            .await?
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .is_some_and(|revision| {
+                revision
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|value| value > 0)
+                    && revision
+                        .get("fingerprint")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| {
+                            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+            });
+    let mut matching_claims = Vec::new();
+    if let Some(credential) = active.as_ref() {
+        for claim in &claims {
+            if claim.state == "COMPLETED" {
+                if let Some(delivery) = db.find_node_credential_delivery(&claim.claim_id).await? {
+                    if delivery.state == "COMPLETED"
+                        && delivery.credential_id == credential.credential_id
+                    {
+                        matching_claims.push(claim);
+                    }
+                }
+            }
+        }
+    }
+    if pool_claims.is_empty() && prior_verified {
+        return Ok(NodePoolAdmission {
+            credential_active,
+            safe_to_add: credential_active,
+            migration_incomplete: false,
+            migration_pending: false,
+            migration_claim_id: None,
+            recovery_available: false,
+        });
+    }
+    let recovery_claim = matching_claims
+        .iter()
+        .find(|claim| {
+            pool_claims.is_empty()
+                || claim.approval_ref == format!("{MIGRATION_CLAIM_PREFIX}{}", claim.claim_id)
+        })
+        .map(|claim| claim.claim_id.clone());
+    let completed =
+        if let (Some(credential), Some(claim_id)) = (active.as_ref(), recovery_claim.as_ref()) {
+            db.get(&completion_key(group_id, node_id.as_str()))
+                .await?
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<MigrationCompletion>(raw).ok())
+                .is_some_and(|record| {
+                    record.claim_id == *claim_id && record.credential_id == credential.credential_id
+                })
+        } else {
+            false
+        };
+    let relevant_claims: Vec<_> = if pool_claims.is_empty() {
+        claims.iter().collect()
+    } else {
+        pool_claims
+    };
+    let pending = relevant_claims.iter().rev().find(|claim| {
+        claim.state == "CREDENTIAL_PENDING"
+            || (matches!(claim.state.as_str(), "APPROVED" | "CLAIMED")
+                && chrono::DateTime::parse_from_rfc3339(&claim.expires_at)
+                    .is_ok_and(|expiry| expiry > chrono::Utc::now()))
+    });
+    let migration_claim_id = recovery_claim
+        .clone()
+        .or_else(|| pending.map(|claim| claim.claim_id.clone()));
+    Ok(NodePoolAdmission {
+        credential_active,
+        safe_to_add: credential_active && completed,
+        migration_incomplete: credential_active && !completed,
+        migration_pending: pending.is_some() || (credential_active && !completed),
+        migration_claim_id,
+        recovery_available: credential_active && !completed && recovery_claim.is_some(),
+    })
+}
+
+pub async fn record_migration_completion(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: &ReuseEligibleNodeId,
+    claim_id: &str,
+    credential_id: &str,
+) -> Result<bool, DbError> {
+    let Some(claim) = db.find_node_credential_claim(claim_id).await? else {
+        return Ok(false);
+    };
+    let Some(delivery) = db.find_node_credential_delivery(claim_id).await? else {
+        return Ok(false);
+    };
+    if claim.home_group_id != group_id
+        || claim.node_id != node_id.as_str()
+        || claim.state != "COMPLETED"
+        || delivery.home_group_id != group_id
+        || delivery.node_id != node_id.as_str()
+        || delivery.state != "COMPLETED"
+        || delivery.credential_id != credential_id
+        || db.node_pool_system_group_id().await? == Some(group_id)
+    {
+        return Ok(false);
+    }
+    let active = db
+        .find_current_active_node_credential_for_identity(group_id, node_id)
+        .await?;
+    if active
+        .as_ref()
+        .map(|credential| credential.credential_id.as_str())
+        != Some(credential_id)
+    {
+        return Ok(false);
+    }
+    let record = MigrationCompletion {
+        claim_id: claim_id.into(),
+        credential_id: credential_id.into(),
+    };
+    db.set(
+        &completion_key(group_id, node_id.as_str()),
+        &serde_json::to_string(&record).expect("completion record is serializable"),
+    )
+    .await?;
+    Ok(true)
 }
 
 pub async fn reconcile_metadata(db: &dyn Repository) -> Result<(), DbError> {
@@ -98,30 +295,18 @@ pub async fn list_nodes(db: &dyn Repository) -> Result<Vec<PoolNode>, DbError> {
                 });
             }
         }
-        let credential_ready = match ReuseEligibleNodeId::parse(&record.node_id) {
-            Ok(id) => db
-                .find_current_active_node_credential_for_identity(record.identity_group_id, &id)
-                .await?
-                .is_some(),
-            Err(_) => false,
-        };
+        let id = ReuseEligibleNodeId::parse(&record.node_id).expect("validated registry identity");
+        let admission = admission_state(db, record.identity_group_id, &id).await?;
         let migration_required =
-            !credential_ready && Some(record.identity_group_id) != system_group;
-        let pending = if migration_required {
-            let id =
-                ReuseEligibleNodeId::parse(&record.node_id).expect("validated registry identity");
-            db.list_node_credential_claims_for_identity(record.identity_group_id, &id)
-                .await?
-                .into_iter()
-                .find(|claim| {
-                    claim.state == "CREDENTIAL_PENDING"
-                        || (matches!(claim.state.as_str(), "APPROVED" | "CLAIMED")
-                            && chrono::DateTime::parse_from_rfc3339(&claim.expires_at)
-                                .is_ok_and(|expiry| expiry > chrono::Utc::now()))
-                })
-        } else {
-            None
-        };
+            !admission.safe_to_add && Some(record.identity_group_id) != system_group;
+        let runtime_verified = raw.as_deref().is_some_and(|value| {
+            crate::api::stats::status_is_online(value, chrono::Utc::now())
+                && status
+                    .as_ref()
+                    .and_then(|v| v.get("verified_concrete_node"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        });
         result.push(PoolNode {
             identity_group_id: record.identity_group_id,
             node_id: record.node_id,
@@ -133,10 +318,15 @@ pub async fn list_nodes(db: &dyn Repository) -> Result<Vec<PoolNode>, DbError> {
                 .is_some_and(|v| crate::api::stats::status_is_online(v, chrono::Utc::now())),
             node_version: field("node_version"),
             last_seen: field("last_seen"),
-            credential_ready,
+            credential_ready: admission.credential_active,
+            credential_active: admission.credential_active,
+            safe_to_add: admission.safe_to_add,
+            migration_incomplete: admission.migration_incomplete,
+            recovery_available: admission.recovery_available,
+            runtime_verified,
             migration_required,
-            migration_pending: pending.is_some(),
-            migration_claim_id: pending.map(|claim| claim.claim_id),
+            migration_pending: admission.migration_pending,
+            migration_claim_id: admission.migration_claim_id,
             auth_reload_supported: status
                 .as_ref()
                 .and_then(|v| v.get("auth_reload_supported"))

@@ -1117,7 +1117,7 @@ if [ -n "${POOL_NODE_ID:-}" ]; then
   printf '%s' "$POOL_CLAIM_SECRET" > "$TRANSACTION_DIR/candidate/pool-secret"
   chmod 0600 "$TRANSACTION_DIR/candidate/pool-secret"
   curl --proto '=https' -fsS "$PANEL_URL/api/v1/node-pool/migrate.py" > "$TRANSACTION_DIR/candidate/migrate.py"
-  python3 "$TRANSACTION_DIR/candidate/migrate.py" --claim-id "$POOL_NODE_ID" --identity-group-id "$POOL_GROUP_ID" --node-id "$POOL_NODE_ID" --secret-file "$TRANSACTION_DIR/candidate/pool-secret" \
+  python3 "$TRANSACTION_DIR/candidate/migrate.py" --bootstrap --claim-id "$POOL_NODE_ID" --identity-group-id "$POOL_GROUP_ID" --node-id "$POOL_NODE_ID" --secret-file "$TRANSACTION_DIR/candidate/pool-secret" \
     || fail "Pool credential bootstrap failed"
   rm -f "$TRANSACTION_DIR/candidate/pool-secret"
   credential_state="/var/lib/relay-panel/node-claims/$POOL_NODE_ID/credential-pending.json"

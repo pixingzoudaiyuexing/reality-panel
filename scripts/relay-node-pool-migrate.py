@@ -40,6 +40,13 @@ def activate_or_verify(request, endpoint, identity, state, secret):
             raise
 
 
+def commit_migration_descriptor(atomic_write, path, descriptor, request, claim_id, secret, credential_id, bootstrap=False):
+    atomic_write(path, json.dumps(descriptor).encode())
+    if not bootstrap:
+        request("node-pool/migrations/" + claim_id + "/complete", {},
+            "RelayNodeCredential " + secret, credential_id)
+
+
 def private_read(path, secret=False):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as source:
@@ -60,6 +67,7 @@ def main():
     parser.add_argument("--identity-group-id", required=True, type=int)
     parser.add_argument("--node-id", required=True)
     parser.add_argument("--secret-file")
+    parser.add_argument("--bootstrap", action="store_true")
     args = parser.parse_args()
     if os.geteuid() != 0 or args.identity_group_id <= 0:
         raise RuntimeError("root and valid identity required")
@@ -154,7 +162,8 @@ def main():
         raise RuntimeError("activated credential identity mismatch")
     descriptor = {"identity_group_id": args.identity_group_id, "node_id": node_id,
         "credential_id": state["credential_id"], "secret_file": os.path.join(state_dir, state["secret_file"])}
-    namespace["atomic_write"](os.path.join(ROOT, "runtime-auth.json"), json.dumps(descriptor).encode())
+    commit_migration_descriptor(namespace["atomic_write"], os.path.join(ROOT, "runtime-auth.json"),
+        descriptor, request, args.claim_id, secret, state["credential_id"], args.bootstrap)
     print("身份已安全持久化，等待节点控制连接确认。原有转发进程保持运行。")
 
 
