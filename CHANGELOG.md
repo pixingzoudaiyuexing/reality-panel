@@ -27,7 +27,6 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 - 无数据库 migration；Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。
 - v1.1.25 可直接升级到 v1.1.26；本版本同时包含 Panel 与 relay-node 变更。
 - 复用仍要求具体节点身份验证、当前有效凭据和显式 Binding；Legacy Group Token Node 仍为 Home-only。
-- 本条目描述 Release Candidate 内容，不代表已创建 Release 或已部署到生产。
 
 ## [1.1.25] - 2026-09-25
 

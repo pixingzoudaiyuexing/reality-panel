@@ -1,6 +1,6 @@
 # Reality Panel — Current Architecture
 
-This document describes the current source design, including the Node Reuse product completion integrated at `555558f17218540211c59b9c08bd767d68e294a9` after independent review and Primary acceptance. The feature has not been released or deployed.
+This document describes the current source design, including the Node Reuse product completion released in `v1.1.26` after independent review and Primary acceptance. Production deployment has not occurred.
 
 ## Control plane and data plane
 

@@ -1,6 +1,6 @@
 # ADR 0001 — Node Reuse V1
 
-Status: **APPROVED BOUNDARY / IMPLEMENTED AND ACCEPTED / NOT RELEASED**
+Status: **APPROVED BOUNDARY / IMPLEMENTED / RELEASED IN v1.1.26 / NOT DEPLOYED**
 
 ## Context
 
@@ -93,4 +93,4 @@ The existing relay-node persistent node ID remains the node identity mechanism.
 
 ## Implementation status
 
-The `v1.1.25` base includes concrete-node credential verification, exact-node management APIs, guarded EffectiveConfig merge, and Node-side LKG/failure isolation. Product completion was integrated on `main` at `555558f17218540211c59b9c08bd767d68e294a9` after independent Gemini review passed and Primary accepted it. Reuse is available by default for verified concrete Nodes, with read-only prospective Preflight, independently guarded Create, and conservative exact-snapshot synchronization status in Node detail. A Binding save is not proof of Node application; offline removal cannot immediately stop remote traffic. No Release or production deployment is claimed.
+The `v1.1.25` base includes concrete-node credential verification, exact-node management APIs, guarded EffectiveConfig merge, and Node-side LKG/failure isolation. Product completion was integrated on `main` at `555558f17218540211c59b9c08bd767d68e294a9` after independent Gemini review passed and Primary accepted it, then published in `v1.1.26` from `5e249ed5b665065d917ce3812075b293414b1ac9`. Reuse is available by default for verified concrete Nodes, with read-only prospective Preflight, independently guarded Create, and conservative exact-snapshot synchronization status in Node detail. A Binding save is not proof of Node application; offline removal cannot immediately stop remote traffic. Production deployment has not occurred.

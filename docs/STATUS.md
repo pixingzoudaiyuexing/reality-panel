@@ -4,7 +4,7 @@ Last verified in source: 2026-09-27
 
 ## Current phase
 
-Node Reuse product completion is integrated and accepted. Reality Panel `v1.1.26` release candidate is being prepared; no tag, GitHub Release or deployment has occurred.
+Node Reuse product completion is integrated, accepted, and published in the stable `v1.1.26` Release. It has not been deployed to production.
 
 ## Git baseline
 
@@ -12,17 +12,17 @@ Node Reuse product completion is integrated and accepted. Reality Panel `v1.1.26
 - Baseline branch: `main`
 - Verified base commit: `28a5ea505ee0e7bf6beb81b34afa6cccbc7dffb0`
 - Integrated implementation branch: `codex/node-reuse-product-completion`
-- Integrated HEAD: `555558f17218540211c59b9c08bd767d68e294a9`
-- Current stable release: `v1.1.25`
-- Current release candidate: `v1.1.26`
+- Accepted implementation commit: `555558f17218540211c59b9c08bd767d68e294a9`
+- Release source commit: `5e249ed5b665065d917ce3812075b293414b1ac9`
+- Current stable release: `v1.1.26`
 - Config Protocol: `10`
 - Lifecycle Protocol: `1`
 
-The implementation is a fast-forward from the exact released `main` base above. The original-base-to-final-HEAD review passed; the Review Pack records the exact anchors and evidence.
+The implementation was a fast-forward from the exact released `main` base above. The original-base-to-final-HEAD review passed before integration and release.
 
 ## Production state
 
-No production mutation, server access, database migration, deployment or release was part of the integration or candidate preparation.
+The `v1.1.26` GitHub Release is published. No production access, database migration, deployment or production mutation has occurred.
 
 ## Current review gate
 
@@ -30,4 +30,4 @@ This task was High Risk because it changes default runtime activation and exact-
 
 ## Next stage
 
-Next: Any Release or production deployment requires a separate explicit task and authorization.
+Next: Production deployment requires a separate explicit task and authorization.
