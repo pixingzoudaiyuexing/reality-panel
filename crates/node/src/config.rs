@@ -8,6 +8,7 @@ const CREDENTIAL_ID_HEADER: &str = "X-Node-Credential-ID";
 const CREDENTIAL_STATE_ROOT: &str = "/var/lib/relay-panel/node-claims";
 const CREDENTIAL_SECRET_FILENAME: &str = "node-credential.secret";
 const CREDENTIAL_STATE_FILENAME: &str = "credential-pending.json";
+pub const RUNTIME_AUTH_DESCRIPTOR: &str = "/var/lib/relay-panel/node-claims/runtime-auth.json";
 
 #[derive(Clone)]
 pub enum NodeRuntimeAuth {
@@ -45,7 +46,7 @@ impl std::fmt::Debug for NodeRuntimeAuth {
 impl NodeRuntimeAuth {
     pub fn load_reload_descriptor(node_id: &str) -> Result<(Self, i64), String> {
         let descriptor = read_private_file(
-            Path::new("/var/lib/relay-panel/node-claims/runtime-auth.json"),
+            Path::new(RUNTIME_AUTH_DESCRIPTOR),
             "runtime authentication descriptor",
         )?;
         #[derive(serde::Deserialize)]

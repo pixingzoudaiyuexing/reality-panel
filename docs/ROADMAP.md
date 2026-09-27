@@ -1,8 +1,8 @@
 # Reality Panel — Roadmap
 
-## Current stage: Node Pool V1 implementation pending independent review
+## Current stage: Node Pool V1 RT-001 restart safety fix pending independent review
 
-Node Pool V1 projects existing Nodes and memberships without automatic runtime changes, adds Pool-managed names and Group-centric assignment, and provisions new Nodes under a hidden identity anchor. It is not merged, released, or deployed. The Owner reports that stable `v1.1.26` is already deployed; this task has not independently verified production. See [ADR 0002](adr/0002-node-pool-v1.md).
+Node Pool V1 projects existing Nodes and memberships without automatic runtime changes, adds Pool-managed names and Group-centric assignment, and provisions new Nodes under a hidden identity anchor. It is integrated on `main` at `95f230bf73e730b92b9023f01e5fad1c2e7d9763`, but not released or deployed. RT-001 restart safety is being fixed on an isolated branch and requires a new independent review. The Owner reports that stable `v1.1.26` is already deployed; this task has not independently verified production. See [ADR 0002](adr/0002-node-pool-v1.md).
 
 ## Stable baseline: Node Reuse product completion
 

@@ -32,7 +32,7 @@ The repository currently contains support for:
 - Lite-node related behavior;
 - GitHub Release based publishing.
 - exact-concrete-node Node Reuse with admin preflight and guarded runtime delivery (released in `v1.1.26`; Owner reports production deployment).
-- Node Pool V1 is under implementation and review on an isolated branch, not released or deployed.
+- Node Pool V1 is integrated on `main` but not released or deployed; RT-001 restart safety is under repair on an isolated branch.
 
 ## Non-goals / boundaries
 

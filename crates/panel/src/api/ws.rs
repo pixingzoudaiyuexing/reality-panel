@@ -342,6 +342,18 @@ pub async fn node_ws_handler(
     let group_id = identity.group_id();
     let node_id = identity.node_id().map(str::to_string);
     let verified_credential = identity.verified().cloned();
+    match crate::service::node_pool::legacy_config_authority_retired(
+        state.db.as_ref(),
+        group_id,
+        node_id.as_deref(),
+        verified_credential.is_some(),
+    )
+    .await
+    {
+        Ok(true) => return axum::http::StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Ok(false) => {}
+    }
     let node_version = headers
         .get("X-Node-Version")
         .and_then(|value| value.to_str().ok())
@@ -606,6 +618,17 @@ pub(crate) async fn build_config_snapshot_for_node(
     verified_concrete_node: bool,
     runtime_enabled: bool,
 ) -> Option<NodeConfigSnapshot> {
+    match crate::service::node_pool::legacy_config_authority_retired(
+        db,
+        group_id,
+        node_id,
+        verified_concrete_node,
+    )
+    .await
+    {
+        Ok(false) => {}
+        Ok(true) | Err(_) => return None,
+    }
     // v0.3.6: delegate to the shared `build_node_config` (same function
     // `get_config` uses). This fixes the v0.3.5 drift where the WS path queried
     // forward_rules WITHOUT joining users, so a reconnecting node could be
@@ -730,6 +753,61 @@ mod tests {
                 .unwrap(),
         );
         request
+    }
+
+    #[tokio::test]
+    async fn migrated_legacy_websocket_is_rejected_before_upgrade() {
+        let (state, _secret, _pool) = ws_credential_state().await;
+        state
+            .db
+            .set(
+                "node_pool_migration_completion:10:Node_A",
+                r#"{"claim_id":"claim-rt001","credential_id":"cred-ws"}"#,
+            )
+            .await
+            .unwrap();
+        let app = axum::Router::new()
+            .route("/node/ws", axum::routing::get(node_ws_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut request = format!("ws://{addr}/node/ws")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", "Bearer legacy-token".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("X-Node-ID", "Node_A".parse().unwrap());
+        request.headers_mut().insert(
+            "X-Config-Protocol-Version",
+            relay_shared::protocol::CONFIG_PROTOCOL_VERSION
+                .to_string()
+                .parse()
+                .unwrap(),
+        );
+        let error = tokio_tungstenite::connect_async(request.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == axum::http::StatusCode::FORBIDDEN)
+        );
+        request
+            .headers_mut()
+            .insert("X-Node-ID", "Node_B".parse().unwrap());
+        let (socket, response) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("same-group unmigrated Node must retain WS access");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SWITCHING_PROTOCOLS
+        );
+        drop(socket);
+        server.abort();
     }
 
     #[tokio::test]

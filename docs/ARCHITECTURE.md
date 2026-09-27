@@ -1,6 +1,6 @@
 # Reality Panel — Current Architecture
 
-This document describes the current source design. Node Reuse product completion was released in `v1.1.26` after independent review and Primary acceptance. The Owner reports that release deployed to production; this task has not independently verified the deployment. Node Pool V1 remains unreleased source work pending independent review.
+This document describes the current source design. Node Reuse product completion was released in `v1.1.26` after independent review and Primary acceptance. The Owner reports that release deployed to production; this task has not independently verified the deployment. Node Pool V1 is integrated but unreleased; its RT-001 restart safety fix remains pending independent review.
 
 ## Control plane and data plane
 

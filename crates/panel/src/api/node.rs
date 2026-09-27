@@ -84,6 +84,19 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     let node_id = identity.node_id().map(str::to_string);
     let verified_concrete_node = identity.verified().is_some();
 
+    match crate::service::node_pool::legacy_config_authority_retired(
+        state.db.as_ref(),
+        group_id,
+        node_id.as_deref(),
+        verified_concrete_node,
+    )
+    .await
+    {
+        Ok(true) => return StatusCode::FORBIDDEN.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Ok(false) => {}
+    }
+
     // v0.3.6: delegate to the shared `build_node_config`. This path and the WS
     // push path (ws.rs) now use the SAME function.
     //
@@ -1051,6 +1064,110 @@ mod tests {
         headers.insert("X-Node-Credential-ID", credential_id.parse().unwrap());
         headers.insert("X-Node-ID", node_id.parse().unwrap());
         headers
+    }
+
+    #[tokio::test]
+    async fn completed_pool_migration_retires_only_exact_legacy_config_authority() {
+        let (mut state, pool) = seeded_state().await;
+        state.config.node_reuse_runtime_enabled = true;
+        let secret =
+            install_active_runtime_credential(&pool, "cred-rt001", 10, "node-a", 0x73).await;
+
+        // ACTIVE without the durable completion ACK is not a retirement.
+        assert_eq!(
+            get_config(
+                State(state.clone()),
+                config_headers_for_node("tok-A", "node-a")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        state
+            .db
+            .set(
+                "node_pool_migration_completion:10:node-a",
+                r#"{"claim_id":"claim-rt001","credential_id":"cred-rt001"}"#,
+            )
+            .await
+            .unwrap();
+        let revision_before = state
+            .db
+            .get("node_config_revision:legacy:10:node-a")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_config(
+                State(state.clone()),
+                config_headers_for_node("tok-A", "node-a")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            state
+                .db
+                .get("node_config_revision:legacy:10:node-a")
+                .await
+                .unwrap(),
+            revision_before
+        );
+        assert!(crate::api::ws::build_config_snapshot_for_node(
+            state.db.as_ref(),
+            std::path::Path::new(&state.config.certificate_state_dir()),
+            10,
+            Some("node-a"),
+            false,
+            true,
+        )
+        .await
+        .is_none());
+        assert_eq!(
+            state
+                .db
+                .get("node_config_revision:legacy:10:node-a")
+                .await
+                .unwrap(),
+            revision_before
+        );
+
+        assert_eq!(
+            get_config(
+                State(state.clone()),
+                config_headers_for_node("tok-A", "node-b")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_config(
+                State(state.clone()),
+                credential_config_headers("cred-rt001", &secret, "node-a")
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        sqlx::query("UPDATE node_credentials SET revoked_at = datetime('now') WHERE credential_id = 'cred-rt001'")
+            .execute(&pool).await.unwrap();
+        assert_eq!(
+            get_config(
+                State(state.clone()),
+                credential_config_headers("cred-rt001", &secret, "node-a")
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_config(State(state), config_headers_for_node("tok-A", "node-a"))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[test]

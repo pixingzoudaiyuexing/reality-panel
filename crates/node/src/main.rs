@@ -493,6 +493,7 @@ async fn run() {
         eprintln!("FATAL: invalid permanent Credential identity: {error}");
         std::process::exit(1);
     }
+    let config = auth_reload::wait_for_startup_auth(config, &node_id).await;
     let (auth_sender, auth_receiver) = tokio::sync::watch::channel(config.clone());
     tokio::spawn(auth_reload::watch_auth(
         config.clone(),

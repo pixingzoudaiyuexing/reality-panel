@@ -48,6 +48,26 @@ fn completion_key(group_id: i64, node_id: &str) -> String {
     format!("node_pool_migration_completion:{group_id}:{node_id}")
 }
 
+/// A completion row retires only this exact Node's legacy config authority.
+/// An unreadable or malformed row must not authorize Home-only delivery.
+pub async fn legacy_config_authority_retired(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: Option<&str>,
+    verified_concrete_node: bool,
+) -> Result<bool, DbError> {
+    if verified_concrete_node {
+        return Ok(false);
+    }
+    let Some(node_id) = node_id.and_then(|id| ReuseEligibleNodeId::parse(id).ok()) else {
+        return Ok(false);
+    };
+    Ok(db
+        .get(&completion_key(group_id, node_id.as_str()))
+        .await?
+        .is_some())
+}
+
 pub struct NodePoolAdmission {
     pub credential_active: bool,
     pub safe_to_add: bool,
