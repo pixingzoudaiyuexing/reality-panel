@@ -514,6 +514,7 @@ pub enum RoutingModeTransitionError {
     ScheduleConfigurationMissing,
     DnsMgrUnavailable,
     ProviderPreflight(String),
+    CarrierMultiValueUnsupported,
     OwnershipUnverified { rule_id: i64, line_id: String },
     DnsSchedulingFailed,
 }
@@ -544,6 +545,9 @@ impl std::fmt::Display for RoutingModeTransitionError {
             Self::DnsMgrUnavailable => formatter.write_str("DNSMgr is disabled or not configured"),
             Self::ProviderPreflight(error) => {
                 write!(formatter, "DNS provider preflight failed: {error}")
+            }
+            Self::CarrierMultiValueUnsupported => {
+                formatter.write_str("CARRIER_MULTI_A_PROVIDER_UNSUPPORTED")
             }
             Self::OwnershipUnverified { rule_id, line_id } => write!(
                 formatter,
@@ -731,6 +735,7 @@ pub enum CarrierPolicyApplyError {
     DnsMgrUnavailable,
     DefaultLineOwnedByRelayPreference,
     ProviderPreflight(String),
+    CarrierMultiValueUnsupported,
     OwnershipUnverified { rule_id: i64, line_id: String },
     DnsSchedulingFailed,
     NodeUninstalling(String),
@@ -768,6 +773,9 @@ impl std::fmt::Display for CarrierPolicyApplyError {
                 )
             }
             Self::ProviderPreflight(error) => write!(f, "DNS provider preflight failed: {error}"),
+            Self::CarrierMultiValueUnsupported => {
+                f.write_str("CARRIER_MULTI_A_PROVIDER_UNSUPPORTED")
+            }
             Self::OwnershipUnverified { rule_id, line_id } => write!(
                 f,
                 "DNS ownership could not be verified for rule {rule_id} line {line_id}"
@@ -1012,6 +1020,36 @@ fn evaluate_node(
         },
         public_ipv4,
     }
+}
+
+pub(crate) fn evaluate_observed_group_node(
+    identity_group_id: i64,
+    node_id: &str,
+    raw_status: Option<&str>,
+    now: DateTime<Utc>,
+    live_node_ids: &HashSet<String>,
+    rules: &[ForwardRule],
+    display_name: &str,
+) -> RelayReadyNode {
+    let mut info = evaluate_node(
+        identity_group_id,
+        node_id.to_string(),
+        raw_status,
+        now,
+        live_node_ids,
+        rules,
+    )
+    .info;
+    info.display_name = display_name.into();
+    info.public_ipv6 = raw_status
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|status| {
+            status
+                .get("public_ipv6")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    info
 }
 
 fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -1766,30 +1804,28 @@ async fn evaluate_group_nodes_inner(
         .into_iter()
         .map(|((identity_group_id, node_id), raw_status)| {
             let raw_status = (!raw_status.is_empty()).then_some(raw_status.as_str());
-            let mut evaluated = evaluate_node(
-                identity_group_id,
-                node_id.clone(),
-                raw_status,
-                now,
-                &live_by_identity[&identity_group_id],
-                &rules,
-            );
-            evaluated.info.display_name = pool_records
+            let display_name = pool_records
                 .iter()
                 .find(|record| {
                     record.identity_group_id == identity_group_id && record.node_id == node_id
                 })
                 .map(|record| record.display_name.clone())
                 .unwrap_or_default();
-            evaluated.info.public_ipv6 = raw_status
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .and_then(|status| {
-                    status
-                        .get("public_ipv6")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                });
-            evaluated
+            let public_ipv4 = raw_status
+                .and_then(|raw| serde_json::from_str::<StoredNodeStatus>(raw).ok())
+                .and_then(|status| reported_public_ipv4(&status).map(str::to_string));
+            EvaluatedNode {
+                info: evaluate_observed_group_node(
+                    identity_group_id,
+                    &node_id,
+                    raw_status,
+                    now,
+                    &live_by_identity[&identity_group_id],
+                    &rules,
+                    &display_name,
+                ),
+                public_ipv4,
+            }
         })
         .collect())
 }
@@ -2345,6 +2381,9 @@ fn map_snapshot_error(
                 line_id: line_id.into(),
             }
         }
+        LineRecordSnapshotError::CarrierMultiValueUnsupported => {
+            CarrierPolicyApplyError::CarrierMultiValueUnsupported
+        }
         LineRecordSnapshotError::Provider(error) => {
             CarrierPolicyApplyError::ProviderPreflight(error.to_string())
         }
@@ -2368,6 +2407,9 @@ fn map_mode_snapshot_error(
                 rule_id,
                 line_id: line_id.into(),
             }
+        }
+        LineRecordSnapshotError::CarrierMultiValueUnsupported => {
+            RoutingModeTransitionError::CarrierMultiValueUnsupported
         }
         LineRecordSnapshotError::Database => {
             RoutingModeTransitionError::ProviderPreflight("database read failed".into())
@@ -3101,6 +3143,10 @@ fn transition_business_error(error: &RoutingModeTransitionError) -> (&'static st
             "DNS_PROVIDER_PREFLIGHT_FAILED",
             "DNS provider preflight failed",
         ),
+        RoutingModeTransitionError::CarrierMultiValueUnsupported => (
+            "CARRIER_MULTI_A_PROVIDER_UNSUPPORTED",
+            "provider groups multiple A values under one record ID; per-node removal is unavailable",
+        ),
         RoutingModeTransitionError::OwnershipUnverified { .. } => (
             "DNS_OWNERSHIP_UNVERIFIED",
             "DNS record ownership could not be verified",
@@ -3140,6 +3186,10 @@ fn carrier_business_error(error: &CarrierPolicyApplyError) -> (&'static str, &'s
         CarrierPolicyApplyError::ProviderPreflight(_) => (
             "DNS_PROVIDER_PREFLIGHT_FAILED",
             "DNS provider preflight failed",
+        ),
+        CarrierPolicyApplyError::CarrierMultiValueUnsupported => (
+            "CARRIER_MULTI_A_PROVIDER_UNSUPPORTED",
+            "provider groups multiple A values under one record ID; per-node removal is unavailable",
         ),
         CarrierPolicyApplyError::OwnershipUnverified { .. } => (
             "DNS_OWNERSHIP_UNVERIFIED",

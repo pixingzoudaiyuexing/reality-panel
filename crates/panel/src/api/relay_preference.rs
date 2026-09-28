@@ -84,6 +84,11 @@ fn carrier_apply_error_response(
             422,
             "OWNERSHIP_UNVERIFIED".into(),
         ),
+        CarrierPolicyApplyError::CarrierMultiValueUnsupported => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            422,
+            "CARRIER_MULTI_A_PROVIDER_UNSUPPORTED".into(),
+        ),
         CarrierPolicyApplyError::CatalogStale => {
             (StatusCode::SERVICE_UNAVAILABLE, 503, "CATALOG_STALE".into())
         }
@@ -228,6 +233,11 @@ pub async fn set_routing_mode(
                 | RoutingModeTransitionError::OwnershipUnverified { .. } => {
                     (StatusCode::UNPROCESSABLE_ENTITY, 422, error.to_string())
                 }
+                RoutingModeTransitionError::CarrierMultiValueUnsupported => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    422,
+                    "CARRIER_MULTI_A_PROVIDER_UNSUPPORTED".into(),
+                ),
                 RoutingModeTransitionError::DnsMgrUnavailable
                 | RoutingModeTransitionError::ProviderPreflight(_) => {
                     (StatusCode::SERVICE_UNAVAILABLE, 503, error.to_string())

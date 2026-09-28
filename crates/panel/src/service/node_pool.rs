@@ -3,7 +3,7 @@ use crate::db::error::DbError;
 use crate::db::repo::{ConcreteNodeIdentity, GroupRepository, Repository, ResourceScope};
 use crate::node_identity::ReuseEligibleNodeId;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PoolMembership {
@@ -263,13 +263,21 @@ pub async fn record_migration_completion(
 }
 
 pub async fn reconcile_metadata(db: &dyn Repository) -> Result<(), DbError> {
+    let status_rows = db.scan_prefix("node_status:").await?;
+    reconcile_metadata_from_rows(db, &status_rows).await
+}
+
+async fn reconcile_metadata_from_rows(
+    db: &dyn Repository,
+    status_rows: &[(String, String)],
+) -> Result<(), DbError> {
     let mut identities: BTreeSet<ConcreteNodeIdentity> = db
         .discover_node_pool_identities()
         .await?
         .into_iter()
         .collect();
-    for (key, _) in db.scan_prefix("node_status:").await? {
-        if let Some((home_group_id, Some(node_id))) = crate::api::stats::parse_status_key(&key) {
+    for (key, _) in status_rows {
+        if let Some((home_group_id, Some(node_id))) = crate::api::stats::parse_status_key(key) {
             if ReuseEligibleNodeId::parse(node_id).is_ok() {
                 identities.insert(ConcreteNodeIdentity {
                     home_group_id,
@@ -288,21 +296,33 @@ pub async fn reconcile_metadata(db: &dyn Repository) -> Result<(), DbError> {
 }
 
 pub async fn list_nodes(db: &dyn Repository) -> Result<Vec<PoolNode>, DbError> {
-    reconcile_metadata(db).await?;
+    let status_rows = db.scan_prefix("node_status:").await?;
+    list_nodes_from_status_rows(db, &status_rows, chrono::Utc::now()).await
+}
+
+pub(crate) async fn list_nodes_from_status_rows(
+    db: &dyn Repository,
+    status_rows: &[(String, String)],
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<PoolNode>, DbError> {
+    reconcile_metadata_from_rows(db, status_rows).await?;
+    let statuses: HashMap<_, _> = status_rows
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
     let system_group = db.node_pool_system_group_id().await?;
     let mut result = Vec::new();
     for record in db.list_node_pool_records().await? {
         if record.retirement_state != "ACTIVE" {
             continue;
         }
-        let raw = db
-            .get(&format!(
-                "node_status:{}:{}",
-                record.identity_group_id, record.node_id
-            ))
-            .await?;
+        let status_key = format!(
+            "node_status:{}:{}",
+            record.identity_group_id, record.node_id
+        );
+        let raw = statuses.get(status_key.as_str()).copied();
         let status = raw
-            .as_deref()
+            .as_ref()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
         let field = |key: &str| {
             status
@@ -337,8 +357,8 @@ pub async fn list_nodes(db: &dyn Repository) -> Result<Vec<PoolNode>, DbError> {
         let admission = admission_state(db, record.identity_group_id, &id).await?;
         let migration_required =
             !admission.safe_to_add && Some(record.identity_group_id) != system_group;
-        let runtime_verified = raw.as_deref().is_some_and(|value| {
-            crate::api::stats::status_is_online(value, chrono::Utc::now())
+        let runtime_verified = raw.is_some_and(|value| {
+            crate::api::stats::status_is_online(value, as_of)
                 && status
                     .as_ref()
                     .and_then(|v| v.get("verified_concrete_node"))
@@ -351,9 +371,7 @@ pub async fn list_nodes(db: &dyn Repository) -> Result<Vec<PoolNode>, DbError> {
             display_name: record.display_name,
             public_ipv4: field("public_ipv4").or_else(|| field("public_ip")),
             public_ipv6: field("public_ipv6"),
-            online: raw
-                .as_deref()
-                .is_some_and(|v| crate::api::stats::status_is_online(v, chrono::Utc::now())),
+            online: raw.is_some_and(|v| crate::api::stats::status_is_online(v, as_of)),
             node_version: field("node_version"),
             last_seen: field("last_seen"),
             credential_ready: admission.credential_active,

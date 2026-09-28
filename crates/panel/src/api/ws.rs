@@ -19,7 +19,7 @@ use relay_shared::control_protocol::{
     LIFECYCLE_PROTOCOL_VERSION,
 };
 use relay_shared::protocol::NodeConfigSnapshot;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -44,6 +44,23 @@ type GroupConns = HashMap<u64, ConnEntry>;
 type ConnMap = Arc<RwLock<HashMap<i64, GroupConns>>>;
 type ControlObservation = (Option<String>, Option<String>);
 type ControlObservations = Arc<RwLock<HashMap<(i64, String), ControlObservation>>>;
+
+#[derive(Clone, Default)]
+pub(crate) struct ControlSnapshot {
+    pub connected: HashSet<(i64, String)>,
+    pub lifecycle_connected: HashSet<(i64, String)>,
+    pub observations: HashMap<(i64, String), ControlObservation>,
+}
+
+impl ControlSnapshot {
+    pub fn online_node_ids(&self, group_id: i64) -> HashSet<String> {
+        self.connected
+            .iter()
+            .filter(|(identity_group_id, _)| *identity_group_id == group_id)
+            .map(|(_, node_id)| node_id.clone())
+            .collect()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UniqueConnectionError {
@@ -111,6 +128,7 @@ impl NodeConnections {
     ) -> (u64, mpsc::UnboundedReceiver<String>) {
         let conn_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
+        let mut map = self.inner.write().await;
         if let Some(id) = &node_id {
             let mut observations = self.observations.write().await;
             if observations.len() >= 10_000 && !observations.contains_key(&(group_id, id.clone())) {
@@ -121,21 +139,37 @@ impl NodeConnections {
             observations.entry((group_id, id.clone())).or_default().0 =
                 Some(chrono::Utc::now().to_rfc3339());
         }
-        self.inner
-            .write()
-            .await
-            .entry(group_id)
-            .or_default()
-            .insert(
-                conn_id,
-                ConnEntry {
-                    tx,
-                    node_id,
-                    config_compatible,
-                    lifecycle_capable,
-                },
-            );
+        map.entry(group_id).or_default().insert(
+            conn_id,
+            ConnEntry {
+                tx,
+                node_id,
+                config_compatible,
+                lifecycle_capable,
+            },
+        );
         (conn_id, rx)
+    }
+
+    pub(crate) async fn capture(&self) -> ControlSnapshot {
+        let map = self.inner.read().await;
+        let observations = self.observations.read().await.clone();
+        let mut snapshot = ControlSnapshot {
+            observations,
+            ..Default::default()
+        };
+        for (group_id, connections) in map.iter() {
+            for entry in connections.values().filter(|entry| !entry.tx.is_closed()) {
+                if let Some(node_id) = &entry.node_id {
+                    let identity = (*group_id, node_id.clone());
+                    snapshot.connected.insert(identity.clone());
+                    if entry.lifecycle_capable {
+                        snapshot.lifecycle_connected.insert(identity);
+                    }
+                }
+            }
+        }
+        snapshot
     }
 
     /// Remove a connection. Called when the socket task exits.
@@ -662,6 +696,7 @@ impl NodeConnections {
         removed
     }
 
+    #[cfg(test)]
     pub async fn observation(
         &self,
         group_id: i64,
@@ -1309,6 +1344,24 @@ mod tests {
         assert!(conns.observation(7, "node-b").await.1.is_none());
         assert_eq!(conns.close_node(7, "node-b").await, 1);
         assert!(conns.observation(7, "node-b").await.1.is_some());
+    }
+
+    #[tokio::test]
+    async fn captured_control_state_is_stable_until_the_next_request() {
+        let connections = NodeConnections::new();
+        let (connection_id, _receiver) = connections.register(7, Some("Node_A".into())).await;
+        let first = connections.capture().await;
+        assert!(first.connected.contains(&(7, "Node_A".into())));
+        assert!(first.observations.contains_key(&(7, "Node_A".into())));
+        connections.unregister(7, connection_id).await;
+        assert!(first.connected.contains(&(7, "Node_A".into())));
+        let second = connections.capture().await;
+        assert!(!second.connected.contains(&(7, "Node_A".into())));
+        assert!(second
+            .observations
+            .get(&(7, "Node_A".into()))
+            .and_then(|observation| observation.1.as_ref())
+            .is_some());
     }
 
     #[tokio::test]

@@ -500,6 +500,16 @@ fn classify_records(
     }
 }
 
+fn carrier_has_multi_value_record(discovery: &RecordDiscovery) -> bool {
+    match discovery {
+        RecordDiscovery::SingleMatchingRecord(record) => record.record.values.len() != 1,
+        RecordDiscovery::MultipleMatchingRecords(records) => {
+            records.iter().any(|record| record.record.values.len() != 1)
+        }
+        _ => false,
+    }
+}
+
 #[allow(dead_code)] // Slice 3 foundation; consumed by Slice 4 ensure_record.
 pub(crate) fn validate_ip_family(
     record_type: DnsRecordType,
@@ -600,6 +610,7 @@ pub(crate) enum EnsureRecordFailure {
     Database,
     PostWriteNotVerified,
     OwnershipUnverified,
+    CarrierMultiValueUnsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -797,6 +808,9 @@ pub(crate) async fn ensure_record(
     };
 
     let discovery = discover_records(client, &zone, input.record_type, &line).await;
+    if line.key != DEFAULT_LINE_KEY && carrier_has_multi_value_record(&discovery) {
+        return EnsureRecordResult::Failed(EnsureRecordFailure::CarrierMultiValueUnsupported);
+    }
     let has_owned_sibling = if binding.is_none() {
         match &discovery {
             RecordDiscovery::SingleMatchingRecord(record) => {
@@ -1081,6 +1095,9 @@ pub(crate) async fn ensure_record_absent(
         Err(_) => return DeleteRecordResult::Failed(EnsureRecordFailure::Database),
     };
     let discovery = discover_records(client, &zone, input.record_type, &line).await;
+    if line.key != DEFAULT_LINE_KEY && carrier_has_multi_value_record(&discovery) {
+        return DeleteRecordResult::Failed(EnsureRecordFailure::CarrierMultiValueUnsupported);
+    }
     let records = match discovery {
         RecordDiscovery::NoRecord => Vec::new(),
         RecordDiscovery::SingleMatchingRecord(record) => vec![record],
@@ -2125,6 +2142,7 @@ pub(crate) enum LineRecordSnapshotError {
     NoMatchingZone,
     Provider(DnsMgrError),
     OwnershipUnverified,
+    CarrierMultiValueUnsupported,
 }
 
 /// Resolve the desired DNS record without contacting DNSMgr. This keeps
@@ -2604,6 +2622,9 @@ async fn inspect_line_record_inner(
         .await
         .map_err(|_| LineRecordSnapshotError::Database)?;
     let discovery = discover_records(client, &zone, DnsRecordType::A, &line).await;
+    if line.key != DEFAULT_LINE_KEY && carrier_has_multi_value_record(&discovery) {
+        return Err(LineRecordSnapshotError::CarrierMultiValueUnsupported);
+    }
     if line.key != DEFAULT_LINE_KEY
         && (binding_key != line.key
             || matches!(discovery, RecordDiscovery::MultipleMatchingRecords(_)))
@@ -3230,7 +3251,8 @@ fn is_transient_failure(failure: &EnsureRecordFailure) -> bool {
         | EnsureRecordFailure::ProviderLineUnavailable
         | EnsureRecordFailure::TtlOutOfRange
         | EnsureRecordFailure::PostWriteNotVerified
-        | EnsureRecordFailure::OwnershipUnverified => false,
+        | EnsureRecordFailure::OwnershipUnverified
+        | EnsureRecordFailure::CarrierMultiValueUnsupported => false,
     }
 }
 
@@ -3456,6 +3478,9 @@ async fn reconcile_one(
                 EnsureRecordFailure::Database => "DATABASE",
                 EnsureRecordFailure::PostWriteNotVerified => "POST_WRITE_NOT_VERIFIED",
                 EnsureRecordFailure::OwnershipUnverified => "DNS_OWNERSHIP_UNVERIFIED",
+                EnsureRecordFailure::CarrierMultiValueUnsupported => {
+                    "CARRIER_MULTI_A_PROVIDER_UNSUPPORTED"
+                }
             };
             let updated = update_sync(
                 db,
@@ -3586,6 +3611,9 @@ async fn reconcile_delete(
                 EnsureRecordFailure::Database => "DATABASE",
                 EnsureRecordFailure::PostWriteNotVerified => "POST_WRITE_NOT_VERIFIED",
                 EnsureRecordFailure::OwnershipUnverified => "DNS_OWNERSHIP_UNVERIFIED",
+                EnsureRecordFailure::CarrierMultiValueUnsupported => {
+                    "CARRIER_MULTI_A_PROVIDER_UNSUPPORTED"
+                }
             };
             if update_sync(
                 db,
@@ -4533,6 +4561,143 @@ mod tests {
         assert_eq!(mock.state.total_mutations(), 0);
     }
 
+    #[tokio::test]
+    async fn carrier_grouped_values_fail_before_upsert_delete_or_ownership_change() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_upsert(&db, 100, "Dianxin", "192.0.2.21")
+            .await
+            .unwrap();
+        insert_line_binding(&db, "Dianxin", "grouped", "192.0.2.21").await;
+        let mut grouped = record("grouped", "A", "192.0.2.21", "Dianxin");
+        grouped.values.push("192.0.2.22".into());
+        let mock = spawn_ensure_mock(
+            vec![grouped.clone()],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        let before = db
+            .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+            .await
+            .unwrap();
+        assert!(matches!(
+            inspect_line_record(&db, &mock.client, 100, "Dianxin").await,
+            Err(LineRecordSnapshotError::CarrierMultiValueUnsupported)
+        ));
+        schedule_line_upsert(&db, 100, "Dianxin", "192.0.2.23")
+            .await
+            .unwrap();
+        assert_eq!(
+            ensure_record(
+                &db,
+                &mock.client,
+                &EnsureRecordInput {
+                    rule_id: 100,
+                    fqdn: "op1.example.com".into(),
+                    record_type: DnsRecordType::A,
+                    expected_value: "192.0.2.23".into(),
+                    line: ProviderLine::from_provider("Dianxin", None),
+                },
+            )
+            .await,
+            EnsureRecordResult::Failed(EnsureRecordFailure::CarrierMultiValueUnsupported)
+        );
+        let sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_one(&db, sync, &mock.client).await;
+        let failed = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, "FAILED");
+        assert_eq!(
+            failed.last_error_category.as_deref(),
+            Some("CARRIER_MULTI_A_PROVIDER_UNSUPPORTED")
+        );
+        assert!(failed.next_attempt_at.is_none());
+        schedule_line_delete(&db, 100, "Dianxin").await.unwrap();
+        assert_eq!(
+            ensure_record_absent(&db, &mock.client, &delete_input("Dianxin")).await,
+            DeleteRecordResult::Failed(EnsureRecordFailure::CarrierMultiValueUnsupported)
+        );
+        let sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_one(&db, sync, &mock.client).await;
+        let failed_delete = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_delete.state, "FAILED");
+        assert_eq!(
+            failed_delete.last_error_category.as_deref(),
+            Some("CARRIER_MULTI_A_PROVIDER_UNSUPPORTED")
+        );
+        assert!(failed_delete.next_attempt_at.is_none());
+        schedule_line_upsert(&db, 100, "Dianxin", "192.0.2.21")
+            .await
+            .unwrap();
+        let sync = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_one(&db, sync, &mock.client).await;
+        let failed_recovery = db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failed_recovery.last_error_category.as_deref(),
+            Some("CARRIER_MULTI_A_PROVIDER_UNSUPPORTED")
+        );
+        assert_eq!(mock.state.total_mutations(), 0);
+        assert_eq!(*mock.state.records.lock().unwrap(), vec![grouped]);
+        assert_eq!(
+            db.find_dns_record_binding_for_rule(100, "op1.example.com", "A", "dnsmgr:Dianxin")
+                .await
+                .unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_unknown_grouped_values_are_not_adopted() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        schedule_line_upsert(&db, 100, "Dianxin", "192.0.2.21")
+            .await
+            .unwrap();
+        let mut external = record("external", "A", "192.0.2.21", "Dianxin");
+        external.values.push("192.0.2.22".into());
+        let mock = spawn_ensure_mock(
+            vec![external.clone()],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        assert!(matches!(
+            inspect_line_record(&db, &mock.client, 100, "Dianxin").await,
+            Err(LineRecordSnapshotError::CarrierMultiValueUnsupported)
+        ));
+        assert_eq!(mock.state.total_mutations(), 0);
+        assert_eq!(*mock.state.records.lock().unwrap(), vec![external]);
+        assert!(db
+            .find_dns_record_binding_by_record(7, "external")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn carrier_ttl_respects_provider_minimum_without_changing_default_ttl() {
         let mut detail = DnsMgrDomainDetail {
@@ -4585,6 +4750,7 @@ mod tests {
             vec!["192.0.2.20", "192.0.2.99"],
             vec!["not-an-ip"],
         ] {
+            let grouped = values.len() != 1;
             let drift_db = ensure_db().await;
             configure_eligible_rule(&drift_db, "op1.example.com", "192.0.2.10").await;
             insert_line_binding(&drift_db, "Dianxin", "owned", "192.0.2.20").await;
@@ -4596,10 +4762,15 @@ mod tests {
                 MutationBehavior::Apply,
             )
             .await;
-            assert!(matches!(
-                inspect_line_record(&drift_db, &drift.client, 100, "Dianxin").await,
-                Err(LineRecordSnapshotError::OwnershipUnverified)
-            ));
+            let result = inspect_line_record(&drift_db, &drift.client, 100, "Dianxin").await;
+            assert!(if grouped {
+                matches!(
+                    result,
+                    Err(LineRecordSnapshotError::CarrierMultiValueUnsupported)
+                )
+            } else {
+                matches!(result, Err(LineRecordSnapshotError::OwnershipUnverified))
+            });
             assert_eq!(drift.state.total_mutations(), 0);
         }
 
@@ -6432,6 +6603,11 @@ mod tests {
             vec!["192.0.2.20", "192.0.2.99"],
             vec!["not-an-ip"],
         ] {
+            let expected = if values.len() == 1 {
+                EnsureRecordFailure::OwnershipUnverified
+            } else {
+                EnsureRecordFailure::CarrierMultiValueUnsupported
+            };
             let value_drift_db = ensure_db().await;
             configure_eligible_rule(&value_drift_db, "op1.example.com", "192.0.2.10").await;
             schedule_line_delete(&value_drift_db, 100, "Dianxin")
@@ -6453,7 +6629,7 @@ mod tests {
                     &delete_input("Dianxin")
                 )
                 .await,
-                DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+                DeleteRecordResult::Failed(expected)
             );
             assert_eq!(value_drift.state.delete_attempts.load(Ordering::SeqCst), 0);
         }

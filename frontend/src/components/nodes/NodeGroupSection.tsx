@@ -37,7 +37,7 @@ interface Props {
 /** Per-group summary: online/total (placeholders excluded) + aggregate live
  *  upload/download across ONLINE nodes only. */
 function groupSummary(rows: NodeDisplayRow[]) {
-  const real = rows.filter((r) => r.node_id);
+  const real = rows.filter((r) => r.node_id || r.legacy_status);
   const onlineRows = real.filter((r) => r.online);
   return {
     total: real.length,
@@ -56,9 +56,9 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
   const { total, online, up, down } = groupSummary(rows);
   const region = head.region;
   const lineType = head.line_type;
-  const onlyPlaceholder = rows.length === 1 && !head.node_id;
+  const onlyPlaceholder = rows.length === 1 && !head.node_id && !head.legacy_status;
   const groupId = head.group_id;
-  const liveReadyNodes: RelayReadyNode[] | undefined = healthNodes?.map((node) => {
+  const liveReadyNodes: RelayReadyNode[] | undefined = healthNodes?.filter((node) => !!node.node_id).map((node) => {
     const group = node.group_readiness.find((item) => item.group_id === groupId);
     const duplicate = healthNodes.filter((other) => other.node_id === node.node_id).length > 1;
     return { node_id: node.node_id, identity_group_id: node.identity_group_id, display_name: node.display_name, public_ipv4: node.telemetry.public_ipv4, public_ipv6: node.telemetry.public_ipv6, online: node.telemetry.fresh, ready: group?.ready ?? false, ready_reasons: group?.reasons ?? [], preferred: !duplicate && relayPreference?.preferred_node_id === node.node_id };

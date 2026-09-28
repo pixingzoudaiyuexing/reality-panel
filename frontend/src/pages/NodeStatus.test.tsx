@@ -29,6 +29,19 @@ const adminNode = {
   group_id: 1, group_name: 'admin-grp', node_id: 'n1', online: true,
   cpu: 5, mem: 5, connections: 0, uptime: 100, last_seen: new Date().toISOString(),
 };
+const adminHealth = (rows: NodeDisplayRow[]) => rows.map((row) => ({
+  identity_group_id: row.group_id,
+  identity_group_name: row.group_name,
+  node_id: row.node_id,
+  display_name: row.display_name ?? row.node_id,
+  as_of: new Date().toISOString(),
+  state: row.online === false ? 'OFFLINE' : 'HEALTHY',
+  telemetry: { ...row, fresh: row.online !== false, age_seconds: 0 },
+  control_connected: row.online !== false,
+  lifecycle_connected: row.lifecycle_online ?? false,
+  runtime: {},
+  group_readiness: [{ group_id: row.group_id, group_name: row.group_name, ready: row.online !== false, reasons: [] }],
+}));
 const sharedNode = {
   group_id: 2, group_name: 'shared-grp', node_id: 's1', online: true, connections: 0,
 };
@@ -129,10 +142,10 @@ afterEach(() => {
 });
 
 describe('NodeStatus page data source', () => {
-  it('admin reads /nodes + Panel artifact catalog (catalog fetched once, not polled)', async () => {
+  it('admin reads one health source + Panel artifact catalog (catalog fetched once, not polled)', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes') return Promise.resolve(ok([adminNode]));
+      if (url === '/admin/node-health') return Promise.resolve(ok(adminHealth([adminNode])));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       return Promise.reject(new Error(`unexpected ${url}`));
     });
@@ -142,7 +155,8 @@ describe('NodeStatus page data source', () => {
     await flush();
 
     expect(screen.getByText('admin-grp')).toBeInTheDocument();
-    expect(mockGet).toHaveBeenCalledWith('/nodes');
+    expect(mockGet).toHaveBeenCalledWith('/admin/node-health');
+    expect(mockGet).not.toHaveBeenCalledWith('/nodes');
     expect(mockGet).toHaveBeenCalledWith('/admin/node-artifacts');
     expect(mockGet).not.toHaveBeenCalledWith('/nodes/shared');
 
@@ -150,6 +164,33 @@ describe('NodeStatus page data source', () => {
     await flush(15000);
     const artifactCalls = mockGet.mock.calls.filter((c) => c[0] === '/admin/node-artifacts').length;
     expect(artifactCalls).toBe(1);
+  });
+
+  it('refreshes the unified health observation on focus and visibility changes', async () => {
+    mockUseAuth.mockReturnValue({ isAdmin: true });
+    let reads = 0;
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/admin/node-health') {
+        reads += 1;
+        return Promise.resolve(ok(adminHealth([{ ...adminNode, cpu: reads }])));
+      }
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+    const originalVisibility = Object.getOwnPropertyDescriptor(document, 'visibilityState');
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    try {
+      renderPage();
+      await flush();
+      window.dispatchEvent(new Event('focus'));
+      await flush();
+      document.dispatchEvent(new Event('visibilitychange'));
+      await flush();
+      expect(reads).toBe(3);
+      expect(mockGet).not.toHaveBeenCalledWith('/nodes');
+    } finally {
+      if (originalVisibility) Object.defineProperty(document, 'visibilityState', originalVisibility);
+    }
   });
 
   it('regular user reads /nodes/shared, never admin nodes or artifacts', async () => {
@@ -173,10 +214,10 @@ describe('NodeStatus page data source', () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     rememberGroup(1);
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes') return Promise.resolve(ok([
+      if (url === '/admin/node-health') return Promise.resolve(ok(adminHealth([
         adminNode,
         { ...adminNode, group_id: 2, group_name: 'out-group', node_id: 'out-node' },
-      ]));
+      ])));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       if (url === '/groups') return Promise.resolve(ok([
         { id: 1, group_type: 'in' },
@@ -226,7 +267,7 @@ describe('NodeStatus load-failure behavior', () => {
   it('shows the error result when the first admin load fails', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes') return Promise.reject(new Error('boom'));
+      if (url === '/admin/node-health') return Promise.reject(new Error('boom'));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       return Promise.reject(new Error(`unexpected ${url}`));
     });
@@ -237,17 +278,17 @@ describe('NodeStatus load-failure behavior', () => {
     expect(screen.getByText('loadFailed')).toBeInTheDocument();
   });
 
-  it('keeps the last good rows through a transient poll failure and resumes updates', async () => {
+  it('marks health unavailable after a transient poll failure and resumes updates', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     let nodeCall = 0;
     const recovered = { ...adminNode, group_name: 'admin-grp-recovered' };
     mockGet.mockImplementation((url: string) => {
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
-      if (url === '/nodes') {
+      if (url === '/admin/node-health') {
         nodeCall += 1;
-        if (nodeCall === 1) return Promise.resolve(ok([adminNode]));
+        if (nodeCall === 1) return Promise.resolve(ok(adminHealth([adminNode])));
         if (nodeCall === 2) return Promise.reject(new Error('transient'));
-        return Promise.resolve(ok([recovered]));
+        return Promise.resolve(ok(adminHealth([recovered])));
       }
       return Promise.reject(new Error(`unexpected ${url}`));
     });
@@ -256,10 +297,9 @@ describe('NodeStatus load-failure behavior', () => {
     await flush();
     expect(screen.getByText('admin-grp')).toBeInTheDocument();
 
-    // 后台轮询失败时保留最后一次成功数据，不用错误页打断操作。
     await flush(5000);
-    expect(screen.queryByText('loadFailed')).not.toBeInTheDocument();
-    expect(screen.getByText('admin-grp')).toBeInTheDocument();
+    expect(screen.getByText('loadFailed')).toBeInTheDocument();
+    expect(screen.queryByText('admin-grp')).not.toBeInTheDocument();
 
     await flush(5000);
     expect(screen.getByText('admin-grp-recovered')).toBeInTheDocument();
@@ -268,13 +308,13 @@ describe('NodeStatus load-failure behavior', () => {
 
   it('keeps the five-second poll from overlapping a slow request', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
-    type NodesResponse = { code: number; message: string; data: typeof adminNode[] };
+    type NodesResponse = { code: number; message: string; data: ReturnType<typeof adminHealth> };
     let resolveNodes!: (value: NodesResponse) => void;
     const pendingNodes = new Promise<NodesResponse>((resolve) => {
       resolveNodes = resolve;
     });
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes') return pendingNodes;
+      if (url === '/admin/node-health') return pendingNodes;
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       return Promise.reject(new Error(`unexpected ${url}`));
     });
@@ -282,12 +322,12 @@ describe('NodeStatus load-failure behavior', () => {
     renderPage();
     await flush();
     await flush(10000);
-    expect(mockGet.mock.calls.filter((call) => call[0] === '/nodes')).toHaveLength(1);
+    expect(mockGet.mock.calls.filter((call) => call[0] === '/admin/node-health')).toHaveLength(1);
 
-    resolveNodes(ok([adminNode]));
+    resolveNodes(ok(adminHealth([adminNode])));
     await flush();
     await flush(5000);
-    expect(mockGet.mock.calls.filter((call) => call[0] === '/nodes')).toHaveLength(2);
+    expect(mockGet.mock.calls.filter((call) => call[0] === '/admin/node-health')).toHaveLength(2);
   });
 });
 
@@ -313,7 +353,6 @@ describe('NodeStatus targeted diagnosis entry point', () => {
     mockPost.mockResolvedValue(ok({ group_id: 1, node_id: 'n1', healthy: true, checks: [] }));
     rememberGroup(1);
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes') return Promise.resolve(ok([adminNode]));
       if (url === '/admin/node-health') return Promise.resolve(ok([
         { identity_group_id: 1, node_id: 'n1', display_name: 'Primary', as_of: new Date().toISOString(), state: 'HEALTHY', telemetry: { fresh: true, age_seconds: 0, public_ipv4: '192.0.2.10' }, control_connected: true, runtime: {}, group_readiness: [{ group_id: 1, ready: true, reasons: [] }] },
         { identity_group_id: 1, node_id: 'n2', display_name: 'Backup', as_of: new Date().toISOString(), state: 'DEGRADED', telemetry: { fresh: true, age_seconds: 0, public_ipv4: '192.0.2.11' }, control_connected: false, runtime: {}, group_readiness: [{ group_id: 1, ready: false, reasons: ['CONTROL_CHANNEL_OFFLINE'] }] },
@@ -388,7 +427,7 @@ describe('NodeStatus log drawer', () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     rememberGroup(1);
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes') return Promise.resolve(ok([logNode]));
+      if (url === '/admin/node-health') return Promise.resolve(ok(adminHealth([logNode])));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       if (url === '/groups') return Promise.resolve(ok([]));
       if (url === '/admin/nodes/1/n1/logs?lines=200') return Promise.resolve(operation(logs, action));
@@ -458,7 +497,7 @@ describe('NodeStatus background lifecycle operations', () => {
     let resolvePoll!: (value: ReturnType<typeof ok<NodeOperation>>) => void;
     const latePoll = new Promise<ReturnType<typeof ok<NodeOperation>>>((resolve) => { resolvePoll = resolve; });
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes') return Promise.resolve(ok([{ ...adminNode, ...runningOperation, lifecycle_online: true, install_method: 'systemd' }]));
+      if (url === '/admin/node-health') return Promise.resolve(ok(adminHealth([{ ...adminNode, lifecycle_online: true, install_method: 'systemd' }])));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       if (url === '/groups') return Promise.resolve(ok([]));
       if (url === '/admin/node-operations') return Promise.resolve(ok([runningOperation]));
@@ -489,7 +528,7 @@ describe('NodeStatus background lifecycle operations', () => {
   it('rediscovers an active operation and opens its latest detail explicitly', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes') return Promise.resolve(ok([adminNode]));
+      if (url === '/admin/node-health') return Promise.resolve(ok(adminHealth([adminNode])));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       if (url === '/groups') return Promise.resolve(ok([]));
       if (url === '/admin/node-operations') return Promise.resolve(ok([runningOperation]));
@@ -527,7 +566,7 @@ describe('NodeStatus batch rolling upgrade', () => {
   function mockBatchPage(batches: typeof runningBatch[] = []) {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes') return Promise.resolve(ok([adminNode]));
+      if (url === '/admin/node-health') return Promise.resolve(ok(adminHealth([adminNode])));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       if (url === '/groups') return Promise.resolve(ok([]));
       if (url === '/admin/node-operations') return Promise.resolve(ok([]));
@@ -561,7 +600,7 @@ describe('NodeStatus batch rolling upgrade', () => {
     let resolvePoll!: (value: ReturnType<typeof ok<typeof runningBatch>>) => void;
     const latePoll = new Promise<ReturnType<typeof ok<typeof runningBatch>>>((resolve) => { resolvePoll = resolve; });
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes') return Promise.resolve(ok([adminNode]));
+      if (url === '/admin/node-health') return Promise.resolve(ok(adminHealth([adminNode])));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       if (url === '/groups') return Promise.resolve(ok([]));
       if (url === '/admin/node-operations') return Promise.resolve(ok([]));
@@ -715,14 +754,14 @@ describe('NodeStatus rendered group order is stable across refreshes', () => {
   it('renders groups in ascending group_id order even when the API returns them shuffled', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes')
+      if (url === '/admin/node-health')
         return Promise.resolve(
-          ok([
+          ok(adminHealth([
             mk(2, 'grp-two'),
             mk(4, 'grp-four'),
             mk(1, 'grp-one'),
             mk(3, 'grp-three'),
-          ]),
+          ])),
         );
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       return Promise.reject(new Error(`unexpected ${url}`));
@@ -744,10 +783,10 @@ describe('NodeStatus rendered group order is stable across refreshes', () => {
     const set = [mk(3, 'grp-three'), mk(1, 'grp-one'), mk(2, 'grp-two')];
     mockGet.mockImplementation((url: string) => {
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
-      if (url === '/nodes') {
+      if (url === '/admin/node-health') {
         call += 1;
         // Second call returns the SAME set in a different order.
-        return Promise.resolve(ok(call === 1 ? set : [set[1], set[2], set[0]]));
+        return Promise.resolve(ok(adminHealth(call === 1 ? set : [set[1], set[2], set[0]])));
       }
       return Promise.reject(new Error(`unexpected ${url}`));
     });
@@ -769,17 +808,17 @@ describe('NodeStatus rendered group order is stable across refreshes', () => {
     expect(isAscending()).toBe(true);
   });
 
-  it('renders a multi-node group with stable node order (admin /nodes)', async () => {
+  it('renders a multi-node group with stable node order (admin health)', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     rememberGroup(1);
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes')
+      if (url === '/admin/node-health')
         return Promise.resolve(
-          ok([
+          ok(adminHealth([
             mk(1, 'g', { node_id: 'n3', public_ipv4: '9.9.9.9' }),
             mk(1, 'g', { node_id: 'n1', public_ipv4: '1.1.1.1' }),
             mk(1, 'g', { node_id: 'n2', public_ipv4: '5.5.5.5' }),
-          ]),
+          ])),
         );
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       return Promise.reject(new Error(`unexpected ${url}`));
@@ -838,11 +877,11 @@ describe('NodeStatus responsive node layout', () => {
   function setupResponsivePage() {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes') return Promise.resolve(ok([responsiveNode]));
       if (url === '/admin/node-health') return Promise.resolve(ok([{
+        ...adminHealth([responsiveNode])[0],
         identity_group_id: 1, node_id: 'n1', display_name: 'Main relay',
         as_of: new Date().toISOString(), state: 'HEALTHY',
-        telemetry: { fresh: true, age_seconds: 0, public_ipv4: responsiveNode.public_ipv4, public_ipv6: responsiveNode.public_ipv6 },
+        telemetry: { ...responsiveNode, fresh: true, age_seconds: 0 },
         control_connected: true, runtime: {}, group_readiness: [],
       }]));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
@@ -862,6 +901,7 @@ describe('NodeStatus responsive node layout', () => {
     ]);
     expect(screen.getByTestId('node-resources-cell')).toHaveTextContent('CPU');
     expect(screen.getByTestId('node-traffic-cell')).toHaveTextContent('527.00 KB/s');
+    expect(mockGet).not.toHaveBeenCalledWith('/nodes');
   });
 
   it('uses responsive cards on a mobile viewport and opens the existing detail drawer', async () => {
@@ -894,12 +934,36 @@ describe('NodeStatus responsive node layout', () => {
 });
 
 describe('NodeStatus reused membership projection', () => {
+  it('shows a legacy group-only report as unknown without an exact Node identity', async () => {
+    mockUseAuth.mockReturnValue({ isAdmin: true });
+    rememberGroup(1);
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/admin/node-health') return Promise.resolve(ok([{
+        ...adminHealth([{ ...adminNode, node_id: '' }])[0],
+        node_id: '', legacy_status: true, display_name: '203.0.113.10', state: 'UNKNOWN',
+        telemetry: { fresh: true, cpu: 7, public_ipv4: '203.0.113.10' },
+        control_connected: false,
+        group_readiness: [{ group_id: 1, group_name: 'admin-grp', ready: false, reasons: ['EXACT_NODE_ID_UNAVAILABLE'] }],
+      }]));
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+    renderPage();
+    await flush();
+    expect(screen.getByText('admin-grp')).toBeInTheDocument();
+    if (groupHeader('admin-grp').getAttribute('aria-expanded') !== 'true') {
+      fireEvent.click(groupHeader('admin-grp'));
+    }
+    expect(screen.getAllByText('203.0.113.10').length).toBeGreaterThan(0);
+    expect(screen.getByText('nodeHealth_UNKNOWN')).toBeInTheDocument();
+  });
+
   it('shows one concrete node in its business group without duplicate lifecycle controls', async () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     rememberGroup(2);
     mockGet.mockImplementation((url: string) => {
-      if (url === '/nodes') return Promise.resolve(ok([{ ...adminNode, group_name: 'identity-group', install_method: 'systemd' }]));
       if (url === '/admin/node-health') return Promise.resolve(ok([{
+        ...adminHealth([{ ...adminNode, group_name: 'identity-group', install_method: 'systemd' }])[0],
         identity_group_id: 1, node_id: 'n1', display_name: 'Shared relay', as_of: new Date().toISOString(),
         state: 'DEGRADED', telemetry: { fresh: true, last_seen: new Date().toISOString(), public_ipv4: '203.0.113.5', public_ipv6: null, node_version: '1.3.0' },
         control_connected: false, runtime: { reconciliation: null, active_listener_rule_ids: [] },

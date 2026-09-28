@@ -736,7 +736,9 @@ export interface PoolNode {
 
 export interface NodeHealthSnapshot {
   identity_group_id: number;
+  identity_group_name?: string;
   node_id: string;
+  legacy_status?: boolean;
   display_name: string;
   as_of: string;
   state: 'HEALTHY' | 'DEGRADED' | 'OFFLINE' | 'UNKNOWN';
@@ -746,16 +748,36 @@ export interface NodeHealthSnapshot {
     fresh: boolean;
     cpu: number | null;
     mem: number | null;
+    uptime?: number | null;
+    process_uptime?: number | null;
+    disk_total?: number | null;
+    disk_used?: number | null;
     disk_usage_percent: number | null;
+    disk_mount?: string | null;
     upload_bps: number | null;
     download_bps: number | null;
+    boot_upload_bytes?: number | null;
+    boot_download_bytes?: number | null;
+    network_interface?: string | null;
     connections: number | null;
+    tcp_connections?: number | null;
+    udp_sessions?: number | null;
+    public_ip?: string | null;
     public_ipv4: string | null;
     public_ipv6: string | null;
+    ipv4_country_code?: string | null;
+    ipv4_country_name?: string | null;
+    ipv6_country_code?: string | null;
+    ipv6_country_name?: string | null;
     node_version: string | null;
+    architecture?: string | null;
+    install_method?: string | null;
+    config_protocol_version?: number | null;
+    verified_concrete_node?: boolean | null;
+    auth_reload_supported?: boolean | null;
   };
   control_connected: boolean;
-  control?: { connected: boolean; last_connected_at: string | null; last_disconnected_at: string | null };
+  control?: { connected: boolean; lifecycle_connected?: boolean; last_connected_at: string | null; last_disconnected_at: string | null };
   runtime: { reconciliation: ReconciliationStatus | null; active_listener_rule_ids: number[] | null; listener_errors?: ListenerError[] | null };
   group_readiness: { group_id: number; group_name: string; ready: boolean; reasons: string[] }[];
 }
@@ -1186,6 +1208,7 @@ export interface SharedNodeSummary {
  *  hence the broad optionality. `online` is always server-supplied now. */
 export interface NodeDisplayRow {
   group_id: number;
+  legacy_status?: boolean;
   verified_concrete_node?: boolean;
   auth_reload_supported?: boolean;
   identity_group_id?: number;

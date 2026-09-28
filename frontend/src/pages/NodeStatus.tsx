@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typography, Badge, List, Space, Descriptions, Progress, Alert } from 'antd';
+import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typography, Badge, List, Space, Descriptions, Progress } from 'antd';
 import { CloudUploadOutlined, CopyOutlined, LineChartOutlined, ReloadOutlined, UnorderedListOutlined, SyncOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog, RelayReadyNode, BatchUpgradeOperation, BatchUpgradePreview, BatchUpgradeItemStatus, NodeHealthSnapshot } from '../api/types';
+import type { ApiEnvelope, DeviceGroup, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog, RelayReadyNode, BatchUpgradeOperation, BatchUpgradePreview, BatchUpgradeItemStatus, NodeHealthSnapshot } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
 import { NodeGroupSection } from '../components/nodes/NodeGroupSection';
@@ -52,7 +52,7 @@ function useIsMobile(breakpoint = 768): boolean {
 
 /**
  * v0.4.15 PR3: unified full-width node status board. Both admins and regular
- * users land here after login (via the sidebar). Admin reads /nodes; regular
+ * users land here after login (via the sidebar). Admin reads /admin/node-health; regular
  * users read /nodes/shared (server-side field filtering — the frontend never
  * hides sensitive fields client-side).
  */
@@ -62,9 +62,7 @@ export default function NodeStatus() {
   const navigate = useNavigate();
   const isMobile = useIsMobile();
 
-  const [adminRows, setAdminRows] = useState<NodeDisplayRow[] | null>(null);
   const [health, setHealth] = useState<NodeHealthSnapshot[] | null>(null);
-  const [healthFailed, setHealthFailed] = useState(false);
   const [userRows, setUserRows] = useState<SharedNodeSummary[] | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [artifactVersions, setArtifactVersions] = useState<Record<string, string>>({});
@@ -93,23 +91,14 @@ export default function NodeStatus() {
 
   const loadAdmin = async () => {
     try {
-      const [res, snapshot] = await Promise.all([
-        api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes'),
-        api.get<unknown, ApiEnvelope<NodeHealthSnapshot[]>>('/admin/node-health').catch(() => null),
-      ]);
-      if (res.code !== 0) {
-        if (!hasLoadedRowsRef.current) setLoadFailed(true);
-        return;
-      }
+      const snapshot = await api.get<unknown, ApiEnvelope<NodeHealthSnapshot[]>>('/admin/node-health');
+      if (snapshot.code !== 0 || !Array.isArray(snapshot.data)) throw new Error(snapshot.message);
       setLoadFailed(false);
-      setAdminRows(res.data || []);
-      setHealth(snapshot?.code === 0 && snapshot.data ? snapshot.data : null);
-      setHealthFailed(!snapshot || snapshot.code !== 0 || !snapshot.data);
+      setHealth(snapshot.data);
       hasLoadedRowsRef.current = true;
     } catch {
       setHealth(null);
-      setHealthFailed(true);
-      if (!hasLoadedRowsRef.current) setLoadFailed(true);
+      setLoadFailed(true);
     }
   };
 
@@ -166,11 +155,10 @@ export default function NodeStatus() {
     }
   };
 
-  // Poll node status every 5s. The version info is NOT polled — it's static
+  // Poll the unified health observation every 5s. Version metadata is static
   // for the lifetime of a panel process, so it's fetched once on mount (admin
-  // only). loadFailed is cleared only on a successful response (inside the
-  // load* fns), so a transient poll failure no longer flashes the error page
-  // back to stale data every 5s.
+  // only). An admin health failure clears the prior observation, so stale
+  // readiness cannot be presented as current.
   useEffect(() => {
     hasLoadedRowsRef.current = false;
     if (isAdmin) loadLifecycleMetadata();
@@ -351,38 +339,49 @@ export default function NodeStatus() {
     }
   };
 
-  const healthByIdentity = new Map((health ?? []).map((node) => [`${node.identity_group_id}:${node.node_id}`, node]));
   const rows: AnyNodeRow[] | null = isAdmin
     ? (() => {
-      if (!adminRows) return null;
-      const native = adminRows.map((row) => {
-        const snapshot = healthByIdentity.get(`${row.group_id}:${row.node_id}`);
-        return snapshot ? { ...row, identity_group_id: snapshot.identity_group_id, display_name: snapshot.display_name, health_state: snapshot.state, online: snapshot.telemetry.fresh } : { ...row, health_state: 'UNKNOWN' as const };
-      });
-      const nativeByIdentity = new Map(native.map((row) => [`${row.group_id}:${row.node_id}`, row]));
-      const reused: NodeDisplayRow[] = [];
-      for (const snapshot of health ?? []) {
+      if (!health) return null;
+      const projected: NodeDisplayRow[] = [];
+      for (const snapshot of health) {
+        const t = snapshot.telemetry;
+        const base: NodeDisplayRow = {
+          group_id: snapshot.identity_group_id,
+          group_name: snapshot.identity_group_name ?? '节点池',
+          identity_group_id: snapshot.identity_group_id,
+          node_id: snapshot.node_id,
+          legacy_status: snapshot.legacy_status,
+          display_name: snapshot.display_name,
+          health_state: snapshot.state,
+          online: t.fresh,
+          lifecycle_online: snapshot.control?.lifecycle_connected ?? snapshot.control_connected,
+          verified_concrete_node: t.verified_concrete_node ?? undefined,
+          auth_reload_supported: t.auth_reload_supported ?? undefined,
+          cpu: t.cpu, mem: t.mem, uptime: t.uptime, process_uptime: t.process_uptime,
+          disk_total: t.disk_total, disk_used: t.disk_used, disk_usage_percent: t.disk_usage_percent,
+          disk_mount: t.disk_mount, upload_bps: t.upload_bps, download_bps: t.download_bps,
+          boot_upload_bytes: t.boot_upload_bytes, boot_download_bytes: t.boot_download_bytes,
+          network_interface: t.network_interface, connections: t.connections,
+          tcp_connections: t.tcp_connections, udp_sessions: t.udp_sessions,
+          public_ip: t.public_ip, public_ipv4: t.public_ipv4, public_ipv6: t.public_ipv6,
+          ipv4_country_code: t.ipv4_country_code, ipv4_country_name: t.ipv4_country_name,
+          ipv6_country_code: t.ipv6_country_code, ipv6_country_name: t.ipv6_country_name,
+          node_version: t.node_version, architecture: t.architecture,
+          install_method: t.install_method, config_protocol_version: t.config_protocol_version,
+          last_seen: t.last_seen, listener_errors: snapshot.runtime.listener_errors,
+          reconciliation: snapshot.runtime.reconciliation,
+        };
+        projected.push(base);
         for (const membership of snapshot.group_readiness) {
           if (membership.group_id === snapshot.identity_group_id) continue;
-          const source = nativeByIdentity.get(`${snapshot.identity_group_id}:${snapshot.node_id}`);
-          reused.push({
-            ...source,
+          projected.push({
+            ...base,
             group_id: membership.group_id,
             group_name: membership.group_name,
-            identity_group_id: snapshot.identity_group_id,
-            node_id: snapshot.node_id,
-            display_name: snapshot.display_name,
-            health_state: snapshot.state,
-            online: snapshot.telemetry.fresh,
-            public_ipv4: snapshot.telemetry.public_ipv4,
-            public_ipv6: snapshot.telemetry.public_ipv6,
-            node_version: snapshot.telemetry.node_version,
-            last_seen: snapshot.telemetry.last_seen,
-            reconciliation: snapshot.runtime.reconciliation,
           });
         }
       }
-      return [...native, ...reused];
+      return projected;
     })()
     : userRows;
   const currentDetail = detailRow && rows?.find((row) => row.group_id === detailRow.group_id
@@ -469,7 +468,6 @@ export default function NodeStatus() {
   return (
     <>
       {pageTitle}
-      {isAdmin && healthFailed ? <Alert type="warning" showIcon title={t('nodeHealthUnavailable')} /> : null}
       {groups.map(([gid, groupRows]) => (
         <NodeGroupSection
           key={gid}
