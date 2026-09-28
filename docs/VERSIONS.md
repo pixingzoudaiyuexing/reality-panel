@@ -1,8 +1,11 @@
 # Release Contract
 
 Reality Panel uses one release tag and one compatibility version for the Panel
-and Node. The current stable release is `v1.1.26`. Config Protocol remains `10`
-and Lifecycle Protocol remains `1`.
+and Node. The current stable release is `v1.1.26`; a historical 1.2.x source
+line exists, so the new candidate is `v1.3.0`. It has not been released or
+deployed. The Owner reports `v1.1.26` is deployed to production; this remains
+Owner-reported and was not independently verified here. Config Protocol
+remains `10` and Lifecycle Protocol remains `1`.
 
 ## Release assets
 
@@ -28,16 +31,16 @@ part of the automatic release workflow.
 ## Version locations
 
 - `crates/panel/Cargo.toml` and `crates/node/Cargo.toml` carry the matching
-  application version.
+  candidate application version `1.3.0`.
 - `Cargo.lock` records both package versions.
 - `crates/panel/src/config.rs` reads the Panel package version by default.
 - `scripts/relay-node-install.sh` is a legacy compatibility script only.
 - `.github/workflows/binary-release.yml` publishes systemd release assets.
 
-Run before tagging:
+Validate the candidate source before a later, separately authorized release:
 
 ```bash
-bash scripts/release-check.sh 1.1.26
+bash scripts/release-check.sh 1.3.0
 ```
 
 The default updater resolves the latest non-prerelease `v*` Release. An

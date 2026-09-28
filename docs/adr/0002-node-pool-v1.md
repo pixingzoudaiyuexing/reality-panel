@@ -1,6 +1,6 @@
 # ADR 0002 - Node Pool V1
 
-Status: **IMPLEMENTATION IN REVIEW / NOT RELEASED / NOT DEPLOYED**
+Status: **IMPLEMENTED / INDEPENDENT REVIEW PASSED / LINUX RUNTIME ACCEPTANCE PASSED / RC v1.3.0 / NOT RELEASED / NOT DEPLOYED**
 
 ## Decision
 
@@ -26,4 +26,6 @@ RT-001 restart safety: isolated Linux acceptance found that a migrated Node coul
 
 ## Operational Boundary
 
-This ADR describes Node Pool V1 source integrated on `main` at `95f230bf73e730b92b9023f01e5fad1c2e7d9763` and a separate, unreviewed RT-001 fix. The Owner reports that stable `v1.1.26` is deployed to production; that deployment has not been independently verified in this task. Node Pool V1 and RT-001 have not been released, deployed, or exercised against production.
+Upgrade from stable `v1.1.26` to candidate `v1.3.0` applies additive SQLite Migration 58 or PostgreSQL revision 42 and performs idempotent Node Pool metadata backfill. Existing concrete identities and Bindings remain in place; installing the Panel alone does not deliver config, advance Node revisions, or restart Nodes. An existing Group-Token Node remains Home-only until it is upgraded to a Node version with runtime auth reload support and completes the exact-node credential migration. New Nodes use the hidden Pool anchor and receive their Permanent Credential during SSH or Manual Bootstrap.
+
+This ADR describes Node Pool V1 source integrated on `main` at `95f230bf73e730b92b9023f01e5fad1c2e7d9763`, RT-001 fix `fe8068f55578b6cacb040d4ac72ceaaf271c8321`, and the `v1.3.0` candidate source. The Owner reports that stable `v1.1.26` is deployed to production; that deployment has not been independently verified. Node Pool V1 and RT-001 remain unreleased and undeployed; no production access occurred during candidate preparation.

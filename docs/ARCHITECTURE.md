@@ -1,6 +1,6 @@
 # Reality Panel — Current Architecture
 
-This document describes the current source design. Node Reuse product completion was released in `v1.1.26` after independent review and Primary acceptance. The Owner reports that release deployed to production; this task has not independently verified the deployment. Node Pool V1 is integrated but unreleased; its RT-001 restart safety fix remains pending independent review.
+This document describes the current source design. Node Reuse product completion was released in `v1.1.26` after independent review and Primary acceptance. The Owner reports that release deployed to production; this task has not independently verified the deployment. Node Pool V1 and RT-001 passed independent review and isolated Debian runtime acceptance. Their candidate source is version `v1.3.0`; it remains unreleased and undeployed.
 
 ## Control plane and data plane
 
@@ -21,6 +21,8 @@ Lifecycle operations use a separate long-lived control protocol, currently `LIFE
 ## Node configuration and LKG
 
 Node Pool V1 adds a metadata registry and admin membership projection over the existing exact-node identity and Node Reuse Bindings. Existing Nodes keep their original identity Group. New Nodes use a hidden internal Pool anchor and receive an exact credential during provisioning. The anchor has no business rules; traffic remains attributed to each rule's actual source Group. Legacy Nodes require one administrator-authorized exact-node credential migration before first cross-group assignment. The upgraded Node can replace control-plane authentication after verifying a durable credential without restarting forwarding listeners. See [ADR 0002](adr/0002-node-pool-v1.md).
+
+On restart, a Node restores LKG before control-plane startup. A present durable auth descriptor is validated and selected before HTTP config polling or WebSocket starts. If validation fails, configuration control traffic remains blocked while LKG forwarding continues; the Panel also rejects legacy config delivery for the exact Node after migration completion. This prevents a legacy Home-only snapshot from replacing a migrated Node's combined EffectiveConfig.
 
 The Panel builds node configuration from an inbound group and its active rules. For an authenticated, verified concrete Node, Node Reuse merges Home Group rules with only that Node's explicit reuse Bindings. Legacy Group Token Nodes remain Home-only even when they report an `X-Node-ID` matching a concrete Node. Node-specific details such as camouflage public-IP resolution retain the Home Group identity namespace.
 

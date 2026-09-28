@@ -7,6 +7,23 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.3.0] - Release Candidate (2026-09-28)
+
+### 新增
+
+- 新增管理员节点池目录；具体 Node 可设置显示名称，IP 和在线状态来自实时 Node 上报。
+- 设备分组“添加节点”从节点池选择已有 Node；已加入节点保留并禁用，分组列表展示名称/IP 并按具体身份投影复用成员。
+- 新部署节点自动进入隐藏系统节点池锚点；SSH Bootstrap 与 Manual Bootstrap 自动建立永久具体节点凭据，无需选择业务分组。
+
+### 安全 / 兼容性
+
+- SQLite Migration 58 与 PostgreSQL revision 42 添加节点池元数据及隐藏锚点支持。v1.1.26 Panel 升级只做幂等元数据回填；既有身份、绑定、配置修订、LKG、监听和流量归属不因升级而改变。
+- 既有节点首次跨组前，需先升级到支持凭据热切换的 relay-node，再运行管理员授权、精确绑定身份的一次性迁移命令。迁移完成前不能建立跨组 Binding；共享 Group Token 不会被全组吊销。
+- 永久凭据在 Node 启动时优先于环境中的旧 Group Token。RT-001 修复在配置 HTTP/WS 启动前验证持久认证描述符；描述符无效时阻断配置交付并保留 A+B LKG 与转发。
+- Panel 对已完成迁移的具体 Node 拒绝其旧 Group Token 配置请求；同组未迁移节点仍保持 Home-only 兼容。
+- 保持 Node Reuse 的精确 Binding、Preflight/Create 冲突检查、单调配置修订、业务 Group 流量归属和 LKG 保护；系统池锚点不作为业务组、规则目标或计费主体。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。本条为候选源码，尚未发布或部署。
+
 ## [1.1.26] - 2026-09-27
 
 ### 新增 / 改进

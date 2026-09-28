@@ -44,7 +44,7 @@ cd / 2>/dev/null || true
 
 # Bump this when releasing a new version. The binary is downloaded from
 # GitHub Releases assets.
-SCRIPT_VERSION="1.1.26"
+SCRIPT_VERSION="1.3.0"
 REPO="pixingzoudaiyuexing/reality-panel"
 
 GREEN='\033[0;32m'
@@ -670,7 +670,7 @@ if [ -z "$TARGET_VERSION" ]; then
         TARGET_VERSION="$LATEST_NODE"
         info "Latest node release: $TARGET_VERSION"
     else
-        fail "Could not resolve the latest stable GitHub Release. Use --version $SCRIPT_VERSION to pin an existing release."
+        fail "Could not resolve the latest stable GitHub Release. Use --version X.Y.Z to pin an available release."
     fi
 else
     info "Installing node version: $TARGET_VERSION (pinned via --version)"

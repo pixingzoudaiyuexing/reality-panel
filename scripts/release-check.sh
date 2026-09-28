@@ -4,6 +4,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="${1:-}"
+PANEL_CHANGELOG="${PANEL_CHANGELOG:-$ROOT/CHANGELOG.md}"
+NODE_CHANGELOG="${NODE_CHANGELOG:-$ROOT/CHANGELOG-NODE.md}"
 
 fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 ok() { printf '[OK] %s\n' "$*"; }
@@ -18,8 +20,22 @@ bash "$ROOT/scripts/release-version-contract.sh" "v$VERSION"
 [ "$panel_version" = "$VERSION" ] || fail "Panel version is $panel_version, expected $VERSION"
 [ "$node_version" = "$VERSION" ] || fail "Node version is $node_version, expected $VERSION"
 [ "$node_installer_version" = "$VERSION" ] || fail "Node installer version is $node_installer_version, expected $VERSION"
-grep -Fq "## [$VERSION]" "$ROOT/CHANGELOG.md" || fail "Panel changelog has no $VERSION entry"
-grep -Fq "## [$VERSION]" "$ROOT/CHANGELOG-NODE.md" || fail "Node changelog has no $VERSION entry"
+panel_heading_count="$(awk -v heading="## [$VERSION]" '
+    index($0, heading) == 1 {
+        suffix = substr($0, length(heading) + 1)
+        if (suffix == "" || suffix ~ /^ - /) count++
+    }
+    END { print count + 0 }
+' "$PANEL_CHANGELOG")"
+node_heading_count="$(awk -v heading="## [$VERSION]" '
+    index($0, heading) == 1 {
+        suffix = substr($0, length(heading) + 1)
+        if (suffix == "" || suffix ~ /^ - /) count++
+    }
+    END { print count + 0 }
+' "$NODE_CHANGELOG")"
+[ "$panel_heading_count" = 1 ] || fail "CHANGELOG.md must contain exactly one release heading for $VERSION (found $panel_heading_count)"
+[ "$node_heading_count" = 1 ] || fail "CHANGELOG-NODE.md must contain exactly one release heading for $VERSION (found $node_heading_count)"
 if ! grep -Fq "stable release is \`v$VERSION\`" "$ROOT/docs/VERSIONS.md" && \
    ! grep -Fq "candidate is \`v$VERSION\`" "$ROOT/docs/VERSIONS.md"; then
     fail "docs/VERSIONS.md does not declare v$VERSION as stable or candidate"

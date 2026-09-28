@@ -7,6 +7,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.3.0] - Release Candidate (2026-09-28)
+
+### 新增 / 改进
+
+- SSH / Manual Bootstrap 新节点自动加入隐藏系统节点池并建立永久具体节点凭据，不依赖业务 Group Token。
+- 旧节点跨组前使用一次性精确身份迁移；新版 Node 可热切换控制面认证而不重启转发监听。
+
+### 安全 / 修复
+
+- 重启时在启动 HTTP / WebSocket 配置通道前读取并验证持久认证描述符，避免迁移完成的 Node 先以遗留 Group Token 拉取 Home-only 配置。
+- 描述符损坏、权限不安全或身份不匹配时阻断控制面配置请求并重试；已恢复 LKG、监听和转发保持运行。
+- 不放宽旧修订与同修订不同指纹拒绝规则；Binding 建立后仍需 Panel 证明精确配置同步。
+
+### 兼容性
+
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。v1.1.26 Node 需先升级到 `1.3.0`，再执行旧节点安全迁移。
+- 本条为候选源码，尚未发布或部署。
+
 ## [1.1.26] - 2026-09-27
 
 ### 修复 / 改进

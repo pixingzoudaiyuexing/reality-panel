@@ -1,14 +1,14 @@
 # Reality Panel — Roadmap
 
-## Current stage: Node Pool V1 RT-001 restart safety fix pending independent review
+## Current stage: Node Pool V1 v1.3.0 release candidate pending Primary review
 
-Node Pool V1 projects existing Nodes and memberships without automatic runtime changes, adds Pool-managed names and Group-centric assignment, and provisions new Nodes under a hidden identity anchor. It is integrated on `main` at `95f230bf73e730b92b9023f01e5fad1c2e7d9763`, but not released or deployed. RT-001 restart safety is being fixed on an isolated branch and requires a new independent review. The Owner reports that stable `v1.1.26` is already deployed; this task has not independently verified production. See [ADR 0002](adr/0002-node-pool-v1.md).
+Node Pool V1 projects existing Nodes and memberships without automatic runtime changes, adds Pool-managed names and Group-centric assignment, and provisions new Nodes under a hidden identity anchor. Implementation and RT-001 have passed independent review; isolated Debian 12 amd64 runtime acceptance also passed, including post-migration restart, invalid descriptor and Pool-native SSH Bootstrap flows. Candidate version is `v1.3.0`; it is not released or deployed. The Owner reports stable `v1.1.26` production deployment; that state has not been independently verified in this task. See [ADR 0002](adr/0002-node-pool-v1.md).
 
 ## Stable baseline: Node Reuse product completion
 
 The implementation based on `v1.1.25` adds default availability, prospective Preflight, server-enforced safe creation, server-proven sync status, and Node-detail management UI. It is integrated on `main` at `555558f17218540211c59b9c08bd767d68e294a9`, passed independent Gemini review, was accepted by Primary, and shipped in `v1.1.26`.
 
-The Owner reports a later production deployment of `v1.1.26`; this implementation task has not accessed production.
+The Owner reports a later production deployment of `v1.1.26`; no production access occurred during RC preparation.
 
 ## Explicitly deferred / excluded from Node Reuse V1
 
