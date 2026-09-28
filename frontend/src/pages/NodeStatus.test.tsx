@@ -314,6 +314,10 @@ describe('NodeStatus targeted diagnosis entry point', () => {
     rememberGroup(1);
     mockGet.mockImplementation((url: string) => {
       if (url === '/nodes') return Promise.resolve(ok([adminNode]));
+      if (url === '/admin/node-health') return Promise.resolve(ok([
+        { identity_group_id: 1, node_id: 'n1', display_name: 'Primary', as_of: new Date().toISOString(), state: 'HEALTHY', telemetry: { fresh: true, age_seconds: 0, public_ipv4: '192.0.2.10' }, control_connected: true, runtime: {}, group_readiness: [{ group_id: 1, ready: true, reasons: [] }] },
+        { identity_group_id: 1, node_id: 'n2', display_name: 'Backup', as_of: new Date().toISOString(), state: 'DEGRADED', telemetry: { fresh: true, age_seconds: 0, public_ipv4: '192.0.2.11' }, control_connected: false, runtime: {}, group_readiness: [{ group_id: 1, ready: false, reasons: ['CONTROL_CHANNEL_OFFLINE'] }] },
+      ]));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       if (url === '/groups') return Promise.resolve(ok([{ id: 1, name: 'group-a', group_type: 'in' }]));
       if (url === '/groups/1/relay-preference') return Promise.resolve(preference());
@@ -835,6 +839,12 @@ describe('NodeStatus responsive node layout', () => {
     mockUseAuth.mockReturnValue({ isAdmin: true });
     mockGet.mockImplementation((url: string) => {
       if (url === '/nodes') return Promise.resolve(ok([responsiveNode]));
+      if (url === '/admin/node-health') return Promise.resolve(ok([{
+        identity_group_id: 1, node_id: 'n1', display_name: 'Main relay',
+        as_of: new Date().toISOString(), state: 'HEALTHY',
+        telemetry: { fresh: true, age_seconds: 0, public_ipv4: responsiveNode.public_ipv4, public_ipv6: responsiveNode.public_ipv6 },
+        control_connected: true, runtime: {}, group_readiness: [],
+      }]));
       if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
       return Promise.reject(new Error(`unexpected ${url}`));
     });
@@ -862,7 +872,8 @@ describe('NodeStatus responsive node layout', () => {
 
     expect(document.querySelector('.ant-table')).toBeNull();
     const card = screen.getByTestId('node-mobile-card');
-    expect(card).toHaveTextContent('online');
+    expect(card).toHaveTextContent('nodeHealth_HEALTHY');
+    expect(card).toHaveTextContent('Main relay');
     expect(card).toHaveTextContent('104.105.136.129');
     expect(card).toHaveTextContent('2600:1901:0:1234:5678:90ab:cdef:1234');
     expect(card).toHaveTextContent('TCP174UDP0');
@@ -879,5 +890,32 @@ describe('NodeStatus responsive node layout', () => {
     expect(screen.getByRole('dialog')).toBeInTheDocument();
     page.unmount();
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
+  });
+});
+
+describe('NodeStatus reused membership projection', () => {
+  it('shows one concrete node in its business group without duplicate lifecycle controls', async () => {
+    mockUseAuth.mockReturnValue({ isAdmin: true });
+    rememberGroup(2);
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/nodes') return Promise.resolve(ok([{ ...adminNode, group_name: 'identity-group', install_method: 'systemd' }]));
+      if (url === '/admin/node-health') return Promise.resolve(ok([{
+        identity_group_id: 1, node_id: 'n1', display_name: 'Shared relay', as_of: new Date().toISOString(),
+        state: 'DEGRADED', telemetry: { fresh: true, last_seen: new Date().toISOString(), public_ipv4: '203.0.113.5', public_ipv6: null, node_version: '1.3.0' },
+        control_connected: false, runtime: { reconciliation: null, active_listener_rule_ids: [] },
+        group_readiness: [
+          { group_id: 1, group_name: 'identity-group', ready: false, reasons: ['CONTROL_CHANNEL_OFFLINE'] },
+          { group_id: 2, group_name: 'business-group', ready: false, reasons: ['CONTROL_CHANNEL_OFFLINE'] },
+        ],
+      }]));
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      if (url === '/groups') return Promise.resolve(ok([{ id: 1, name: 'identity-group', group_type: 'in' }, { id: 2, name: 'business-group', group_type: 'in' }]));
+      return Promise.reject(new Error(`unexpected ${url}`));
+    });
+    renderPage();
+    await flush();
+    expect(screen.getByText('business-group')).toBeInTheDocument();
+    expect(screen.getAllByText('Shared relay').length).toBeGreaterThan(0);
+    expect(screen.queryByRole('button', { name: 'nodeRestart' })).not.toBeInTheDocument();
   });
 });

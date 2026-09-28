@@ -8,6 +8,7 @@ import { RelaySchedulePanel } from './RelaySchedulePanel';
 import { CarrierAffinityPanel } from './CarrierAffinityPanel';
 import { RelayFailoverPanel } from './RelayFailoverPanel';
 import { relayReadyReasonLabel } from './shared';
+import { poolNodeName } from './poolNodeName';
 import { dnsSyncStateDisplay } from '../../utils/realityRuleStatus';
 
 const { Text } = Typography;
@@ -21,6 +22,7 @@ type LoadPreference = (showSpinner?: boolean, allowInitialRetry?: boolean) => Pr
 interface Props {
   groupId: number;
   t: Tfn;
+  healthNodes?: RelayReadyNode[];
   onDiagnoseNode?: (node: RelayReadyNode) => void;
   onViewChange?: (view: RelayPreferenceView | null) => void;
 }
@@ -84,7 +86,7 @@ function routingApplyErrorLabel(code: string | null | undefined, t: Tfn): string
   return t(keys[code ?? ''] ?? 'routingApplyFailed');
 }
 
-export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange }: Props) {
+export function RelayPreferencePanel({ groupId, t, healthNodes, onDiagnoseNode, onViewChange }: Props) {
   const [view, setView] = useState<RelayPreferenceView | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
@@ -313,10 +315,13 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
   const busy = loading || submittingMode !== null;
   const modeConflict = (view?.routing_mode_conflict?.length ?? 0) > 1;
   const activeMode = view?.active_routing_mode ?? 'normal';
-  const nodeById = new Map((view?.nodes ?? []).map((node) => [node.node_id, node]));
+  const currentNodes = healthNodes ?? view?.nodes ?? [];
+  const uniqueNodes = currentNodes.filter((node) => currentNodes.filter((candidate) => candidate.node_id === node.node_id).length === 1);
+  const nodeById = new Map(uniqueNodes.map((node) => [node.node_id, node]));
   const nodeLabel = (nodeId: string | null | undefined) => {
     if (!nodeId) return '-';
-    return nodeById.get(nodeId)?.public_ipv4 ?? nodeId;
+    const node = nodeById.get(nodeId);
+    return node ? poolNodeName(node) : nodeId.slice(0, 12);
   };
   const topologyLocked = view?.state === 'switching'
     || view?.state === 'rolling_back'
@@ -471,29 +476,31 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
                     {t(normalActive ? 'routingSaveChanges' : 'routingSaveAndActivate')}
                   </Button>
                 </div>
-                {view && view.nodes.length === 0 ? <Alert type="warning" showIcon title={t('relayPreferenceNoNodes')} /> : null}
-                {view?.nodes.map((node) => {
+                {view && currentNodes.length === 0 ? <Alert type="warning" showIcon title={t('relayPreferenceNoNodes')} /> : null}
+                {view && currentNodes.map((node) => {
+                  const ambiguous = !nodeById.has(node.node_id);
                   const reasons = node.ready_reasons.map((reason) => relayReadyReasonLabel(reason, t));
-                  const effective = node.node_id === view.preferred_node_id;
-                  const selected = node.node_id === normalDraftNodeId;
+                  const effective = !ambiguous && node.node_id === view.preferred_node_id;
+                  const selected = !ambiguous && node.node_id === normalDraftNodeId;
                   return (
-                    <div className="rp-default-line-candidate" data-testid={`default-line-candidate-${node.node_id}`} key={node.node_id}>
+                    <div className="rp-default-line-candidate" data-testid={`default-line-candidate-${node.node_id}`} key={`${node.identity_group_id}:${node.node_id}`}>
                       <div className="rp-default-line-candidate-main">
                         <Space size={6} wrap>
-                          <Text strong className="rp-mono">{node.public_ipv4 ?? node.node_id}</Text>
+                          <Text strong>{poolNodeName(node)}</Text>
                           <Tag color={node.online ? 'green' : undefined}>{node.online ? t('online') : t('offline')}</Tag>
                           <Tag color={node.ready ? 'green' : 'red'}>{node.ready ? t('relayReady') : t('relayNotReady')}</Tag>
                           {effective ? <Tag>{t('routingEffectiveDefault')}</Tag> : null}
                           {selected ? <Tag color="blue">{t('routingNormalSelected')}</Tag> : null}
                         </Space>
-                        {node.public_ipv4 ? <Text type="secondary" code>{node.node_id}</Text> : null}
+                        {node.public_ipv4 ? <Text type="secondary" code>{node.public_ipv4}</Text> : null}
                         {!node.ready && reasons.length > 0 ? <Text type="danger">{reasons.join(' · ')}</Text> : null}
+                        {ambiguous ? <Text type="danger">{t('nodeIdentityAmbiguous')}</Text> : null}
                       </div>
                       <Space size={4} wrap>
                         {onDiagnoseNode ? (
                           <Button size="small" icon={<MedicineBoxOutlined />} onClick={() => onDiagnoseNode(node)}>{t('diagnose')}</Button>
                         ) : null}
-                        {!selected && node.ready ? (
+                        {!selected && node.ready && !ambiguous ? (
                           <Button
                             size="small"
                             disabled={topologyLocked || busy || modeConflict}
@@ -519,7 +526,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
               <CarrierAffinityPanel
                 key={`carrier-${discardRevisions.carrier ?? 0}`}
                 groupId={groupId}
-                nodes={view?.nodes ?? []}
+                nodes={currentNodes}
                 t={t}
                 dnsRecords={view?.dns_records ?? []}
                 onViewChange={setCarrierView}
@@ -538,7 +545,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
               <RelaySchedulePanel
                 key={`schedule-${discardRevisions.schedule ?? 0}`}
                 groupId={groupId}
-                nodes={view?.nodes ?? []}
+                nodes={uniqueNodes}
                 t={t}
                 carrierPolicy={carrierView?.active_policy}
                 carrierCatalog={carrierCatalog}
@@ -557,6 +564,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
               <RelayFailoverPanel
                 key={`failover-${discardRevisions.failover ?? 0}`}
                 groupId={groupId}
+                names={Object.fromEntries(uniqueNodes.map((node) => [node.node_id, poolNodeName(node)]))}
                 t={t}
                 active={activeMode === 'failover'}
                 disabled={modeConflict || topologyLocked}

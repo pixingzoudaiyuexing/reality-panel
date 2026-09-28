@@ -285,6 +285,20 @@ pub async fn get_node_status(
             Some(parsed) => parsed,
             None => continue,
         };
+        if let Some(node_id) = node_id_from_key {
+            match state.db.find_node_pool_record(group_id, node_id).await {
+                Ok(Some(record)) if record.retirement_state == "RETIRED" => continue,
+                Err(error) => {
+                    tracing::warn!("node retirement lookup unavailable: {error}");
+                    return Json(ApiResponse {
+                        code: 500,
+                        message: "database error".into(),
+                        data: None,
+                    });
+                }
+                _ => {}
+            }
+        }
         let mut status: serde_json::Value = match serde_json::from_str(value) {
             Ok(v) => v,
             Err(_) => continue,

@@ -1,0 +1,21 @@
+# ADR 0003 - Node Management V2
+
+Status: IMPLEMENTED ON ISOLATED BRANCH / INDEPENDENT REVIEW PENDING / NOT INTEGRATED OR RELEASED
+
+## Decision
+
+Concrete Node identity remains `(identity_group_id, node_id)`. Node Pool is the persistent catalog; business membership is the existing native identity Group plus exact Node Reuse Bindings. Existing identities and memberships are not re-anchored by upgrade. Pool display names remain administrator metadata, never Node-reported authority.
+
+Global health combines current telemetry, control connection, reconciliation and listener errors into HEALTHY, DEGRADED, OFFLINE or UNKNOWN. Group-specific READY remains a separate strict routing decision. A WebSocket-only interruption with fresh telemetry is degradation, not evidence that forwarding stopped. Read-only views identify reused Nodes by the complete concrete identity. Legacy routing writes that still store only `node_id` reject ambiguity rather than selecting a candidate.
+
+New SSH and Manual Bootstrap Nodes use the hidden Pool anchor and must persist an exact Permanent Credential before success. SSH bootstrap reports a fixed, secret-free failure stage. A retry after confirmed rollback reuses the original deployment ID, Claim and credential continuation; a fresh deployment ID cannot silently replace an existing persistent Node ID. Trusted HTTPS reverse-proxy ingress requires the configured immediate proxy peer and exactly one `X-Forwarded-Proto: https` header.
+
+Historical Group-Token Nodes use one administrator-authorized, unique live Lifecycle connection for one-time migration. This is continuity of the selected live connection, not proof of historical physical host ownership. The Node persists the bootstrap secret before ACK, redeems it through the existing Claim/Credential flow, and records completion only after the Panel confirms exact credential authentication. An authorized migration blocks Legacy config from replacing LKG during retry or restart. A published `v1.3.0` Node does not understand this automatic flow, so the unreleased V2 source uses version `1.4.0` and a distinct capability report: it upgrades the binary once, then migrates. Future upgrades reuse the Permanent Credential.
+
+Retirement is a soft tombstone for the exact identity. Preview checks memberships, routing references, unfinished Claims and lifecycle work; committing retirement revokes the active exact Credential atomically. Historical traffic, credentials and audit records remain. The shared Group Token cannot cryptographically revoke one historical physical machine. Restore requires an explicit action and does not recreate business memberships.
+
+Carrier policy permits multiple exact Node targets on one provider line. New target keys encode provider line plus concrete identity; historical single-target keys remain readable. Each managed A record has separate desired state, ownership binding and provider record ID. Discovery may return several Panel-owned A records on one line; unknown external records still fail closed. An Apply snapshots and verifies every exact record and rolls back only its own mutations. Advertised membership follows fresh traffic-serving evidence, required listeners, reconciliation and retirement, not control connectivity alone. A failure must persist for 90 seconds before its A record is removed; recovery must persist for 20 seconds before re-publication. Existing IP changes are projected immediately. Carrier TTL is `max(60 seconds, provider minimum TTL)`; the default line keeps its existing 600-second floor.
+
+## Compatibility And Gate
+
+The additive retirement schema is SQLite Migration 59 and PostgreSQL revision 43. Schema upgrade and metadata projection do not deliver config, advance existing revision authority, rotate credentials, change LKG, or restart forwarding. Config Protocol remains 10 and Lifecycle Protocol remains 1. Isolated Linux evidence covers fresh SSH credential provisioning, safe failure/retry, current and published-Node migration, and forwarding continuity. This implementation is not integrated, released or deployed. Its exact final HEAD requires independent Gemini review before integration.

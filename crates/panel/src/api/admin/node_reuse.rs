@@ -62,6 +62,14 @@ fn error_response(error: NodeReuseServiceError) -> Response {
                 409,
                 "NODE_POOL_MIGRATION_INCOMPLETE".to_string(),
             ),
+            NodeReuseBindingCreateRejection::NodeRetired => {
+                (StatusCode::CONFLICT, 409, "NODE_RETIRED".to_string())
+            }
+            NodeReuseBindingCreateRejection::AmbiguousGroupNodeId => (
+                StatusCode::CONFLICT,
+                409,
+                "AMBIGUOUS_GROUP_NODE_ID".to_string(),
+            ),
         },
         NodeReuseServiceError::BindingChangedDuringRead => (
             StatusCode::CONFLICT,

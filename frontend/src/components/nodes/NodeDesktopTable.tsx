@@ -40,7 +40,7 @@ interface Props {
  *  columns — the permission difference is in the data source (admin reads
  *  /nodes, user reads /nodes/shared) and the detail drawer. */
 export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {}, onDelete, relayNodes = [], showRelayReady = false }: Props) {
-  const relayById = new Map(relayNodes.map((node) => [node.node_id, node]));
+  const relayById = new Map(relayNodes.map((node) => [`${node.identity_group_id ?? rows[0]?.group_id}:${node.node_id}`, node]));
 
   const columns = [
     {
@@ -49,7 +49,7 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
         <NodeStatusCell
           row={r}
           panelProtocol={panelProtocol}
-          relayNode={r.node_id ? relayById.get(r.node_id) : undefined}
+          relayNode={r.node_id ? relayById.get(`${r.identity_group_id ?? r.group_id}:${r.node_id}`) : undefined}
           showRelayReady={showRelayReady}
           t={t}
         />
@@ -105,7 +105,7 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
     <Table
       dataSource={rows}
       columns={columns}
-      rowKey={(r) => `${r.group_id}:${r.node_id || 'legacy'}`}
+      rowKey={(r) => `${r.group_id}:${r.node_key ?? `${r.identity_group_id ?? r.group_id}:${r.node_id || 'legacy'}`}`}
       // v1.2.5: offline rows are greyed (see .rp-node-offline in theme.css).
       // Their numbers are the last report, not a live reading — and since these
       // rows now stay listed for 24h instead of 2 minutes, telling them apart

@@ -18,6 +18,7 @@ use crate::api::AppState;
 use crate::dto::{SharedGroupSummary, SharedNodeSummary};
 use axum::{extract::State, Json};
 use relay_shared::protocol::ApiResponse;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 /// Build a typed 500 error envelope (`ApiResponse::error` is fixed to
@@ -139,7 +140,22 @@ pub async fn list_shared_node_summary(
         }
     };
 
-    let mut summaries = aggregate_shared_node_summaries(groups, &rows, chrono::Utc::now());
+    let pool = match crate::service::node_pool::list_nodes(state.db.as_ref()).await {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            tracing::warn!("shared node projection unavailable: {error}");
+            return db_error();
+        }
+    };
+    let (projected, display_names) = match project_shared_rows(&groups, &rows, pool) {
+        Ok(value) => value,
+        Err(()) => {
+            tracing::warn!("duplicate concrete node ID in shared group projection");
+            return db_error();
+        }
+    };
+    let mut summaries = aggregate_shared_node_summaries(groups, &projected, chrono::Utc::now());
+    apply_shared_metadata(&mut summaries, &display_names);
 
     // v0.4.15: enrich each node row with GeoIP country from the KVS cache
     // (geoip:{ip}). This is a READ of cached results — no third-party call
@@ -161,6 +177,76 @@ pub async fn list_shared_node_summary(
     }
 
     Json(ApiResponse::success(summaries))
+}
+
+struct SharedNodeMetadata {
+    display_name: String,
+    node_id: String,
+}
+
+type SharedMetadata = HashMap<(i64, String), SharedNodeMetadata>;
+type SharedProjection = (Vec<(String, String)>, SharedMetadata);
+
+fn apply_shared_metadata(summaries: &mut [SharedNodeSummary], metadata: &SharedMetadata) {
+    for summary in summaries {
+        if let Some(node) = metadata.get(&(summary.group_id, summary.node_id.clone())) {
+            summary.node_key = Some(summary.node_id.clone());
+            summary.node_id = node.node_id.clone();
+            summary.display_name =
+                (!node.display_name.is_empty()).then(|| node.display_name.clone());
+        }
+    }
+}
+
+fn project_shared_rows(
+    groups: &[SharedGroupSummary],
+    rows: &[(String, String)],
+    pool: Vec<crate::service::node_pool::PoolNode>,
+) -> Result<SharedProjection, ()> {
+    let authorized: HashSet<i64> = groups.iter().map(|group| group.id).collect();
+    let canonical: HashMap<String, String> = rows.iter().cloned().collect();
+    let mut projected = rows
+        .iter()
+        .filter(|(key, _)| parse_status_key(key).is_some_and(|(_, id)| id.is_none()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut display_names = HashMap::new();
+    for node in pool {
+        let status = canonical
+            .get(&format!(
+                "node_status:{}:{}",
+                node.identity_group_id, node.node_id
+            ))
+            .filter(|status| status_last_seen(status).is_some())
+            .cloned()
+            .unwrap_or_else(|| {
+                r#"{"last_seen":"1970-01-01T00:00:00Z","pool_offline":true}"#.to_string()
+            });
+        for membership in node.memberships {
+            if !authorized.contains(&membership.group_id) {
+                continue;
+            }
+            let opaque_key = format!(
+                "{:x}",
+                Sha256::digest(format!("{}:{}", node.identity_group_id, node.node_id).as_bytes())
+            );
+            let key = (membership.group_id, opaque_key);
+            if display_names
+                .insert(
+                    key.clone(),
+                    SharedNodeMetadata {
+                        display_name: node.display_name.clone(),
+                        node_id: node.node_id.clone(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(());
+            }
+            projected.push((format!("node_status:{}:{}", key.0, key.1), status.clone()));
+        }
+    }
+    Ok((projected, display_names))
 }
 
 /// Pure transform of node_status kvs rows into per-NODE [`SharedNodeSummary`]
@@ -233,6 +319,8 @@ fn aggregate_shared_node_summaries(
                 region: g.region.clone(),
                 line_type: g.line_type.clone(),
                 node_id,
+                node_key: None,
+                display_name: None,
                 online,
                 public_ip: s("public_ip"),
                 // v0.4.15: dual-stack. public_ipv4 falls back to the legacy
@@ -274,7 +362,16 @@ fn aggregate_shared_node_summaries(
                 // Stable order: by node_id so the table doesn't reshuffle.
                 nodes.sort_by(|a, b| a.0.cmp(&b.0));
                 for (node_id, json, online, last_seen) in nodes {
-                    out.push(base(node_id, online, Some(&json), Some(last_seen)));
+                    out.push(base(
+                        node_id,
+                        online,
+                        Some(&json),
+                        (!json
+                            .get("pool_offline")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false))
+                        .then_some(last_seen),
+                    ));
                 }
             }
             // No node reported for this shared group → one placeholder row.
@@ -287,6 +384,105 @@ fn aggregate_shared_node_summaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pool_node(
+        group_id: i64,
+        node_id: &str,
+        memberships: Vec<i64>,
+    ) -> crate::service::node_pool::PoolNode {
+        crate::service::node_pool::PoolNode {
+            identity_group_id: group_id,
+            node_id: node_id.into(),
+            display_name: "Named relay".into(),
+            public_ipv4: None,
+            public_ipv6: None,
+            online: false,
+            node_version: None,
+            last_seen: None,
+            credential_ready: false,
+            credential_active: false,
+            safe_to_add: false,
+            migration_incomplete: false,
+            recovery_available: false,
+            runtime_verified: false,
+            migration_required: true,
+            migration_pending: false,
+            migration_claim_id: None,
+            auth_reload_supported: false,
+            automatic_migration_supported: false,
+            memberships: memberships
+                .into_iter()
+                .map(|id| crate::service::node_pool::PoolMembership {
+                    group_id: id,
+                    group_name: format!("g{id}"),
+                    native: id == group_id,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn reused_shared_node_projects_canonical_status_only_to_authorized_groups() {
+        let groups = vec![group(20, "Japan")];
+        let now = chrono::Utc::now();
+        let rows = vec![(
+            "node_status:10:Node_A".into(),
+            serde_json::json!({"last_seen": now.to_rfc3339(), "public_ipv4": "203.0.113.5"})
+                .to_string(),
+        )];
+        let (projected, names) = project_shared_rows(
+            &groups,
+            &rows,
+            vec![pool_node(10, "Node_A", vec![10, 20, 30])],
+        )
+        .unwrap();
+        assert_eq!(projected.len(), 1);
+        let mut summaries = aggregate_shared_node_summaries(groups, &projected, now);
+        apply_shared_metadata(&mut summaries, &names);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].group_id, 20);
+        assert_eq!(summaries[0].node_id, "Node_A");
+        assert_eq!(summaries[0].display_name.as_deref(), Some("Named relay"));
+        assert_eq!(summaries[0].public_ipv4.as_deref(), Some("203.0.113.5"));
+        assert!(summaries[0].online);
+    }
+
+    #[test]
+    fn shared_projection_keeps_offline_name_and_separates_same_ids_without_topology_exposure() {
+        let groups = vec![group(20, "Japan")];
+        let first = pool_node(10, "SAME", vec![20]);
+        let (projected, names) = project_shared_rows(&groups, &[], vec![first]).unwrap();
+        let mut rows = aggregate_shared_node_summaries(
+            vec![group(20, "Japan")],
+            &projected,
+            chrono::Utc::now(),
+        );
+        apply_shared_metadata(&mut rows, &names);
+        assert_eq!(rows[0].node_id, "SAME");
+        assert!(!rows[0].online);
+        assert!(rows[0].last_seen.is_none());
+        assert_eq!(rows[0].display_name.as_deref(), Some("Named relay"));
+        let (projected, names) = project_shared_rows(
+            &groups,
+            &[],
+            vec![
+                pool_node(10, "SAME", vec![20]),
+                pool_node(11, "SAME", vec![20]),
+            ],
+        )
+        .unwrap();
+        let mut summaries = aggregate_shared_node_summaries(groups, &projected, chrono::Utc::now());
+        apply_shared_metadata(&mut summaries, &names);
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().all(|node| node.node_id == "SAME"));
+        assert_ne!(summaries[0].node_key, summaries[1].node_key);
+        let public = serde_json::to_value(&summaries).unwrap();
+        assert!(public
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node.get("identity_group_id").is_none()));
+    }
 
     fn group(id: i64, name: &str) -> SharedGroupSummary {
         SharedGroupSummary {

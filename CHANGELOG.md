@@ -7,6 +7,12 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.4.0] - Unreleased
+
+- Node Management V2 adds exact-node health and retirement, automatic one-time migration of historical Group-Token Nodes, and permanent-credential-only provisioning for new Nodes.
+- Carrier routing supports multiple independently owned A records per provider line, with exact-node targets, serving-health hysteresis, and per-record transaction rollback.
+- No release, tag, integration, or production deployment has been performed for this version.
+
 ## [1.3.0] - Release Candidate (2026-09-28)
 
 ### 新增

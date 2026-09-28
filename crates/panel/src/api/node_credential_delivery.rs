@@ -4,7 +4,7 @@
 //! authenticate normal HTTP/WS runtime traffic and grant no Node Reuse authority.
 
 use crate::api::node::extract_node_token;
-use crate::api::node_claim::production_claim_transport_allowed;
+use crate::api::node_claim::{claim_transport_failure_message, production_claim_transport_allowed};
 use crate::api::AppState;
 use crate::db::repo::{
     ActivateInitialNodeCredentialFromDelivery, GroupRepository,
@@ -293,11 +293,8 @@ pub async fn prepare_credential(
     Json(req): Json<PrepareCredentialDeliveryRequest>,
 ) -> Response {
     if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Node Credential delivery requires the configured trusted HTTPS ingress",
-        );
+        let reason = claim_transport_failure_message(&state, peer, &headers).await;
+        return sensitive_error(StatusCode::SERVICE_UNAVAILABLE, 503, &reason);
     }
     prepare_credential_after_transport(state, claim_id, headers, req).await
 }
@@ -503,11 +500,8 @@ pub async fn activate_credential(
     Json(req): Json<ActivateCredentialDeliveryRequest>,
 ) -> Response {
     if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Node Credential delivery requires the configured trusted HTTPS ingress",
-        );
+        let reason = claim_transport_failure_message(&state, peer, &headers).await;
+        return sensitive_error(StatusCode::SERVICE_UNAVAILABLE, 503, &reason);
     }
     activate_credential_after_transport(state, claim_id, headers, req).await
 }
@@ -1759,6 +1753,63 @@ mod tests {
             oversized.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_pool_claim_and_prepare_share_exact_trusted_proxy_gate() {
+        let _lock = DELIVERY_ENV_LOCK.lock().await;
+        std::env::remove_var("NODE_CLAIM_TRUSTED_PROXY_IPS");
+        let state = sqlite_state().await;
+        let router = crate::api::routes().with_state(state.clone());
+        let peer: SocketAddr = "127.0.0.1:42002".parse().unwrap();
+        let create = post_json(
+            router.clone(),
+            "/admin/node-credential-claims",
+            serde_json::json!({"home_group_id":7,"node_id":"POOL_NEW"}),
+            Some(&admin_token(&state)),
+            peer,
+            "https",
+        )
+        .await;
+        let (create_status, _, create_body) = json_response(create).await;
+        assert_eq!(create_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            create_body["message"],
+            "POOL_CREDENTIAL_TRANSPORT_REJECTED:TRUSTED_PROXY_IPS_MISSING_OR_INVALID"
+        );
+        let prepare = post_json(
+            router.clone(),
+            "/node-credential-claims/00000000-0000-4000-8000-000000000001/credential/prepare",
+            serde_json::json!({
+                "home_group_id": 7, "node_id": "POOL_NEW",
+                "claim_secret": "invalid", "claimant_nonce": "invalid",
+                "delivery_nonce": "invalid", "credential_id": "invalid",
+                "verifier_format": "invalid", "verifier_version": 1,
+                "verifier_data": "invalid"
+            }),
+            Some("delivery-group-token"),
+            peer,
+            "https",
+        )
+        .await;
+        let (prepare_status, _, prepare_body) = json_response(prepare).await;
+        assert_eq!(prepare_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(prepare_body["message"], create_body["message"]);
+
+        std::env::set_var("NODE_CLAIM_TRUSTED_PROXY_IPS", "127.0.0.1,::1");
+        let allowed = post_json(
+            router,
+            "/admin/node-credential-claims",
+            serde_json::json!({"home_group_id":7,"node_id":"POOL_NEW"}),
+            Some(&admin_token(&state)),
+            peer,
+            "https",
+        )
+        .await;
+        let (allowed_status, _, body) = json_response(allowed).await;
+        assert_eq!(allowed_status, StatusCode::OK);
+        assert!(body["data"]["claim"]["claim_id"].is_string());
+        std::env::remove_var("NODE_CLAIM_TRUSTED_PROXY_IPS");
     }
 
     #[test]

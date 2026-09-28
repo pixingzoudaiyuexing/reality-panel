@@ -2,6 +2,10 @@ use crate::api::node_auth::{
     authenticate_node, verified_credential_still_active, VerifiedConcreteNode,
 };
 use crate::api::AppState;
+use crate::db::error::DbError;
+use crate::db::repo::{NewNodeCredentialClaim, NodeCredentialClaimCreateResult, Repository};
+use crate::node_claim::{NodeClaimSecret, NodeClaimSecretVerifier};
+use crate::node_identity::ReuseEligibleNodeId;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -38,6 +42,33 @@ struct ConnEntry {
 type GroupConns = HashMap<u64, ConnEntry>;
 /// Shared registry: group_id -> that group's live connections.
 type ConnMap = Arc<RwLock<HashMap<i64, GroupConns>>>;
+type ControlObservation = (Option<String>, Option<String>);
+type ControlObservations = Arc<RwLock<HashMap<(i64, String), ControlObservation>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniqueConnectionError {
+    Offline,
+    Ambiguous,
+}
+
+struct PendingBootstrap {
+    operation_id: String,
+    claim_id: String,
+    group_id: i64,
+    node_id: String,
+    connection_id: u64,
+    approved_by: i64,
+    secret: NodeClaimSecret,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapError {
+    Offline,
+    Ambiguous,
+    Pending,
+    Unavailable,
+}
 
 /// Tracks live WebSocket connections per group_id so the panel can push
 /// `config_changed` notifications when an admin mutates rules or groups.
@@ -49,6 +80,8 @@ type ConnMap = Arc<RwLock<HashMap<i64, GroupConns>>>;
 pub struct NodeConnections {
     next_id: Arc<AtomicU64>,
     inner: ConnMap,
+    observations: ControlObservations,
+    bootstraps: Arc<RwLock<HashMap<String, PendingBootstrap>>>,
 }
 
 impl NodeConnections {
@@ -78,6 +111,16 @@ impl NodeConnections {
     ) -> (u64, mpsc::UnboundedReceiver<String>) {
         let conn_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
+        if let Some(id) = &node_id {
+            let mut observations = self.observations.write().await;
+            if observations.len() >= 10_000 && !observations.contains_key(&(group_id, id.clone())) {
+                if let Some(oldest) = observations.keys().next().cloned() {
+                    observations.remove(&oldest);
+                }
+            }
+            observations.entry((group_id, id.clone())).or_default().0 =
+                Some(chrono::Utc::now().to_rfc3339());
+        }
         self.inner
             .write()
             .await
@@ -99,11 +142,27 @@ impl NodeConnections {
     pub async fn unregister(&self, group_id: i64, conn_id: u64) {
         let mut map = self.inner.write().await;
         if let Some(conns) = map.get_mut(&group_id) {
-            conns.remove(&conn_id);
+            let removed = conns.remove(&conn_id).and_then(|entry| entry.node_id);
+            if let Some(id) = removed {
+                if !conns
+                    .values()
+                    .any(|entry| entry.node_id.as_deref() == Some(&id))
+                {
+                    if let Some(observation) =
+                        self.observations.write().await.get_mut(&(group_id, id))
+                    {
+                        observation.1 = Some(chrono::Utc::now().to_rfc3339());
+                    }
+                }
+            }
             if conns.is_empty() {
                 map.remove(&group_id);
             }
         }
+        self.bootstraps
+            .write()
+            .await
+            .retain(|_, pending| pending.group_id != group_id || pending.connection_id != conn_id);
     }
 
     /// Fan a message out to every live connection across every group.
@@ -183,30 +242,292 @@ impl NodeConnections {
         sent
     }
 
-    /// Deliver the one operation that must survive config-protocol skew.
-    /// Upgrade-only connections are eligible, but only when the node advertised
-    /// (or is a known legacy implementation of) the stable lifecycle protocol.
-    pub async fn send_upgrade_node(&self, group_id: i64, node_id: &str, msg: &str) -> usize {
-        let mut map = self.inner.write().await;
-        let Some(conns) = map.get_mut(&group_id) else {
-            return 0;
-        };
-        let mut sent = 0usize;
-        conns.retain(|_, e| {
-            if e.node_id.as_deref() != Some(node_id) || !e.lifecycle_capable {
-                return true;
-            }
-            if e.tx.send(msg.to_string()).is_ok() {
-                sent += 1;
-                true
-            } else {
-                false
-            }
-        });
-        if conns.is_empty() {
-            map.remove(&group_id);
+    pub async fn unique_lifecycle_connection(
+        &self,
+        group_id: i64,
+        node_id: &str,
+        upgrade: bool,
+    ) -> Result<u64, UniqueConnectionError> {
+        let map = self.inner.read().await;
+        let matches = map
+            .get(&group_id)
+            .into_iter()
+            .flat_map(|conns| conns.iter())
+            .filter(|(_, entry)| {
+                entry.node_id.as_deref() == Some(node_id)
+                    && !entry.tx.is_closed()
+                    && if upgrade {
+                        entry.lifecycle_capable
+                    } else {
+                        entry.config_compatible
+                    }
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Err(UniqueConnectionError::Offline),
+            [id] => Ok(*id),
+            _ => Err(UniqueConnectionError::Ambiguous),
         }
-        sent
+    }
+
+    pub async fn send_exact_connection(
+        &self,
+        group_id: i64,
+        node_id: &str,
+        connection_id: u64,
+        msg: &str,
+    ) -> bool {
+        self.inner
+            .read()
+            .await
+            .get(&group_id)
+            .and_then(|conns| conns.get(&connection_id))
+            .is_some_and(|entry| {
+                entry.node_id.as_deref() == Some(node_id) && entry.tx.send(msg.to_string()).is_ok()
+            })
+    }
+
+    #[cfg(test)]
+    pub async fn begin_bootstrap(
+        &self,
+        group_id: i64,
+        node_id: &str,
+        admin_id: i64,
+    ) -> Result<String, BootstrapError> {
+        let operation_id = uuid::Uuid::new_v4().to_string();
+        self.begin_bootstrap_with_id(group_id, node_id, admin_id, &operation_id)
+            .await?;
+        Ok(operation_id)
+    }
+
+    pub async fn begin_bootstrap_with_id(
+        &self,
+        group_id: i64,
+        node_id: &str,
+        admin_id: i64,
+        operation_id: &str,
+    ) -> Result<(), BootstrapError> {
+        if uuid::Uuid::parse_str(operation_id).is_err() {
+            return Err(BootstrapError::Unavailable);
+        }
+        let map = self.inner.read().await;
+        let matches = map
+            .get(&group_id)
+            .into_iter()
+            .flat_map(|conns| conns.iter())
+            .filter(|(_, entry)| {
+                entry.node_id.as_deref() == Some(node_id)
+                    && entry.lifecycle_capable
+                    && !entry.tx.is_closed()
+            })
+            .collect::<Vec<_>>();
+        let (connection_id, entry) = match matches.as_slice() {
+            [] => return Err(BootstrapError::Offline),
+            [selected] => *selected,
+            _ => return Err(BootstrapError::Ambiguous),
+        };
+        if !entry.config_compatible {
+            return Err(BootstrapError::Unavailable);
+        }
+        let secret = NodeClaimSecret::generate().map_err(|_| BootstrapError::Unavailable)?;
+        let operation_id = operation_id.to_string();
+        let claim_id = operation_id.clone();
+        let expires_at = chrono::Utc::now() + chrono::Duration::minutes(10);
+        let mut pending = self.bootstraps.write().await;
+        pending.retain(|_, item| item.expires_at > chrono::Utc::now());
+        if pending
+            .values()
+            .any(|item| item.group_id == group_id && item.node_id == node_id)
+        {
+            return Err(BootstrapError::Pending);
+        }
+        let message = relay_shared::protocol::NodeMigrationBootstrap {
+            msg_type: "node_migration_bootstrap".into(),
+            operation_id: operation_id.clone(),
+            identity_group_id: group_id,
+            node_id: node_id.into(),
+            claim_id: claim_id.clone(),
+            claim_secret: secret.to_wire_value(),
+            expires_at: expires_at.to_rfc3339(),
+        };
+        let payload = serde_json::to_string(&message).map_err(|_| BootstrapError::Unavailable)?;
+        pending.insert(
+            operation_id.clone(),
+            PendingBootstrap {
+                operation_id: operation_id.clone(),
+                claim_id,
+                group_id,
+                node_id: node_id.into(),
+                connection_id: *connection_id,
+                approved_by: admin_id,
+                secret,
+                expires_at,
+            },
+        );
+        if entry.tx.send(payload).is_err() {
+            pending.remove(&operation_id);
+            return Err(BootstrapError::Offline);
+        }
+        Ok(())
+    }
+
+    pub async fn acknowledge_bootstrap(
+        &self,
+        db: &dyn Repository,
+        group_id: i64,
+        node_id: &str,
+        connection_id: u64,
+        ack: &relay_shared::protocol::NodeMigrationBootstrapAck,
+    ) -> Result<(), BootstrapError> {
+        let map = self.inner.read().await;
+        let connection = map
+            .get(&group_id)
+            .and_then(|conns| conns.get(&connection_id));
+        if !connection
+            .is_some_and(|entry| entry.node_id.as_deref() == Some(node_id) && !entry.tx.is_closed())
+        {
+            return Err(BootstrapError::Offline);
+        }
+        let live_matches = map
+            .get(&group_id)
+            .into_iter()
+            .flat_map(|conns| conns.values())
+            .filter(|entry| {
+                entry.node_id.as_deref() == Some(node_id)
+                    && entry.lifecycle_capable
+                    && !entry.tx.is_closed()
+            })
+            .count();
+        if live_matches != 1 {
+            self.bootstraps.write().await.remove(&ack.operation_id);
+            return Err(BootstrapError::Ambiguous);
+        }
+        let mut pending = self.bootstraps.write().await;
+        let Some(item) = pending.remove(&ack.operation_id) else {
+            return Err(BootstrapError::Pending);
+        };
+        if ack.msg_type != "node_migration_bootstrap_ack"
+            || ack.node_id != node_id
+            || item.operation_id != ack.operation_id
+            || item.claim_id != ack.claim_id
+            || item.group_id != group_id
+            || item.node_id != node_id
+            || item.connection_id != connection_id
+            || item.expires_at <= chrono::Utc::now()
+        {
+            return Err(BootstrapError::Unavailable);
+        }
+        let exact = ReuseEligibleNodeId::parse(node_id).map_err(|_| BootstrapError::Unavailable)?;
+        if db
+            .find_node_pool_record(group_id, node_id)
+            .await
+            .map_err(|_| BootstrapError::Unavailable)?
+            .is_some_and(|record| record.retirement_state != "ACTIVE")
+        {
+            return Err(BootstrapError::Unavailable);
+        }
+        let created = db
+            .create_node_credential_claim(&NewNodeCredentialClaim {
+                claim_id: item.claim_id.clone(),
+                home_group_id: group_id,
+                node_id: exact.clone(),
+                secret_verifier: NodeClaimSecretVerifier::derive(
+                    &item.claim_id,
+                    group_id,
+                    &exact,
+                    &item.secret,
+                ),
+                approved_by: item.approved_by,
+                approval_ref: format!("node-pool-migration:{}", item.claim_id),
+                created_at: chrono::Utc::now(),
+                expires_at: item.expires_at,
+            })
+            .await
+            .map_err(|_| BootstrapError::Unavailable)?;
+        if !matches!(created, NodeCredentialClaimCreateResult::Created(_)) {
+            return Err(BootstrapError::Pending);
+        }
+        let claim_id = item.claim_id.clone();
+        let authorized = relay_shared::protocol::NodeMigrationBootstrapAuthorized {
+            msg_type: "node_migration_bootstrap_authorized".into(),
+            operation_id: item.operation_id,
+            claim_id,
+            node_id: item.node_id,
+        };
+        let payload =
+            serde_json::to_string(&authorized).map_err(|_| BootstrapError::Unavailable)?;
+        if connection
+            .expect("checked connection")
+            .tx
+            .send(payload)
+            .is_err()
+        {
+            let _ = db
+                .cancel_node_credential_claim(&item.claim_id, group_id, &exact, chrono::Utc::now())
+                .await;
+            return Err(BootstrapError::Offline);
+        }
+        drop(pending);
+        drop(map);
+        crate::service::node_convergence::mark_verifying(db, group_id, node_id, &item.claim_id)
+            .await
+            .map_err(|_| BootstrapError::Unavailable)?;
+        Ok(())
+    }
+
+    pub async fn resume_bootstrap_authorization(
+        &self,
+        db: &dyn Repository,
+        group_id: i64,
+        node_id: &str,
+        connection_id: u64,
+    ) -> Result<(), DbError> {
+        if self
+            .unique_lifecycle_connection(group_id, node_id, true)
+            .await
+            != Ok(connection_id)
+        {
+            return Ok(());
+        }
+        let Some(record) = crate::service::node_convergence::load(db, group_id, node_id)
+            .await?
+            .filter(|record| {
+                matches!(
+                    record.phase,
+                    crate::service::node_convergence::Phase::MigratingIdentity
+                        | crate::service::node_convergence::Phase::Verifying
+                )
+            })
+        else {
+            return Ok(());
+        };
+        let Some(claim) = db.find_node_credential_claim(&record.id).await? else {
+            return Ok(());
+        };
+        if claim.state != "APPROVED" {
+            return Ok(());
+        }
+        let payload =
+            serde_json::to_string(&relay_shared::protocol::NodeMigrationBootstrapAuthorized {
+                msg_type: "node_migration_bootstrap_authorized".into(),
+                operation_id: record.id,
+                claim_id: claim.claim_id,
+                node_id: node_id.into(),
+            })
+            .map_err(|_| {
+                DbError::Other(sqlx::Error::Protocol(
+                    "bootstrap authorization encode failed".into(),
+                ))
+            })?;
+        let map = self.inner.read().await;
+        if let Some(entry) = map
+            .get(&group_id)
+            .and_then(|connections| connections.get(&connection_id))
+        {
+            let _ = entry.tx.send(payload);
+        }
+        Ok(())
     }
 
     /// v0.4.14: the set of node_ids in a group that currently have a live WS
@@ -302,7 +623,56 @@ impl NodeConnections {
     /// and re-authenticates with the new token.
     pub async fn close_group(&self, group_id: i64) -> usize {
         let mut map = self.inner.write().await;
-        map.remove(&group_id).map(|conns| conns.len()).unwrap_or(0)
+        let Some(conns) = map.remove(&group_id) else {
+            return 0;
+        };
+        let mut observations = self.observations.write().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        for entry in conns.values() {
+            if let Some(id) = &entry.node_id {
+                if let Some(observation) = observations.get_mut(&(group_id, id.clone())) {
+                    observation.1 = Some(now.clone());
+                }
+            }
+        }
+        conns.len()
+    }
+
+    pub async fn close_node(&self, group_id: i64, node_id: &str) -> usize {
+        let mut map = self.inner.write().await;
+        let Some(conns) = map.get_mut(&group_id) else {
+            return 0;
+        };
+        let before = conns.len();
+        conns.retain(|_, entry| entry.node_id.as_deref() != Some(node_id));
+        let removed = before - conns.len();
+        if removed > 0 {
+            if let Some(observation) = self
+                .observations
+                .write()
+                .await
+                .get_mut(&(group_id, node_id.to_string()))
+            {
+                observation.1 = Some(chrono::Utc::now().to_rfc3339());
+            }
+        }
+        if conns.is_empty() {
+            map.remove(&group_id);
+        }
+        removed
+    }
+
+    pub async fn observation(
+        &self,
+        group_id: i64,
+        node_id: &str,
+    ) -> (Option<String>, Option<String>) {
+        self.observations
+            .read()
+            .await
+            .get(&(group_id, node_id.to_string()))
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -464,6 +834,14 @@ async fn handle_node_ws(
         )
         .await;
     if let Some(node_id) = lifecycle_node_id.as_deref() {
+        if let Err(error) = node_connections
+            .resume_bootstrap_authorization(db.as_ref(), group_id, node_id, conn_id)
+            .await
+        {
+            tracing::warn!("automatic migration authorization resume unavailable: {error}");
+        }
+    }
+    if let Some(node_id) = lifecycle_node_id.as_deref() {
         for operation in node_operations.connected(
             group_id,
             node_id,
@@ -532,6 +910,24 @@ async fn handle_node_ws(
                     break;
                 }
                 Ok(Some(Ok(Message::Text(text)))) => {
+                    if let Ok(ack) = serde_json::from_str::<
+                        relay_shared::protocol::NodeMigrationBootstrapAck,
+                    >(&text)
+                    {
+                        if ack.msg_type == "node_migration_bootstrap_ack" {
+                            if verified_credential.is_none() {
+                                if let Some(id) = lifecycle_node_id.as_deref() {
+                                    if let Err(error) = node_connections
+                                        .acknowledge_bootstrap(db.as_ref(), group_id, id, conn_id, &ack)
+                                        .await
+                                    {
+                                        tracing::warn!("automatic migration acknowledgement rejected: {error:?}");
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
                     if let Ok(event) = serde_json::from_str::<
                         relay_shared::protocol::NodeLifecycleEvent,
                     >(&text)
@@ -540,7 +936,7 @@ async fn handle_node_ws(
                             let outcome = node_operations.event_from_authenticated_node(
                                 group_id,
                                 lifecycle_node_id.as_deref(),
-                                event,
+                                event.clone(),
                             );
                             if let Some(ack) = outcome.boot_ack {
                                 if let Ok(payload) = serde_json::to_string(&ack) {
@@ -549,12 +945,32 @@ async fn handle_node_ws(
                                     }
                                 }
                             }
+                            let upgrade_confirmed = outcome.operation.as_ref().is_some_and(|operation| {
+                                operation.action == relay_shared::protocol::NodeLifecycleAction::Upgrade
+                                    && operation.status == crate::api::node_ops::OperationStatus::Success
+                            });
                             if let Some(operation) = outcome.operation {
+                                if operation.action == relay_shared::protocol::NodeLifecycleAction::Upgrade
+                                    && matches!(operation.status, crate::api::node_ops::OperationStatus::Failed | crate::api::node_ops::OperationStatus::Timeout)
+                                {
+                                    if let Err(error) = crate::service::node_convergence::mark_upgrade_failed(
+                                        &state, group_id, &operation.node_id, &operation.id, &operation.message,
+                                    ).await {
+                                        tracing::warn!("identity convergence failure observation unavailable: {error}");
+                                    }
+                                }
                                 crate::api::node_ops::audit_terminal_operation(
                                     &state,
                                     &operation,
                                 )
                                 .await;
+                            }
+                            if upgrade_confirmed {
+                                if let Err(error) = crate::service::node_convergence::after_boot_event(
+                                    &state, group_id, &event, verified_credential.is_some(),
+                                ).await {
+                                    tracing::warn!("identity convergence boot correlation unavailable: {error}");
+                                }
                             }
                         }
                     }
@@ -880,6 +1296,138 @@ mod tests {
         assert_eq!(msg.as_deref(), Some(r#"{"type":"config_changed"}"#));
     }
 
+    #[tokio::test]
+    async fn control_observations_follow_exact_connections() {
+        let conns = NodeConnections::new();
+        let (first, _first_rx) = conns.register(7, Some("node-a".into())).await;
+        let (_second, _second_rx) = conns.register(7, Some("node-b".into())).await;
+        let observed = conns.observation(7, "node-a").await;
+        assert!(observed.0.is_some());
+        assert!(observed.1.is_none());
+        conns.unregister(7, first).await;
+        assert!(conns.observation(7, "node-a").await.1.is_some());
+        assert!(conns.observation(7, "node-b").await.1.is_none());
+        assert_eq!(conns.close_node(7, "node-b").await, 1);
+        assert!(conns.observation(7, "node-b").await.1.is_some());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_selection_requires_one_exact_connection_and_never_resends_to_replacement() {
+        let conns = NodeConnections::new();
+        assert_eq!(
+            conns.unique_lifecycle_connection(7, "Node_A", true).await,
+            Err(UniqueConnectionError::Offline)
+        );
+        let (first, mut first_rx) = conns.register(7, Some("Node_A".into())).await;
+        let (duplicate, mut duplicate_rx) = conns.register(7, Some("Node_A".into())).await;
+        assert_eq!(
+            conns.unique_lifecycle_connection(7, "Node_A", true).await,
+            Err(UniqueConnectionError::Ambiguous)
+        );
+        assert!(first_rx.try_recv().is_err());
+        assert!(duplicate_rx.try_recv().is_err());
+        conns.unregister(7, duplicate).await;
+        assert_eq!(
+            conns.unique_lifecycle_connection(7, "Node_A", true).await,
+            Ok(first)
+        );
+        assert!(
+            conns
+                .send_exact_connection(7, "Node_A", first, "bootstrap")
+                .await
+        );
+        assert_eq!(first_rx.recv().await.as_deref(), Some("bootstrap"));
+        conns.unregister(7, first).await;
+        let (_replacement, mut replacement_rx) = conns.register(7, Some("Node_A".into())).await;
+        assert!(
+            !conns
+                .send_exact_connection(7, "Node_A", first, "secret")
+                .await
+        );
+        assert!(replacement_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_claim_requires_ack_from_selected_live_connection() {
+        use crate::db::repo::{NodeCredentialClaimRepository, NodePoolRepository};
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO device_groups (id,name,group_type,token,uid) VALUES (7,'home','in','token-7',1)")
+            .execute(&pool).await.unwrap();
+        let db = SqliteRepository::new(pool);
+        db.register_node_pool_identity(7, "Node_A").await.unwrap();
+        let conns = NodeConnections::new();
+        assert_eq!(
+            conns.begin_bootstrap(7, "Node_A", 1).await,
+            Err(BootstrapError::Offline)
+        );
+        let (_first, mut first_rx) = conns.register(7, Some("Node_A".into())).await;
+        let (duplicate, _dup_rx) = conns.register(7, Some("Node_A".into())).await;
+        assert_eq!(
+            conns.begin_bootstrap(7, "Node_A", 1).await,
+            Err(BootstrapError::Ambiguous)
+        );
+        conns.unregister(7, duplicate).await;
+        let operation = conns.begin_bootstrap(7, "Node_A", 1).await.unwrap();
+        let message: relay_shared::protocol::NodeMigrationBootstrap =
+            serde_json::from_str(&first_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(message.operation_id, operation);
+        assert_eq!(message.node_id, "Node_A");
+        let ack = relay_shared::protocol::NodeMigrationBootstrapAck {
+            msg_type: "node_migration_bootstrap_ack".into(),
+            operation_id: operation.clone(),
+            claim_id: message.claim_id.clone(),
+            node_id: "Node_A".into(),
+        };
+        let (intruder, _intruder_rx) = conns.register(7, Some("Node_A".into())).await;
+        assert_eq!(
+            conns
+                .acknowledge_bootstrap(&db, 7, "Node_A", intruder, &ack)
+                .await,
+            Err(BootstrapError::Ambiguous)
+        );
+        assert!(db
+            .find_node_credential_claim(&message.claim_id)
+            .await
+            .unwrap()
+            .is_none());
+        conns.unregister(7, intruder).await;
+        let second = conns.begin_bootstrap(7, "Node_A", 1).await.unwrap();
+        let delivered: relay_shared::protocol::NodeMigrationBootstrap =
+            serde_json::from_str(&first_rx.recv().await.unwrap()).unwrap();
+        assert_ne!(delivered.claim_secret, message.claim_secret);
+        let selected = conns
+            .unique_lifecycle_connection(7, "Node_A", true)
+            .await
+            .unwrap();
+        let valid_ack = relay_shared::protocol::NodeMigrationBootstrapAck {
+            msg_type: "node_migration_bootstrap_ack".into(),
+            operation_id: second,
+            claim_id: delivered.claim_id.clone(),
+            node_id: "Node_A".into(),
+        };
+        conns
+            .acknowledge_bootstrap(&db, 7, "Node_A", selected, &valid_ack)
+            .await
+            .unwrap();
+        let authorized: relay_shared::protocol::NodeMigrationBootstrapAuthorized =
+            serde_json::from_str(&first_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(authorized.msg_type, "node_migration_bootstrap_authorized");
+        assert_eq!(authorized.claim_id, delivered.claim_id);
+        assert_eq!(
+            db.find_node_credential_claim(&delivered.claim_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "APPROVED"
+        );
+    }
+
     /// broadcast_all must fan out to EVERY registered connection, not just
     /// the first one — otherwise only one node per group would get pushes.
     #[tokio::test]
@@ -1038,7 +1586,15 @@ mod tests {
         assert!(old_rx.try_recv().is_err(), "group control must be blocked");
         assert_eq!(current_rx.recv().await.as_deref(), Some("group-control"));
 
-        assert_eq!(conns.send_upgrade_node(1, "old-node", "upgrade").await, 1);
+        let selected = conns
+            .unique_lifecycle_connection(1, "old-node", true)
+            .await
+            .unwrap();
+        assert!(
+            conns
+                .send_exact_connection(1, "old-node", selected, "upgrade")
+                .await
+        );
         assert_eq!(old_rx.recv().await.as_deref(), Some("upgrade"));
 
         assert!(conns

@@ -23,7 +23,7 @@ pub mod node_enrollment;
 pub mod node_ops;
 pub mod node_pool;
 pub mod notify;
-mod provisioning;
+pub(crate) mod provisioning;
 pub mod reapply;
 pub mod redeem;
 pub mod relay_failover;
@@ -74,6 +74,12 @@ pub fn routes() -> Router<AppState> {
             )),
         )
         .route(
+            "/admin/node-pool/nodes/{identity_group_id}/{node_id}/identity-convergence",
+            axum::routing::post(node_pool::start_identity_convergence).layer(
+                axum::middleware::from_fn(node_claim::claim_response_headers),
+            ),
+        )
+        .route(
             "/node-pool/migrate.py",
             axum::routing::get(node_pool::migration_script),
         )
@@ -84,6 +90,30 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/admin/node-pool/nodes",
             axum::routing::get(node_pool::list_nodes),
+        )
+        .route(
+            "/admin/node-health",
+            axum::routing::get(node_pool::node_health),
+        )
+        .route(
+            "/admin/node-pool/retired",
+            axum::routing::get(node_pool::retired_nodes),
+        )
+        .route(
+            "/admin/node-pool/credential-transport",
+            axum::routing::get(node_pool::credential_transport_diagnostics),
+        )
+        .route(
+            "/admin/node-pool/nodes/{identity_group_id}/{node_id}/retirement-preview",
+            axum::routing::get(node_pool::retirement_preview),
+        )
+        .route(
+            "/admin/node-pool/nodes/{identity_group_id}/{node_id}/retire",
+            axum::routing::post(node_pool::retire_node),
+        )
+        .route(
+            "/admin/node-pool/nodes/{identity_group_id}/{node_id}/restore",
+            axum::routing::post(node_pool::restore_node),
         )
         .route(
             "/admin/node-pool/nodes/{identity_group_id}/{node_id}",
@@ -171,6 +201,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/admin/node-deployments/{id}/logs",
             axum::routing::get(node_deploy::deployment_logs),
+        )
+        .route(
+            "/admin/node-deployments/{id}/retry",
+            axum::routing::post(node_deploy::retry_deployment),
         )
         .route(
             "/admin/node-credential-claims",

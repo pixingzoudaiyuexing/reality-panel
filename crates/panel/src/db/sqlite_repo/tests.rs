@@ -74,6 +74,124 @@ async fn node_pool_metadata_contract() {
 }
 
 #[tokio::test]
+async fn node_retirement_is_atomic_and_restore_keeps_credential_revoked() {
+    let db = repo().await;
+    seed_group(&db, 71).await;
+    seed_group(&db, 72).await;
+    db.register_node_pool_identity(71, "POOL_A").await.unwrap();
+    sqlx::query("INSERT INTO node_credentials (credential_id, home_group_id, node_id, generation, verifier_format, verifier_version, verifier_data, activated_at) VALUES ('retire-credential', 71, 'POOL_A', 1, 'test', 1, x'01', datetime('now'))")
+        .execute(&db.pool).await.unwrap();
+    db.insert_node_reuse_binding(72, 71, "POOL_A")
+        .await
+        .unwrap();
+    assert!(!db
+        .retire_node_pool_identity(71, "POOL_A", 0, 1, "retired")
+        .await
+        .unwrap());
+    let record = db
+        .find_node_pool_record(71, "POOL_A")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.retirement_state, "ACTIVE");
+    let revoked: Option<String> = sqlx::query_scalar(
+        "SELECT revoked_at FROM node_credentials WHERE credential_id = 'retire-credential'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(revoked.is_none());
+    db.delete_node_reuse_binding(72, 71, "POOL_A")
+        .await
+        .unwrap();
+    assert!(db
+        .retire_node_pool_identity(71, "POOL_A", 0, 1, "retired")
+        .await
+        .unwrap());
+    assert_eq!(
+        db.find_node_pool_record(71, "POOL_A")
+            .await
+            .unwrap()
+            .unwrap()
+            .retirement_version,
+        1
+    );
+    let revoked: Option<String> = sqlx::query_scalar(
+        "SELECT revoked_at FROM node_credentials WHERE credential_id = 'retire-credential'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(revoked.is_some());
+    db.register_node_pool_identity(71, "POOL_A").await.unwrap();
+    assert_eq!(
+        db.find_node_pool_record(71, "POOL_A")
+            .await
+            .unwrap()
+            .unwrap()
+            .retirement_state,
+        "RETIRED"
+    );
+    assert!(db
+        .restore_node_pool_identity(71, "POOL_A", 1)
+        .await
+        .unwrap());
+    assert!(db
+        .find_current_active_node_credential_for_identity(
+            71,
+            &crate::node_identity::ReuseEligibleNodeId::parse("POOL_A").unwrap()
+        )
+        .await
+        .unwrap()
+        .is_none());
+    db.register_node_pool_identity(71, "POOL_B").await.unwrap();
+    sqlx::query("INSERT INTO node_credentials (credential_id, home_group_id, node_id, generation, verifier_format, verifier_version, verifier_data) VALUES ('inactive-b', 71, 'POOL_B', 1, 'test', 1, x'01')")
+        .execute(&db.pool).await.unwrap();
+    assert!(db
+        .retire_node_pool_identity(71, "POOL_B", 0, 1, "retired")
+        .await
+        .unwrap());
+    assert_eq!(
+        db.activate_node_credential(
+            "inactive-b",
+            71,
+            &crate::node_identity::ReuseEligibleNodeId::parse("POOL_B").unwrap(),
+            1
+        )
+        .await
+        .unwrap(),
+        NodeCredentialMutationResult::Rejected
+    );
+}
+
+#[tokio::test]
+async fn node_binding_create_rejects_ambiguous_business_group_id() {
+    let db = repo().await;
+    seed_group(&db, 71).await;
+    seed_group(&db, 72).await;
+    db.set("node_status:72:SAME", "{}").await.unwrap();
+    sqlx::query("INSERT INTO node_credentials (credential_id, home_group_id, node_id, generation, verifier_format, verifier_version, verifier_data, activated_at) VALUES ('same-credential', 71, 'SAME', 1, 'test', 1, x'01', datetime('now'))")
+        .execute(&db.pool).await.unwrap();
+    assert_eq!(
+        db.create_node_reuse_binding_if_active(
+            72,
+            71,
+            &crate::node_identity::ReuseEligibleNodeId::parse("SAME").unwrap()
+        )
+        .await
+        .unwrap(),
+        NodeReuseBindingCreateResult::Rejected(
+            NodeReuseBindingCreateRejection::AmbiguousGroupNodeId
+        )
+    );
+    assert!(db
+        .find_node_reuse_binding(72, 71, "SAME")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn node_pool_upgrade_is_additive_and_idempotent() {
     let db = repo().await;
     seed_group(&db, 71).await;

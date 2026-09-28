@@ -11,6 +11,7 @@ const { Text } = Typography;
 interface Props {
   groupId: number;
   t: Tfn;
+  names?: Record<string, string>;
   active?: boolean;
   disabled?: boolean;
   onApply: (request: RoutingApplyRequest) => Promise<RoutingApplyResult | null>;
@@ -38,7 +39,7 @@ function errorLabel(error: string, t: Tfn): string {
   return error === 'NO_AVAILABLE_CANDIDATES' ? t('relayFailoverNoCandidates') : error;
 }
 
-export function RelayFailoverPanel({ groupId, t, active = false, disabled = false, onApply, onDirtyChange }: Props) {
+export function RelayFailoverPanel({ groupId, t, names = {}, active = false, disabled = false, onApply, onDirtyChange }: Props) {
   const [view, setView] = useState<RelayFailoverView | null>(null);
   const [port, setPort] = useState<number>(443);
   const [failureAfter, setFailureAfter] = useState<number>(5);
@@ -207,7 +208,7 @@ export function RelayFailoverPanel({ groupId, t, active = false, disabled = fals
           ) : null}
           <Space size={6} wrap style={{ marginBottom: 8 }}>
             <Text type="secondary">{t('relayFailoverCurrent')}:</Text>
-            <Text code>{view.current_node_id ?? '-'}</Text>
+            <Text title={view.current_node_id ?? undefined}>{view.current_node_id ? names[view.current_node_id] || view.current_node_id.slice(0, 12) : '-'}</Text>
             {view.last_result ? <Tag>{resultLabel(view.last_result, t)}</Tag> : null}
             {view.last_error ? <Text type="danger">{errorLabel(view.last_error, t)}</Text> : null}
           </Space>
@@ -229,11 +230,11 @@ export function RelayFailoverPanel({ groupId, t, active = false, disabled = fals
               <div className="rp-default-line-candidate" data-testid={`relay-failover-node-${node.node_id}`} key={node.node_id}>
                 <div className="rp-default-line-candidate-main">
                   <Space size={6} wrap>
-                    <Text strong className="rp-mono">{node.public_ipv4 ?? node.node_id}</Text>
+                    <Text strong title={node.node_id}>{names[node.node_id] || node.public_ipv4 || node.node_id.slice(0, 12)}</Text>
                     <Tag color={node.current ? 'blue' : node.excluded ? 'red' : node.ready ? 'green' : undefined}>{role}</Tag>
                     <Tag color={node.probe_status === 'healthy' ? 'green' : node.probe_status === 'unhealthy' ? 'red' : undefined}>{probe}</Tag>
                   </Space>
-                  {node.public_ipv4 ? <Text type="secondary" code>{node.node_id}</Text> : null}
+                  {node.public_ipv4 && names[node.node_id] !== node.public_ipv4 ? <Text type="secondary" code>{node.public_ipv4}</Text> : null}
                   {!node.ready && node.ready_reasons.length > 0 ? (
                     <Text type="danger">{node.ready_reasons.map((reason) => relayReadyReasonLabel(reason, t)).join(' · ')}</Text>
                   ) : null}

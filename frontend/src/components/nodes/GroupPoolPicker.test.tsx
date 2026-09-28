@@ -60,7 +60,8 @@ describe('GroupPoolPicker', () => {
     render(<GroupPoolPicker group={group} onClose={vi.fn()} onChanged={vi.fn()} />);
     await chooseNode();
     expect(screen.getByText('poolUpgradeRequired')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'poolStartMigration' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'poolConvergeNode' })).toBeEnabled();
+    expect(screen.queryByRole('button', { name: 'poolStartMigration' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: /nodeReuseCheck/ })).toBeDisabled();
     expect(mockPost).not.toHaveBeenCalled();
   });
@@ -94,11 +95,26 @@ describe('GroupPoolPicker', () => {
     await chooseNode();
     expect(screen.getByText('poolMigrationIncomplete')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /nodeReuseCheck/ })).toBeDisabled();
+    fireEvent.click(screen.getByText('poolAdvancedRecovery'));
     fireEvent.click(screen.getByRole('button', { name: 'poolContinueMigration' }));
     expect(await screen.findByText('python3 migrate.py --claim-id claim-a')).toBeInTheDocument();
     expect(screen.queryByLabelText('poolMigrationSecret')).not.toBeInTheDocument();
     expect(mockPost).toHaveBeenCalledWith('/admin/node-pool/nodes/10/NODE_LONG_IDENTIFIER/migration');
     expect(mockPost).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts automatic identity convergence without exposing a migration command or adding membership', async () => {
+    mockGet.mockResolvedValue(ok([node({ credential_ready: false, credential_active: false,
+      safe_to_add: false, migration_required: true, auth_reload_supported: false })]));
+    mockPost.mockResolvedValue(ok({ id: 'operation-1', group_id: 10, node_id: 'NODE_LONG_IDENTIFIER',
+      action: 'upgrade', status: 'INSTALLING', convergence_phase: 'UPGRADING' }));
+    render(<GroupPoolPicker group={group} onClose={vi.fn()} onChanged={vi.fn()} />);
+    await chooseNode();
+    fireEvent.click(screen.getByRole('button', { name: 'poolConvergeNode' }));
+    expect(await screen.findByText('poolConvergence_UPGRADING')).toBeInTheDocument();
+    expect(mockPost).toHaveBeenCalledWith('/admin/node-pool/nodes/10/NODE_LONG_IDENTIFIER/identity-convergence', {});
+    expect(mockPost).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/migrate\.py/)).not.toBeInTheDocument();
   });
 
   it('does not add a node after conflicting prospective preflight', async () => {

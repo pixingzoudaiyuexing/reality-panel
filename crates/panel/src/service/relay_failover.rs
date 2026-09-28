@@ -254,6 +254,26 @@ async fn store_policy(
     group_id: i64,
     policy: &RelayFailoverPolicy,
 ) -> Result<(), RelayFailoverError> {
+    let _retirement_guard = crate::service::node_retirement::RETIREMENT_GATE
+        .lock()
+        .await;
+    if crate::service::node_retirement::references_retired(
+        db,
+        policy
+            .excluded_failed_node_ids
+            .iter()
+            .cloned()
+            .chain(policy.last_from_node_id.iter().cloned())
+            .chain(policy.last_to_node_id.iter().cloned())
+            .map(|node_id| (group_id, node_id))
+            .collect(),
+    )
+    .await?
+    {
+        return Err(RelayFailoverError::InvalidInput(
+            "retired node reference".into(),
+        ));
+    }
     db.set(
         &failover_key(group_id),
         &serde_json::to_string(policy)
@@ -1407,6 +1427,9 @@ mod tests {
         let nodes = vec![
             RelayReadyNode {
                 node_id: "current".into(),
+                identity_group_id: 1,
+                display_name: String::new(),
+                public_ipv6: None,
                 public_ipv4: Some("8.8.8.8".into()),
                 online: true,
                 ready: true,
@@ -1415,6 +1438,9 @@ mod tests {
             },
             RelayReadyNode {
                 node_id: "eligible".into(),
+                identity_group_id: 1,
+                display_name: String::new(),
+                public_ipv6: None,
                 public_ipv4: Some("1.1.1.1".into()),
                 online: true,
                 ready: true,
@@ -1423,6 +1449,9 @@ mod tests {
             },
             RelayReadyNode {
                 node_id: "excluded".into(),
+                identity_group_id: 1,
+                display_name: String::new(),
+                public_ipv6: None,
                 public_ipv4: Some("9.9.9.9".into()),
                 online: true,
                 ready: true,
@@ -1431,6 +1460,9 @@ mod tests {
             },
             RelayReadyNode {
                 node_id: "unready".into(),
+                identity_group_id: 1,
+                display_name: String::new(),
+                public_ipv6: None,
                 public_ipv4: Some("8.8.4.4".into()),
                 online: false,
                 ready: false,
@@ -1439,6 +1471,9 @@ mod tests {
             },
             RelayReadyNode {
                 node_id: "invalid".into(),
+                identity_group_id: 1,
+                display_name: String::new(),
+                public_ipv6: None,
                 public_ipv4: Some("127.0.0.1".into()),
                 online: true,
                 ready: true,
@@ -1816,6 +1851,7 @@ mod tests {
                     line_id: "Dianxin".into(),
                     mode: crate::service::relay_preference::CarrierLineMode::FollowDefault,
                     node_id: None,
+                    identity_group_id: None,
                 }],
             },
             ..Default::default()
@@ -1844,6 +1880,7 @@ mod tests {
                         line_id: "Dianxin".into(),
                         mode: crate::service::relay_preference::CarrierLineMode::FollowDefault,
                         node_id: None,
+                        identity_group_id: None,
                     }],
                 },
             )

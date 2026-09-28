@@ -5,7 +5,7 @@ use crate::node_identity::ReuseEligibleNodeId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PoolMembership {
     pub group_id: i64,
     pub group_name: String,
@@ -32,6 +32,7 @@ pub struct PoolNode {
     pub migration_pending: bool,
     pub migration_claim_id: Option<String>,
     pub auth_reload_supported: bool,
+    pub automatic_migration_supported: bool,
     pub memberships: Vec<PoolMembership>,
 }
 
@@ -82,6 +83,20 @@ pub async fn admission_state(
     group_id: i64,
     node_id: &ReuseEligibleNodeId,
 ) -> Result<NodePoolAdmission, DbError> {
+    if db
+        .find_node_pool_record(group_id, node_id.as_str())
+        .await?
+        .is_some_and(|record| record.retirement_state == "RETIRED")
+    {
+        return Ok(NodePoolAdmission {
+            credential_active: false,
+            safe_to_add: false,
+            migration_incomplete: false,
+            migration_pending: false,
+            migration_claim_id: None,
+            recovery_available: false,
+        });
+    }
     let active = db
         .find_current_active_node_credential_for_identity(group_id, node_id)
         .await?;
@@ -277,6 +292,9 @@ pub async fn list_nodes(db: &dyn Repository) -> Result<Vec<PoolNode>, DbError> {
     let system_group = db.node_pool_system_group_id().await?;
     let mut result = Vec::new();
     for record in db.list_node_pool_records().await? {
+        if record.retirement_state != "ACTIVE" {
+            continue;
+        }
         let raw = db
             .get(&format!(
                 "node_status:{}:{}",
@@ -350,6 +368,11 @@ pub async fn list_nodes(db: &dyn Repository) -> Result<Vec<PoolNode>, DbError> {
             auth_reload_supported: status
                 .as_ref()
                 .and_then(|v| v.get("auth_reload_supported"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true),
+            automatic_migration_supported: status
+                .as_ref()
+                .and_then(|v| v.get("automatic_migration_supported"))
                 .and_then(serde_json::Value::as_bool)
                 == Some(true),
             memberships,

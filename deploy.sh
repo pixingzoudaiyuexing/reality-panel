@@ -122,6 +122,21 @@ health_port="${listen##*:}"
 [[ "$health_port" =~ ^[0-9]+$ ]] && [ "$health_port" -ge 1 ] && [ "$health_port" -le 65535 ] || \
     fail "Existing LISTEN does not contain a valid health-check port"
 
+# Concrete Node Claim / Permanent Credential delivery requires a real TLS
+# terminating proxy peer. Same-host loopback deployments can safely use the
+# loopback peer default; external or separately-hosted proxies must declare
+# their exact immediate socket peer explicitly instead of trusting a public
+# range.
+if ! grep -q '^NODE_CLAIM_TRUSTED_PROXY_IPS=' "$env_file" 2>/dev/null; then
+    if [[ "$public_url" == https://* ]]; then
+        printf '\nNODE_CLAIM_TRUSTED_PROXY_IPS=127.0.0.1,::1\n' >> "$env_file"
+        chown root:relay-panel "$env_file"
+        chmod 0640 "$env_file"
+        info "Trusted Credential transport permits only same-host loopback proxy peers by default."
+        warn "For an external reverse proxy, set NODE_CLAIM_TRUSTED_PROXY_IPS to its exact immediate socket-peer IP and restart Panel."
+    fi
+fi
+
 staging="$INSTALL_ROOT/releases/.${version}.staging.$$"
 final="$INSTALL_ROOT/releases/$version"
 old_final=""

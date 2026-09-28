@@ -39,7 +39,9 @@ export function NodeStatusCell({
     && row.config_protocol_version !== panelProtocol;
   return (
     <Space orientation="vertical" size={2} className="rp-node-status-cell" data-testid="node-status-cell">
-      {statusTag(row, t, panelProtocol)}
+      {row.health_state
+        ? <Tag color={{ HEALTHY: 'green', DEGRADED: 'gold', OFFLINE: 'default', UNKNOWN: 'default' }[row.health_state]}>{t(`nodeHealth_${row.health_state}`)}</Tag>
+        : statusTag(row, t, panelProtocol)}
       {protocolMismatch ? <Tag color={row.online ? 'green' : undefined}>{row.online ? t('online') : t('offline')}</Tag> : null}
       {showRelayReady ? <RelayReadyStatus node={relayNode} t={t} /> : null}
     </Space>
@@ -175,19 +177,23 @@ export function NodeActionControls({
   onUpgrade?: (row: NodeDisplayRow) => void;
   onDelete?: (row: NodeDisplayRow) => void;
 }) {
+  const managedHere = row.identity_group_id === undefined || row.identity_group_id === row.group_id;
   const arch = row.architecture === 'x86_64' ? 'amd64' : row.architecture === 'aarch64' ? 'arm64' : (row.architecture || '');
   const target = artifactVersions[arch];
   const protocolCompatible = row.config_protocol_version == null || panelProtocol <= 0 || row.config_protocol_version === panelProtocol;
   const normalLifecycleReady = !!row.node_id && !!row.online && row.install_method === 'systemd' && protocolCompatible;
   const lifecycleOnline = row.lifecycle_online ?? row.online;
-  const canLifecycleUpgrade = !!row.node_id && !!lifecycleOnline && row.install_method === 'systemd' && !!target && target !== row.node_version;
+  const currentLegacy = row.verified_concrete_node === false
+    && row.auth_reload_supported === true && target === row.node_version;
+  const canLifecycleUpgrade = !!row.node_id && !!lifecycleOnline && !!target
+    && (currentLegacy || row.install_method === 'systemd' && target !== row.node_version);
   const standaloneUpgrade = onUpgrade ? resolveNodeUpgrade(row, latestNodeVersion, panelProtocol, nodeVersionCheckFailed) : null;
 
   const moreItems: MenuProps['items'] = [];
-  if (onLifecycle) {
+  if (onLifecycle && managedHere) {
     moreItems.push({ key: 'uninstall', danger: true, icon: <StopOutlined />, label: t('nodeUninstall'), disabled: !normalLifecycleReady });
   }
-  if (onDelete && !row.online) {
+  if (onDelete && !row.online && managedHere) {
     moreItems.push({ key: 'delete', danger: true, icon: <DeleteOutlined />, label: t('removeNodeTitle') });
   }
 
@@ -207,9 +213,9 @@ export function NodeActionControls({
 
   return (
     <Space size={2} className="rp-node-actions" wrap data-testid="node-action-controls">
-      {onLifecycle ? iconButton(t('nodeLogs'), <FileTextOutlined />, () => onLifecycle(row, 'logs'), !normalLifecycleReady) : null}
-      {onLifecycle ? iconButton(t('nodeRestart'), <ReloadOutlined />, () => onLifecycle(row, 'restart'), !normalLifecycleReady) : null}
-      {onLifecycle ? iconButton(
+      {onLifecycle && managedHere ? iconButton(t('nodeLogs'), <FileTextOutlined />, () => onLifecycle(row, 'logs'), !normalLifecycleReady) : null}
+      {onLifecycle && managedHere ? iconButton(t('nodeRestart'), <ReloadOutlined />, () => onLifecycle(row, 'restart'), !normalLifecycleReady) : null}
+      {onLifecycle && managedHere ? iconButton(
         target ? t('nodeUpgradeTip').replace('{v}', target) : t('nodeArtifactMissing'),
         <CloudDownloadOutlined />,
         () => onLifecycle(row, 'upgrade'),

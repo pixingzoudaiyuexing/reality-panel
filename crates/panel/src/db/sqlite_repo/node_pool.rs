@@ -14,6 +14,114 @@ impl NodePoolRepository for SqliteRepository {
         )
     }
 
+    async fn find_node_pool_record(
+        &self,
+        group_id: i64,
+        node_id: &str,
+    ) -> Result<Option<NodePoolRecord>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM node_pool_nodes WHERE identity_group_id = ? AND node_id = ?",
+        )
+        .bind(group_id)
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn retire_node_pool_identity(
+        &self,
+        group_id: i64,
+        node_id: &str,
+        expected_version: i64,
+        admin_id: i64,
+        reason: &str,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE node_pool_nodes SET node_id = node_id WHERE 0")
+            .execute(&mut *tx)
+            .await?;
+        let bindings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM node_reuse_bindings WHERE home_group_id = ? AND node_id = ?",
+        )
+        .bind(group_id)
+        .bind(node_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if bindings != 0 {
+            return Ok(false);
+        }
+        let pending_claims: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM node_credential_claims WHERE home_group_id = ? AND node_id = ?
+             AND state NOT IN ('COMPLETED', 'CANCELLED', 'EXPIRED')",
+        )
+        .bind(group_id)
+        .bind(node_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let pending_deliveries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM node_credential_deliveries WHERE home_group_id = ? AND node_id = ?
+             AND state = 'PREPARED'",
+        )
+        .bind(group_id)
+        .bind(node_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if pending_claims != 0 || pending_deliveries != 0 {
+            return Ok(false);
+        }
+        let changed = sqlx::query(
+            "UPDATE node_pool_nodes SET retirement_state = 'RETIRED',
+             retired_at = datetime('now'), retired_by = ?, retirement_reason = ?,
+             retirement_version = retirement_version + 1, updated_at = datetime('now')
+             WHERE identity_group_id = ? AND node_id = ?
+               AND retirement_state = 'ACTIVE' AND retirement_version = ?",
+        )
+        .bind(admin_id)
+        .bind(reason)
+        .bind(group_id)
+        .bind(node_id)
+        .bind(expected_version)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE node_credentials SET revoked_at = datetime('now'), updated_at = datetime('now')
+             WHERE home_group_id = ? AND node_id = ? AND activated_at IS NOT NULL AND revoked_at IS NULL",
+        )
+        .bind(group_id)
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn restore_node_pool_identity(
+        &self,
+        group_id: i64,
+        node_id: &str,
+        expected_version: i64,
+    ) -> Result<bool, DbError> {
+        let changed = sqlx::query(
+            "UPDATE node_pool_nodes SET retirement_state = 'ACTIVE', retirement_version = retirement_version + 1,
+             updated_at = datetime('now') WHERE identity_group_id = ? AND node_id = ?
+             AND retirement_state = 'RETIRED' AND retirement_version = ?
+             AND NOT EXISTS (SELECT 1 FROM node_credentials WHERE home_group_id = ? AND node_id = ?
+             AND activated_at IS NOT NULL AND revoked_at IS NULL)",
+        )
+        .bind(group_id)
+        .bind(node_id)
+        .bind(expected_version)
+        .bind(group_id)
+        .bind(node_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(changed.rows_affected() == 1)
+    }
+
     async fn discover_node_pool_identities(&self) -> Result<Vec<ConcreteNodeIdentity>, DbError> {
         let rows: Vec<(i64, String)> = sqlx::query_as(
             "SELECT home_group_id, node_id FROM node_credentials WHERE activated_at IS NOT NULL AND revoked_at IS NULL
@@ -56,7 +164,7 @@ impl NodePoolRepository for SqliteRepository {
     ) -> Result<u64, DbError> {
         Ok(sqlx::query(
             "UPDATE node_pool_nodes SET display_name = ?, updated_at = datetime('now')
-            WHERE identity_group_id = ? AND node_id = ?",
+            WHERE identity_group_id = ? AND node_id = ? AND retirement_state = 'ACTIVE'",
         )
         .bind(name)
         .bind(group_id)

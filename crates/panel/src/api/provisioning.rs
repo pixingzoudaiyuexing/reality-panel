@@ -72,6 +72,15 @@ pub(crate) async fn pool_credential_bootstrap_config(
     use hmac::{Hmac, Mac};
     let node_id = crate::node_identity::ReuseEligibleNodeId::parse(enrollment_id)
         .map_err(|_| "invalid provisioning identity")?;
+    if state
+        .db
+        .find_node_pool_record(group_id, node_id.as_str())
+        .await
+        .map_err(|_| "could not inspect Pool identity")?
+        .is_some_and(|record| record.retirement_state != "ACTIVE")
+    {
+        return Err("node bootstrap identity retired".into());
+    }
     let mut mac = Hmac::<Sha256>::new_from_slice(state.config.jwt_secret.as_bytes())
         .map_err(|_| "invalid provisioning key")?;
     mac.update(b"node-pool-bootstrap-claim/v1\0");
@@ -98,16 +107,34 @@ pub(crate) async fn pool_credential_bootstrap_config(
         created_at: now,
         expires_at: now + chrono::Duration::seconds(bootstrap_session_lifetime_secs()),
     };
-    match state
+    let existing = state
         .db
-        .create_node_credential_claim(&claim)
+        .find_node_credential_claim(enrollment_id)
         .await
-        .map_err(|_| "could not authorize node bootstrap")?
-    {
-        NodeCredentialClaimCreateResult::Created(_)
-        | NodeCredentialClaimCreateResult::Existing(_) => {}
-        NodeCredentialClaimCreateResult::Rejected => {
-            return Err("node bootstrap identity unavailable".into())
+        .map_err(|_| "could not inspect node bootstrap")?;
+    if let Some(existing) = existing {
+        if existing.home_group_id != group_id
+            || existing.node_id != node_id.as_str()
+            || existing.approval_ref != format!("node-pool-bootstrap:{enrollment_id}")
+            || !matches!(
+                existing.state.as_str(),
+                "APPROVED" | "CLAIMED" | "CREDENTIAL_PENDING" | "COMPLETED"
+            )
+        {
+            return Err("node bootstrap continuation unavailable".into());
+        }
+    } else {
+        match state
+            .db
+            .create_node_credential_claim(&claim)
+            .await
+            .map_err(|_| "could not authorize node bootstrap")?
+        {
+            NodeCredentialClaimCreateResult::Created(_)
+            | NodeCredentialClaimCreateResult::Existing(_) => {}
+            NodeCredentialClaimCreateResult::Rejected => {
+                return Err("node bootstrap identity unavailable".into())
+            }
         }
     }
     Ok(format!(

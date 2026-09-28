@@ -33,6 +33,7 @@ import type {
 } from '../../api/types';
 import type { Tfn } from './types';
 import { relayReadyReasonLabel } from './shared';
+import { poolNodeName } from './poolNodeName';
 import { formatUtcOffset, utcOffsetOptions } from './relayScheduleTime';
 
 const { Text } = Typography;
@@ -162,7 +163,7 @@ export function RelaySchedulePanel({ groupId, nodes, t, carrierPolicy, carrierCa
   );
   const nodeOptions = nodes.map((node) => ({
     value: node.node_id,
-    label: `${node.public_ipv4 ?? node.node_id}${node.public_ipv4 ? ` · ${node.node_id}` : ''} · ${node.ready ? t('relayReady') : `${t('relayNotReady')}: ${node.ready_reasons.map((reason) => relayReadyReasonLabel(reason, t)).join(' · ')}`}`,
+    label: `${poolNodeName(node)}${node.display_name?.trim() && (node.public_ipv4 || node.public_ipv6) ? ` · ${node.public_ipv4 || node.public_ipv6}` : ''} · ${node.ready ? t('relayReady') : `${t('relayNotReady')}: ${node.ready_reasons.map((reason) => relayReadyReasonLabel(reason, t)).join(' · ')}`}`,
   }));
   const catalogNames = new Map((carrierCatalog?.lines ?? []).map((line) => [line.id, line.name || line.id]));
   const followDefaultLines = (carrierPolicy?.bindings ?? []).filter((binding) => binding.mode === 'follow_default');
@@ -297,7 +298,7 @@ export function RelaySchedulePanel({ groupId, nodes, t, carrierPolicy, carrierCa
 
       {schedules.map((schedule) => {
         const target = nodeById.get(schedule.target_node_id);
-        const targetPrimary = target?.public_ipv4 ?? schedule.target_node_id;
+        const targetPrimary = target ? poolNodeName(target) : schedule.target_node_id.slice(0, 12);
         const consumedOneTime = schedule.schedule_type === 'one_time' && schedule.last_run_slot !== null;
         const toggleButton = (confirmFirst: boolean) => (
           <Button

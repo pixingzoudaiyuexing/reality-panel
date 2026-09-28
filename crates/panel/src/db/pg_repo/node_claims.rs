@@ -116,6 +116,16 @@ impl NodeCredentialClaimRepository for PgRepository {
             tx.rollback().await?;
             return Err(DbError::ForeignKeyViolation);
         }
+        let retired: Option<String> = sqlx::query_scalar(
+            "SELECT retirement_state FROM node_pool_nodes WHERE identity_group_id = $1 AND node_id = $2",
+        )
+        .bind(claim.home_group_id)
+        .bind(claim.node_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if retired.as_deref() == Some("RETIRED") {
+            return Ok(NodeCredentialClaimCreateResult::Rejected);
+        }
         expire_identity_if_due(
             &mut tx,
             claim.home_group_id,

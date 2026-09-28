@@ -48,6 +48,9 @@ fn build_config_request(
 }
 
 pub async fn fetch_config(config: &NodeConfig, node_id: &str) -> FetchResult {
+    if crate::automatic_migration::legacy_config_auth_blocked(node_id, &config.auth) {
+        return FetchResult::Transient;
+    }
     let url = format!("{}/api/v1/node/config", config.panel_url);
     let client = reqwest::Client::new();
 
@@ -67,6 +70,9 @@ pub async fn fetch_config(config: &NodeConfig, node_id: &str) -> FetchResult {
     };
 
     let status = resp.status();
+    if crate::automatic_migration::legacy_config_auth_blocked(node_id, &config.auth) {
+        return FetchResult::Transient;
+    }
     if status == reqwest::StatusCode::UPGRADE_REQUIRED {
         // Permanent: the panel's config protocol doesn't match ours. Parse the
         // structured body for a clear log line, then back off.

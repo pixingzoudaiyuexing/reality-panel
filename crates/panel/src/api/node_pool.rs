@@ -75,7 +75,23 @@ pub async fn complete_migration(
     )
     .await
     {
-        Ok(true) => Json(ApiResponse::success(())).into_response(),
+        Ok(true) => {
+            state
+                .node_connections
+                .close_node(verified.home_group_id, verified.node_id.as_str())
+                .await;
+            match crate::service::node_convergence::mark_complete(
+                &state,
+                verified.home_group_id,
+                verified.node_id.as_str(),
+                &claim_id,
+            )
+            .await
+            {
+                Ok(()) => Json(ApiResponse::success(())).into_response(),
+                Err(_) => unavailable(),
+            }
+        }
         Ok(false) => (
             StatusCode::CONFLICT,
             Json(ApiResponse::<()>::error(409, "迁移身份与当前凭据不匹配")),
@@ -103,9 +119,57 @@ pub async fn start_migration(
     headers: axum::http::HeaderMap,
 ) -> Response {
     if !crate::api::node_claim::production_claim_transport_allowed(&state, peer.0, &headers).await {
-        return unavailable();
+        let reason =
+            crate::api::node_claim::claim_transport_failure_message(&state, peer.0, &headers).await;
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::<()>::error(503, &reason)),
+        )
+            .into_response();
     }
     start_migration_after_transport(admin, state, identity_group_id, node_id, peer, headers).await
+}
+
+pub async fn start_identity_convergence(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    Path((group_id, node_id)): Path<(i64, String)>,
+    peer: axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !crate::api::node_claim::production_claim_transport_allowed(&state, peer.0, &headers).await {
+        let reason =
+            crate::api::node_claim::claim_transport_failure_message(&state, peer.0, &headers).await;
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::<()>::error(503, &reason)),
+        )
+            .into_response();
+    }
+    if ReuseEligibleNodeId::parse(&node_id).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let nodes = match node_pool::list_nodes(state.db.as_ref()).await {
+        Ok(nodes) => nodes,
+        Err(_) => return unavailable(),
+    };
+    let Some(node) = nodes
+        .iter()
+        .find(|node| node.identity_group_id == group_id && node.node_id == node_id)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !node.migration_required || node.credential_active {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::<()>::error(409, "节点当前无法开始身份迁移")),
+        )
+            .into_response();
+    }
+    match crate::service::node_convergence::start(&state, admin.user_id, group_id, &node_id).await {
+        Ok(operation) => Json(ApiResponse::success(operation.operation_view())).into_response(),
+        Err(error) => crate::api::node_ops::convergence_response(error),
+    }
 }
 
 async fn start_migration_after_transport(
@@ -238,6 +302,184 @@ pub async fn list_nodes(_admin: AdminOnly, State(state): State<AppState>) -> Res
             tracing::warn!("pool listing unavailable: {error}");
             unavailable()
         }
+    }
+}
+
+pub async fn node_health(_admin: AdminOnly, State(state): State<AppState>) -> Response {
+    match crate::service::node_health::snapshots(state.db.as_ref(), &state.node_connections).await {
+        Ok(nodes) => Json(ApiResponse::success(nodes)).into_response(),
+        Err(error) => {
+            tracing::warn!("node health unavailable: {error}");
+            unavailable()
+        }
+    }
+}
+
+pub async fn retirement_preview(
+    _admin: AdminOnly,
+    State(state): State<AppState>,
+    Path((group_id, node_id)): Path<(i64, String)>,
+) -> Response {
+    if ReuseEligibleNodeId::parse(&node_id).is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match crate::service::node_retirement::preview(&state, group_id, &node_id).await {
+        Ok(Some(preview)) => Json(ApiResponse::success(preview)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::warn!("retirement preview unavailable: {error}");
+            unavailable()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetireNodeRequest {
+    expected_version: i64,
+    confirm_node_id: String,
+    confirm_online: bool,
+    reason: String,
+}
+
+pub async fn retire_node(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    Path((group_id, node_id)): Path<(i64, String)>,
+    Json(request): Json<RetireNodeRequest>,
+) -> Response {
+    if ReuseEligibleNodeId::parse(&node_id).is_err()
+        || request.confirm_node_id != node_id
+        || request.expected_version < 0
+        || request.reason.trim().is_empty()
+        || request.reason.len() > 500
+        || request.reason.chars().any(char::is_control)
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let _gate = crate::service::node_retirement::RETIREMENT_GATE
+        .lock()
+        .await;
+    let preview = match crate::service::node_retirement::preview(&state, group_id, &node_id).await {
+        Ok(Some(preview)) => preview,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return unavailable(),
+    };
+    if preview.retirement_version != request.expected_version
+        || !preview.blockers.is_empty()
+        || (preview.online || preview.control_connected) && !request.confirm_online
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::<()>::error(
+                409,
+                "节点状态或引用已变化，请重新预检",
+            )),
+        )
+            .into_response();
+    }
+    match state
+        .db
+        .retire_node_pool_identity(
+            group_id,
+            &node_id,
+            request.expected_version,
+            admin.user_id,
+            request.reason.trim(),
+        )
+        .await
+    {
+        Ok(true) => {
+            state.node_connections.close_node(group_id, &node_id).await;
+            crate::service::audit::record(
+                &state,
+                Some(admin.user_id),
+                "node_retired",
+                "node",
+                &node_id,
+                &format!("identity_group_id={group_id}"),
+            )
+            .await;
+            Json(ApiResponse::success(())).into_response()
+        }
+        Ok(false) => StatusCode::CONFLICT.into_response(),
+        Err(error) => {
+            tracing::warn!("node retirement failed: {error}");
+            unavailable()
+        }
+    }
+}
+
+pub async fn retired_nodes(_admin: AdminOnly, State(state): State<AppState>) -> Response {
+    match crate::service::node_retirement::retired(state.db.as_ref()).await {
+        Ok(nodes) => Json(ApiResponse::success(nodes)).into_response(),
+        Err(_) => unavailable(),
+    }
+}
+
+pub async fn credential_transport_diagnostics(
+    _admin: AdminOnly,
+    State(state): State<AppState>,
+    peer: axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let reason =
+        crate::api::node_claim::production_claim_transport_failure(&state, peer.0, &headers).await;
+    Json(ApiResponse::success(serde_json::json!({
+        "ready": reason.is_none(),
+        "reason": reason,
+        "hint": reason.map(|value| match value {
+            "TRUSTED_PROXY_IPS_MISSING_OR_INVALID" => "设置 NODE_CLAIM_TRUSTED_PROXY_IPS 为直接连接 Panel 的反向代理 socket peer 地址",
+            "PUBLIC_PANEL_URL_MISSING_OR_INVALID" => "设置有效的 PUBLIC_PANEL_URL 或站点公网面板地址",
+            "PUBLIC_PANEL_URL_NOT_HTTPS" => "永久凭据交付需要 HTTPS 公网面板地址",
+            "SOCKET_PEER_NOT_TRUSTED_PROXY" => "当前 socket peer 不在 NODE_CLAIM_TRUSTED_PROXY_IPS 中",
+            "X_FORWARDED_PROTO_NOT_EXACTLY_HTTPS" => "受信代理必须覆盖为唯一 X-Forwarded-Proto: https",
+            _ => "检查受信 HTTPS 反向代理配置",
+        }),
+    }))).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreNodeRequest {
+    expected_version: i64,
+    confirm_node_id: String,
+}
+
+pub async fn restore_node(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    Path((group_id, node_id)): Path<(i64, String)>,
+    Json(request): Json<RestoreNodeRequest>,
+) -> Response {
+    if ReuseEligibleNodeId::parse(&node_id).is_err()
+        || request.confirm_node_id != node_id
+        || request.expected_version < 0
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let _gate = crate::service::node_retirement::RETIREMENT_GATE
+        .lock()
+        .await;
+    match state
+        .db
+        .restore_node_pool_identity(group_id, &node_id, request.expected_version)
+        .await
+    {
+        Ok(true) => {
+            crate::service::audit::record(
+                &state,
+                Some(admin.user_id),
+                "node_restored",
+                "node",
+                &node_id,
+                &format!("identity_group_id={group_id}"),
+            )
+            .await;
+            Json(ApiResponse::success(())).into_response()
+        }
+        Ok(false) => StatusCode::CONFLICT.into_response(),
+        Err(_) => unavailable(),
     }
 }
 
@@ -453,6 +695,144 @@ mod tests {
             geoip_in_flight: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         };
         (state, pool)
+    }
+
+    #[tokio::test]
+    async fn retirement_api_requires_confirmation_preserves_authority_and_restores_explicitly() {
+        let (state, pool) = fixture().await;
+        let preview_response = retirement_preview(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path((10, "LEGACY".into())),
+        )
+        .await;
+        assert_eq!(preview_response.status(), StatusCode::OK);
+        let preview_body = to_bytes(preview_response.into_body(), 65536).await.unwrap();
+        let preview: serde_json::Value = serde_json::from_slice(&preview_body).unwrap();
+        assert_eq!(preview["data"]["retirement_version"], 0);
+        assert_eq!(preview["data"]["blockers"], serde_json::json!([]));
+        assert_eq!(
+            preview["data"]["warnings"][0],
+            "LEGACY_TOKEN_CANNOT_REVOKE_PHYSICAL_NODE"
+        );
+
+        let rejected = retire_node(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path((10, "LEGACY".into())),
+            Json(RetireNodeRequest {
+                expected_version: 0,
+                confirm_node_id: "wrong".into(),
+                confirm_online: false,
+                reason: "retired host".into(),
+            }),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let accepted = retire_node(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path((10, "LEGACY".into())),
+            Json(RetireNodeRequest {
+                expected_version: 0,
+                confirm_node_id: "LEGACY".into(),
+                confirm_online: false,
+                reason: "retired host".into(),
+            }),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .db
+                .get("node_config_revision:legacy:10:LEGACY")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"revision":7}"#)
+        );
+        assert!(state
+            .db
+            .get("node_status:10:LEGACY")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(crate::service::node_pool::list_nodes(state.db.as_ref())
+            .await
+            .unwrap()
+            .is_empty());
+        let retired: String = sqlx::query_scalar(
+            "SELECT retirement_state FROM node_pool_nodes WHERE identity_group_id = 10 AND node_id = 'LEGACY'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(retired, "RETIRED");
+        let restored = restore_node(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path((10, "LEGACY".into())),
+            Json(RestoreNodeRequest {
+                expected_version: 1,
+                confirm_node_id: "LEGACY".into(),
+            }),
+        )
+        .await;
+        assert_eq!(restored.status(), StatusCode::OK);
+        assert_eq!(
+            crate::service::node_pool::list_nodes(state.db.as_ref())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_api_revalidates_version_and_online_confirmation() {
+        let (state, _) = fixture().await;
+        state
+            .db
+            .set(
+                "node_status:10:LEGACY",
+                &serde_json::json!({
+                    "last_seen": chrono::Utc::now().to_rfc3339(), "public_ipv4": "203.0.113.5"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let request = |expected_version, confirm_online| RetireNodeRequest {
+            expected_version,
+            confirm_node_id: "LEGACY".into(),
+            confirm_online,
+            reason: "decommissioned host".into(),
+        };
+        let stale = retire_node(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path((10, "LEGACY".into())),
+            Json(request(1, true)),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let unconfirmed = retire_node(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path((10, "LEGACY".into())),
+            Json(request(0, false)),
+        )
+        .await;
+        assert_eq!(unconfirmed.status(), StatusCode::CONFLICT);
+        let accepted = retire_node(
+            AdminOnly { user_id: 1 },
+            State(state.clone()),
+            Path((10, "LEGACY".into())),
+            Json(request(0, true)),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert!(crate::service::node_pool::list_nodes(state.db.as_ref())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     fn jwt(user_id: i64, admin: bool) -> String {

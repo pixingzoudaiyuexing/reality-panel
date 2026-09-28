@@ -16,6 +16,7 @@ use crate::integrations::dnsmgr::{
     DnsMgrRecordMutation, DomainListParams, RecordListParams,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::OnceLock;
@@ -184,6 +185,35 @@ impl ProviderLine {
                 .map(str::to_string),
         }
     }
+}
+
+fn provider_line_matches_binding_key(raw_id: &str, binding_key: &str) -> bool {
+    let Some(provider) = canonical_provider_line(raw_id) else {
+        return false;
+    };
+    if binding_key == provider.key {
+        return true;
+    }
+    if provider.key == DEFAULT_LINE_KEY {
+        return false;
+    }
+    let Some(suffix) = binding_key.strip_prefix("carrier-target:") else {
+        return false;
+    };
+    let Some((encoded_line, remainder)) = suffix.split_once(':') else {
+        return false;
+    };
+    if encoded_line != hex::encode(raw_id.as_bytes()) {
+        return false;
+    }
+    let Some((identity_group_id, encoded_node_id)) = remainder.split_once(':') else {
+        return false;
+    };
+    identity_group_id.parse::<i64>().is_ok_and(|id| id > 0)
+        && hex::decode(encoded_node_id).is_ok_and(|bytes| {
+            std::str::from_utf8(&bytes)
+                .is_ok_and(|node_id| !node_id.is_empty() && hex::encode(&bytes) == encoded_node_id)
+        })
 }
 
 impl Default for ProviderLine {
@@ -725,7 +755,7 @@ pub(crate) async fn ensure_record(
         Ok(false) => return EnsureRecordResult::Failed(EnsureRecordFailure::InvalidRule),
         Err(_) => return EnsureRecordResult::Failed(EnsureRecordFailure::Database),
     }
-    if canonical_provider_line(&input.line.raw_id).is_none_or(|line| line.key != input.line.key) {
+    if !provider_line_matches_binding_key(&input.line.raw_id, &input.line.key) {
         return EnsureRecordResult::Failed(EnsureRecordFailure::InvalidRule);
     }
     let zone = match resolve_zone(client, &fqdn).await {
@@ -745,7 +775,11 @@ pub(crate) async fn ensure_record(
         Some(line) => line,
         None => return EnsureRecordResult::Failed(EnsureRecordFailure::ProviderLineUnavailable),
     };
-    let ttl = match write_ttl(&detail) {
+    let ttl = match if line.key == DEFAULT_LINE_KEY {
+        write_ttl(&detail)
+    } else {
+        write_carrier_ttl(&detail)
+    } {
         Some(ttl) => ttl,
         None => return EnsureRecordResult::Failed(EnsureRecordFailure::TtlOutOfRange),
     };
@@ -754,7 +788,7 @@ pub(crate) async fn ensure_record(
             input.rule_id,
             fqdn.as_str(),
             input.record_type.as_str(),
-            &line.key,
+            &input.line.key,
         )
         .await
     {
@@ -763,6 +797,56 @@ pub(crate) async fn ensure_record(
     };
 
     let discovery = discover_records(client, &zone, input.record_type, &line).await;
+    let has_owned_sibling = if binding.is_none() {
+        match &discovery {
+            RecordDiscovery::SingleMatchingRecord(record) => {
+                let zone_id = match i64::try_from(zone.domain_id) {
+                    Ok(zone_id) => zone_id,
+                    Err(_) => return EnsureRecordResult::Failed(EnsureRecordFailure::Database),
+                };
+                match db
+                    .find_dns_record_binding_by_record(zone_id, &record.record.record_id)
+                    .await
+                {
+                    Ok(Some(existing)) => {
+                        existing.rule_id == Some(input.rule_id)
+                            && existing.line_key != input.line.key
+                            && carrier_binding_matches_record(
+                                &existing,
+                                input.rule_id,
+                                &fqdn,
+                                &zone,
+                                record,
+                            )
+                    }
+                    Ok(None) => false,
+                    Err(_) => return EnsureRecordResult::Failed(EnsureRecordFailure::Database),
+                }
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    if line.key != DEFAULT_LINE_KEY
+        && (input.line.key != line.key
+            || has_owned_sibling
+            || matches!(discovery, RecordDiscovery::MultipleMatchingRecords(_)))
+    {
+        return ensure_carrier_owned_record(
+            db,
+            client,
+            input,
+            &fqdn,
+            &zone,
+            &line,
+            ttl,
+            expected_ip,
+            binding.as_ref(),
+            discovery,
+        )
+        .await;
+    }
     let detached_binding = if binding.is_none() {
         match &discovery {
             RecordDiscovery::SingleMatchingRecord(record) => {
@@ -962,6 +1046,9 @@ pub(crate) async fn ensure_record_absent(
         Ok(fqdn) => fqdn,
         Err(error) => return DeleteRecordResult::Failed(EnsureRecordFailure::InvalidInput(error)),
     };
+    if !provider_line_matches_binding_key(&input.line.raw_id, &input.line.key) {
+        return DeleteRecordResult::Failed(EnsureRecordFailure::InvalidRule);
+    }
     match delete_is_authorized(db, input, &fqdn).await {
         Ok(true) => {}
         Ok(false) => return DeleteRecordResult::Failed(EnsureRecordFailure::InvalidRule),
@@ -986,7 +1073,7 @@ pub(crate) async fn ensure_record_absent(
             input.rule_id,
             fqdn.as_str(),
             input.record_type.as_str(),
-            &line.key,
+            &input.line.key,
         )
         .await
     {
@@ -1005,6 +1092,19 @@ pub(crate) async fn ensure_record_absent(
             return DeleteRecordResult::Failed(EnsureRecordFailure::Upstream(error))
         }
     };
+    if line.key != DEFAULT_LINE_KEY && (input.line.key != line.key || records.len() > 1) {
+        return ensure_carrier_owned_record_absent(
+            db,
+            client,
+            input,
+            &fqdn,
+            &zone,
+            &line,
+            binding.as_ref(),
+            &records,
+        )
+        .await;
+    }
     let Some(binding) = binding else {
         return if records.is_empty() {
             DeleteRecordResult::AlreadyAbsent
@@ -1185,8 +1285,7 @@ async fn delete_is_authorized(
         && sync.fqdn == fqdn.as_str()
         && sync.record_type == input.record_type.as_str()
         && sync.line == input.line.raw_id
-        && canonical_provider_line(&input.line.raw_id)
-            .is_some_and(|line| line.key == input.line.key))
+        && provider_line_matches_binding_key(&input.line.raw_id, &input.line.key))
 }
 
 fn canonical_provider_line(raw_id: &str) -> Option<ProviderLine> {
@@ -1224,6 +1323,295 @@ pub(crate) fn write_ttl(detail: &DnsMgrDomainDetail) -> Option<u32> {
     u32::try_from(minimum)
         .ok()
         .map(|minimum| minimum.max(DNSMGR_DEFAULT_WRITE_TTL))
+}
+
+fn write_carrier_ttl(detail: &DnsMgrDomainDetail) -> Option<u32> {
+    u32::try_from(detail.min_ttl.unwrap_or(1))
+        .ok()
+        .map(|minimum| minimum.max(60))
+}
+
+fn carrier_binding_matches_record(
+    binding: &DnsRecordBinding,
+    rule_id: i64,
+    fqdn: &NormalizedFqdn,
+    zone: &ResolvedZone,
+    record: &DiscoveredRecord,
+) -> bool {
+    binding.rule_id == Some(rule_id)
+        && binding.fqdn == fqdn.as_str()
+        && i64::try_from(zone.domain_id).ok() == Some(binding.zone_id)
+        && binding.zone_name == zone.zone_name
+        && binding.host == zone.host
+        && binding.record_type == "A"
+        && binding.line == record.line.raw_id
+        && provider_line_matches_binding_key(&binding.line, &binding.line_key)
+        && binding.record_id == record.record.record_id
+        && matches!(binding.state.as_str(), "BOUND" | "MISSING")
+        && binding.last_error_category.is_none()
+        && record.record.values.as_slice() == [binding.desired_value.as_str()]
+}
+
+async fn owned_carrier_records(
+    db: &dyn Repository,
+    rule_id: i64,
+    fqdn: &NormalizedFqdn,
+    zone: &ResolvedZone,
+    records: &[DiscoveredRecord],
+) -> Result<(), EnsureRecordFailure> {
+    let zone_id = i64::try_from(zone.domain_id).map_err(|_| EnsureRecordFailure::Database)?;
+    for record in records {
+        let binding = db
+            .find_dns_record_binding_by_record(zone_id, &record.record.record_id)
+            .await
+            .map_err(|_| EnsureRecordFailure::Database)?;
+        if !binding.as_ref().is_some_and(|binding| {
+            carrier_binding_matches_record(binding, rule_id, fqdn, zone, record)
+        }) {
+            return Err(EnsureRecordFailure::OwnershipUnverified);
+        }
+    }
+    Ok(())
+}
+
+fn carrier_discovered_records(
+    discovery: RecordDiscovery,
+) -> Result<Vec<DiscoveredRecord>, EnsureRecordFailure> {
+    match discovery {
+        RecordDiscovery::NoRecord => Ok(Vec::new()),
+        RecordDiscovery::SingleMatchingRecord(record) => Ok(vec![record]),
+        RecordDiscovery::MultipleMatchingRecords(records) => Ok(records),
+        RecordDiscovery::ConflictingRecordType(_) => Err(EnsureRecordFailure::OwnershipUnverified),
+        RecordDiscovery::UpstreamFailure(error) => Err(EnsureRecordFailure::Upstream(error)),
+    }
+}
+
+fn other_carrier_records_unchanged(
+    before: &[DiscoveredRecord],
+    after: &[DiscoveredRecord],
+    target_record_id: &str,
+) -> bool {
+    let previous = before
+        .iter()
+        .filter(|record| record.record.record_id != target_record_id)
+        .map(|record| (&record.record.record_id, &record.record.values))
+        .collect::<Vec<_>>();
+    let current = after
+        .iter()
+        .filter(|record| record.record.record_id != target_record_id)
+        .map(|record| (&record.record.record_id, &record.record.values))
+        .collect::<Vec<_>>();
+    previous.len() == current.len() && previous.iter().all(|old| current.contains(old))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ensure_carrier_owned_record(
+    db: &dyn Repository,
+    client: &DnsMgrClient,
+    input: &EnsureRecordInput,
+    fqdn: &NormalizedFqdn,
+    zone: &ResolvedZone,
+    line: &ProviderLine,
+    ttl: u32,
+    expected_ip: IpAddr,
+    binding: Option<&DnsRecordBinding>,
+    discovery: RecordDiscovery,
+) -> EnsureRecordResult {
+    let records = match carrier_discovered_records(discovery) {
+        Ok(records) => records,
+        Err(error) => return EnsureRecordResult::Failed(error),
+    };
+    if let Err(error) = owned_carrier_records(db, input.rule_id, fqdn, zone, &records).await {
+        return EnsureRecordResult::Failed(error);
+    }
+    if let Some(record) = binding.and_then(|binding| {
+        records
+            .iter()
+            .find(|record| record.record.record_id == binding.record_id)
+    }) {
+        if !binding.is_some_and(|binding| {
+            carrier_binding_matches_record(binding, input.rule_id, fqdn, zone, record)
+                && binding.line_key == input.line.key
+        }) {
+            return EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified);
+        }
+        let needs_update = !record_value_matches(&record.record.values, expected_ip)
+            || record.record.ttl != u64::from(ttl);
+        if needs_update {
+            if let Err(result) = update_provider_record_and_verify(
+                db, client, input, zone, line, ttl, binding, record, false,
+            )
+            .await
+            {
+                return result;
+            }
+            let after = match carrier_discovered_records(
+                discover_records(client, zone, input.record_type, line).await,
+            ) {
+                Ok(after) => after,
+                Err(_) => return EnsureRecordResult::MutationOutcomeUnknown,
+            };
+            if !other_carrier_records_unchanged(&records, &after, &record.record.record_id) {
+                return EnsureRecordResult::MutationOutcomeUnknown;
+            }
+        }
+        if persist_verified_binding(
+            db,
+            input,
+            fqdn,
+            zone,
+            line,
+            &record.record.record_id,
+            binding,
+            false,
+        )
+        .await
+        .is_err()
+        {
+            return EnsureRecordResult::MutationOutcomeUnknown;
+        }
+        return if needs_update {
+            EnsureRecordResult::Updated {
+                record_id: record.record.record_id.clone(),
+            }
+        } else {
+            EnsureRecordResult::AlreadyCorrect {
+                record_id: record.record.record_id.clone(),
+            }
+        };
+    }
+
+    if let Some(binding) = binding {
+        if set_binding_state(db, binding.id, "MISSING", None)
+            .await
+            .is_err()
+        {
+            return EnsureRecordResult::Failed(EnsureRecordFailure::Database);
+        }
+    }
+    let mutation = mutation_request(input, zone, line, ttl);
+    match client.create_record(zone.domain_id, &mutation).await {
+        Ok(_) => {}
+        Err(error) if error.is_ambiguous_write() => {
+            return EnsureRecordResult::MutationOutcomeUnknown
+        }
+        Err(error) => return EnsureRecordResult::Failed(EnsureRecordFailure::Upstream(error)),
+    }
+    let after = match carrier_discovered_records(
+        discover_records(client, zone, input.record_type, line).await,
+    ) {
+        Ok(after) => after,
+        Err(_) => return EnsureRecordResult::MutationOutcomeUnknown,
+    };
+    let old_ids = records
+        .iter()
+        .map(|record| record.record.record_id.as_str())
+        .collect::<HashSet<_>>();
+    let additions = after
+        .iter()
+        .filter(|record| !old_ids.contains(record.record.record_id.as_str()))
+        .collect::<Vec<_>>();
+    let [new_record] = additions.as_slice() else {
+        return EnsureRecordResult::MutationOutcomeUnknown;
+    };
+    if !record_value_matches(&new_record.record.values, expected_ip)
+        || new_record.record.ttl != u64::from(ttl)
+        || !other_carrier_records_unchanged(&records, &after, &new_record.record.record_id)
+    {
+        return EnsureRecordResult::MutationOutcomeUnknown;
+    }
+    if persist_verified_binding(
+        db,
+        input,
+        fqdn,
+        zone,
+        line,
+        &new_record.record.record_id,
+        binding,
+        true,
+    )
+    .await
+    .is_err()
+    {
+        return EnsureRecordResult::MutationOutcomeUnknown;
+    }
+    if let Some(binding) = binding {
+        EnsureRecordResult::Recreated {
+            old_record_id: binding.record_id.clone(),
+            record_id: new_record.record.record_id.clone(),
+        }
+    } else {
+        EnsureRecordResult::Created {
+            record_id: new_record.record.record_id.clone(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ensure_carrier_owned_record_absent(
+    db: &dyn Repository,
+    client: &DnsMgrClient,
+    input: &DeleteRecordInput,
+    fqdn: &NormalizedFqdn,
+    zone: &ResolvedZone,
+    line: &ProviderLine,
+    binding: Option<&DnsRecordBinding>,
+    records: &[DiscoveredRecord],
+) -> DeleteRecordResult {
+    if let Err(error) = owned_carrier_records(db, input.rule_id, fqdn, zone, records).await {
+        return DeleteRecordResult::Failed(error);
+    }
+    let Some(binding) = binding else {
+        return DeleteRecordResult::AlreadyAbsent;
+    };
+    let Some(record) = records
+        .iter()
+        .find(|record| record.record.record_id == binding.record_id)
+    else {
+        return match set_binding_state(db, binding.id, "MISSING", None).await {
+            Ok(()) => DeleteRecordResult::AlreadyAbsent,
+            Err(()) => DeleteRecordResult::Failed(EnsureRecordFailure::Database),
+        };
+    };
+    if !carrier_binding_matches_record(binding, input.rule_id, fqdn, zone, record)
+        || binding.line_key != input.line.key
+    {
+        return DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified);
+    }
+    let ambiguous = match client
+        .delete_record(zone.domain_id, &binding.record_id)
+        .await
+    {
+        Ok(_) => false,
+        Err(error) if error.is_ambiguous_write() => true,
+        Err(error) => return DeleteRecordResult::Failed(EnsureRecordFailure::Upstream(error)),
+    };
+    let after = match carrier_discovered_records(
+        discover_records(client, zone, input.record_type, line).await,
+    ) {
+        Ok(after) => after,
+        Err(_) => return DeleteRecordResult::MutationOutcomeUnknown,
+    };
+    if after
+        .iter()
+        .any(|candidate| candidate.record.record_id == binding.record_id)
+        || !other_carrier_records_unchanged(records, &after, &binding.record_id)
+    {
+        return if ambiguous {
+            DeleteRecordResult::MutationOutcomeUnknown
+        } else {
+            DeleteRecordResult::Failed(EnsureRecordFailure::PostWriteNotVerified)
+        };
+    }
+    if set_binding_state(db, binding.id, "MISSING", None)
+        .await
+        .is_err()
+    {
+        return DeleteRecordResult::MutationOutcomeUnknown;
+    }
+    DeleteRecordResult::Deleted {
+        record_id: binding.record_id.clone(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1520,7 +1908,7 @@ async fn persist_verified_binding(
             || existing.host != zone.host
             || existing.record_type != input.record_type.as_str()
             || existing.line != line.raw_id
-            || existing.line_key != line.key
+            || existing.line_key != input.line.key
             || existing.record_id != record_id
         {
             return Err(PersistVerifiedBindingError::OwnershipUnverified);
@@ -1534,7 +1922,7 @@ async fn persist_verified_binding(
             host: zone.host.clone(),
             record_type: input.record_type.as_str().to_string(),
             line: line.raw_id.clone(),
-            line_key: line.key.clone(),
+            line_key: input.line.key.clone(),
             record_id: record_id.to_string(),
             previous_desired_value: existing.desired_value,
             desired_value: input.expected_value.clone(),
@@ -1561,7 +1949,7 @@ async fn persist_verified_binding(
             host: zone.host.clone(),
             record_type: input.record_type.as_str().to_string(),
             line: line.raw_id.clone(),
-            line_key: line.key.clone(),
+            line_key: input.line.key.clone(),
             record_id: record_id.to_string(),
             desired_value: input.expected_value.clone(),
             state: "BOUND".into(),
@@ -1593,7 +1981,7 @@ async fn verify_persisted_binding(
             input.rule_id,
             fqdn.as_str(),
             input.record_type.as_str(),
-            &line.key,
+            &input.line.key,
         )
         .await
         .map_err(|_| PersistVerifiedBindingError::Database)?;
@@ -1605,7 +1993,7 @@ async fn verify_persisted_binding(
             && binding.host == zone.host
             && binding.record_type == input.record_type.as_str()
             && binding.line == line.raw_id
-            && binding.line_key == line.key
+            && binding.line_key == input.line.key
             && binding.record_id == record_id
             && binding.desired_value == input.expected_value
             && binding.state == "BOUND"
@@ -1947,6 +2335,7 @@ pub(crate) async fn schedule_line_delete(
     persist_line_desired(db, &desired, "DELETE", None, true).await
 }
 
+#[cfg(test)]
 pub(crate) async fn schedule_transaction_line(
     db: &dyn Repository,
     rule_id: i64,
@@ -1956,6 +2345,23 @@ pub(crate) async fn schedule_transaction_line(
     value: Option<&str>,
 ) -> Result<(), LineDesiredError> {
     let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
+    schedule_transaction_target(db, rule_id, fqdn, raw_line_id, &line.key, action, value).await
+}
+
+pub(crate) async fn schedule_transaction_target(
+    db: &dyn Repository,
+    rule_id: i64,
+    fqdn: &str,
+    raw_line_id: &str,
+    line_key: &str,
+    action: &str,
+    value: Option<&str>,
+) -> Result<(), LineDesiredError> {
+    let mut line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
+    if !provider_line_matches_binding_key(raw_line_id, line_key) {
+        return Err(LineDesiredError::InvalidLine);
+    }
+    line.key = line_key.to_string();
     if !matches!(action, "UPSERT" | "DELETE") {
         return Err(LineDesiredError::InvalidLine);
     }
@@ -1964,7 +2370,7 @@ pub(crate) async fn schedule_transaction_line(
         db,
         rule_id,
         fqdn.as_str(),
-        &line.key,
+        line_key,
         action,
         value,
     )
@@ -2136,7 +2542,17 @@ pub(crate) async fn inspect_line_record(
     rule_id: i64,
     raw_line_id: &str,
 ) -> Result<LineRecordSnapshot, LineRecordSnapshotError> {
-    inspect_line_record_inner(db, client, rule_id, raw_line_id, false).await
+    inspect_line_record_inner(db, client, rule_id, raw_line_id, None, false).await
+}
+
+pub(crate) async fn inspect_carrier_target_record(
+    db: &dyn Repository,
+    client: &DnsMgrClient,
+    rule_id: i64,
+    raw_line_id: &str,
+    line_key: &str,
+) -> Result<LineRecordSnapshot, LineRecordSnapshotError> {
+    inspect_line_record_inner(db, client, rule_id, raw_line_id, Some(line_key), false).await
 }
 
 pub(crate) async fn inspect_default_line_record_for_transaction(
@@ -2144,7 +2560,7 @@ pub(crate) async fn inspect_default_line_record_for_transaction(
     client: &DnsMgrClient,
     rule_id: i64,
 ) -> Result<LineRecordSnapshot, LineRecordSnapshotError> {
-    inspect_line_record_inner(db, client, rule_id, DEFAULT_LINE_KEY, true).await
+    inspect_line_record_inner(db, client, rule_id, DEFAULT_LINE_KEY, None, true).await
 }
 
 async fn inspect_line_record_inner(
@@ -2152,11 +2568,16 @@ async fn inspect_line_record_inner(
     client: &DnsMgrClient,
     rule_id: i64,
     raw_line_id: &str,
+    binding_key: Option<&str>,
     allow_default: bool,
 ) -> Result<LineRecordSnapshot, LineRecordSnapshotError> {
     let requested =
         canonical_provider_line(raw_line_id).ok_or(LineRecordSnapshotError::InvalidLine)?;
     if requested.key == DEFAULT_LINE_KEY && !allow_default {
+        return Err(LineRecordSnapshotError::InvalidLine);
+    }
+    let binding_key = binding_key.unwrap_or(&requested.key).to_string();
+    if !provider_line_matches_binding_key(raw_line_id, &binding_key) {
         return Err(LineRecordSnapshotError::InvalidLine);
     }
     let rule = RuleRepository::find_rule_by_id(db, rule_id, &ResourceScope::All)
@@ -2179,10 +2600,41 @@ async fn inspect_line_record_inner(
         .map_err(LineRecordSnapshotError::Provider)?;
     let line = resolve_mutation_line(&requested, &detail).unwrap_or(requested);
     let binding = db
-        .find_dns_record_binding_for_rule(rule_id, fqdn.as_str(), "A", &line.key)
+        .find_dns_record_binding_for_rule(rule_id, fqdn.as_str(), "A", &binding_key)
         .await
         .map_err(|_| LineRecordSnapshotError::Database)?;
-    match discover_records(client, &zone, DnsRecordType::A, &line).await {
+    let discovery = discover_records(client, &zone, DnsRecordType::A, &line).await;
+    if line.key != DEFAULT_LINE_KEY
+        && (binding_key != line.key
+            || matches!(discovery, RecordDiscovery::MultipleMatchingRecords(_)))
+    {
+        let records = carrier_discovered_records(discovery)
+            .map_err(|_| LineRecordSnapshotError::OwnershipUnverified)?;
+        owned_carrier_records(db, rule_id, &fqdn, &zone, &records)
+            .await
+            .map_err(|_| LineRecordSnapshotError::OwnershipUnverified)?;
+        let Some(record) = binding.as_ref().and_then(|binding| {
+            records
+                .iter()
+                .find(|record| record.record.record_id == binding.record_id)
+        }) else {
+            return Ok(LineRecordSnapshot::Absent);
+        };
+        if !binding.as_ref().is_some_and(|binding| {
+            carrier_binding_matches_record(binding, rule_id, &fqdn, &zone, record)
+                && binding.line_key == binding_key
+        }) {
+            return Err(LineRecordSnapshotError::OwnershipUnverified);
+        }
+        let [value] = record.record.values.as_slice() else {
+            return Err(LineRecordSnapshotError::OwnershipUnverified);
+        };
+        return Ok(LineRecordSnapshot::PanelOwned {
+            value: value.clone(),
+            record_id: record.record.record_id.clone(),
+        });
+    }
+    match discovery {
         RecordDiscovery::NoRecord => Ok(LineRecordSnapshot::Absent),
         RecordDiscovery::SingleMatchingRecord(record) => {
             let owned =
@@ -2450,10 +2902,26 @@ async fn persist_carrier_desired(
                         "carrier UPSERT desired value is missing".into(),
                     )));
                 };
-                project_line_desired(db, rule_id, &desired.line_id, "UPSERT", Some(value)).await
+                project_target_line_desired(
+                    db,
+                    rule_id,
+                    &desired.line_id,
+                    &desired.line_key,
+                    "UPSERT",
+                    Some(value),
+                )
+                .await
             }
             crate::service::relay_preference::RelayDnsAction::Delete => {
-                project_line_desired(db, rule_id, &desired.line_id, "DELETE", None).await
+                project_target_line_desired(
+                    db,
+                    rule_id,
+                    &desired.line_id,
+                    &desired.line_key,
+                    "DELETE",
+                    None,
+                )
+                .await
             }
         };
         result.map_err(|error| {
@@ -2465,6 +2933,7 @@ async fn persist_carrier_desired(
     Ok(())
 }
 
+#[cfg(test)]
 async fn project_line_desired(
     db: &dyn Repository,
     rule_id: i64,
@@ -2473,10 +2942,48 @@ async fn project_line_desired(
     value: Option<&str>,
 ) -> Result<(), LineDesiredError> {
     let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
-    let desired = line_desired_for_rule(db, rule_id, line, value).await?;
+    project_target_line_desired(db, rule_id, raw_line_id, &line.key, action, value).await
+}
+
+async fn project_target_line_desired(
+    db: &dyn Repository,
+    rule_id: i64,
+    raw_line_id: &str,
+    line_key: &str,
+    action: &str,
+    value: Option<&str>,
+) -> Result<(), LineDesiredError> {
+    let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
+    if !provider_line_matches_binding_key(raw_line_id, line_key) {
+        return Err(LineDesiredError::InvalidLine);
+    }
+    let mut desired = line_desired_for_rule(db, rule_id, line, value).await?;
+    desired.line.key = line_key.into();
     persist_line_desired(db, &desired, action, value, false).await
 }
 
+pub(crate) async fn project_carrier_target_desired(
+    db: &dyn Repository,
+    rule_id: i64,
+    raw_line_id: &str,
+    line_key: &str,
+    value: Option<&str>,
+) -> Result<(), LineDesiredError> {
+    if canonical_provider_line(raw_line_id).is_none_or(|line| line.key == DEFAULT_LINE_KEY) {
+        return Err(LineDesiredError::InvalidLine);
+    }
+    project_target_line_desired(
+        db,
+        rule_id,
+        raw_line_id,
+        line_key,
+        if value.is_some() { "UPSERT" } else { "DELETE" },
+        value,
+    )
+    .await
+}
+
+#[cfg(test)]
 pub(crate) async fn project_carrier_line_desired(
     db: &dyn Repository,
     rule_id: i64,
@@ -2799,13 +3306,14 @@ async fn reconcile_one(
         return audits;
     }
 
-    let input = EnsureRecordInput {
+    let mut input = EnsureRecordInput {
         rule_id: sync.rule_id,
         fqdn: sync.fqdn.clone(),
         record_type: DnsRecordType::A,
         expected_value: sync.expected_value.clone().unwrap_or_default(),
         line: ProviderLine::from_provider(&sync.line, None),
     };
+    input.line.key = sync.line_key.clone();
     match ensure_record(db, client, &input).await {
         result @ (EnsureRecordResult::AlreadyCorrect { .. }
         | EnsureRecordResult::Created { .. }
@@ -3002,12 +3510,13 @@ async fn reconcile_delete(
         return audits;
     }
 
-    let input = DeleteRecordInput {
+    let mut input = DeleteRecordInput {
         rule_id: sync.rule_id,
         fqdn: sync.fqdn.clone(),
         record_type: DnsRecordType::A,
         line: ProviderLine::from_provider(&sync.line, None),
     };
+    input.line.key = sync.line_key.clone();
     match ensure_record_absent(db, client, &input).await {
         DeleteRecordResult::Deleted { .. } | DeleteRecordResult::AlreadyAbsent => {
             let verified_at = utc_now();
@@ -3857,6 +4366,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn carrier_targets_own_three_a_records_and_delete_only_one_target() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        let mock =
+            spawn_ensure_mock(Vec::new(), MutationBehavior::Apply, MutationBehavior::Apply).await;
+        let targets = [
+            ("node-a", "192.0.2.21"),
+            ("node-b", "192.0.2.22"),
+            ("node-c", "192.0.2.23"),
+        ];
+        for (node_id, value) in targets {
+            let key = format!(
+                "carrier-target:{}:7:{}",
+                hex::encode("Dianxin"),
+                hex::encode(node_id)
+            );
+            project_carrier_target_desired(&db, 100, "Dianxin", &key, Some(value))
+                .await
+                .unwrap();
+            let sync = db.find_dns_record_sync(100, &key).await.unwrap().unwrap();
+            reconcile_one(&db, sync, &mock.client).await;
+            assert_eq!(
+                db.find_dns_record_sync(100, &key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "PROPAGATED"
+            );
+            assert_eq!(
+                inspect_carrier_target_record(&db, &mock.client, 100, "Dianxin", &key)
+                    .await
+                    .unwrap(),
+                LineRecordSnapshot::PanelOwned {
+                    value: value.into(),
+                    record_id: format!(
+                        "created-{}",
+                        mock.state.add_attempts.load(Ordering::SeqCst)
+                    ),
+                }
+            );
+        }
+        assert_eq!(mock.state.records.lock().unwrap().len(), 3);
+        assert_eq!(
+            mock.state
+                .last_add_form
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get("ttl")
+                .map(String::as_str),
+            Some("1200")
+        );
+
+        let node_b_key = format!(
+            "carrier-target:{}:7:{}",
+            hex::encode("Dianxin"),
+            hex::encode("node-b")
+        );
+        project_carrier_target_desired(&db, 100, "Dianxin", &node_b_key, None)
+            .await
+            .unwrap();
+        let sync = db
+            .find_dns_record_sync(100, &node_b_key)
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_one(&db, sync, &mock.client).await;
+        let after_delete = db
+            .find_dns_record_sync(100, &node_b_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_delete.state, "PROPAGATED",
+            "delete failed: {:?}",
+            after_delete.last_error_category
+        );
+        let remaining = mock
+            .state
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|record| record.values[0].clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            remaining,
+            HashSet::from(["192.0.2.21".into(), "192.0.2.23".into()])
+        );
+        assert_eq!(mock.state.delete_attempts.load(Ordering::SeqCst), 1);
+
+        project_carrier_target_desired(&db, 100, "Dianxin", &node_b_key, Some("192.0.2.22"))
+            .await
+            .unwrap();
+        let sync = db
+            .find_dns_record_sync(100, &node_b_key)
+            .await
+            .unwrap()
+            .unwrap();
+        reconcile_one(&db, sync, &mock.client).await;
+        let restored = mock
+            .state
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|record| record.values[0].clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            restored,
+            HashSet::from([
+                "192.0.2.21".into(),
+                "192.0.2.22".into(),
+                "192.0.2.23".into()
+            ])
+        );
+        assert_eq!(mock.state.delete_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn carrier_multi_a_rejects_unknown_external_record_before_mutation() {
+        let db = ensure_db().await;
+        configure_eligible_rule(&db, "op1.example.com", "192.0.2.10").await;
+        let node_a_key = format!(
+            "carrier-target:{}:7:{}",
+            hex::encode("Dianxin"),
+            hex::encode("node-a")
+        );
+        let node_b_key = format!(
+            "carrier-target:{}:7:{}",
+            hex::encode("Dianxin"),
+            hex::encode("node-b")
+        );
+        project_carrier_target_desired(&db, 100, "Dianxin", &node_a_key, Some("192.0.2.21"))
+            .await
+            .unwrap();
+        project_carrier_target_desired(&db, 100, "Dianxin", &node_b_key, Some("192.0.2.22"))
+            .await
+            .unwrap();
+        let mock = spawn_ensure_mock(
+            vec![record("external", "A", "192.0.2.99", "Dianxin")],
+            MutationBehavior::Apply,
+            MutationBehavior::Apply,
+        )
+        .await;
+        let mut line = ProviderLine::from_provider("Dianxin", None);
+        line.key = node_b_key;
+        assert_eq!(
+            ensure_record(
+                &db,
+                &mock.client,
+                &EnsureRecordInput {
+                    rule_id: 100,
+                    fqdn: "op1.example.com".into(),
+                    record_type: DnsRecordType::A,
+                    expected_value: "192.0.2.22".into(),
+                    line,
+                },
+            )
+            .await,
+            EnsureRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified)
+        );
+        assert_eq!(mock.state.total_mutations(), 0);
+    }
+
+    #[test]
+    fn carrier_ttl_respects_provider_minimum_without_changing_default_ttl() {
+        let mut detail = DnsMgrDomainDetail {
+            domain: domain(7, "example.com"),
+            min_ttl: Some(1),
+            record_lines: Vec::new(),
+        };
+        assert_eq!(write_carrier_ttl(&detail), Some(60));
+        assert_eq!(write_ttl(&detail), Some(600));
+        detail.min_ttl = Some(1200);
+        assert_eq!(write_carrier_ttl(&detail), Some(1200));
+    }
+
+    #[tokio::test]
     async fn carrier_preflight_snapshots_only_absent_or_exact_panel_owned_records() {
         let absent_db = ensure_db().await;
         configure_eligible_rule(&absent_db, "op1.example.com", "192.0.2.10").await;
@@ -4311,16 +5001,25 @@ mod tests {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::Node,
                     node_id: Some("node-a".into()),
+                    identity_group_id: None,
+                },
+                CarrierLineBinding {
+                    line_id: "Dianxin".into(),
+                    mode: CarrierLineMode::Node,
+                    node_id: Some("node-b".into()),
+                    identity_group_id: Some(10),
                 },
                 CarrierLineBinding {
                     line_id: "Liantong".into(),
                     mode: CarrierLineMode::Node,
                     node_id: Some("node-a".into()),
+                    identity_group_id: None,
                 },
                 CarrierLineBinding {
                     line_id: "Yidong".into(),
                     mode: CarrierLineMode::Node,
                     node_id: Some("node-b".into()),
+                    identity_group_id: None,
                 },
             ],
         };
@@ -4342,8 +5041,26 @@ mod tests {
             stored.transaction_kind,
             Some(RelayTransactionKind::CarrierPolicyApply)
         );
-        assert_eq!(stored.pending_carrier_policy, Some(policy));
-        assert_eq!(stored.dns_records.len(), 4);
+        assert_eq!(stored.pending_carrier_policy, Some(policy.clone()));
+        assert_eq!(stored.dns_records.len(), 5);
+        let node_b_key = format!(
+            "carrier-target:{}:10:{}",
+            hex::encode("Dianxin"),
+            hex::encode("node-b")
+        );
+        assert!(stored.dns_records.iter().any(|record| {
+            record.line_key == node_b_key && record.target_value.as_deref() == Some("192.0.2.30")
+        }));
+        assert!(db
+            .find_dns_record_sync(100, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(db
+            .find_dns_record_sync(100, &node_b_key)
+            .await
+            .unwrap()
+            .is_some());
         assert_eq!(
             stored
                 .dns_records
@@ -4353,6 +5070,117 @@ mod tests {
             1
         );
         assert_eq!(mock.state.total_mutations(), 0);
+        let mut syncs = db.list_dns_record_syncs_for_rule(100).await.unwrap();
+        syncs.sort_by(|left, right| left.line_key.cmp(&right.line_key));
+        for sync in syncs {
+            reconcile_one(&db, sync, &mock.client).await;
+        }
+        crate::service::relay_preference::finalize_switching_group_for_test(&db, &connections, 10)
+            .await
+            .unwrap();
+        let committed = crate::service::relay_preference::load_preference(&db, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            committed.state,
+            crate::service::relay_preference::RelayPreferencePhase::Idle
+        );
+        assert_eq!(committed.carrier_policy, policy);
+        let dianxin_values = mock
+            .state
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| record.line == "Dianxin")
+            .map(|record| record.values[0].clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            dianxin_values,
+            HashSet::from(["192.0.2.20".into(), "192.0.2.30".into()])
+        );
+
+        let before_failure = mock.state.records.lock().unwrap().clone();
+        db.set(
+            "node_status:10:node-c",
+            &node_status("node-c", "192.0.2.40"),
+        )
+        .await
+        .unwrap();
+        db.set(
+            "node_status:10:node-d",
+            &node_status("node-d", "192.0.2.50"),
+        )
+        .await
+        .unwrap();
+        let (_c, _c_rx) = connections.register(10, Some("node-c".into())).await;
+        let (_d, _d_rx) = connections.register(10, Some("node-d".into())).await;
+        let mut expanded = policy.clone();
+        expanded
+            .bindings
+            .extend(
+                ["node-c", "node-d"]
+                    .into_iter()
+                    .map(|node_id| CarrierLineBinding {
+                        line_id: "Dianxin".into(),
+                        mode: CarrierLineMode::Node,
+                        identity_group_id: Some(10),
+                        node_id: Some(node_id.into()),
+                    }),
+            );
+        *mock.state.reject_add_attempt.lock().unwrap() =
+            Some(mock.state.add_attempts.load(Ordering::SeqCst) + 2);
+        crate::service::relay_preference::start_carrier_policy_apply(
+            &db,
+            &connections,
+            10,
+            expanded,
+        )
+        .await
+        .unwrap();
+        let pending = crate::service::relay_preference::load_preference(&db, 10)
+            .await
+            .unwrap();
+        let mut journal = pending.dns_records.clone();
+        journal.sort_by(|left, right| left.line_key.cmp(&right.line_key));
+        for entry in &journal {
+            let sync = db
+                .find_dns_record_sync(entry.rule_id, &entry.line_key)
+                .await
+                .unwrap()
+                .unwrap();
+            reconcile_one(&db, sync, &mock.client).await;
+        }
+        crate::service::relay_preference::finalize_switching_group_for_test(&db, &connections, 10)
+            .await
+            .unwrap();
+        let rolling_back = crate::service::relay_preference::load_preference(&db, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rolling_back.state,
+            crate::service::relay_preference::RelayPreferencePhase::RollingBack
+        );
+        for entry in &rolling_back.dns_records {
+            let sync = db
+                .find_dns_record_sync(entry.rule_id, &entry.line_key)
+                .await
+                .unwrap()
+                .unwrap();
+            reconcile_one(&db, sync, &mock.client).await;
+        }
+        crate::service::relay_preference::finalize_switching_group_for_test(&db, &connections, 10)
+            .await
+            .unwrap();
+        let rolled_back = crate::service::relay_preference::load_preference(&db, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rolled_back.state,
+            crate::service::relay_preference::RelayPreferencePhase::FailedRolledBack
+        );
+        assert_eq!(rolled_back.carrier_policy, policy);
+        assert_eq!(*mock.state.records.lock().unwrap(), before_failure);
     }
 
     #[tokio::test]
@@ -4420,16 +5248,19 @@ mod tests {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::FollowDefault,
                     node_id: None,
+                    identity_group_id: None,
                 },
                 CarrierLineBinding {
                     line_id: "Liantong".into(),
                     mode: CarrierLineMode::Node,
                     node_id: Some("node-a".into()),
+                    identity_group_id: None,
                 },
                 CarrierLineBinding {
                     line_id: "Yidong".into(),
                     mode: CarrierLineMode::Node,
                     node_id: Some("node-b".into()),
+                    identity_group_id: None,
                 },
             ],
         };
@@ -6102,6 +6933,7 @@ mod tests {
         records: Mutex<Vec<DnsMgrRecord>>,
         record_lines: Mutex<Vec<DnsMgrRecordLine>>,
         add_behavior: MutationBehavior,
+        reject_add_attempt: Mutex<Option<usize>>,
         update_behavior: MutationBehavior,
         delete_behavior: Mutex<MutationBehavior>,
         add_attempts: AtomicUsize,
@@ -6158,6 +6990,7 @@ mod tests {
                 },
             ]),
             add_behavior,
+            reject_add_attempt: Mutex::new(None),
             update_behavior,
             delete_behavior: Mutex::new(MutationBehavior::Apply),
             add_attempts: AtomicUsize::new(0),
@@ -6233,6 +7066,9 @@ mod tests {
     ) -> Response {
         let attempt = state.add_attempts.fetch_add(1, Ordering::SeqCst) + 1;
         *state.last_add_form.lock().unwrap() = Some(form.clone());
+        if *state.reject_add_attempt.lock().unwrap() == Some(attempt) {
+            return Json(json!({"code": 403, "msg": "isolated provider refusal"})).into_response();
+        }
         if matches!(
             state.add_behavior,
             MutationBehavior::Apply | MutationBehavior::TransportAfterApply
@@ -6304,12 +7140,14 @@ mod tests {
     }
 
     fn record_from_form(record_id: &str, form: &HashMap<String, String>) -> DnsMgrRecord {
-        record(
+        let mut created = record(
             record_id,
             form.get("type").unwrap(),
             form.get("value").unwrap(),
             form.get("line").unwrap(),
-        )
+        );
+        created.ttl = form.get("ttl").unwrap().parse().unwrap();
+        created
     }
 
     fn record_json(record: &DnsMgrRecord) -> serde_json::Value {

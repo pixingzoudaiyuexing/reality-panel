@@ -201,7 +201,36 @@ impl NodeOperationRegistry {
         sha256: Option<String>,
         actor_id: Option<i64>,
     ) -> Result<NodeOperation, ()> {
+        self.start_with_id(
+            group_id,
+            node_id,
+            action,
+            current_version,
+            target_version,
+            architecture,
+            sha256,
+            actor_id,
+            uuid::Uuid::new_v4().to_string(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_id(
+        &self,
+        group_id: i64,
+        node_id: String,
+        action: NodeLifecycleAction,
+        current_version: Option<String>,
+        target_version: Option<String>,
+        architecture: Option<String>,
+        sha256: Option<String>,
+        actor_id: Option<i64>,
+        operation_id: String,
+    ) -> Result<NodeOperation, ()> {
         let mut inner = self.inner.lock().expect("node operation registry lock");
+        if inner.contains_key(&operation_id) {
+            return Err(());
+        }
         if action != NodeLifecycleAction::Logs
             && inner.values().any(|entry| {
                 entry.operation.group_id == group_id
@@ -214,7 +243,7 @@ impl NodeOperationRegistry {
         }
         let timestamp = now();
         let operation = NodeOperation {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: operation_id,
             group_id,
             node_id,
             action,
@@ -869,22 +898,25 @@ fn status_supports_lifecycle(
         == Some(CONFIG_PROTOCOL_VERSION as u64)
 }
 
-async fn operation_channel_online(
+async fn operation_connection(
     connections: &crate::api::ws::NodeConnections,
     group_id: i64,
     node_id: &str,
     action: NodeLifecycleAction,
-) -> bool {
-    if action == NodeLifecycleAction::Upgrade {
-        connections
-            .lifecycle_online_node_ids(group_id)
-            .await
-            .contains(node_id)
-    } else {
-        connections
-            .config_online_node_ids(group_id)
-            .await
-            .contains(node_id)
+) -> Result<u64, Response> {
+    match connections
+        .unique_lifecycle_connection(group_id, node_id, action == NodeLifecycleAction::Upgrade)
+        .await
+    {
+        Ok(id) => Ok(id),
+        Err(crate::api::ws::UniqueConnectionError::Offline) => {
+            Err(response::<()>(StatusCode::CONFLICT, 409, "NODE_OFFLINE"))
+        }
+        Err(crate::api::ws::UniqueConnectionError::Ambiguous) => Err(response::<()>(
+            StatusCode::CONFLICT,
+            409,
+            "AMBIGUOUS_NODE_IDENTITY",
+        )),
     }
 }
 
@@ -896,6 +928,31 @@ pub(crate) async fn create_operation(
     action: NodeLifecycleAction,
     log_lines: Option<u16>,
 ) -> Result<NodeOperation, Response> {
+    create_operation_with_id(state, actor_id, group_id, node_id, action, log_lines, None).await
+}
+
+pub(crate) async fn create_operation_with_id(
+    state: &AppState,
+    actor_id: i64,
+    group_id: i64,
+    node_id: String,
+    action: NodeLifecycleAction,
+    log_lines: Option<u16>,
+    operation_id: Option<String>,
+) -> Result<NodeOperation, Response> {
+    match state.db.find_node_pool_record(group_id, &node_id).await {
+        Ok(Some(record)) if record.retirement_state == "RETIRED" => {
+            return Err(response::<()>(StatusCode::CONFLICT, 409, "NODE_RETIRED"));
+        }
+        Err(_) => {
+            return Err(response::<()>(
+                StatusCode::SERVICE_UNAVAILABLE,
+                503,
+                "NODE_POOL_UNAVAILABLE",
+            ))
+        }
+        _ => {}
+    }
     if action != NodeLifecycleAction::Logs {
         match has_active_durable_uninstall(state, group_id, &node_id).await {
             Ok(true) => {
@@ -916,9 +973,8 @@ pub(crate) async fn create_operation(
             }
         }
     }
-    if !operation_channel_online(&state.node_connections, group_id, &node_id, action).await {
-        return Err(response::<()>(StatusCode::CONFLICT, 409, "NODE_OFFLINE"));
-    }
+    let selected_connection =
+        operation_connection(&state.node_connections, group_id, &node_id, action).await?;
     let status = node_status(state, group_id, &node_id)
         .await
         .map_err(|error| {
@@ -985,19 +1041,49 @@ pub(crate) async fn create_operation(
             .and_then(|value| value.as_str())
             .map(str::to_string);
     }
-    let operation = state
-        .node_operations
-        .start(
-            group_id,
-            node_id.clone(),
-            action,
-            current_version,
-            target_version,
-            architecture,
-            sha256,
-            Some(actor_id),
-        )
-        .map_err(|_| response::<()>(StatusCode::CONFLICT, 409, "NODE_OPERATION_IN_PROGRESS"))?;
+    let operation = {
+        let _retirement_guard = crate::service::node_retirement::RETIREMENT_GATE
+            .lock()
+            .await;
+        match state.db.find_node_pool_record(group_id, &node_id).await {
+            Ok(Some(record)) if record.retirement_state == "RETIRED" => {
+                return Err(response::<()>(StatusCode::CONFLICT, 409, "NODE_RETIRED"));
+            }
+            Err(_) => {
+                return Err(response::<()>(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    503,
+                    "NODE_POOL_UNAVAILABLE",
+                ));
+            }
+            _ => {}
+        }
+        let started = match operation_id {
+            Some(id) => state.node_operations.start_with_id(
+                group_id,
+                node_id.clone(),
+                action,
+                current_version,
+                target_version,
+                architecture,
+                sha256,
+                Some(actor_id),
+                id,
+            ),
+            None => state.node_operations.start(
+                group_id,
+                node_id.clone(),
+                action,
+                current_version,
+                target_version,
+                architecture,
+                sha256,
+                Some(actor_id),
+            ),
+        };
+        started
+            .map_err(|_| response::<()>(StatusCode::CONFLICT, 409, "NODE_OPERATION_IN_PROGRESS"))?
+    };
     if action == NodeLifecycleAction::Uninstall {
         {
             let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
@@ -1086,17 +1172,12 @@ pub(crate) async fn create_operation(
             "serialize lifecycle command failed",
         )
     })?;
-    let delivered = if action == NodeLifecycleAction::Upgrade {
+    let delivered = usize::from(
         state
             .node_connections
-            .send_upgrade_node(group_id, &node_id, &encoded)
-            .await
-    } else {
-        state
-            .node_connections
-            .send_node(group_id, &node_id, &encoded)
-            .await
-    };
+            .send_exact_connection(group_id, &node_id, selected_connection, &encoded)
+            .await,
+    );
     if delivered == 0 {
         state.node_operations.update(
             &operation.id,
@@ -1158,9 +1239,79 @@ pub async fn start_operation(
             "UNINSTALL_CONFIRMATION_REQUIRED",
         );
     }
+    if action == NodeLifecycleAction::Upgrade {
+        let pool_nodes = match crate::service::node_pool::list_nodes(state.db.as_ref()).await {
+            Ok(nodes) => nodes,
+            Err(_) => {
+                return response::<()>(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    503,
+                    "NODE_POOL_UNAVAILABLE",
+                )
+            }
+        };
+        if pool_nodes.iter().any(|node| {
+            node.identity_group_id == group_id
+                && node.node_id == node_id
+                && node.migration_required
+                && !node.credential_active
+        }) {
+            return match crate::service::node_convergence::start(
+                &state,
+                admin.user_id,
+                group_id,
+                &node_id,
+            )
+            .await
+            {
+                Ok(operation) => success(operation.operation_view()),
+                Err(error) => convergence_response(error),
+            };
+        }
+    }
     match create_operation(&state, admin.user_id, group_id, node_id, action, None).await {
         Ok(operation) => success(operation),
         Err(response) => response,
+    }
+}
+
+pub(crate) fn convergence_response(
+    error: crate::service::node_convergence::ConvergenceError,
+) -> Response {
+    use crate::service::node_convergence::ConvergenceError;
+    match error {
+        ConvergenceError::Db(error) => {
+            tracing::warn!("node convergence database unavailable: {error}");
+            response::<()>(
+                StatusCode::SERVICE_UNAVAILABLE,
+                503,
+                "NODE_CONVERGENCE_UNAVAILABLE",
+            )
+        }
+        ConvergenceError::Missing => response::<()>(StatusCode::NOT_FOUND, 404, "NODE_NOT_FOUND"),
+        ConvergenceError::Offline => response::<()>(StatusCode::CONFLICT, 409, "NODE_OFFLINE"),
+        ConvergenceError::Ambiguous => {
+            response::<()>(StatusCode::CONFLICT, 409, "AMBIGUOUS_NODE_IDENTITY")
+        }
+        ConvergenceError::AlreadyReady => {
+            response::<()>(StatusCode::CONFLICT, 409, "NODE_IDENTITY_ALREADY_READY")
+        }
+        ConvergenceError::InProgress => {
+            response::<()>(StatusCode::CONFLICT, 409, "NODE_OPERATION_IN_PROGRESS")
+        }
+        ConvergenceError::Unsupported => {
+            response::<()>(StatusCode::CONFLICT, 409, "NODE_LIFECYCLE_UNSUPPORTED")
+        }
+        ConvergenceError::Unavailable => response::<()>(
+            StatusCode::SERVICE_UNAVAILABLE,
+            503,
+            "NODE_CONVERGENCE_UNAVAILABLE",
+        ),
+        ConvergenceError::ArtifactNotNewer => response::<()>(
+            StatusCode::CONFLICT,
+            409,
+            "NODE_AUTOMATIC_MIGRATION_REQUIRES_NEWER_ARTIFACT",
+        ),
     }
 }
 
@@ -1193,6 +1344,17 @@ pub async fn get_operation(
     State(state): State<AppState>,
     Path((group_id, node_id, operation_id)): Path<(i64, String, String)>,
 ) -> Response {
+    match crate::service::node_convergence::load(state.db.as_ref(), group_id, &node_id).await {
+        Ok(Some(record)) if record.id == operation_id => return success(record.operation_view()),
+        Err(_) => {
+            return response::<()>(
+                StatusCode::SERVICE_UNAVAILABLE,
+                503,
+                "NODE_CONVERGENCE_UNAVAILABLE",
+            )
+        }
+        _ => {}
+    }
     let operation = state
         .node_operations
         .get(&operation_id)
@@ -1218,7 +1380,35 @@ pub async fn get_operation(
 }
 
 pub async fn list_operations(_admin: AdminOnly, State(state): State<AppState>) -> Response {
-    success(state.node_operations.active_and_recent())
+    let mut operations: Vec<serde_json::Value> = state
+        .node_operations
+        .active_and_recent()
+        .into_iter()
+        .filter_map(|operation| serde_json::to_value(operation).ok())
+        .collect();
+    for (_, raw) in match state.db.scan_prefix("node_convergence:").await {
+        Ok(rows) => rows,
+        Err(_) => {
+            return response::<()>(
+                StatusCode::SERVICE_UNAVAILABLE,
+                503,
+                "NODE_CONVERGENCE_UNAVAILABLE",
+            )
+        }
+    } {
+        let Ok(record) =
+            serde_json::from_str::<crate::service::node_convergence::Convergence>(&raw)
+        else {
+            return response::<()>(
+                StatusCode::SERVICE_UNAVAILABLE,
+                503,
+                "NODE_CONVERGENCE_UNAVAILABLE",
+            );
+        };
+        operations.retain(|operation| operation["id"] != record.id);
+        operations.push(record.operation_view());
+    }
+    success(operations)
 }
 
 pub async fn list_artifacts(_admin: AdminOnly) -> Response {
@@ -3010,21 +3200,25 @@ mod tests {
             .await;
 
         assert!(
-            operation_channel_online(&connections, 1, "old-node", NodeLifecycleAction::Upgrade,)
+            operation_connection(&connections, 1, "old-node", NodeLifecycleAction::Upgrade)
                 .await
+                .is_ok()
         );
         for action in [
             NodeLifecycleAction::Logs,
             NodeLifecycleAction::Restart,
             NodeLifecycleAction::Uninstall,
         ] {
-            assert!(!operation_channel_online(&connections, 1, "old-node", action).await);
+            assert!(operation_connection(&connections, 1, "old-node", action)
+                .await
+                .is_err());
         }
 
         drop(lifecycle_rx);
         assert!(
-            !operation_channel_online(&connections, 1, "old-node", NodeLifecycleAction::Upgrade,)
+            operation_connection(&connections, 1, "old-node", NodeLifecycleAction::Upgrade)
                 .await
+                .is_err()
         );
     }
 

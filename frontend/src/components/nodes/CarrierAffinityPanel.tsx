@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import api from '../../api/client';
 import type { ApiEnvelope, CarrierAffinityView, CarrierCatalogIssue, CarrierLineBinding, CarrierLineCatalog, RelayDnsRecordView, RelayReadyNode, RoutingApplyRequest, RoutingApplyResult, RoutingMode } from '../../api/types';
 import type { Tfn } from './types';
+import { poolNodeName } from './poolNodeName';
 import {
   assignCarrierLines,
   buildCarrierLineOptions,
@@ -30,8 +31,10 @@ interface Props {
 
 function normalize(defaultNodeId: string | null | undefined, bindings: CarrierLineBinding[]): string {
   return JSON.stringify({ default_node_id: defaultNodeId ?? null, bindings: [...bindings]
-    .map((binding) => ({ line_id: binding.line_id, mode: binding.mode, node_id: binding.node_id ?? null }))
-    .sort((left, right) => left.line_id < right.line_id ? -1 : left.line_id > right.line_id ? 1 : 0) });
+    .map((binding) => ({ line_id: binding.line_id, mode: binding.mode, node_id: binding.node_id ?? null, identity_group_id: binding.identity_group_id ?? null }))
+    .sort((left, right) => left.line_id.localeCompare(right.line_id)
+      || (left.identity_group_id ?? 0) - (right.identity_group_id ?? 0)
+      || (left.node_id ?? '').localeCompare(right.node_id ?? '')) });
 }
 
 function transactionLabel(view: CarrierAffinityView, t: Tfn) {
@@ -45,10 +48,12 @@ function transactionLabel(view: CarrierAffinityView, t: Tfn) {
   }
 }
 
-function nodeLines(bindings: CarrierLineBinding[], nodeId: string, defaultNodeId?: string | null): string[] {
+function nodeLines(bindings: CarrierLineBinding[], nodeId: string, identityGroupId: number | undefined, defaultNodeId?: string | null): string[] {
   return bindings
     .filter((binding) => isCarrierMutableLineId(binding.line_id))
-    .filter((binding) => binding.mode === 'node' ? binding.node_id === nodeId : defaultNodeId === nodeId)
+    .filter((binding) => binding.mode === 'node'
+      ? binding.node_id === nodeId && (binding.identity_group_id == null || binding.identity_group_id === identityGroupId)
+      : defaultNodeId === nodeId)
     .map((binding) => binding.line_id)
     .sort((left, right) => left.localeCompare(right));
 }
@@ -156,8 +161,9 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
     onDirtyChange?.(dirty);
   }, [dirty, onDirtyChange]);
 
-  const assignLines = (nodeId: string, selected: string[]) => {
-    setDraft((current) => assignCarrierLines(current, nodeId, selected, draftDefaultNodeId));
+  const assignLines = (nodeId: string, identityGroupId: number | undefined, selected: string[]) => {
+    if (identityGroupId == null) return;
+    setDraft((current) => assignCarrierLines(current, nodeId, identityGroupId, selected, draftDefaultNodeId));
   };
 
   const save = async () => {
@@ -198,20 +204,33 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
         <div className="rp-carrier-node-grid" role="table" aria-label={t('carrierAffinityTitle')}>
           <div className="rp-carrier-node-grid-head" role="row"><Text>{t('nodes')}</Text><Text>IP</Text><Text>{t('carrierAllNetworkDefault')}</Text><Text>{t('carrierLine')}</Text></div>
           {nodes.map((node) => (
-            <div className="rp-carrier-node-grid-row" role="row" data-testid={`carrier-node-${node.node_id}`} key={node.node_id}>
-              <Text code>{node.node_id}</Text>
+            <div className="rp-carrier-node-grid-row" role="row" data-testid={`carrier-node-${node.node_id}`} data-node-identity={`${node.identity_group_id}:${node.node_id}`} key={`${node.identity_group_id}:${node.node_id}`}>
+              <Text strong title={node.node_id}>{poolNodeName(node)}</Text>
               <Text code>{node.public_ipv4 ?? '-'}</Text>
               <Space orientation="vertical" size={4}>
                 <Space size={4}><Tag color={node.online ? 'green' : undefined}>{node.online ? t('online') : t('offline')}</Tag><Tag color={node.ready ? 'green' : 'orange'}>{node.ready ? t('relayReady') : t('relayNotReady')}</Tag></Space>
-                {draftDefaultNodeId === node.node_id ? (
+                {draftDefaultNodeId === node.node_id && nodes.filter((candidate) => candidate.node_id === node.node_id).length === 1 ? (
                   <Tag color="blue" data-testid="carrier-default-node-indicator">{t('carrierDefaultSelected')}</Tag>
                 ) : (
-                  <Button size="small" disabled={mutationLocked || disabled} onClick={() => setDraftDefaultNodeId(node.node_id)}>{t('carrierSetDefault')}</Button>
+                  <Button size="small" disabled={mutationLocked || disabled || nodes.filter((candidate) => candidate.node_id === node.node_id).length !== 1} onClick={() => setDraftDefaultNodeId(node.node_id)}>{t('carrierSetDefault')}</Button>
                 )}
                 {effectiveDefaultNodeId === node.node_id && activeMode !== 'carrier' ? <Text type="secondary">{t('routingEffectiveDefault')}</Text> : null}
               </Space>
               <Space orientation="vertical" size={4} style={{ width: '100%' }}>
-                <Select mode="multiple" showSearch aria-label={`${node.node_id} ${t('carrierLine')}`} value={nodeLines(draft, node.node_id, draftDefaultNodeId)} disabled={mutationLocked || catalogUnavailable || disabled} placeholder={t('carrierNotConfigured')} options={lineOptions} filterOption={(query, option) => carrierLineMatchesSearch(query, { value: String(option?.value ?? ''), label: String(option?.label ?? '') })} onChange={(values) => assignLines(node.node_id, values)} style={{ width: '100%' }} />
+                <Select mode="multiple" showSearch aria-label={`${node.node_id} ${t('carrierLine')}`} value={nodeLines(draft, node.node_id, node.identity_group_id, draftDefaultNodeId)} disabled={mutationLocked || catalogUnavailable || disabled || node.identity_group_id == null} placeholder={t('carrierNotConfigured')} options={lineOptions} filterOption={(query, option) => carrierLineMatchesSearch(query, { value: String(option?.value ?? ''), label: String(option?.label ?? '') })} onChange={(values) => assignLines(node.node_id, node.identity_group_id, values)} style={{ width: '100%' }} />
+                <Space size={4} wrap>
+                  {(view?.bindings ?? [])
+                    .filter((binding) => binding.effective_node_id === node.node_id && (binding.identity_group_id == null || binding.identity_group_id === node.identity_group_id))
+                    .map((binding) => {
+                      const state = binding.dns_state;
+                      const label = state === 'effective' ? t('carrierDnsEffective')
+                        : state === 'removed' ? t('carrierDnsRemoved')
+                        : state === 'recovering' ? t('carrierDnsRecovering')
+                        : state === 'failed' ? t('carrierDnsFailed')
+                        : state === 'pending' ? t('carrierDnsPending') : t('carrierDnsApplying');
+                      return <Tag key={`${binding.line_id}:${binding.identity_group_id ?? 'legacy'}`} color={state === 'effective' ? 'green' : state === 'failed' || state === 'removed' ? 'red' : 'orange'}>{names.get(binding.line_id) ?? binding.line_id} · {label}</Tag>;
+                    })}
+                </Space>
               </Space>
             </div>
           ))}

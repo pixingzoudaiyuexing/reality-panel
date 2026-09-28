@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typography, Badge, List, Space, Descriptions, Progress } from 'antd';
+import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typography, Badge, List, Space, Descriptions, Progress, Alert } from 'antd';
 import { CloudUploadOutlined, CopyOutlined, LineChartOutlined, ReloadOutlined, UnorderedListOutlined, SyncOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog, RelayReadyNode, BatchUpgradeOperation, BatchUpgradePreview, BatchUpgradeItemStatus } from '../api/types';
+import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog, RelayReadyNode, BatchUpgradeOperation, BatchUpgradePreview, BatchUpgradeItemStatus, NodeHealthSnapshot } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
 import { NodeGroupSection } from '../components/nodes/NodeGroupSection';
@@ -11,6 +11,7 @@ import { NodeDetailDrawer } from '../components/nodes/NodeDetailDrawer';
 import { stableGroupedRows } from '../components/nodes/sort';
 import { NodeDiagnosisDrawer } from '../components/diagnosis/NodeDiagnosisDrawer';
 import { operationStatusLabel } from '../components/nodes/lifecycleStatus';
+import { poolNodeName } from '../components/nodes/poolNodeName';
 
 type AnyNodeRow = NodeDisplayRow;
 
@@ -61,7 +62,9 @@ export default function NodeStatus() {
   const navigate = useNavigate();
   const isMobile = useIsMobile();
 
-  const [adminRows, setAdminRows] = useState<NodeStatus[] | null>(null);
+  const [adminRows, setAdminRows] = useState<NodeDisplayRow[] | null>(null);
+  const [health, setHealth] = useState<NodeHealthSnapshot[] | null>(null);
+  const [healthFailed, setHealthFailed] = useState(false);
   const [userRows, setUserRows] = useState<SharedNodeSummary[] | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [artifactVersions, setArtifactVersions] = useState<Record<string, string>>({});
@@ -90,15 +93,22 @@ export default function NodeStatus() {
 
   const loadAdmin = async () => {
     try {
-      const res = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes');
+      const [res, snapshot] = await Promise.all([
+        api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes'),
+        api.get<unknown, ApiEnvelope<NodeHealthSnapshot[]>>('/admin/node-health').catch(() => null),
+      ]);
       if (res.code !== 0) {
         if (!hasLoadedRowsRef.current) setLoadFailed(true);
         return;
       }
       setLoadFailed(false);
       setAdminRows(res.data || []);
+      setHealth(snapshot?.code === 0 && snapshot.data ? snapshot.data : null);
+      setHealthFailed(!snapshot || snapshot.code !== 0 || !snapshot.data);
       hasLoadedRowsRef.current = true;
     } catch {
+      setHealth(null);
+      setHealthFailed(true);
       if (!hasLoadedRowsRef.current) setLoadFailed(true);
     }
   };
@@ -166,7 +176,15 @@ export default function NodeStatus() {
     if (isAdmin) loadLifecycleMetadata();
     refresh();
     const ti = setInterval(refresh, 5000);
-    return () => clearInterval(ti);
+    const onFocus = () => void refresh();
+    const onVisibility = () => { if (document.visibilityState === 'visible') void refresh(); };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      clearInterval(ti);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAdmin]);
 
@@ -235,11 +253,12 @@ export default function NodeStatus() {
 
   const startOperation = async (row: AnyNodeRow, action: NodeLifecycleAction, confirmation?: string) => {
     if (!row.node_id) return;
+    const identityGroupId = row.identity_group_id ?? row.group_id;
     try {
       const res = action === 'logs'
-        ? await api.get<unknown, ApiEnvelope<NodeOperation>>(`/admin/nodes/${row.group_id}/${row.node_id}/logs?lines=200`)
+        ? await api.get<unknown, ApiEnvelope<NodeOperation>>(`/admin/nodes/${identityGroupId}/${row.node_id}/logs?lines=200`)
         : await api.post<unknown, ApiEnvelope<NodeOperation>>(
-            `/admin/nodes/${row.group_id}/${row.node_id}/operations/${action}`,
+            `/admin/nodes/${identityGroupId}/${row.node_id}/operations/${action}`,
             confirmation ? { confirmation } : {},
           );
       if (res.code !== 0 || !res.data) { message.error(res.message); return; }
@@ -287,7 +306,7 @@ export default function NodeStatus() {
   const handleDiagnoseNode = (groupId: number, node: RelayReadyNode) => {
     const nodeId = node.node_id.trim();
     if (!nodeId) return;
-    setNodeDiagnosisTarget({ groupId, nodeId, label: node.public_ipv4 ?? nodeId });
+    setNodeDiagnosisTarget({ groupId: node.identity_group_id ?? groupId, nodeId, label: poolNodeName(node) });
   };
 
   const openBatchUpgrade = async () => {
@@ -332,7 +351,44 @@ export default function NodeStatus() {
     }
   };
 
-  const rows: AnyNodeRow[] | null = isAdmin ? adminRows : userRows;
+  const healthByIdentity = new Map((health ?? []).map((node) => [`${node.identity_group_id}:${node.node_id}`, node]));
+  const rows: AnyNodeRow[] | null = isAdmin
+    ? (() => {
+      if (!adminRows) return null;
+      const native = adminRows.map((row) => {
+        const snapshot = healthByIdentity.get(`${row.group_id}:${row.node_id}`);
+        return snapshot ? { ...row, identity_group_id: snapshot.identity_group_id, display_name: snapshot.display_name, health_state: snapshot.state, online: snapshot.telemetry.fresh } : { ...row, health_state: 'UNKNOWN' as const };
+      });
+      const nativeByIdentity = new Map(native.map((row) => [`${row.group_id}:${row.node_id}`, row]));
+      const reused: NodeDisplayRow[] = [];
+      for (const snapshot of health ?? []) {
+        for (const membership of snapshot.group_readiness) {
+          if (membership.group_id === snapshot.identity_group_id) continue;
+          const source = nativeByIdentity.get(`${snapshot.identity_group_id}:${snapshot.node_id}`);
+          reused.push({
+            ...source,
+            group_id: membership.group_id,
+            group_name: membership.group_name,
+            identity_group_id: snapshot.identity_group_id,
+            node_id: snapshot.node_id,
+            display_name: snapshot.display_name,
+            health_state: snapshot.state,
+            online: snapshot.telemetry.fresh,
+            public_ipv4: snapshot.telemetry.public_ipv4,
+            public_ipv6: snapshot.telemetry.public_ipv6,
+            node_version: snapshot.telemetry.node_version,
+            last_seen: snapshot.telemetry.last_seen,
+            reconciliation: snapshot.runtime.reconciliation,
+          });
+        }
+      }
+      return [...native, ...reused];
+    })()
+    : userRows;
+  const currentDetail = detailRow && rows?.find((row) => row.group_id === detailRow.group_id
+    && row.node_key === detailRow.node_key
+    && (row.identity_group_id ?? row.group_id) === (detailRow.identity_group_id ?? detailRow.group_id)
+    && row.node_id === detailRow.node_id) || null;
   const groups = useMemo(() => (rows ? stableGroupedRows(rows) : null), [rows]);
 
   useEffect(() => {
@@ -401,7 +457,7 @@ export default function NodeStatus() {
   const handleDelete = async (row: NodeDisplayRow) => {
     try {
       const qs = row.node_id ? `?node_id=${encodeURIComponent(row.node_id)}` : '';
-      const res = await api.delete<unknown, ApiEnvelope<null>>(`/nodes/${row.group_id}${qs}`);
+      const res = await api.delete<unknown, ApiEnvelope<null>>(`/nodes/${row.identity_group_id ?? row.group_id}${qs}`);
       if (res.code !== 0) { message.error(res.message || t('nodeRemoveFailed')); return; }
       message.success(t('nodeRemoved'));
       refresh();
@@ -413,6 +469,7 @@ export default function NodeStatus() {
   return (
     <>
       {pageTitle}
+      {isAdmin && healthFailed ? <Alert type="warning" showIcon title={t('nodeHealthUnavailable')} /> : null}
       {groups.map(([gid, groupRows]) => (
         <NodeGroupSection
           key={gid}
@@ -427,14 +484,15 @@ export default function NodeStatus() {
           artifactVersions={artifactVersions}
           onDelete={isAdmin ? handleDelete : undefined}
           showRelayPreference={isAdmin && inboundGroupIds.has(gid)}
+          healthNodes={health?.filter((node) => node.group_readiness.some((group) => group.group_id === gid)) ?? []}
           onDiagnoseNode={isAdmin ? handleDiagnoseNode : undefined}
           expanded={expandedGroupId === gid}
           onExpandedChange={(expanded) => toggleExpandedGroup(gid, expanded)}
         />
       ))}
       <NodeDetailDrawer
-        row={detailRow}
-        open={detailRow !== null}
+        row={currentDetail}
+        open={currentDetail !== null}
         onClose={() => setDetailRow(null)}
         isAdmin={isAdmin}
         panelProtocol={panelProtocol}

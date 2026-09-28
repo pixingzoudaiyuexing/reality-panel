@@ -13,17 +13,24 @@ export function mutableCarrierBindings(bindings: CarrierLineBinding[]): CarrierL
 export function assignCarrierLines(
   bindings: CarrierLineBinding[],
   nodeId: string,
+  identityGroupId: number,
   selected: string[],
   defaultNodeId?: string | null,
 ): CarrierLineBinding[] {
   const mutableSelected = selected.filter(isCarrierMutableLineId);
-  const selectedSet = new Set(mutableSelected);
+  const belongsToNode = (binding: CarrierLineBinding) => binding.mode === 'node'
+    ? binding.node_id === nodeId && (binding.identity_group_id == null || binding.identity_group_id === identityGroupId)
+    : defaultNodeId === nodeId;
   const next = mutableCarrierBindings(bindings).filter((binding) => {
-    const effectiveNodeId = binding.mode === 'node' ? binding.node_id : defaultNodeId;
-    return effectiveNodeId !== nodeId && !selectedSet.has(binding.line_id);
+    return !belongsToNode(binding);
   });
-  next.push(...mutableSelected.map((lineId) => ({ line_id: lineId, mode: 'node' as const, node_id: nodeId })));
-  return next.sort((left, right) => left.line_id < right.line_id ? -1 : left.line_id > right.line_id ? 1 : 0);
+  next.push(...mutableSelected.map((lineId) => bindings.find((binding) =>
+    binding.line_id === lineId && belongsToNode(binding)) ?? {
+    line_id: lineId, mode: 'node' as const, node_id: nodeId, identity_group_id: identityGroupId,
+  }));
+  return next.sort((left, right) => left.line_id.localeCompare(right.line_id)
+    || (left.identity_group_id ?? 0) - (right.identity_group_id ?? 0)
+    || (left.node_id ?? '').localeCompare(right.node_id ?? ''));
 }
 
 export interface CatalogTreeNode {

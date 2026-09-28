@@ -88,6 +88,8 @@ pub struct CarrierLineBinding {
     pub mode: CarrierLineMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_group_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,7 +126,8 @@ pub enum CarrierPolicyValidationError {
     InvalidLineId,
     InvalidDefaultNodeId,
     DefaultLineOwnedByRelayPreference,
-    DuplicateLineId,
+    DuplicateTarget,
+    InvalidIdentityGroupId,
     UnexpectedNodeId,
     MissingNodeId,
 }
@@ -181,11 +184,10 @@ impl CarrierPolicy {
             if carrier_line_uses_default_authority(&binding.line_id) {
                 return Err(CarrierPolicyValidationError::DefaultLineOwnedByRelayPreference);
             }
-            if !seen.insert(binding.line_id.clone()) {
-                return Err(CarrierPolicyValidationError::DuplicateLineId);
-            }
             match binding.mode {
-                CarrierLineMode::FollowDefault if binding.node_id.is_some() => {
+                CarrierLineMode::FollowDefault
+                    if binding.node_id.is_some() || binding.identity_group_id.is_some() =>
+                {
                     return Err(CarrierPolicyValidationError::UnexpectedNodeId)
                 }
                 CarrierLineMode::FollowDefault => {}
@@ -197,11 +199,29 @@ impl CarrierPolicy {
                     if node_id.is_empty() {
                         return Err(CarrierPolicyValidationError::MissingNodeId);
                     }
+                    if binding.identity_group_id.is_some_and(|id| id <= 0) {
+                        return Err(CarrierPolicyValidationError::InvalidIdentityGroupId);
+                    }
                 }
             }
+            if !seen.insert(carrier_binding_sync_key(binding)) {
+                return Err(CarrierPolicyValidationError::DuplicateTarget);
+            }
         }
-        self.bindings
-            .sort_by(|left, right| left.line_id.cmp(&right.line_id));
+        self.bindings.sort_by(|left, right| {
+            (
+                &left.line_id,
+                left.mode as u8,
+                left.identity_group_id,
+                &left.node_id,
+            )
+                .cmp(&(
+                    &right.line_id,
+                    right.mode as u8,
+                    right.identity_group_id,
+                    &right.node_id,
+                ))
+        });
         Ok(self)
     }
 }
@@ -378,7 +398,10 @@ fn complete_transaction_to_idle(preference: &mut RelayPreferenceState) {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayReadyNode {
     pub node_id: String,
+    pub identity_group_id: i64,
+    pub display_name: String,
     pub public_ipv4: Option<String>,
+    pub public_ipv6: Option<String>,
     pub online: bool,
     pub ready: bool,
     pub ready_reasons: Vec<String>,
@@ -587,6 +610,7 @@ pub struct CarrierAffinityBindingView {
     pub line_id: String,
     pub mode: CarrierLineMode,
     pub node_id: Option<String>,
+    pub identity_group_id: Option<i64>,
     pub effective_node_id: Option<String>,
     pub relay_health: Option<String>,
     pub catalog_available: bool,
@@ -853,6 +877,7 @@ impl From<DbError> for RelayPreferenceError {
 /// key supplies the authoritative group/node identity; public IP is telemetry,
 /// never an identity key.
 fn evaluate_node(
+    identity_group_id: i64,
     node_id: String,
     raw_status: Option<&str>,
     now: DateTime<Utc>,
@@ -864,6 +889,9 @@ fn evaluate_node(
         return EvaluatedNode {
             info: RelayReadyNode {
                 node_id,
+                identity_group_id,
+                display_name: String::new(),
+                public_ipv6: None,
                 public_ipv4: None,
                 online: false,
                 ready: false,
@@ -879,6 +907,9 @@ fn evaluate_node(
             return EvaluatedNode {
                 info: RelayReadyNode {
                     node_id,
+                    identity_group_id,
+                    display_name: String::new(),
+                    public_ipv6: None,
                     public_ipv4: None,
                     online: false,
                     ready: false,
@@ -970,6 +1001,9 @@ fn evaluate_node(
     EvaluatedNode {
         info: RelayReadyNode {
             node_id,
+            identity_group_id,
+            display_name: String::new(),
+            public_ipv6: None,
             public_ipv4: public_ipv4.clone(),
             online,
             ready: reasons.is_empty(),
@@ -1208,6 +1242,59 @@ async fn store_preference(
     group_id: i64,
     preference: &RelayPreferenceState,
 ) -> Result<(), DbError> {
+    let _retirement_guard = crate::service::node_retirement::RETIREMENT_GATE
+        .lock()
+        .await;
+    let mut references = Vec::new();
+    for id in [
+        preference.normal_default_node_id.as_ref(),
+        preference.preferred_node_id.as_ref(),
+        preference.pending_node_id.as_ref(),
+        preference.carrier_policy.default_node_id.as_ref(),
+        preference
+            .pending_carrier_policy
+            .as_ref()
+            .and_then(|policy| policy.default_node_id.as_ref()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        references.push(id.clone());
+    }
+    for policy in
+        std::iter::once(&preference.carrier_policy).chain(preference.pending_carrier_policy.iter())
+    {
+        for binding in &policy.bindings {
+            if let (Some(identity), Some(node_id)) =
+                (binding.identity_group_id, binding.node_id.as_deref())
+            {
+                if db
+                    .find_node_pool_record(identity, node_id)
+                    .await?
+                    .is_some_and(|record| record.retirement_state != "ACTIVE")
+                {
+                    return Err(DbError::Other(sqlx::Error::Protocol(
+                        "retired exact Carrier target".into(),
+                    )));
+                }
+            } else {
+                references.extend(binding.node_id.iter().cloned());
+            }
+        }
+    }
+    if crate::service::node_retirement::references_retired(
+        db,
+        references
+            .into_iter()
+            .map(|node_id| (group_id, node_id))
+            .collect(),
+    )
+    .await?
+    {
+        return Err(DbError::Other(sqlx::Error::Protocol(
+            "retired node reference".into(),
+        )));
+    }
     db.set(
         &preference_key(group_id),
         &serde_json::to_string(preference).expect("relay preference is serializable"),
@@ -1287,7 +1374,35 @@ async fn stored_node_public_ipv4(
     group_id: i64,
     node_id: &str,
 ) -> Result<RelayDnsTarget, DbError> {
-    let Some(raw) = db.get(&format!("node_status:{group_id}:{node_id}")).await? else {
+    let identities = db.list_reused_concrete_nodes_for_group(group_id).await?;
+    let reused = identities
+        .iter()
+        .filter(|identity| identity.node_id == node_id);
+    let native_key = format!("node_status:{group_id}:{node_id}");
+    let native = db.get(&native_key).await?;
+    let native_registered = db
+        .find_node_pool_record(group_id, node_id)
+        .await?
+        .is_some_and(|record| record.retirement_state == "ACTIVE");
+    let candidates = reused.count() + usize::from(native.is_some() || native_registered);
+    if candidates > 1 {
+        return Ok(RelayDnsTarget::Invalid("AMBIGUOUS_NODE_ID"));
+    }
+    let raw = if let Some(raw) = native {
+        Some(raw)
+    } else if let Some(identity) = identities
+        .iter()
+        .find(|identity| identity.node_id == node_id)
+    {
+        db.get(&format!(
+            "node_status:{}:{}",
+            identity.home_group_id, node_id
+        ))
+        .await?
+    } else {
+        None
+    };
+    let Some(raw) = raw else {
         return Ok(RelayDnsTarget::Invalid("RELAY_NODE_STATUS_MISSING"));
     };
     let Ok(status) = serde_json::from_str::<StoredNodeStatus>(&raw) else {
@@ -1298,6 +1413,174 @@ async fn stored_node_public_ipv4(
         Some(ip) => RelayDnsTarget::Resolved(ip),
         None => RelayDnsTarget::Invalid("INVALID_RELAY_IPV4"),
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CarrierAvailability {
+    Serving(String),
+    NotServing,
+    Retired,
+}
+
+const CARRIER_FAILURE_GRACE_SECS: i64 = 90;
+const CARRIER_RECOVERY_GRACE_SECS: i64 = 20;
+static CARRIER_HEALTH_LOCK: Lazy<tokio::sync::Mutex<()>> =
+    Lazy::new(|| tokio::sync::Mutex::new(()));
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct CarrierHealthLatch {
+    effective_value: Option<String>,
+    failure_since: Option<DateTime<Utc>>,
+    recovery_since: Option<DateTime<Utc>>,
+    ever_published: bool,
+}
+
+fn advance_carrier_health_latch(
+    mut latch: CarrierHealthLatch,
+    observed: CarrierAvailability,
+    now: DateTime<Utc>,
+) -> CarrierHealthLatch {
+    match observed {
+        CarrierAvailability::Retired => {
+            latch.effective_value = None;
+            latch.failure_since = None;
+            latch.recovery_since = None;
+            latch.ever_published = true;
+        }
+        CarrierAvailability::Serving(value) => {
+            latch.failure_since = None;
+            if latch.effective_value.as_deref() == Some(value.as_str()) {
+                latch.recovery_since = None;
+            } else if latch.effective_value.is_some() {
+                latch.effective_value = Some(value);
+                latch.recovery_since = None;
+            } else if !latch.ever_published {
+                latch.effective_value = Some(value);
+                latch.ever_published = true;
+            } else {
+                let since = *latch.recovery_since.get_or_insert(now);
+                if (now - since).num_seconds() >= CARRIER_RECOVERY_GRACE_SECS {
+                    latch.effective_value = Some(value);
+                    latch.recovery_since = None;
+                }
+            }
+        }
+        CarrierAvailability::NotServing => {
+            latch.recovery_since = None;
+            if latch.effective_value.is_some() {
+                let since = *latch.failure_since.get_or_insert(now);
+                if (now - since).num_seconds() >= CARRIER_FAILURE_GRACE_SECS {
+                    latch.effective_value = None;
+                    latch.failure_since = None;
+                }
+            }
+        }
+    }
+    latch
+}
+
+async fn latched_carrier_value(
+    db: &dyn Repository,
+    group_id: i64,
+    rule_id: i64,
+    line_key: &str,
+    observed: CarrierAvailability,
+) -> Result<Option<String>, DbError> {
+    let _guard = CARRIER_HEALTH_LOCK.lock().await;
+    let key = format!("carrier_health:{group_id}:{line_key}");
+    let stored = db.get(&key).await?;
+    let previous = match stored {
+        Some(raw) => serde_json::from_str::<CarrierHealthLatch>(&raw)
+            .map_err(|error| DbError::Other(sqlx::Error::Protocol(error.to_string())))?,
+        None => {
+            let effective_value = db
+                .find_dns_record_sync(rule_id, line_key)
+                .await?
+                .filter(|sync| {
+                    sync.desired_action == "UPSERT"
+                        && sync.state == "PROPAGATED"
+                        && sync.ownership == "PANEL"
+                })
+                .and_then(|sync| sync.expected_value);
+            CarrierHealthLatch {
+                ever_published: effective_value.is_some(),
+                effective_value,
+                ..Default::default()
+            }
+        }
+    };
+    let next = advance_carrier_health_latch(previous.clone(), observed, Utc::now());
+    if next != previous {
+        db.set(
+            &key,
+            &serde_json::to_string(&next)
+                .map_err(|error| DbError::Other(sqlx::Error::Protocol(error.to_string())))?,
+        )
+        .await?;
+    }
+    Ok(next.effective_value)
+}
+
+async fn carrier_status_value(
+    db: &dyn Repository,
+    group_id: i64,
+    node_id: &str,
+    identity_group_id: Option<i64>,
+) -> Result<CarrierAvailability, DbError> {
+    let native = db.get(&format!("node_status:{group_id}:{node_id}")).await?;
+    let native_registered = db.find_node_pool_record(group_id, node_id).await?;
+    let mut identities = Vec::new();
+    if native.is_some()
+        || native_registered
+            .as_ref()
+            .is_some_and(|record| record.retirement_state == "ACTIVE")
+    {
+        identities.push(group_id);
+    }
+    identities.extend(
+        db.list_reused_concrete_nodes_for_group(group_id)
+            .await?
+            .into_iter()
+            .filter(|identity| identity.node_id == node_id)
+            .map(|identity| identity.home_group_id),
+    );
+    identities.sort_unstable();
+    identities.dedup();
+    let resolved = match identity_group_id {
+        Some(expected) if identities.contains(&expected) => expected,
+        None if identities.len() == 1 => identities[0],
+        _ => return Ok(CarrierAvailability::NotServing),
+    };
+    if db
+        .find_node_pool_record(resolved, node_id)
+        .await?
+        .is_some_and(|record| record.retirement_state != "ACTIVE")
+    {
+        return Ok(CarrierAvailability::Retired);
+    }
+    let raw = if resolved == group_id {
+        native
+    } else {
+        db.get(&format!("node_status:{resolved}:{node_id}")).await?
+    };
+    let Some(raw) = raw else {
+        return Ok(CarrierAvailability::NotServing);
+    };
+    let rules = db.list_active_for_config(group_id).await?;
+    let live_ids = HashSet::from([node_id.to_string()]);
+    let evaluated = evaluate_node(
+        resolved,
+        node_id.to_string(),
+        Some(&raw),
+        Utc::now(),
+        &live_ids,
+        &rules,
+    );
+    Ok(node_serving_eligible(&evaluated)
+        .then(|| valid_public_ipv4(evaluated.public_ipv4.as_deref()))
+        .flatten()
+        .map(CarrierAvailability::Serving)
+        .unwrap_or(CarrierAvailability::NotServing))
 }
 
 /// Resolve the DNS target from the current persisted preference. IP addresses
@@ -1402,11 +1685,27 @@ async fn evaluate_group_nodes(
     node_connections: &NodeConnections,
     group_id: i64,
 ) -> Result<Vec<EvaluatedNode>, RelayPreferenceError> {
+    evaluate_group_nodes_inner(db, node_connections, group_id, false).await
+}
+
+async fn evaluate_carrier_group_nodes(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+) -> Result<Vec<EvaluatedNode>, RelayPreferenceError> {
+    evaluate_group_nodes_inner(db, node_connections, group_id, true).await
+}
+
+async fn evaluate_group_nodes_inner(
+    db: &dyn Repository,
+    node_connections: &NodeConnections,
+    group_id: i64,
+    allow_duplicate_node_ids: bool,
+) -> Result<Vec<EvaluatedNode>, RelayPreferenceError> {
     let rules = db.list_active_for_config(group_id).await?;
     let rows = db.scan_prefix("node_status:").await?;
-    let live_node_ids = node_connections.online_node_ids(group_id).await;
     let now = Utc::now();
-    let mut statuses = BTreeMap::new();
+    let mut statuses: BTreeMap<(i64, String), String> = BTreeMap::new();
 
     for (key, raw_status) in rows {
         let Some((status_group_id, node_id)) = status_identity(&key) else {
@@ -1415,16 +1714,82 @@ async fn evaluate_group_nodes(
         if status_group_id != group_id {
             continue;
         }
-        statuses.insert(node_id, raw_status);
+        statuses.insert((group_id, node_id), raw_status);
     }
-    for node_id in &live_node_ids {
-        statuses.entry(node_id.clone()).or_default();
+    let native_live_ids = node_connections.online_node_ids(group_id).await;
+    for node_id in &native_live_ids {
+        statuses.entry((group_id, node_id.clone())).or_default();
+    }
+    let mut live_by_identity = BTreeMap::new();
+    live_by_identity.insert(group_id, native_live_ids);
+    let pool_records = db.list_node_pool_records().await?;
+    let retired: HashSet<(i64, String)> = pool_records
+        .iter()
+        .filter(|record| record.retirement_state == "RETIRED")
+        .map(|record| (record.identity_group_id, record.node_id.clone()))
+        .collect();
+    for record in pool_records.iter().filter(|record| {
+        record.identity_group_id == group_id && record.retirement_state == "ACTIVE"
+    }) {
+        statuses
+            .entry((group_id, record.node_id.clone()))
+            .or_default();
+    }
+    statuses.retain(|identity, _| !retired.contains(identity));
+    for identity in db.list_reused_concrete_nodes_for_group(group_id).await? {
+        if retired.contains(&(identity.home_group_id, identity.node_id.clone())) {
+            continue;
+        }
+        let raw = db
+            .get(&format!(
+                "node_status:{}:{}",
+                identity.home_group_id, identity.node_id
+            ))
+            .await?
+            .unwrap_or_default();
+        live_by_identity.entry(identity.home_group_id).or_insert(
+            node_connections
+                .online_node_ids(identity.home_group_id)
+                .await,
+        );
+        statuses.insert((identity.home_group_id, identity.node_id), raw);
+    }
+    if !allow_duplicate_node_ids {
+        let mut seen = HashSet::new();
+        if statuses.keys().any(|(_, node_id)| !seen.insert(node_id)) {
+            return Err(RelayPreferenceError::Database(DbError::Other(
+                sqlx::Error::Protocol("ambiguous concrete node_id in business group".into()),
+            )));
+        }
     }
     Ok(statuses
         .into_iter()
-        .map(|(node_id, raw_status)| {
+        .map(|((identity_group_id, node_id), raw_status)| {
             let raw_status = (!raw_status.is_empty()).then_some(raw_status.as_str());
-            evaluate_node(node_id, raw_status, now, &live_node_ids, &rules)
+            let mut evaluated = evaluate_node(
+                identity_group_id,
+                node_id.clone(),
+                raw_status,
+                now,
+                &live_by_identity[&identity_group_id],
+                &rules,
+            );
+            evaluated.info.display_name = pool_records
+                .iter()
+                .find(|record| {
+                    record.identity_group_id == identity_group_id && record.node_id == node_id
+                })
+                .map(|record| record.display_name.clone())
+                .unwrap_or_default();
+            evaluated.info.public_ipv6 = raw_status
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|status| {
+                    status
+                        .get("public_ipv6")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+            evaluated
         })
         .collect())
 }
@@ -1434,7 +1799,7 @@ pub(crate) async fn evaluate_group_ready_nodes(
     node_connections: &NodeConnections,
     group_id: i64,
 ) -> Result<Vec<RelayReadyNode>, RelayPreferenceError> {
-    Ok(evaluate_group_nodes(db, node_connections, group_id)
+    Ok(evaluate_carrier_group_nodes(db, node_connections, group_id)
         .await?
         .into_iter()
         .map(|node| node.info)
@@ -1633,6 +1998,7 @@ pub async fn remove_node_assignment(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CarrierPolicyChange {
     line_id: String,
+    line_key: String,
     old: Option<CarrierLineBinding>,
     new: Option<CarrierLineBinding>,
 }
@@ -1652,24 +2018,25 @@ fn carrier_policy_diff(
     let active = active
         .bindings
         .iter()
-        .map(|binding| (binding.line_id.as_str(), binding))
+        .map(|binding| (carrier_binding_sync_key(binding), binding))
         .collect::<BTreeMap<_, _>>();
     let requested = requested
         .bindings
         .iter()
-        .map(|binding| (binding.line_id.as_str(), binding))
+        .map(|binding| (carrier_binding_sync_key(binding), binding))
         .collect::<BTreeMap<_, _>>();
     active
         .keys()
         .chain(requested.keys())
-        .copied()
+        .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .filter_map(|line_id| {
-            let old = active.get(line_id).map(|binding| (*binding).clone());
-            let new = requested.get(line_id).map(|binding| (*binding).clone());
+        .filter_map(|line_key| {
+            let old = active.get(&line_key).map(|binding| (*binding).clone());
+            let new = requested.get(&line_key).map(|binding| (*binding).clone());
             (old != new).then(|| CarrierPolicyChange {
-                line_id: line_id.to_string(),
+                line_id: new.as_ref().or(old.as_ref()).unwrap().line_id.clone(),
+                line_key,
                 old,
                 new,
             })
@@ -1686,27 +2053,26 @@ fn carrier_policy_transaction_diff(
         let active_by_line = active
             .bindings
             .iter()
-            .map(|binding| (binding.line_id.as_str(), binding))
+            .map(|binding| (carrier_binding_sync_key(binding), binding))
             .collect::<BTreeMap<_, _>>();
         for binding in requested
             .bindings
             .iter()
             .filter(|binding| binding.mode == CarrierLineMode::FollowDefault)
         {
-            if changes
-                .iter()
-                .all(|change| change.line_id != binding.line_id)
-            {
+            let line_key = carrier_binding_sync_key(binding);
+            if changes.iter().all(|change| change.line_key != line_key) {
                 changes.push(CarrierPolicyChange {
                     line_id: binding.line_id.clone(),
+                    line_key: line_key.clone(),
                     old: active_by_line
-                        .get(binding.line_id.as_str())
+                        .get(&line_key)
                         .map(|binding| (*binding).clone()),
                     new: Some(binding.clone()),
                 });
             }
         }
-        changes.sort_by(|left, right| left.line_id.cmp(&right.line_id));
+        changes.sort_by(|left, right| left.line_key.cmp(&right.line_key));
     }
     changes
 }
@@ -1732,6 +2098,7 @@ async fn default_relay_value(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CarrierLineDesired {
     pub line_id: String,
+    pub line_key: String,
     pub action: RelayDnsAction,
     pub value: Option<String>,
 }
@@ -1764,13 +2131,14 @@ pub(crate) async fn carrier_line_desired_for_rule(
         .await
         .map_err(|error| DbError::Other(sqlx::Error::Protocol(error.to_string())))?;
     let mut desired = BTreeMap::new();
-    let mut configured_lines = HashSet::new();
+    let mut configured_keys = HashSet::new();
     for binding in preference.carrier_policy.bindings.iter().filter(|binding| {
         active_mode == RoutingMode::Carrier
             && !carrier_line_uses_default_authority(&binding.line_id)
     }) {
-        configured_lines.insert(binding.line_id.clone());
-        let value = match binding.mode {
+        let line_key = carrier_binding_sync_key(binding);
+        configured_keys.insert(line_key.clone());
+        let observed = match binding.mode {
             CarrierLineMode::FollowDefault => {
                 let node_id = preference
                     .carrier_policy
@@ -1785,41 +2153,44 @@ pub(crate) async fn carrier_line_desired_for_rule(
                     });
                 match node_id {
                     Some(node_id) => {
-                        match stored_node_public_ipv4(db, rule.device_group_in, node_id).await? {
-                            RelayDnsTarget::Resolved(value) => Some(value),
-                            RelayDnsTarget::NotSet
-                            | RelayDnsTarget::Frozen
-                            | RelayDnsTarget::Invalid(_) => None,
-                        }
+                        carrier_status_value(db, rule.device_group_in, node_id, None).await?
                     }
                     None if preference.active_routing_mode.is_none() => {
                         valid_public_ipv4(Some(&group.connect_host))
+                            .map(CarrierAvailability::Serving)
+                            .unwrap_or(CarrierAvailability::NotServing)
                     }
-                    None => None,
+                    None => CarrierAvailability::NotServing,
                 }
             }
             CarrierLineMode::Node => match binding.node_id.as_deref() {
                 Some(node_id) => {
-                    match stored_node_public_ipv4(db, rule.device_group_in, node_id).await? {
-                        RelayDnsTarget::Resolved(value) => Some(value),
-                        RelayDnsTarget::NotSet
-                        | RelayDnsTarget::Frozen
-                        | RelayDnsTarget::Invalid(_) => None,
-                    }
+                    carrier_status_value(
+                        db,
+                        rule.device_group_in,
+                        node_id,
+                        binding.identity_group_id,
+                    )
+                    .await?
                 }
-                None => None,
+                None => CarrierAvailability::NotServing,
             },
         };
-        if let Some(value) = value {
-            desired.insert(
-                binding.line_id.clone(),
-                CarrierLineDesired {
-                    line_id: binding.line_id.clone(),
-                    action: RelayDnsAction::Upsert,
-                    value: Some(value),
+        let value =
+            latched_carrier_value(db, rule.device_group_in, rule_id, &line_key, observed).await?;
+        desired.insert(
+            line_key.clone(),
+            CarrierLineDesired {
+                line_id: binding.line_id.clone(),
+                line_key,
+                action: if value.is_some() {
+                    RelayDnsAction::Upsert
+                } else {
+                    RelayDnsAction::Delete
                 },
-            );
-        }
+                value,
+            },
+        );
     }
 
     if preference.transaction_kind.is_some()
@@ -1831,16 +2202,17 @@ pub(crate) async fn carrier_line_desired_for_rule(
         for record in preference.dns_records.iter().filter(|record| {
             record.rule_id == rule_id && record.line_key != crate::service::dnsmgr::DEFAULT_LINE_KEY
         }) {
-            configured_lines.insert(record.line_id.clone());
+            configured_keys.insert(record.line_key.clone());
             let (action, value) = if preference.state == RelayPreferencePhase::RollingBack {
                 (record.rollback_action, record.rollback_value.clone())
             } else {
                 (record.target_action, record.target_value.clone())
             };
             desired.insert(
-                record.line_id.clone(),
+                record.line_key.clone(),
                 CarrierLineDesired {
                     line_id: record.line_id.clone(),
+                    line_key: record.line_key.clone(),
                     action,
                     value,
                 },
@@ -1850,14 +2222,15 @@ pub(crate) async fn carrier_line_desired_for_rule(
 
     for sync in db.list_dns_record_syncs_for_rule(rule_id).await? {
         if sync.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY
-            || configured_lines.contains(&sync.line)
+            || configured_keys.contains(&sync.line_key)
         {
             continue;
         }
         desired.insert(
-            sync.line.clone(),
+            sync.line_key.clone(),
             CarrierLineDesired {
                 line_id: sync.line,
+                line_key: sync.line_key,
                 action: RelayDnsAction::Delete,
                 value: None,
             },
@@ -1876,6 +2249,21 @@ fn carrier_sync_key(line_id: &str) -> String {
     }
 }
 
+fn carrier_binding_sync_key(binding: &CarrierLineBinding) -> String {
+    match (
+        binding.mode,
+        binding.identity_group_id,
+        binding.node_id.as_deref(),
+    ) {
+        (CarrierLineMode::Node, Some(identity_group_id), Some(node_id)) => format!(
+            "carrier-target:{}:{identity_group_id}:{}",
+            hex::encode(binding.line_id.as_bytes()),
+            hex::encode(node_id.as_bytes())
+        ),
+        _ => carrier_sync_key(&binding.line_id),
+    }
+}
+
 fn carrier_binding_target(
     binding: &CarrierLineBinding,
     default_value: Option<&str>,
@@ -1886,13 +2274,14 @@ fn carrier_binding_target(
         CarrierLineMode::FollowDefault => {
             let default_value = default_value.expect("FollowDefault preflight resolved default");
             if let Some(node_id) = default_node_id {
-                let Some(node) = evaluated
+                let matches = evaluated
                     .iter()
-                    .find(|candidate| candidate.info.node_id == node_id)
-                else {
+                    .filter(|candidate| candidate.info.node_id == node_id)
+                    .collect::<Vec<_>>();
+                let [node] = matches.as_slice() else {
                     return Err(CarrierPolicyApplyError::NodeNotInGroup(node_id.into()));
                 };
-                if !node.info.ready {
+                if !node_serving_eligible(node) {
                     return Ok((Some(node_id.into()), None));
                 }
             }
@@ -1906,13 +2295,19 @@ fn carrier_binding_target(
                 .node_id
                 .as_deref()
                 .expect("normalized Node binding has node_id");
-            let Some(node) = evaluated
+            let matches = evaluated
                 .iter()
-                .find(|candidate| candidate.info.node_id == node_id)
-            else {
+                .filter(|candidate| {
+                    candidate.info.node_id == node_id
+                        && binding
+                            .identity_group_id
+                            .is_none_or(|id| candidate.info.identity_group_id == id)
+                })
+                .collect::<Vec<_>>();
+            let [node] = matches.as_slice() else {
                 return Err(CarrierPolicyApplyError::NodeNotInGroup(node_id.into()));
             };
-            if !node.info.ready {
+            if !node_serving_eligible(node) {
                 return Ok((Some(node_id.into()), None));
             }
             let Some(value) = valid_public_ipv4(node.public_ipv4.as_deref()) else {
@@ -1923,6 +2318,15 @@ fn carrier_binding_target(
             Ok((Some(node_id.into()), Some(value)))
         }
     }
+}
+
+fn node_serving_eligible(node: &EvaluatedNode) -> bool {
+    node.info.online
+        && node
+            .info
+            .ready_reasons
+            .iter()
+            .all(|reason| reason == "CONTROL_CHANNEL_OFFLINE")
 }
 
 fn map_snapshot_error(
@@ -2006,10 +2410,11 @@ async fn mode_default_target(
         RoutingMode::Normal => RoutingModeTransitionError::NormalDefaultNotReady(node_id.into()),
         _ => RoutingModeTransitionError::CarrierDefaultNotReady(node_id.into()),
     };
-    let Some(node) = evaluated
+    let matching = evaluated
         .iter()
-        .find(|candidate| candidate.info.node_id == node_id)
-    else {
+        .filter(|candidate| candidate.info.node_id == node_id)
+        .collect::<Vec<_>>();
+    let [node] = matching.as_slice() else {
         return Err(not_ready());
     };
     if !node.info.ready || node_is_uninstalling(db, group_id, node_id).await? {
@@ -2074,7 +2479,7 @@ async fn build_mode_transition_records(
                 evaluated,
             )
             .map_err(|error| RoutingModeTransitionError::ProviderPreflight(error.to_string()))?;
-            targets.insert(change.line_id.clone(), value);
+            targets.insert(change.line_key.clone(), value);
         }
     }
 
@@ -2120,13 +2525,18 @@ async fn build_mode_transition_records(
             });
         }
         for change in &line_changes {
-            let snapshot =
-                crate::service::dnsmgr::inspect_line_record(db, client, *rule_id, &change.line_id)
-                    .await
-                    .map_err(|error| map_mode_snapshot_error(*rule_id, &change.line_id, error))?;
+            let snapshot = crate::service::dnsmgr::inspect_carrier_target_record(
+                db,
+                client,
+                *rule_id,
+                &change.line_id,
+                &change.line_key,
+            )
+            .await
+            .map_err(|error| map_mode_snapshot_error(*rule_id, &change.line_id, error))?;
             let (rollback_action, rollback_value, rollback_record_id) = snapshot_rollback(snapshot);
             let (target_action, target_value) = match change.new.as_ref() {
-                Some(_) => match targets.get(&change.line_id).cloned().flatten() {
+                Some(_) => match targets.get(&change.line_key).cloned().flatten() {
                     Some(value) => (RelayDnsAction::Upsert, Some(value)),
                     None => (RelayDnsAction::Delete, None),
                 },
@@ -2136,7 +2546,7 @@ async fn build_mode_transition_records(
                 rule_id: *rule_id,
                 fqdn: fqdn.clone(),
                 line_id: change.line_id.clone(),
-                line_key: carrier_sync_key(&change.line_id),
+                line_key: change.line_key.clone(),
                 target_action,
                 target_value,
                 rollback_action,
@@ -2226,6 +2636,38 @@ pub async fn start_carrier_policy_apply(
         }
     }
     let active_policy = carrier_policy_without_default_authority(&preference.carrier_policy);
+    let membership_nodes = evaluate_carrier_group_nodes(db, node_connections, group_id)
+        .await
+        .map_err(|error| CarrierPolicyApplyError::ProviderPreflight(error.to_string()))?;
+    let mut concrete_targets = BTreeSet::new();
+    for binding in requested
+        .bindings
+        .iter()
+        .filter(|binding| binding.mode == CarrierLineMode::Node)
+    {
+        let node_id = binding.node_id.as_deref().expect("normalized node binding");
+        let candidates = membership_nodes
+            .iter()
+            .filter(|candidate| {
+                candidate.info.node_id == node_id
+                    && binding
+                        .identity_group_id
+                        .is_none_or(|identity| candidate.info.identity_group_id == identity)
+            })
+            .collect::<Vec<_>>();
+        let [candidate] = candidates.as_slice() else {
+            return Err(CarrierPolicyApplyError::NodeNotInGroup(node_id.into()));
+        };
+        if !concrete_targets.insert((
+            binding.line_id.clone(),
+            candidate.info.identity_group_id,
+            node_id,
+        )) {
+            return Err(CarrierPolicyApplyError::InvalidPolicy(
+                CarrierPolicyValidationError::DuplicateTarget,
+            ));
+        }
+    }
     let removed_legacy_default = active_policy != preference.carrier_policy;
     let changes = carrier_policy_transaction_diff(&active_policy, &requested);
     let default_changed = active_policy.default_node_id != requested.default_node_id;
@@ -2276,7 +2718,7 @@ pub async fn start_carrier_policy_apply(
 
     let eligible_rule_ids =
         crate::service::dnsmgr::eligible_rule_ids_for_group(db, group_id).await?;
-    let evaluated = evaluate_group_nodes(db, node_connections, group_id)
+    let evaluated = evaluate_carrier_group_nodes(db, node_connections, group_id)
         .await
         .map_err(|error| match error {
             RelayPreferenceError::Database(error) => CarrierPolicyApplyError::Database(error),
@@ -2291,10 +2733,15 @@ pub async fn start_carrier_policy_apply(
         .default_node_id
         .as_deref()
         .ok_or(CarrierPolicyApplyError::CarrierDefaultRequired)?;
-    let carrier_default = evaluated
+    let defaults = evaluated
         .iter()
-        .find(|node| node.info.node_id == carrier_default_node_id)
-        .ok_or_else(|| CarrierPolicyApplyError::NodeNotInGroup(carrier_default_node_id.into()))?;
+        .filter(|node| node.info.node_id == carrier_default_node_id)
+        .collect::<Vec<_>>();
+    let [carrier_default] = defaults.as_slice() else {
+        return Err(CarrierPolicyApplyError::NodeNotInGroup(
+            carrier_default_node_id.into(),
+        ));
+    };
     if !carrier_default.info.ready {
         return Err(CarrierPolicyApplyError::CarrierDefaultNotReady(
             carrier_default_node_id.into(),
@@ -2332,7 +2779,7 @@ pub async fn start_carrier_policy_apply(
                 requested.default_node_id.as_deref(),
                 &evaluated,
             )?;
-            targets.insert(change.line_id.clone(), value);
+            targets.insert(change.line_key.clone(), value);
         }
     }
     if eligible_rule_ids.is_empty() {
@@ -2398,10 +2845,15 @@ pub async fn start_carrier_policy_apply(
             target_error: None,
         });
         for change in &changes {
-            let snapshot =
-                crate::service::dnsmgr::inspect_line_record(db, &client, *rule_id, &change.line_id)
-                    .await
-                    .map_err(|error| map_snapshot_error(*rule_id, &change.line_id, error))?;
+            let snapshot = crate::service::dnsmgr::inspect_carrier_target_record(
+                db,
+                &client,
+                *rule_id,
+                &change.line_id,
+                &change.line_key,
+            )
+            .await
+            .map_err(|error| map_snapshot_error(*rule_id, &change.line_id, error))?;
             let (rollback_action, rollback_value, rollback_record_id) = match snapshot {
                 crate::service::dnsmgr::LineRecordSnapshot::Absent => {
                     (RelayDnsAction::Delete, None, None)
@@ -2411,7 +2863,7 @@ pub async fn start_carrier_policy_apply(
                 }
             };
             let (target_action, target_value) = match change.new.as_ref() {
-                Some(_) => match targets.get(&change.line_id).cloned().flatten() {
+                Some(_) => match targets.get(&change.line_key).cloned().flatten() {
                     Some(value) => (RelayDnsAction::Upsert, Some(value)),
                     None => (RelayDnsAction::Delete, None),
                 },
@@ -2421,7 +2873,7 @@ pub async fn start_carrier_policy_apply(
                 rule_id: *rule_id,
                 fqdn: fqdn.clone(),
                 line_id: change.line_id.clone(),
-                line_key: carrier_sync_key(&change.line_id),
+                line_key: change.line_key.clone(),
                 target_action,
                 target_value,
                 rollback_action,
@@ -2514,7 +2966,11 @@ pub async fn transition_routing_mode(
             "group has no eligible DNS rules".into(),
         ));
     }
-    let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
+    let evaluated = if source_mode == RoutingMode::Carrier || target_mode == RoutingMode::Carrier {
+        evaluate_carrier_group_nodes(db, node_connections, group_id).await?
+    } else {
+        evaluate_group_nodes(db, node_connections, group_id).await?
+    };
     let client = crate::service::dnsmgr::load_client(db)
         .await
         .map_err(|error| RoutingModeTransitionError::ProviderPreflight(error.to_string()))?
@@ -3166,8 +3622,6 @@ pub(crate) async fn refresh_carrier_desired(
         {
             continue;
         }
-        let evaluated =
-            evaluate_group_nodes(state.db.as_ref(), &state.node_connections, group_id).await?;
         let rule_ids =
             crate::service::dnsmgr::eligible_rule_ids_for_group(state.db.as_ref(), group_id)
                 .await?;
@@ -3183,17 +3637,32 @@ pub(crate) async fn refresh_carrier_desired(
                     preference.carrier_policy.default_node_id.as_deref()
                 }
             };
-            let value = node_id.and_then(|node_id| {
-                evaluated
-                    .iter()
-                    .find(|node| node.info.node_id == node_id && node.info.ready)
-                    .and_then(|node| valid_public_ipv4(node.public_ipv4.as_deref()))
-            });
+            let observed = match node_id {
+                Some(node_id) => {
+                    carrier_status_value(
+                        state.db.as_ref(),
+                        group_id,
+                        node_id,
+                        binding.identity_group_id,
+                    )
+                    .await?
+                }
+                None => CarrierAvailability::NotServing,
+            };
             for rule_id in &rule_ids {
-                crate::service::dnsmgr::project_carrier_line_desired(
+                let value = latched_carrier_value(
+                    state.db.as_ref(),
+                    group_id,
+                    *rule_id,
+                    &carrier_binding_sync_key(binding),
+                    observed.clone(),
+                )
+                .await?;
+                crate::service::dnsmgr::project_carrier_target_desired(
                     state.db.as_ref(),
                     *rule_id,
                     &binding.line_id,
+                    &carrier_binding_sync_key(binding),
                     value.as_deref(),
                 )
                 .await
@@ -3718,11 +4187,12 @@ async fn schedule_transaction_records(
                 let Some(value) = value else {
                     return Err(());
                 };
-                crate::service::dnsmgr::schedule_transaction_line(
+                crate::service::dnsmgr::schedule_transaction_target(
                     db,
                     record.rule_id,
                     &record.fqdn,
                     &record.line_id,
+                    &record.line_key,
                     "UPSERT",
                     Some(value),
                 )
@@ -3733,11 +4203,12 @@ async fn schedule_transaction_records(
                 if value.is_some() {
                     return Err(());
                 }
-                crate::service::dnsmgr::schedule_transaction_line(
+                crate::service::dnsmgr::schedule_transaction_target(
                     db,
                     record.rule_id,
                     &record.fqdn,
                     &record.line_id,
+                    &record.line_key,
                     "DELETE",
                     None,
                 )
@@ -4217,7 +4688,7 @@ async fn recheck_carrier_commit_targets(
     let bindings = pending
         .bindings
         .iter()
-        .map(|binding| (binding.line_id.as_str(), binding))
+        .map(|binding| (carrier_binding_sync_key(binding), binding))
         .collect::<BTreeMap<_, _>>();
     let mut changed_targets = BTreeMap::<&str, &str>::new();
     for record in preference
@@ -4229,7 +4700,7 @@ async fn recheck_carrier_commit_targets(
             return Ok(Err("CARRIER_TARGET_VALUE_UNAVAILABLE"));
         };
         if changed_targets
-            .insert(record.line_id.as_str(), value)
+            .insert(record.line_key.as_str(), value)
             .is_some_and(|existing| existing != value)
         {
             return Ok(Err("CARRIER_TARGET_VALUE_INCONSISTENT"));
@@ -4239,13 +4710,13 @@ async fn recheck_carrier_commit_targets(
         return Ok(Ok(()));
     }
 
-    let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
+    let evaluated = evaluate_carrier_group_nodes(db, node_connections, group_id).await?;
     let group = GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await?;
     let Some(group) = group.filter(|group| group.group_type == "in") else {
         return Ok(Err("CARRIER_GROUP_UNAVAILABLE_AFTER_DNS"));
     };
-    for (line_id, expected_value) in changed_targets {
-        if line_id == crate::service::dnsmgr::DEFAULT_LINE_KEY {
+    for (line_key, expected_value) in changed_targets {
+        if line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY {
             let Some(node_id) = pending.default_node_id.as_deref() else {
                 return Ok(Err("CARRIER_DEFAULT_NODE_MISSING"));
             };
@@ -4266,7 +4737,7 @@ async fn recheck_carrier_commit_targets(
             }
             continue;
         }
-        let Some(binding) = bindings.get(line_id) else {
+        let Some(binding) = bindings.get(line_key) else {
             return Ok(Err("CARRIER_TARGET_BINDING_MISSING"));
         };
         let node_id = match binding.mode {
@@ -4285,10 +4756,12 @@ async fn recheck_carrier_commit_targets(
             }
             continue;
         };
-        let Some(node) = evaluated
-            .iter()
-            .find(|candidate| candidate.info.node_id == node_id)
-        else {
+        let Some(node) = evaluated.iter().find(|candidate| {
+            candidate.info.node_id == node_id
+                && binding
+                    .identity_group_id
+                    .is_none_or(|identity| candidate.info.identity_group_id == identity)
+        }) else {
             return Ok(Err("CARRIER_TARGET_NOT_READY_AFTER_DNS"));
         };
         let Some(current_value) = valid_public_ipv4(node.public_ipv4.as_deref()) else {
@@ -4297,7 +4770,7 @@ async fn recheck_carrier_commit_targets(
         if current_value != expected_value {
             return Ok(Err("CARRIER_TARGET_PUBLIC_IPV4_CHANGED"));
         }
-        if !node.info.ready {
+        if !node_serving_eligible(node) {
             return Ok(Err("CARRIER_TARGET_NOT_READY_AFTER_DNS"));
         }
     }
@@ -4384,11 +4857,16 @@ async fn finalize_routing_mode_transition(
             )
             .await;
         };
-        let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
-        if !evaluated
+        let evaluated = if target_mode == RoutingMode::Carrier {
+            evaluate_carrier_group_nodes(db, node_connections, group_id).await?
+        } else {
+            evaluate_group_nodes(db, node_connections, group_id).await?
+        };
+        let matching = evaluated
             .iter()
-            .any(|node| node.info.node_id == target_node_id && node.info.ready)
-        {
+            .filter(|node| node.info.node_id == target_node_id)
+            .collect::<Vec<_>>();
+        if !matches!(matching.as_slice(), [node] if node.info.ready) {
             return begin_rollback(
                 db,
                 group_id,
@@ -4756,7 +5234,11 @@ pub async fn get_relay_preference(
     } else {
         Vec::new()
     };
-    let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
+    let evaluated = if preference.active_routing_mode == Some(RoutingMode::Carrier) {
+        evaluate_carrier_group_nodes(db, node_connections, group_id).await?
+    } else {
+        evaluate_group_nodes(db, node_connections, group_id).await?
+    };
     let mut dns_records = Vec::with_capacity(preference.dns_records.len());
     for record in &preference.dns_records {
         let sync = db
@@ -4805,7 +5287,13 @@ pub async fn get_relay_preference(
         });
     }
 
-    let preferred_node_id = preference.preferred_node_id.clone();
+    let preferred_node_id = preference.preferred_node_id.clone().filter(|node_id| {
+        evaluated
+            .iter()
+            .filter(|node| node.info.node_id == *node_id)
+            .count()
+            == 1
+    });
     let preferred_ip = evaluated
         .iter()
         .find(|node| Some(node.info.node_id.as_str()) == preferred_node_id.as_deref())
@@ -4836,11 +5324,22 @@ pub async fn get_relay_preference(
     })
 }
 
-fn relay_health_for_node(evaluated: &[EvaluatedNode], node_id: Option<&str>) -> Option<String> {
+fn relay_health_for_node(
+    evaluated: &[EvaluatedNode],
+    node_id: Option<&str>,
+    identity_group_id: Option<i64>,
+) -> Option<String> {
     let node_id = node_id?;
-    let node = evaluated
+    let matches = evaluated
         .iter()
-        .find(|candidate| candidate.info.node_id == node_id)?;
+        .filter(|candidate| {
+            candidate.info.node_id == node_id
+                && identity_group_id.is_none_or(|id| candidate.info.identity_group_id == id)
+        })
+        .collect::<Vec<_>>();
+    let [node] = matches.as_slice() else {
+        return None;
+    };
     Some(
         if node.info.ready {
             "ready"
@@ -4863,7 +5362,7 @@ pub async fn get_carrier_affinity(
         return Err(RelayPreferenceError::Database(DbError::NotFound));
     }
     let preference = load_preference(db, group_id).await?;
-    let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
+    let evaluated = evaluate_carrier_group_nodes(db, node_connections, group_id).await?;
     let (catalog_ids, catalog_stale) =
         match crate::service::carrier_lines::group_catalog(db, group_id).await {
             Ok(catalog) => (
@@ -4888,29 +5387,40 @@ pub async fn get_carrier_affinity(
             CarrierLineMode::FollowDefault => preference.preferred_node_id.clone(),
             CarrierLineMode::Node => binding.node_id.clone(),
         };
-        let line_key = carrier_sync_key(&binding.line_id);
+        let line_key = carrier_binding_sync_key(binding);
+        let recovering = db
+            .get(&format!("carrier_health:{group_id}:{line_key}"))
+            .await?
+            .and_then(|raw| serde_json::from_str::<CarrierHealthLatch>(&raw).ok())
+            .is_some_and(|latch| latch.recovery_since.is_some());
         let mut states = Vec::with_capacity(eligible.len());
         for rule_id in &eligible {
             states.push(
                 db.find_dns_record_sync(*rule_id, &line_key)
                     .await?
-                    .map(|sync| sync.state),
+                    .map(|sync| (sync.state, sync.desired_action)),
             );
         }
         let dns_state = if states.is_empty() {
             "pending"
-        } else if states
-            .iter()
-            .all(|state| state.as_deref() == Some("PROPAGATED"))
-        {
-            "effective"
         } else if states.iter().any(|state| {
             matches!(
-                state.as_deref(),
-                Some("CONFLICT" | "MUTATION_OUTCOME_UNKNOWN" | "FAILED")
+                state,
+                Some((status, _)) if matches!(status.as_str(), "CONFLICT" | "MUTATION_OUTCOME_UNKNOWN" | "FAILED")
             )
         }) {
             "failed"
+        } else if recovering {
+            "recovering"
+        } else if states.iter().all(|state| {
+            matches!(state, Some((status, action)) if status == "PROPAGATED" && action == "DELETE")
+        }) {
+            "removed"
+        } else if states
+            .iter()
+            .all(|state| matches!(state, Some((status, action)) if status == "PROPAGATED" && action == "UPSERT"))
+        {
+            "effective"
         } else {
             "applying"
         };
@@ -4918,8 +5428,13 @@ pub async fn get_carrier_affinity(
             line_id: binding.line_id.clone(),
             mode: binding.mode,
             node_id: binding.node_id.clone(),
+            identity_group_id: binding.identity_group_id,
             effective_node_id: effective_node_id.clone(),
-            relay_health: relay_health_for_node(&evaluated, effective_node_id.as_deref()),
+            relay_health: relay_health_for_node(
+                &evaluated,
+                effective_node_id.as_deref(),
+                binding.identity_group_id,
+            ),
             catalog_available: catalog_ids.contains(&binding.line_id),
             dns_state: dns_state.into(),
         });
@@ -5052,7 +5567,7 @@ mod tests {
         } else {
             HashSet::new()
         };
-        evaluate_node("node-a".into(), Some(raw), Utc::now(), &ids, rules).info
+        evaluate_node(1, "node-a".into(), Some(raw), Utc::now(), &ids, rules).info
     }
 
     #[test]
@@ -5810,11 +6325,13 @@ mod tests {
                     line_id: "Dianxin_Shandong".into(),
                     mode: CarrierLineMode::FollowDefault,
                     node_id: None,
+                    identity_group_id: None,
                 },
                 CarrierLineBinding {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::Node,
                     node_id: Some(" node-b ".into()),
+                    identity_group_id: None,
                 },
             ],
         }
@@ -5836,11 +6353,13 @@ mod tests {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::FollowDefault,
                     node_id: None,
+                    identity_group_id: None,
                 },
                 CarrierLineBinding {
                     line_id: "dianxin".into(),
                     mode: CarrierLineMode::FollowDefault,
                     node_id: None,
+                    identity_group_id: None,
                 },
             ],
         };
@@ -5848,26 +6367,48 @@ mod tests {
     }
 
     #[test]
-    fn carrier_policy_rejects_duplicate_and_invalid_mode_payloads() {
+    fn carrier_policy_allows_same_line_on_different_nodes_but_rejects_duplicate_target() {
         let duplicate = CarrierPolicy {
             default_node_id: None,
             bindings: vec![
                 CarrierLineBinding {
                     line_id: "Dianxin".into(),
-                    mode: CarrierLineMode::FollowDefault,
-                    node_id: None,
+                    mode: CarrierLineMode::Node,
+                    node_id: Some("node-a".into()),
+                    identity_group_id: Some(7),
                 },
                 CarrierLineBinding {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::Node,
                     node_id: Some("node-a".into()),
+                    identity_group_id: Some(7),
                 },
             ],
         };
         assert_eq!(
             duplicate.normalize(),
-            Err(CarrierPolicyValidationError::DuplicateLineId)
+            Err(CarrierPolicyValidationError::DuplicateTarget)
         );
+        let multi = CarrierPolicy {
+            default_node_id: None,
+            bindings: vec![
+                CarrierLineBinding {
+                    line_id: "Dianxin".into(),
+                    mode: CarrierLineMode::Node,
+                    node_id: Some("node-a".into()),
+                    identity_group_id: Some(7),
+                },
+                CarrierLineBinding {
+                    line_id: "Dianxin".into(),
+                    mode: CarrierLineMode::Node,
+                    node_id: Some("node-b".into()),
+                    identity_group_id: Some(8),
+                },
+            ],
+        }
+        .normalize()
+        .unwrap();
+        assert_eq!(multi.bindings.len(), 2);
         assert_eq!(
             CarrierPolicy {
                 default_node_id: None,
@@ -5875,6 +6416,7 @@ mod tests {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::FollowDefault,
                     node_id: Some("node-a".into()),
+                    identity_group_id: None,
                 }]
             }
             .normalize(),
@@ -5887,6 +6429,7 @@ mod tests {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::Node,
                     node_id: None,
+                    identity_group_id: None,
                 }]
             }
             .normalize(),
@@ -5904,6 +6447,7 @@ mod tests {
                         line_id: line_id.into(),
                         mode: CarrierLineMode::Node,
                         node_id: Some("node-a".into()),
+                        identity_group_id: None,
                     }]
                 }
                 .normalize(),
@@ -6007,6 +6551,7 @@ mod tests {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::Node,
                     node_id: Some("node-b".into()),
+                    identity_group_id: None,
                 }],
             }),
             dns_records: vec![
@@ -6159,7 +6704,7 @@ mod tests {
     #[test]
     fn missing_status_fails_closed_even_with_live_ws() {
         let ids = HashSet::from(["node-a".to_string()]);
-        let node = evaluate_node("node-a".into(), None, Utc::now(), &ids, &[]).info;
+        let node = evaluate_node(1, "node-a".into(), None, Utc::now(), &ids, &[]).info;
         assert!(!node.ready);
         assert_eq!(node.ready_reasons, vec!["STATUS_MISSING"]);
     }
@@ -6177,6 +6722,83 @@ mod tests {
         assert_eq!(
             status_identity("node_status:8:node-a"),
             Some((8, "node-a".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn reused_node_readiness_projects_exact_identities_and_legacy_writes_reject_duplicate_ids(
+    ) {
+        use crate::db::schema::SCHEMA_SQL;
+        use crate::db::sqlite_repo::SqliteRepository;
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(SCHEMA_SQL).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, password, admin) VALUES (2, 'owner', 'hash', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (id, name) in [(7, "home"), (8, "reusing")] {
+            sqlx::query("INSERT INTO device_groups (id, name, group_type, token, uid, connect_host) VALUES (?, ?, 'in', ?, 2, '')")
+                .bind(id).bind(name).bind(format!("token-{id}"))
+                .execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO node_reuse_bindings (reusing_group_id, home_group_id, node_id) VALUES (8, 7, 'node-a')")
+            .execute(&pool).await.unwrap();
+        let repo = SqliteRepository::new(pool);
+        repo.set("node_status:7:node-a", &status_with_ip("203.0.113.5", 0))
+            .await
+            .unwrap();
+        let connections = NodeConnections::new();
+        let (_conn, _rx) = connections.register(7, Some("node-a".into())).await;
+
+        let nodes = evaluate_group_ready_nodes(&repo, &connections, 8)
+            .await
+            .unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_id, "node-a");
+        assert!(nodes[0].ready);
+        assert_eq!(
+            stored_node_public_ipv4(&repo, 8, "node-a").await.unwrap(),
+            RelayDnsTarget::Resolved("203.0.113.5".into())
+        );
+
+        repo.set("node_status:8:node-a", &status_with_ip("203.0.113.9", 0))
+            .await
+            .unwrap();
+        let projected = evaluate_group_ready_nodes(&repo, &connections, 8)
+            .await
+            .unwrap();
+        assert_eq!(projected.len(), 2);
+        assert_eq!(
+            projected
+                .iter()
+                .map(|node| node.identity_group_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([7, 8])
+        );
+        assert!(evaluate_group_nodes(&repo, &connections, 8).await.is_err());
+        assert_eq!(
+            carrier_status_value(&repo, 8, "node-a", Some(7))
+                .await
+                .unwrap(),
+            CarrierAvailability::Serving("203.0.113.5".into())
+        );
+        assert_eq!(
+            carrier_status_value(&repo, 8, "node-a", None)
+                .await
+                .unwrap(),
+            CarrierAvailability::NotServing
+        );
+        assert_eq!(
+            stored_node_public_ipv4(&repo, 8, "node-a").await.unwrap(),
+            RelayDnsTarget::Invalid("AMBIGUOUS_NODE_ID")
         );
     }
 
@@ -6382,6 +7004,7 @@ mod tests {
                     line_id: "Dianxin".into(),
                     mode: CarrierLineMode::Node,
                     node_id: Some("node-a".into()),
+                    identity_group_id: None,
                 }],
             },
         )
@@ -6775,6 +7398,7 @@ mod tests {
             line_id: line_id.into(),
             mode,
             node_id: node_id.map(str::to_string),
+            identity_group_id: None,
         }
     }
 
@@ -6899,6 +7523,9 @@ mod tests {
         let ready = EvaluatedNode {
             info: RelayReadyNode {
                 node_id: "node-a".into(),
+                identity_group_id: 1,
+                display_name: String::new(),
+                public_ipv6: None,
                 public_ipv4: Some("203.0.113.5".into()),
                 online: true,
                 ready: true,
@@ -6910,6 +7537,9 @@ mod tests {
         let unhealthy = EvaluatedNode {
             info: RelayReadyNode {
                 node_id: "node-b".into(),
+                identity_group_id: 1,
+                display_name: String::new(),
+                public_ipv6: None,
                 public_ipv4: Some("203.0.113.6".into()),
                 online: true,
                 ready: false,
@@ -6937,6 +7567,9 @@ mod tests {
                 &[EvaluatedNode {
                     info: RelayReadyNode {
                         node_id: "node-b".into(),
+                        identity_group_id: 1,
+                        display_name: String::new(),
+                        public_ipv6: None,
                         public_ipv4: Some("203.0.113.6".into()),
                         online: true,
                         ready: false,
@@ -6959,6 +7592,9 @@ mod tests {
                 &[EvaluatedNode {
                     info: RelayReadyNode {
                         node_id: "node-c".into(),
+                        identity_group_id: 1,
+                        display_name: String::new(),
+                        public_ipv6: None,
                         public_ipv4: Some("203.0.113.7".into()),
                         online: true,
                         ready: true,
@@ -6971,6 +7607,45 @@ mod tests {
             .unwrap(),
             (Some("node-c".into()), Some("203.0.113.7".into()))
         );
+    }
+
+    #[test]
+    fn carrier_health_hysteresis_holds_transient_failure_and_recovery() {
+        let now = DateTime::parse_from_rfc3339("2026-09-29T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let published = advance_carrier_health_latch(
+            CarrierHealthLatch::default(),
+            CarrierAvailability::Serving("192.0.2.21".into()),
+            now,
+        );
+        assert_eq!(published.effective_value.as_deref(), Some("192.0.2.21"));
+        let failed = advance_carrier_health_latch(
+            published,
+            CarrierAvailability::NotServing,
+            now + chrono::Duration::seconds(1),
+        );
+        assert_eq!(failed.effective_value.as_deref(), Some("192.0.2.21"));
+        let removed = advance_carrier_health_latch(
+            failed,
+            CarrierAvailability::NotServing,
+            now + chrono::Duration::seconds(91),
+        );
+        assert_eq!(removed.effective_value, None);
+        let recovering = advance_carrier_health_latch(
+            removed,
+            CarrierAvailability::Serving("192.0.2.21".into()),
+            now + chrono::Duration::seconds(92),
+        );
+        assert_eq!(recovering.effective_value, None);
+        let restored = advance_carrier_health_latch(
+            recovering,
+            CarrierAvailability::Serving("192.0.2.21".into()),
+            now + chrono::Duration::seconds(112),
+        );
+        assert_eq!(restored.effective_value.as_deref(), Some("192.0.2.21"));
+        let retired = advance_carrier_health_latch(restored, CarrierAvailability::Retired, now);
+        assert_eq!(retired.effective_value, None);
     }
 
     #[tokio::test]
@@ -7443,6 +8118,101 @@ mod tests {
         let rolled_back = load_preference(&repo, 7).await.unwrap();
         assert_eq!(rolled_back.state, RelayPreferencePhase::FailedRolledBack);
         assert_eq!(rolled_back.carrier_policy, active);
+    }
+
+    #[tokio::test]
+    async fn carrier_multi_target_rollback_keeps_existing_node_record() {
+        let (repo, connections, _) = switch_fixture().await;
+        let existing = carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-a"));
+        let node_b = CarrierLineBinding {
+            line_id: "Dianxin".into(),
+            mode: CarrierLineMode::Node,
+            node_id: Some("node-b".into()),
+            identity_group_id: Some(7),
+        };
+        let node_b_key = carrier_binding_sync_key(&node_b);
+        let existing_record = carrier_record(
+            1,
+            "Dianxin",
+            RelayDnsAction::Upsert,
+            Some("203.0.113.5"),
+            RelayDnsAction::Upsert,
+            Some("203.0.113.5"),
+        );
+        let mut new_record = carrier_record(
+            1,
+            "Dianxin",
+            RelayDnsAction::Upsert,
+            Some("203.0.113.6"),
+            RelayDnsAction::Delete,
+            None,
+        );
+        new_record.line_key = node_b_key.clone();
+        let records = vec![existing_record, new_record];
+        store_preference(
+            &repo,
+            7,
+            &RelayPreferenceState {
+                preferred_node_id: Some("node-a".into()),
+                carrier_policy: CarrierPolicy {
+                    default_node_id: None,
+                    bindings: vec![existing.clone()],
+                },
+                pending_carrier_policy: Some(CarrierPolicy {
+                    default_node_id: None,
+                    bindings: vec![existing, node_b],
+                }),
+                transaction_kind: Some(RelayTransactionKind::CarrierPolicyApply),
+                state: RelayPreferencePhase::Switching,
+                dns_records: records.clone(),
+                ..RelayPreferenceState::default()
+            },
+        )
+        .await
+        .unwrap();
+        schedule_transaction_records(&repo, &records, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.find_dns_record_sync(1, "dnsmgr:Dianxin")
+                .await
+                .unwrap()
+                .unwrap()
+                .expected_value
+                .as_deref(),
+            Some("203.0.113.5")
+        );
+        assert_eq!(
+            repo.find_dns_record_sync(1, &node_b_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .expected_value
+                .as_deref(),
+            Some("203.0.113.6")
+        );
+        set_line_sync_state(&repo, 1, "dnsmgr:Dianxin", "PROPAGATED", None).await;
+        set_line_sync_state(&repo, 1, &node_b_key, "FAILED", Some("DNS_CONFLICT")).await;
+        assert!(matches!(
+            finalize_switching_group(&repo, &connections, 7)
+                .await
+                .unwrap(),
+            FinalizeOutcome::RollbackStarted { .. }
+        ));
+        let node_a_sync = repo
+            .find_dns_record_sync(1, "dnsmgr:Dianxin")
+            .await
+            .unwrap()
+            .unwrap();
+        let node_b_sync = repo
+            .find_dns_record_sync(1, &node_b_key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node_a_sync.desired_action, "UPSERT");
+        assert_eq!(node_a_sync.expected_value.as_deref(), Some("203.0.113.5"));
+        assert_eq!(node_b_sync.desired_action, "DELETE");
+        assert_eq!(node_b_sync.expected_value, None);
     }
 
     #[tokio::test]

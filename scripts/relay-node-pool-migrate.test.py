@@ -22,6 +22,13 @@ class MigrationRecoveryTests(unittest.TestCase):
         self.identity = {"home_group_id": 7, "node_id": "NODE_A"}
         self.state = {"credential_id": "credential-a", "delivery_nonce": "nonce-a"}
 
+    def test_failure_stages_are_stable_and_secret_free(self):
+        self.assertEqual(migrate.stage_for("node/identity"), "POOL_CREDENTIAL_VERIFY_FAILED")
+        self.assertEqual(migrate.stage_for("node-credential-claims/x/credential/prepare"), "POOL_CREDENTIAL_PREPARE_FAILED")
+        self.assertEqual(migrate.stage_for("node-credential-claims/x/credential/activate"), "POOL_CREDENTIAL_ACTIVATE_FAILED")
+        error = migrate.PoolCredentialFailure("POOL_CREDENTIAL_CLAIM_FAILED", "HTTP_409")
+        self.assertNotIn("secret", str(error).lower())
+
     def test_successful_activation(self):
         calls = []
         def request(*args):

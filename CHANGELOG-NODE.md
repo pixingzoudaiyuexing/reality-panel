@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.4.0] - Unreleased
+
+- Reports automatic identity-migration capability separately from authentication hot reload.
+- Persists administrator-authorized migration privately, retries completion after lost acknowledgement, and prevents Legacy config from replacing working LKG during the transition.
+- No Node binary for this version has been released or deployed.
+
 ## [1.3.0] - Release Candidate (2026-09-28)
 
 ### 新增 / 改进

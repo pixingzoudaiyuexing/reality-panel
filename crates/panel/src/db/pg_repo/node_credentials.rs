@@ -156,6 +156,9 @@ impl NodeCredentialRepository for PgRepository {
                  updated_at = to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') \
              WHERE credential_id = $1 AND home_group_id = $2 AND node_id = $3 AND generation = $4 \
                AND activated_at IS NULL AND revoked_at IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM node_pool_nodes AS pool \
+                   WHERE pool.identity_group_id = candidate.home_group_id \
+                     AND pool.node_id = candidate.node_id AND pool.retirement_state = 'RETIRED') \
                AND NOT EXISTS ( \
                    SELECT 1 FROM node_credentials AS history \
                    WHERE history.home_group_id = candidate.home_group_id \

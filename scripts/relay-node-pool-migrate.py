@@ -10,11 +10,51 @@ import json
 import os
 import re
 import stat
+import sys
 import urllib.request
 import urllib.parse
+from urllib.error import HTTPError, URLError
 
 ROOT = "/var/lib/relay-panel/node-claims"
 HELPER_SHA256 = "__STATE_HELPER_SHA256__"
+
+
+class PoolCredentialFailure(RuntimeError):
+    def __init__(self, stage, reason):
+        self.stage = stage
+        self.reason = reason
+        super().__init__(reason)
+
+
+def stage_for(endpoint):
+    if endpoint == "node/identity":
+        return "POOL_CREDENTIAL_VERIFY_FAILED"
+    if endpoint.endswith("/claim"):
+        return "POOL_CREDENTIAL_CLAIM_FAILED"
+    if endpoint.endswith("/credential/prepare"):
+        return "POOL_CREDENTIAL_PREPARE_FAILED"
+    if endpoint.endswith("/credential/activate"):
+        return "POOL_CREDENTIAL_ACTIVATE_FAILED"
+    if endpoint.endswith("/complete"):
+        return "POOL_CREDENTIAL_COMPLETE_FAILED"
+    return "POOL_CREDENTIAL_REQUEST_FAILED"
+
+
+def safe_response_reason(status, body):
+    try:
+        value = json.loads(body.decode("utf-8", "replace"))
+        message = value.get("message") if isinstance(value, dict) else None
+        if isinstance(message, str) and message.startswith("POOL_CREDENTIAL_TRANSPORT_REJECTED:"):
+            reason = message.partition(":")[2]
+            if reason in {
+                "TRUSTED_PROXY_IPS_MISSING_OR_INVALID", "PUBLIC_PANEL_URL_MISSING_OR_INVALID",
+                "PUBLIC_PANEL_URL_NOT_HTTPS", "SOCKET_PEER_NOT_TRUSTED_PROXY",
+                "X_FORWARDED_PROTO_NOT_EXACTLY_HTTPS",
+            }:
+                return f"HTTP_{status}:{message}"
+    except Exception:
+        pass
+    return f"HTTP_{status}"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -26,6 +66,8 @@ def credential_identity_matches(request, secret, credential_id, group_id, node_i
     try:
         return request("node/identity", None, "RelayNodeCredential " + secret, credential_id) == {
             "identity_group_id": group_id, "node_id": node_id}
+    except PoolCredentialFailure:
+        raise
     except Exception:
         return False
 
@@ -34,10 +76,14 @@ def activate_or_verify(request, endpoint, identity, state, secret):
     try:
         request(endpoint, dict(identity, credential_id=state["credential_id"],
             delivery_nonce=state["delivery_nonce"], credential_secret=secret))
-    except Exception:
-        if not credential_identity_matches(request, secret, state["credential_id"],
-                identity["home_group_id"], identity["node_id"]):
-            raise
+    except Exception as activation_error:
+        try:
+            confirmed = credential_identity_matches(request, secret, state["credential_id"],
+                identity["home_group_id"], identity["node_id"])
+        except Exception:
+            confirmed = False
+        if not confirmed:
+            raise activation_error
 
 
 def commit_migration_descriptor(atomic_write, path, descriptor, request, claim_id, secret, credential_id, bootstrap=False):
@@ -84,7 +130,7 @@ def main():
     origin = config.get("PANEL_URL", "").rstrip("/")
     url = urllib.parse.urlsplit(origin)
     if url.scheme != "https" or not url.hostname or url.username or url.password or url.query or url.fragment or url.path:
-        raise RuntimeError("trusted HTTPS Panel origin required")
+        raise PoolCredentialFailure("POOL_CREDENTIAL_TRANSPORT_REJECTED", "PANEL_URL_NOT_HTTPS_ORIGIN")
     token = config.get("NODE_TOKEN", "")
     if not token or any(c.isspace() for c in token):
         raise RuntimeError("trusted legacy authentication unavailable")
@@ -108,7 +154,12 @@ def main():
         raise RuntimeError("unsafe migration lock")
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     opener = urllib.request.build_opener(NoRedirect())
-    helper_bytes = opener.open(origin + "/api/v1/node-pool/credential-state.py", timeout=15).read(100000)
+    try:
+        helper_bytes = opener.open(origin + "/api/v1/node-pool/credential-state.py", timeout=15).read(100000)
+    except HTTPError as error:
+        raise PoolCredentialFailure("POOL_CREDENTIAL_TRANSPORT_REJECTED", f"HTTP_{error.code}") from None
+    except (URLError, TimeoutError, OSError):
+        raise PoolCredentialFailure("POOL_CREDENTIAL_TRANSPORT_REJECTED", "HELPER_FETCH_FAILED") from None
     if hashlib.sha256(helper_bytes).hexdigest() != HELPER_SHA256:
         raise RuntimeError("credential helper integrity mismatch")
     namespace = {"__name__": "credential_state", "__file__": "credential_state"}
@@ -130,15 +181,26 @@ def main():
             headers["X-Node-Credential-ID"] = credential_id
         req = urllib.request.Request(origin + "/api/v1/" + endpoint,
             data=None if body is None else json.dumps(body).encode(), headers=headers)
-        with opener.open(req, timeout=15) as response:
-            raw = response.read(65537)
+        try:
+            with opener.open(req, timeout=15) as response:
+                raw = response.read(65537)
+                status = response.status
+        except HTTPError as error:
+            raw = error.read(65537)
+            reason = safe_response_reason(error.code, raw)
+            stage = "POOL_CREDENTIAL_TRANSPORT_REJECTED" if "POOL_CREDENTIAL_TRANSPORT_REJECTED:" in reason else stage_for(endpoint)
+            raise PoolCredentialFailure(stage, reason) from None
+        except (URLError, TimeoutError, OSError) as error:
+            raise PoolCredentialFailure("POOL_CREDENTIAL_TRANSPORT_REJECTED", type(error).__name__) from None
         if len(raw) > 65536:
             raise RuntimeError("migration response exceeds limit")
         value = json.loads(raw, object_pairs_hook=namespace["reject_duplicates"])
         if not isinstance(value, dict):
             raise RuntimeError("invalid migration response")
         if body is not None and value.get("code") != 0:
-            raise RuntimeError("migration authorization rejected; retry with the same local state")
+            safe_reason = safe_response_reason(status, json.dumps(value).encode())
+            stage = "POOL_CREDENTIAL_TRANSPORT_REJECTED" if "POOL_CREDENTIAL_TRANSPORT_REJECTED:" in safe_reason else stage_for(endpoint)
+            raise PoolCredentialFailure(stage, safe_reason)
         return value
 
     identity = {"home_group_id": args.identity_group_id, "node_id": node_id}
@@ -170,5 +232,11 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        raise SystemExit("安全迁移未完成；原有认证和转发保留。请检查连接与授权后使用同一命令重试。")
+    except PoolCredentialFailure as error:
+        print(f"POOL_CREDENTIAL_STAGE={error.stage}", file=sys.stderr)
+        print(f"POOL_CREDENTIAL_REASON={error.reason}", file=sys.stderr)
+        raise SystemExit("Pool credential bootstrap failed")
+    except Exception as error:
+        print("POOL_CREDENTIAL_STAGE=POOL_CREDENTIAL_LOCAL_FAILED", file=sys.stderr)
+        print(f"POOL_CREDENTIAL_REASON={type(error).__name__}", file=sys.stderr)
+        raise SystemExit("Pool credential bootstrap failed")

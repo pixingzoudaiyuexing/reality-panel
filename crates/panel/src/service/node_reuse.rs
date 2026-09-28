@@ -720,6 +720,30 @@ async fn collect_effective_config_for_node(
             NodeReuseBindingCreateRejection::ReusingGroupNotInbound,
         ));
     }
+    if let Some(candidate_group_id) = candidate_group_id {
+        let reused = db
+            .list_reused_concrete_nodes_for_group(candidate_group_id)
+            .await?;
+        let duplicate_binding = reused.iter().any(|identity| {
+            identity.node_id == node_id.as_str() && identity.home_group_id != home_group_id
+        });
+        let native = db
+            .find_node_pool_record(candidate_group_id, node_id.as_str())
+            .await?
+            .is_some_and(|record| record.retirement_state == "ACTIVE")
+            || db
+                .get(&format!(
+                    "node_status:{candidate_group_id}:{}",
+                    node_id.as_str()
+                ))
+                .await?
+                .is_some();
+        if duplicate_binding || native {
+            return Err(NodeReuseServiceError::AdmissionRejected(
+                NodeReuseBindingCreateRejection::AmbiguousGroupNodeId,
+            ));
+        }
+    }
     let home = crate::db::repo::GroupRepository::find_by_id(db, home_group_id, &ResourceScope::All)
         .await?;
     let Some(home) = home else {

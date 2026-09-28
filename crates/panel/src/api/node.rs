@@ -735,6 +735,7 @@ pub async fn report_status(
             "reconciliation": req.reconciliation,
             "verified_concrete_node": identity.verified().is_some(),
             "auth_reload_supported": headers.get("X-Node-Auth-Reload").is_some_and(|value| value == "1"),
+            "automatic_migration_supported": headers.get("X-Node-Automatic-Migration").is_some_and(|value| value == "1"),
         });
         // Status persistence is best-effort: the original used .ok() to swallow
         // any DB error so a transient failure never broke the report cycle.

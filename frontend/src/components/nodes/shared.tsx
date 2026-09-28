@@ -12,7 +12,7 @@ const { Text } = Typography;
 export function NetworkCell({ row, compact = false }: { row: NodeDisplayRow; t: Tfn; compact?: boolean }) {
   const v4 = row.public_ipv4 ?? row.public_ip;
   const v6 = row.public_ipv6;
-  if (!v4 && !v6) return <Text type="secondary">-</Text>;
+  const name = row.display_name?.trim() || v4 || v6 || row.node_id?.slice(0, 12) || '-';
   const line = (ip: string, code: string | null | undefined) => (
     <div key={ip} className="rp-node-network-line">
       <CountryFlag code={code} />
@@ -23,6 +23,7 @@ export function NetworkCell({ row, compact = false }: { row: NodeDisplayRow; t: 
   );
   return (
     <div className="rp-node-network" data-testid="node-network-cell">
+      <Tooltip title={row.node_id}><Text strong>{name}</Text></Tooltip>
       {v4 ? line(v4, row.ipv4_country_code) : null}
       {v6 ? line(v6, row.ipv6_country_code) : null}
     </div>

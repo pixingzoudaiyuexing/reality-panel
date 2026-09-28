@@ -1,8 +1,12 @@
 # Reality Panel — Roadmap
 
-## Current stage: Node Pool V1 v1.3.0 release candidate pending Primary review
+## Current stage: Node Management V2 implementation on isolated branch
 
-Node Pool V1 projects existing Nodes and memberships without automatic runtime changes, adds Pool-managed names and Group-centric assignment, and provisions new Nodes under a hidden identity anchor. Implementation and RT-001 have passed independent review; isolated Debian 12 amd64 runtime acceptance also passed, including post-migration restart, invalid descriptor and Pool-native SSH Bootstrap flows. Candidate version is `v1.3.0`; it is not released or deployed. The Owner reports stable `v1.1.26` production deployment; that state has not been independently verified in this task. See [ADR 0002](adr/0002-node-pool-v1.md).
+Node Pool V1 projects existing Nodes and memberships without automatic runtime changes, adds Pool-managed names and Group-centric assignment, and provisions new Nodes under a hidden identity anchor. Implementation and RT-001 have passed independent review; isolated Debian 12 amd64 runtime acceptance also passed, including post-migration restart, invalid descriptor and Pool-native SSH Bootstrap flows. GitHub Release `v1.3.0` is published. The Owner previously reported `v1.1.26` production deployment; current production version was not inspected in this task. V2 is not released or deployed. See [ADR 0002](adr/0002-node-pool-v1.md).
+
+Node Management V2 adds unified health, exact membership projection, soft retirement, and one-time historical Legacy identity convergence. New Nodes remain Permanent-Credential-only.
+
+The isolated `1.4.0` implementation also makes Carrier targets many-to-one per provider line with independent Panel-owned A records. Its final source requires independent review before any integration. The public `v1.3.0` Node upgrade path and fresh `1.4.0` SSH Bootstrap have isolated Linux runtime evidence; neither implies production deployment.
 
 ## Stable baseline: Node Reuse product completion
 

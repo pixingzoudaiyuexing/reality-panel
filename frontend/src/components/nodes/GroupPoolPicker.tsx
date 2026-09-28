@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Button, Input, Modal, Select, Space, Typography } from 'antd';
+import { Alert, Button, Collapse, Input, Modal, Select, Space, Tag, Typography } from 'antd';
 import { ReloadOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
 import api from '../../api/client';
-import type { ApiEnvelope, DeviceGroup, NodeReusePreview, NodeReuseRuntimeStatus, PoolNode } from '../../api/types';
+import type { ApiEnvelope, DeviceGroup, NodeOperation, NodeReusePreview, NodeReuseRuntimeStatus, PoolNode } from '../../api/types';
 import { useI18n } from '../../i18n/context';
 import { poolNodeKey, poolNodeName } from './poolNodeName';
 
@@ -15,6 +15,7 @@ export function GroupPoolPicker({ group, onClose, onChanged }: { group: DeviceGr
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [migration, setMigration] = useState<Migration | null>(null);
+  const [convergence, setConvergence] = useState<NodeOperation | null>(null);
   const [saved, setSaved] = useState(false);
   const [sync, setSync] = useState<NodeReuseRuntimeStatus | null>(null);
   const generation = useRef(0);
@@ -43,6 +44,23 @@ export function GroupPoolPicker({ group, onClose, onChanged }: { group: DeviceGr
     const timer = window.setInterval(() => void refresh(), 5000);
     return () => { active = false; window.clearInterval(timer); };
   }, [identityGroupId, nodeId, node?.safe_to_add, migration, saved, load]);
+  useEffect(() => {
+    if (!convergence || !identityGroupId || !nodeId || convergence.status === 'SUCCESS' || convergence.status === 'FAILED') return;
+    let active = true;
+    const refresh = async () => {
+      try {
+        const response = await api.get<unknown, ApiEnvelope<NodeOperation>>(
+          `/admin/nodes/${identityGroupId}/${encodeURIComponent(nodeId)}/operations/${convergence.id}`,
+        );
+        if (active && response.code === 0 && response.data) {
+          setConvergence(response.data);
+          if (response.data.status === 'SUCCESS') await load();
+        }
+      } catch { if (active) setError(t('poolMigrationFailed')); }
+    };
+    const timer = window.setInterval(() => void refresh(), 5000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [convergence, identityGroupId, nodeId, load, t]);
   const check = async () => {
     if (!node) return;
     const request = ++generation.current;
@@ -75,6 +93,20 @@ export function GroupPoolPicker({ group, onClose, onChanged }: { group: DeviceGr
     } catch { if (request === generation.current) setError(t('poolMigrationFailed')); }
     finally { if (request === generation.current) setBusy(false); }
   };
+  const converge = async () => {
+    if (!node) return;
+    setBusy(true); setError(null);
+    try {
+      const response = await api.post<unknown, ApiEnvelope<NodeOperation>>(
+        `/admin/node-pool/nodes/${node.identity_group_id}/${encodeURIComponent(node.node_id)}/identity-convergence`, {},
+      );
+      if (response.code !== 0 || !response.data) throw new Error(response.message);
+      setConvergence(response.data);
+    } catch (cause) {
+      const detail = (cause as { response?: { data?: { message?: string } } }).response?.data?.message;
+      setError(detail === 'AMBIGUOUS_NODE_IDENTITY' ? t('poolIdentityConflict') : t('poolMigrationFailed'));
+    } finally { setBusy(false); }
+  };
   const cancelMigration = async () => {
     const claimId = migration?.claim.claim_id || node?.migration_claim_id;
     if (!claimId) return;
@@ -92,7 +124,7 @@ export function GroupPoolPicker({ group, onClose, onChanged }: { group: DeviceGr
       {error && <Alert type="error" showIcon title={error} />}
       <Select aria-label={t('poolChooseNode')} showSearch style={{ width: '100%' }} disabled={saved || busy}
         value={selected} placeholder={t('poolChooseNode')}
-        onChange={value => { generation.current += 1; setSelected(value); setPreview(null); setMigration(null); setError(null); }}
+        onChange={value => { generation.current += 1; setSelected(value); setPreview(null); setMigration(null); setConvergence(null); setError(null); }}
         options={nodes.map(n => ({ value: poolNodeKey(n), disabled: n.memberships.some(m => m.group_id === group.id),
           label: `${poolNodeName(n)} · ${n.public_ipv4 || n.public_ipv6 || '-'} · ${t(n.online ? 'online' : 'offline')}${n.memberships.some(m => m.group_id === group.id) ? ' · ' + t('poolAlreadyMember') : ''}` }))}
         filterOption={(input, option) => {
@@ -101,19 +133,27 @@ export function GroupPoolPicker({ group, onClose, onChanged }: { group: DeviceGr
         }} />
       {!saved && node?.migration_required && <>
         <Alert type="info" showIcon title={t(node.migration_incomplete ? 'poolMigrationIncomplete' : 'poolMigrationRequired')}
-          description={!node.auth_reload_supported && !node.recovery_available ? t('poolUpgradeRequired') : undefined} />
-        {!migration && (node.recovery_available || !node.migration_pending) && <Button
-          disabled={!node.recovery_available && !node.auth_reload_supported} loading={busy} onClick={() => void migrate()}>
-          {t(node.recovery_available ? 'poolContinueMigration' : 'poolStartMigration')}
+          description={!node.auth_reload_supported ? t('poolUpgradeRequired') : undefined} />
+        {!convergence && !node.migration_pending && <Button type="primary" loading={busy} onClick={() => void converge()}>
+          {t('poolConvergeNode')}
         </Button>}
-        {!migration && node.migration_pending && !node.recovery_available && <Alert type="info" title={t('poolMigrationExistingPending')} />}
-        {!node.credential_active && (migration || node.migration_pending) && <Button loading={busy} onClick={() => void cancelMigration()}>{t('cancel')}</Button>}
-        {migration && <>
-          <Typography.Text>{t('poolMigrationPending')}</Typography.Text>
-          <Typography.Paragraph copyable={{ text: command }}><code style={{ overflowWrap: 'anywhere' }}>{command}</code></Typography.Paragraph>
-          {migration.claim_secret && <Input.Password readOnly value={migration.claim_secret} aria-label={t('poolMigrationSecret')} />}
-          <Typography.Text type="secondary">{migration.claim.expires_at}</Typography.Text>
-        </>}
+        {convergence && <Tag color={convergence.status === 'FAILED' ? 'red' : convergence.status === 'SUCCESS' ? 'green' : 'blue'}>
+          {t(`poolConvergence_${convergence.convergence_phase ?? 'PREPARING_NODE'}`)}
+        </Tag>}
+        {node.migration_pending && !convergence && <Alert type="info" title={t('poolMigrationExistingPending')} />}
+        <Collapse ghost items={[{ key: 'recovery', label: t('poolAdvancedRecovery'), children: <>
+          {!migration && (node.recovery_available || !node.migration_pending) && <Button
+            disabled={!node.recovery_available && !node.auth_reload_supported} loading={busy} onClick={() => void migrate()}>
+            {t(node.recovery_available ? 'poolContinueMigration' : 'poolStartMigration')}
+          </Button>}
+          {!node.credential_active && (migration || node.migration_pending) && <Button loading={busy} onClick={() => void cancelMigration()}>{t('cancel')}</Button>}
+          {migration && <>
+            <Typography.Text>{t('poolMigrationPending')}</Typography.Text>
+            <Typography.Paragraph copyable={{ text: command }}><code style={{ overflowWrap: 'anywhere' }}>{command}</code></Typography.Paragraph>
+            {migration.claim_secret && <Input.Password readOnly value={migration.claim_secret} aria-label={t('poolMigrationSecret')} />}
+            <Typography.Text type="secondary">{migration.claim.expires_at}</Typography.Text>
+          </>}
+        </> }]} />
       </>}
       {!saved && node && !node.safe_to_add && !node.migration_required && <Alert type="error" showIcon title={t('poolCredentialUnavailable')} />}
       {!saved && <Button icon={<SafetyCertificateOutlined />} disabled={!node?.safe_to_add} loading={busy} onClick={() => void check()}>{t('nodeReuseCheck')}</Button>}

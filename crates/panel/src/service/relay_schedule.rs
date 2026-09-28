@@ -262,6 +262,22 @@ async fn save_schedules(
     db: &dyn Repository,
     schedules: &[RelaySchedule],
 ) -> Result<(), RelayScheduleError> {
+    let _retirement_guard = crate::service::node_retirement::RETIREMENT_GATE
+        .lock()
+        .await;
+    if crate::service::node_retirement::references_retired(
+        db,
+        schedules
+            .iter()
+            .map(|schedule| (schedule.group_id, schedule.target_node_id.clone()))
+            .collect(),
+    )
+    .await?
+    {
+        return Err(RelayScheduleError::InvalidInput(
+            "retired node reference".into(),
+        ));
+    }
     let raw = serde_json::to_string(schedules)
         .map_err(|error| RelayScheduleError::InvalidStoredData(error.to_string()))?;
     db.set(RELAY_SWITCH_SCHEDULES_KEY, &raw).await?;
@@ -287,14 +303,37 @@ async fn validate_group_and_target(
         None => return Err(RelayScheduleError::GroupNotFound),
     }
 
-    let prefix = format!("node_status:{group_id}:");
-    let has_status = db
-        .scan_prefix(&prefix)
+    let native = db.find_node_pool_record(group_id, target_node_id).await?;
+    let native_retired = native
+        .as_ref()
+        .is_some_and(|record| record.retirement_state == "RETIRED");
+    let native_known = !native_retired
+        && (native.is_some()
+            || db
+                .get(&format!("node_status:{group_id}:{target_node_id}"))
+                .await?
+                .is_some()
+            || node_connections
+                .online_node_ids(group_id)
+                .await
+                .contains(target_node_id));
+    let reused = db
+        .list_reused_concrete_nodes_for_group(group_id)
         .await?
-        .iter()
-        .any(|(key, _)| key.strip_prefix(&prefix) == Some(target_node_id));
-    let online_nodes = node_connections.online_node_ids(group_id).await;
-    if !has_status && !online_nodes.contains(target_node_id) {
+        .into_iter()
+        .filter(|identity| identity.node_id == target_node_id)
+        .collect::<Vec<_>>();
+    let mut candidates = usize::from(native_known);
+    for identity in reused {
+        if db
+            .find_node_pool_record(identity.home_group_id, &identity.node_id)
+            .await?
+            .is_none_or(|record| record.retirement_state != "RETIRED")
+        {
+            candidates += 1;
+        }
+    }
+    if candidates != 1 {
         return Err(RelayScheduleError::TargetNodeNotFound);
     }
     Ok(target_node_id.to_string())
@@ -830,7 +869,7 @@ pub fn spawn(state: AppState) {
 mod tests {
     use super::*;
     use crate::api::ws::NodeConnections;
-    use crate::db::repo::{GroupRepository, KvsRepository};
+    use crate::db::repo::{GroupRepository, KvsRepository, NodeReuseRepository};
     use crate::db::schema::SCHEMA_SQL;
     use crate::db::sqlite_repo::SqliteRepository;
     use sqlx::sqlite::SqlitePoolOptions;
@@ -1340,6 +1379,39 @@ mod tests {
         unknown.target_node_id = "node-missing".into();
         assert!(matches!(
             create_schedule(&repo, &connections, unknown).await,
+            Err(RelayScheduleError::TargetNodeNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn schedule_accepts_reused_member_but_rejects_duplicate_node_id() {
+        let repo = test_repo().await;
+        repo.insert_group(
+            "business",
+            "in",
+            "token-business",
+            1,
+            "",
+            "1000-1001",
+            1.0,
+            false,
+        )
+        .await
+        .unwrap();
+        let group_id = 2;
+        repo.insert_node_reuse_binding(group_id, 1, "node-a")
+            .await
+            .unwrap();
+        let connections = NodeConnections::new();
+        let mut request = one_time_request();
+        request.group_id = group_id;
+        assert!(create_schedule(&repo, &connections, request).await.is_ok());
+
+        repo.set(&format!("node_status:{group_id}:node-a"), "{}")
+            .await
+            .unwrap();
+        assert!(matches!(
+            validate_group_and_target(&repo, &connections, group_id, "node-a").await,
             Err(RelayScheduleError::TargetNodeNotFound)
         ));
     }

@@ -54,6 +54,16 @@ async fn main() {
 
     let config = Config::load();
 
+    if std::env::var("NODE_CLAIM_TRUSTED_PROXY_IPS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_none()
+    {
+        tracing::warn!(
+            "Permanent Credential Claim transport is disabled: NODE_CLAIM_TRUSTED_PROXY_IPS is missing"
+        );
+    }
+
     // v1.2.5: CLI subcommands run against the same database and then exit —
     // they never start the HTTP server. Checked before anything else binds a
     // port, so a recovery command works on a host where the panel is already
@@ -163,6 +173,7 @@ async fn main() {
     // state even when notifications are disabled, so turning them on later
     // doesn't immediately fire for outages that started before.
     service::node_watch::spawn(state.clone());
+    service::node_convergence::spawn(state.clone());
 
     // v1.2.0: traffic-history retention. The history table has no FK, so this
     // sweeper is the only thing that ever deletes its rows.

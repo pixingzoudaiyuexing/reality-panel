@@ -611,6 +611,8 @@ pub enum NodeReuseBindingCreateRejection {
     HomeGroupNotInbound,
     ActiveCredentialMissing,
     MigrationIncomplete,
+    NodeRetired,
+    AmbiguousGroupNodeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -679,6 +681,11 @@ pub struct NodePoolRecord {
     pub identity_group_id: i64,
     pub node_id: String,
     pub display_name: String,
+    pub retirement_state: String,
+    pub retired_at: Option<String>,
+    pub retired_by: Option<i64>,
+    pub retirement_reason: Option<String>,
+    pub retirement_version: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -686,6 +693,25 @@ pub struct NodePoolRecord {
 #[async_trait]
 pub trait NodePoolRepository: Send + Sync {
     async fn list_node_pool_records(&self) -> Result<Vec<NodePoolRecord>, DbError>;
+    async fn find_node_pool_record(
+        &self,
+        group_id: i64,
+        node_id: &str,
+    ) -> Result<Option<NodePoolRecord>, DbError>;
+    async fn retire_node_pool_identity(
+        &self,
+        group_id: i64,
+        node_id: &str,
+        expected_version: i64,
+        admin_id: i64,
+        reason: &str,
+    ) -> Result<bool, DbError>;
+    async fn restore_node_pool_identity(
+        &self,
+        group_id: i64,
+        node_id: &str,
+        expected_version: i64,
+    ) -> Result<bool, DbError>;
     async fn discover_node_pool_identities(&self) -> Result<Vec<ConcreteNodeIdentity>, DbError>;
     async fn register_node_pool_identity(
         &self,

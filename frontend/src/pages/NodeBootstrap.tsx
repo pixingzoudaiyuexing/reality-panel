@@ -1,5 +1,5 @@
 import { Alert, Button, Descriptions, Input, InputNumber, Segmented, Space, Tabs, Tag, Typography, message } from 'antd';
-import { CloudUploadOutlined, CopyOutlined, DeleteOutlined, PlusOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
+import { CloudUploadOutlined, CopyOutlined, DeleteOutlined, PlusOutlined, ReloadOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
 import { useEffect, useRef, useState } from 'react';
 import api, { type ApiEnvelope } from '../api/client';
 import type { ProvisioningCapabilities } from '../api/types';
@@ -11,7 +11,7 @@ const { Text } = Typography;
 type Values = { group_id?: number; host: string; port: number; username: string; password: string };
 type SshProbe = { fingerprint: string; os: string; architecture: string };
 type DeployLog = { stage: string; message: string; at: string };
-type Deployment = { id: string; group_id: number; host: string; stage: string; status: string; message: string; node_id?: string | null; profile: 'reality_camouflage'; lite_mode: boolean; capabilities?: ProvisioningCapabilities | null };
+type Deployment = { id: string; group_id: number; host: string; stage: string; status: string; message: string; node_id?: string | null; profile: 'reality_camouflage'; lite_mode: boolean; capabilities?: ProvisioningCapabilities | null; retry_available?: boolean };
 type RowState = 'WAITING' | 'TESTING' | 'PASSED' | 'FAILED' | 'DEPLOYING' | 'SUCCESS';
 type SshRow = { id: number; values: Values; state: RowState; probe: SshProbe | null; deployment: Deployment | null; logs: DeployLog[]; error: string | null };
 type EnrollmentState = 'PENDING' | 'CLAIMED' | 'VERIFYING' | 'LOCAL_COMMITTED' | 'SUCCESS' | 'FAILED' | 'EXPIRED';
@@ -74,7 +74,9 @@ export default function NodeBootstrap() {
     return () => window.clearInterval(timer);
   }, [manualResult]);
 
-  const updateRow = (id: number, patch: Partial<Values>) => setRows((current) => current.map((row) => row.id === id ? { ...row, values: { ...row.values, ...patch }, state: 'WAITING', probe: null, deployment: null, logs: [], error: null } : row));
+  const updateRow = (id: number, patch: Partial<Values>) => setRows((current) => current.map((row) => row.id === id ? row.deployment
+    ? { ...row, values: { ...row.values, ...patch } }
+    : { ...row, values: { ...row.values, ...patch }, state: 'WAITING', probe: null, logs: [], error: null } : row));
   const rowValid = (row: SshRow) => Boolean(row.values.host.trim() && row.values.username.trim() && row.values.password && row.values.port >= 1 && row.values.port <= 65535);
   const rowsLocked = batchBusy || rows.some((row) => row.state === 'DEPLOYING');
 
@@ -98,22 +100,45 @@ export default function NodeBootstrap() {
   };
 
   const deployAll = async () => {
-    if (!rows.every((row) => row.state === 'PASSED' && row.probe)) return;
+    if (!rows.every((row) => row.state === 'PASSED' && row.probe && (!row.deployment || row.deployment.retry_available))) return;
     setBatchBusy(true);
     setRows((current) => current.map((row) => ({ ...row, state: 'DEPLOYING', error: null })));
     const results = await Promise.all(rows.map(async (row) => {
       try {
-        const response = await api.post<unknown, ApiEnvelope<Deployment>>('/admin/node-deployments', { ...row.values, confirmed_fingerprint: row.probe!.fingerprint, profile: 'reality_camouflage', lite_mode: liteMode });
+        const endpoint = row.deployment ? `/admin/node-deployments/${row.deployment.id}/retry` : '/admin/node-deployments';
+        const response = await api.post<unknown, ApiEnvelope<Deployment>>(endpoint, { ...row.values, confirmed_fingerprint: row.probe!.fingerprint, profile: 'reality_camouflage', lite_mode: row.deployment?.lite_mode ?? liteMode });
         if (!response.data) throw new Error(response.message);
         return { id: row.id, deployment: response.data, error: null };
-      } catch (error) { return { id: row.id, deployment: null, error: errorText(error, t('nodeBootstrapStartFailed')) }; }
+      } catch (error) { return { id: row.id, deployment: row.deployment, error: errorText(error, t('nodeBootstrapStartFailed')) }; }
     }));
     setRows((current) => current.map((row) => {
       const result = results.find((item) => item.id === row.id);
       if (!result) return row;
-      return { ...row, deployment: result.deployment, state: result.deployment ? 'DEPLOYING' : 'FAILED', error: result.error, values: { ...row.values, password: '' } };
+      return { ...row, deployment: result.deployment, state: result.deployment && !result.error ? 'DEPLOYING' : 'FAILED', error: result.error, values: { ...row.values, password: '' } };
     }));
     setBatchBusy(false);
+  };
+
+  const retryRow = async (row: SshRow) => {
+    if (!row.deployment?.retry_available || !rowValid(row) || rowsLocked) return;
+    setBatchBusy(true);
+    try {
+      const probe = await api.post<unknown, ApiEnvelope<SshProbe>>('/admin/node-deployments/fingerprint', row.values);
+      if (!probe.data || probe.data.fingerprint !== row.probe?.fingerprint) throw new Error(t('nodeBootstrapHostKeyChanged'));
+      const response = await api.post<unknown, ApiEnvelope<Deployment>>(`/admin/node-deployments/${row.deployment.id}/retry`, {
+        ...row.values, confirmed_fingerprint: probe.data.fingerprint,
+        profile: row.deployment.profile, lite_mode: row.deployment.lite_mode,
+      });
+      if (!response.data) throw new Error(response.message);
+      setRows((current) => current.map((item) => item.id === row.id ? {
+        ...item, deployment: response.data!, state: 'DEPLOYING', error: null,
+        values: { ...item.values, password: '' },
+      } : item));
+    } catch (error) {
+      setRows((current) => current.map((item) => item.id === row.id ? {
+        ...item, error: errorText(error, error instanceof Error ? error.message : t('nodeBootstrapStartFailed')),
+      } : item));
+    } finally { setBatchBusy(false); }
   };
 
   const createEnrollment = async () => {
@@ -150,18 +175,19 @@ export default function NodeBootstrap() {
     <div className="rp-ssh-batch" data-testid="ssh-batch">
       {rows.map((row, index) => <div className="rp-ssh-row" data-testid={`ssh-row-${row.id}`} key={row.id}>
         <Text type="secondary">#{index + 1}</Text>
-        <Input disabled={rowsLocked} aria-label={`${t('nodeBootstrapHost')} ${index + 1}`} value={row.values.host} placeholder={t('nodeBootstrapHost')} onChange={(event) => updateRow(row.id, { host: event.target.value })} />
-        <InputNumber disabled={rowsLocked} aria-label={`${t('nodeBootstrapPort')} ${index + 1}`} min={1} max={65535} value={row.values.port} onChange={(value) => updateRow(row.id, { port: value ?? 22 })} />
+        <Input disabled={rowsLocked || !!row.deployment} aria-label={`${t('nodeBootstrapHost')} ${index + 1}`} value={row.values.host} placeholder={t('nodeBootstrapHost')} onChange={(event) => updateRow(row.id, { host: event.target.value })} />
+        <InputNumber disabled={rowsLocked || !!row.deployment} aria-label={`${t('nodeBootstrapPort')} ${index + 1}`} min={1} max={65535} value={row.values.port} onChange={(value) => updateRow(row.id, { port: value ?? 22 })} />
         <Input disabled={rowsLocked} aria-label={`${t('nodeBootstrapUser')} ${index + 1}`} value={row.values.username} onChange={(event) => updateRow(row.id, { username: event.target.value })} />
         <Input.Password disabled={rowsLocked} aria-label={`${t('nodeBootstrapPassword')} ${index + 1}`} value={row.values.password} autoComplete="new-password" onChange={(event) => updateRow(row.id, { password: event.target.value })} />
         <Space size={4}><Tag color={rowColor[row.state]}>{t(`nodeBootstrapRow${row.state}` as keyof Dict)}</Tag>{rows.length > 1 ? <Button disabled={rowsLocked} type="text" danger icon={<DeleteOutlined />} aria-label={`${t('delete')} ${index + 1}`} onClick={() => setRows((current) => current.filter((item) => item.id !== row.id))} /> : null}</Space>
         {row.error ? <Text type="danger" className="rp-ssh-row-message">{row.error}</Text> : row.deployment ? <Text className="rp-ssh-row-message">{row.deployment.message}</Text> : row.probe ? <Text type="secondary" className="rp-ssh-row-message">{row.probe.os} · {row.probe.architecture} · {row.probe.fingerprint}</Text> : null}
+        {row.deployment?.status === 'FAILED' ? <Button icon={<ReloadOutlined />} disabled={rowsLocked || !row.deployment.retry_available || !rowValid(row)} onClick={() => void retryRow(row)}>{t('nodeBootstrapRetryOriginal')}</Button> : null}
       </div>)}
     </div>
     <Space wrap style={{ marginTop: 12 }}>
       <Button disabled={rowsLocked} icon={<PlusOutlined />} onClick={() => setRows((current) => [...current, newRow(nextId.current++, current[0]?.values.group_id)])}>{t('nodeBootstrapAddServer')}</Button>
       <Button icon={<SafetyCertificateOutlined />} loading={batchBusy} onClick={() => void testAll()}>{t('nodeBootstrapTestConnection')}</Button>
-      <Button type="primary" icon={<CloudUploadOutlined />} loading={batchBusy} disabled={!rows.every((row) => row.state === 'PASSED' && row.probe)} onClick={() => void deployAll()}>{t('nodeBootstrapDeploy')}</Button>
+      <Button type="primary" icon={<CloudUploadOutlined />} loading={batchBusy} disabled={!rows.every((row) => row.state === 'PASSED' && row.probe && (!row.deployment || row.deployment.retry_available))} onClick={() => void deployAll()}>{t('nodeBootstrapDeploy')}</Button>
     </Space>
   </>;
 

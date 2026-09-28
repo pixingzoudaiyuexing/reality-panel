@@ -37,14 +37,14 @@ interface Props {
 /** Mobile node cards reuse the same data presentation and actions as the
  * desktop table, but reorder them for status-first scanning without a table. */
 export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {}, onDelete, relayNodes = [], showRelayReady = false }: Props) {
-  const relayById = new Map(relayNodes.map((node) => [node.node_id, node]));
+  const relayById = new Map(relayNodes.map((node) => [`${node.identity_group_id ?? rows[0]?.group_id}:${node.node_id}`, node]));
 
   return (
     <Space orientation="vertical" style={{ width: '100%' }} size={8}>
       {rows.map((r) => {
         return (
           <div
-            key={`${r.group_id}:${r.node_id || 'none'}`}
+            key={`${r.group_id}:${r.node_key ?? `${r.identity_group_id ?? r.group_id}:${r.node_id || 'none'}`}`}
             // v1.2.5: offline cards are greyed, same signal as the desktop
             // table's offline rows — every figure on the card is the node's
             // last report rather than a live reading.
@@ -55,7 +55,7 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
               <NodeStatusCell
                 row={r}
                 panelProtocol={panelProtocol}
-                relayNode={r.node_id ? relayById.get(r.node_id) : undefined}
+                relayNode={r.node_id ? relayById.get(`${r.identity_group_id ?? r.group_id}:${r.node_id}`) : undefined}
                 showRelayReady={showRelayReady}
                 t={t}
               />

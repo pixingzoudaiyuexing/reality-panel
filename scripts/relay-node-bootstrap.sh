@@ -250,6 +250,9 @@ service_state() {
 
 capture_transaction() {
   [ -n "$TRANSACTION_DIR" ] || fail "transaction directory is required"
+  if [ -f "$TRANSACTION_DIR/state" ] && [ "$(cat "$TRANSACTION_DIR/state")" = rolled_back ]; then
+    rm -f -- "$TRANSACTION_DIR/state"
+  fi
   [ ! -e "$TRANSACTION_DIR/state" ] || fail "transaction already exists"
   install -d -m 0700 "$TRANSACTION_DIR" "$TRANSACTION_DIR/files"
   if [ "$TRANSACTION_LOCK_HELD" = 0 ]; then
@@ -1116,9 +1119,18 @@ if [ -n "${POOL_NODE_ID:-}" ]; then
   command -v python3 >/dev/null || fail "python3 is required for Pool credential bootstrap"
   printf '%s' "$POOL_CLAIM_SECRET" > "$TRANSACTION_DIR/candidate/pool-secret"
   chmod 0600 "$TRANSACTION_DIR/candidate/pool-secret"
-  curl --proto '=https' -fsS "$PANEL_URL/api/v1/node-pool/migrate.py" > "$TRANSACTION_DIR/candidate/migrate.py"
-  python3 "$TRANSACTION_DIR/candidate/migrate.py" --bootstrap --claim-id "$POOL_NODE_ID" --identity-group-id "$POOL_GROUP_ID" --node-id "$POOL_NODE_ID" --secret-file "$TRANSACTION_DIR/candidate/pool-secret" \
-    || fail "Pool credential bootstrap failed"
+  if ! curl --proto '=https' -fsS "$PANEL_URL/api/v1/node-pool/migrate.py" > "$TRANSACTION_DIR/candidate/migrate.py"; then
+    fail "Pool credential bootstrap failed: POOL_CREDENTIAL_TRANSPORT_REJECTED: MIGRATION_SCRIPT_FETCH_FAILED"
+  fi
+  pool_credential_log="$TRANSACTION_DIR/candidate/pool-credential-bootstrap.log"
+  if ! python3 "$TRANSACTION_DIR/candidate/migrate.py" --bootstrap --claim-id "$POOL_NODE_ID" --identity-group-id "$POOL_GROUP_ID" --node-id "$POOL_NODE_ID" --secret-file "$TRANSACTION_DIR/candidate/pool-secret" 2>"$pool_credential_log"; then
+    pool_stage="$(sed -n 's/^POOL_CREDENTIAL_STAGE=//p' "$pool_credential_log" | tail -n 1 || true)"
+    pool_reason="$(sed -n 's/^POOL_CREDENTIAL_REASON=//p' "$pool_credential_log" | tail -n 1 || true)"
+    [ -n "$pool_stage" ] || pool_stage=POOL_CREDENTIAL_LOCAL_FAILED
+    [ -n "$pool_reason" ] || pool_reason=UNKNOWN
+    fail "Pool credential bootstrap failed: ${pool_stage}: ${pool_reason}"
+  fi
+  rm -f "$pool_credential_log"
   rm -f "$TRANSACTION_DIR/candidate/pool-secret"
   credential_state="/var/lib/relay-panel/node-claims/$POOL_NODE_ID/credential-pending.json"
   credential_id="$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1], encoding="utf-8")); assert s["phase"] == "ACTIVE_CONFIRMED"; print(s["credential_id"])' "$credential_state")" \

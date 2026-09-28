@@ -248,6 +248,10 @@ pub struct SharedNodeSummary {
     pub line_type: Option<String>,
     /// Per-node identity (row key). Empty for a group's no-node placeholder row.
     pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_key: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// This node's last_seen is within the online window (backend SoT).
     pub online: bool,
     /// v0.4.14: node public IP (exposed to regular users). v0.4.15: this is the

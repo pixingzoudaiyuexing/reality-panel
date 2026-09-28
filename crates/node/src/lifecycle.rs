@@ -1501,8 +1501,10 @@ mod tests {
         std::fs::write(&binary, b"old-binary").unwrap();
         let bytes = elf("amd64");
         let sha = format!("{:x}", Sha256::digest(&bytes));
-        install_artifact_with_probe(&binary, &bytes, "x86_64", &sha, "1.3.1", |_| {
-            Ok(b"relay-node 1.3.1\n".to_vec())
+        let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        let target = format!("{}.0.0", current.major + 1);
+        install_artifact_with_probe(&binary, &bytes, "x86_64", &sha, &target, |_| {
+            Ok(format!("relay-node {target}\n").into_bytes())
         })
         .unwrap();
         assert_eq!(std::fs::read(&binary).unwrap(), bytes);

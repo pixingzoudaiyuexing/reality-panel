@@ -102,6 +102,11 @@ CREATE TABLE IF NOT EXISTS node_pool_nodes (
     identity_group_id INTEGER NOT NULL REFERENCES device_groups(id) ON DELETE CASCADE,
     node_id TEXT NOT NULL CHECK (length(node_id) BETWEEN 1 AND 128 AND node_id NOT GLOB '*[^A-Za-z0-9_-]*'),
     display_name TEXT NOT NULL DEFAULT '' CHECK (length(display_name) <= 128),
+    retirement_state TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (retirement_state IN ('ACTIVE', 'RETIRED')),
+    retired_at TEXT,
+    retired_by INTEGER,
+    retirement_reason TEXT,
+    retirement_version INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (identity_group_id, node_id)
@@ -2687,6 +2692,17 @@ pub async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> 
         .execute(pool)
         .await?;
     tracing::info!("Migration 58: Node Pool metadata tables present");
+
+    for (column, definition) in [
+        ("retirement_state", "TEXT NOT NULL DEFAULT 'ACTIVE'"),
+        ("retired_at", "TEXT"),
+        ("retired_by", "INTEGER"),
+        ("retirement_reason", "TEXT"),
+        ("retirement_version", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        add_column_if_missing(pool, "node_pool_nodes", column, definition).await?;
+    }
+    tracing::info!("Migration 59: Node retirement metadata present");
 
     Ok(())
 }

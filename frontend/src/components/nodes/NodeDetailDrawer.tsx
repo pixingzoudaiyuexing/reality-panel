@@ -51,7 +51,7 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
 
   const handleDelete = async () => {
     if (!row) return;
-    const gid = row.group_id;
+    const gid = row.identity_group_id ?? row.group_id;
     const nid = row.node_id;
     const url = nid
       ? `/nodes/${gid}?node_id=${encodeURIComponent(nid)}`
@@ -174,9 +174,9 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
 
       )}
       {isAdmin && row?.node_id && /^[A-Za-z0-9_-]{1,128}$/.test(row.node_id) ? (
-        <GroupMembershipSummary key={`${row.group_id}:${row.node_id}`} homeGroupId={row.group_id} nodeId={row.node_id} open={open} />
+        <GroupMembershipSummary key={`${row.identity_group_id ?? row.group_id}:${row.node_id}`} homeGroupId={row.identity_group_id ?? row.group_id} nodeId={row.node_id} open={open} />
       ) : null}
-      {isAdmin && row && row.online === false && (
+      {isAdmin && row && row.online === false && (row.identity_group_id === undefined || row.identity_group_id === row.group_id) && (
         <div style={{ marginTop: 16 }}>
           <Popconfirm title={t('nodeStatusDeleteConfirm')} onConfirm={handleDelete}>
             <Button danger icon={<DeleteOutlined />}>{t('nodeStatusDelete')}</Button>

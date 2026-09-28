@@ -95,6 +95,23 @@ pub async fn diagnose_node(
             data: None,
         });
     }
+    match state.db.find_node_pool_record(group_id, &node_id).await {
+        Ok(Some(record)) if record.retirement_state == "RETIRED" => {
+            return Json(ApiResponse {
+                code: 404,
+                message: "Node not found".into(),
+                data: None,
+            });
+        }
+        Err(_) => {
+            return Json(ApiResponse {
+                code: 500,
+                message: "database error".into(),
+                data: None,
+            })
+        }
+        _ => {}
+    }
     let key = format!("node_status:{group_id}:{node_id}");
     let raw = match state.db.get(&key).await {
         Ok(Some(raw)) => raw,

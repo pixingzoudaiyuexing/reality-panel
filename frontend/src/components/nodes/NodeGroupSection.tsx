@@ -1,7 +1,7 @@
  
 import { Tag, Typography, Collapse } from 'antd';
 import { ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons';
-import type { NodeDisplayRow, RelayPreferenceView, RelayReadyNode } from '../../api/types';
+import type { NodeDisplayRow, RelayPreferenceView, RelayReadyNode, NodeHealthSnapshot } from '../../api/types';
 import { useState } from 'react';
 import type { NodeLifecycleHandler, Tfn } from './types';
 import { NodeDesktopTable } from './NodeDesktopTable';
@@ -28,6 +28,7 @@ interface Props {
   artifactVersions?: Record<string, string>;
   onDelete?: (row: NodeDisplayRow) => void;
   showRelayPreference?: boolean;
+  healthNodes?: NodeHealthSnapshot[];
   onDiagnoseNode?: (groupId: number, node: RelayReadyNode) => void;
   expanded?: boolean;
   onExpandedChange?: (expanded: boolean) => void;
@@ -49,16 +50,23 @@ function groupSummary(rows: NodeDisplayRow[]) {
 /** One group block: header bar (name · ID · online/total · aggregate ↑↓) +
  *  either a desktop table or mobile list. Collapsible. A group with only a
  *  placeholder row shows "no node reporting". */
-export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade, onLifecycle, artifactVersions, onDelete, showRelayPreference = false, onDiagnoseNode, expanded = true, onExpandedChange }: Props) {
+export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, isMobile, t, openDetail, onUpgrade, onLifecycle, artifactVersions, onDelete, showRelayPreference = false, healthNodes, onDiagnoseNode, expanded = true, onExpandedChange }: Props) {
   const [relayPreference, setRelayPreference] = useState<RelayPreferenceView | null>(null);
   const head = rows[0];
   const { total, online, up, down } = groupSummary(rows);
   const region = head.region;
   const lineType = head.line_type;
   const onlyPlaceholder = rows.length === 1 && !head.node_id;
-  const readyCount = relayPreference?.nodes.filter((node) => node.ready).length;
-  const anomalyCount = relayPreference
-    ? relayPreference.nodes.filter((node) => !node.online || !node.ready).length
+  const groupId = head.group_id;
+  const liveReadyNodes: RelayReadyNode[] | undefined = healthNodes?.map((node) => {
+    const group = node.group_readiness.find((item) => item.group_id === groupId);
+    const duplicate = healthNodes.filter((other) => other.node_id === node.node_id).length > 1;
+    return { node_id: node.node_id, identity_group_id: node.identity_group_id, display_name: node.display_name, public_ipv4: node.telemetry.public_ipv4, public_ipv6: node.telemetry.public_ipv6, online: node.telemetry.fresh, ready: group?.ready ?? false, ready_reasons: group?.reasons ?? [], preferred: !duplicate && relayPreference?.preferred_node_id === node.node_id };
+  });
+  const displayedReadyNodes = liveReadyNodes ?? relayPreference?.nodes;
+  const readyCount = displayedReadyNodes?.filter((node) => node.ready).length;
+  const anomalyCount = displayedReadyNodes
+    ? displayedReadyNodes.filter((node) => !node.online || !node.ready).length
     : null;
 
   const header = (
@@ -99,18 +107,18 @@ export function NodeGroupSection({ rows, panelProtocol, latestNodeVersion, nodeV
         onLifecycle={onLifecycle}
         artifactVersions={artifactVersions}
         onDelete={onDelete}
-        relayNodes={relayPreference?.nodes}
+        relayNodes={displayedReadyNodes}
         showRelayReady={showRelayPreference}
       />
     </div>
   ) : (
-    <NodeDesktopTable rows={rows} panelProtocol={panelProtocol} latestNodeVersion={latestNodeVersion} nodeVersionCheckFailed={nodeVersionCheckFailed} t={t} openDetail={openDetail} onUpgrade={onUpgrade} onLifecycle={onLifecycle} artifactVersions={artifactVersions} onDelete={onDelete} relayNodes={relayPreference?.nodes} showRelayReady={showRelayPreference} />
+    <NodeDesktopTable rows={rows} panelProtocol={panelProtocol} latestNodeVersion={latestNodeVersion} nodeVersionCheckFailed={nodeVersionCheckFailed} t={t} openDetail={openDetail} onUpgrade={onUpgrade} onLifecycle={onLifecycle} artifactVersions={artifactVersions} onDelete={onDelete} relayNodes={displayedReadyNodes} showRelayReady={showRelayPreference} />
   );
 
   const body = (
     <>
       {nodeBody}
-      {showRelayPreference ? <RelayPreferencePanel groupId={head.group_id} t={t} onViewChange={setRelayPreference} onDiagnoseNode={onDiagnoseNode ? (node) => onDiagnoseNode(head.group_id, node) : undefined} /> : null}
+      {showRelayPreference ? <RelayPreferencePanel groupId={head.group_id} t={t} healthNodes={displayedReadyNodes} onViewChange={setRelayPreference} onDiagnoseNode={onDiagnoseNode ? (node) => onDiagnoseNode(head.group_id, node) : undefined} /> : null}
     </>
   );
 

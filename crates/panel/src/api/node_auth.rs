@@ -129,6 +129,31 @@ pub async fn authenticate_node(
         if group.group_type != "in" {
             return Err(NodeAuthError::Forbidden);
         }
+        if let Some(exact_id) = node_id
+            .as_deref()
+            .and_then(|id| ReuseEligibleNodeId::parse(id).ok())
+        {
+            if crate::service::node_pool::legacy_config_authority_retired(
+                state.db.as_ref(),
+                group.id,
+                Some(exact_id.as_str()),
+                false,
+            )
+            .await
+            .map_err(|_| NodeAuthError::Unavailable)?
+            {
+                return Err(NodeAuthError::Forbidden);
+            }
+            if state
+                .db
+                .find_node_pool_record(group.id, exact_id.as_str())
+                .await
+                .map_err(|_| NodeAuthError::Unavailable)?
+                .is_some_and(|record| record.retirement_state == "RETIRED")
+            {
+                return Err(NodeAuthError::Forbidden);
+            }
+        }
         return Ok(AuthenticatedNodeIdentity::LegacyHomeGroup {
             group,
             reported_node_id: node_id,
@@ -187,6 +212,15 @@ pub async fn authenticate_node(
             .map_err(|_| NodeAuthError::Unavailable)?
             .ok_or(NodeAuthError::Unauthorized)?;
     if group.group_type != "in" {
+        return Err(NodeAuthError::Forbidden);
+    }
+    if state
+        .db
+        .find_node_pool_record(group.id, node_id.as_str())
+        .await
+        .map_err(|_| NodeAuthError::Unavailable)?
+        .is_some_and(|record| record.retirement_state == "RETIRED")
+    {
         return Err(NodeAuthError::Forbidden);
     }
     Ok(AuthenticatedNodeIdentity::VerifiedConcreteNode {
@@ -479,6 +513,39 @@ mod tests {
     async fn runtime_auth_contract_sqlite() {
         let (state, secret) = sqlite_state_with_active_credential().await;
         exercise_runtime_auth_contract(state, secret).await;
+    }
+
+    #[tokio::test]
+    async fn retired_exact_node_cannot_authenticate_but_legacy_sibling_remains() {
+        let (state, secret) = sqlite_state_with_active_credential().await;
+        state
+            .db
+            .register_node_pool_identity(10, "Node_A")
+            .await
+            .unwrap();
+        assert!(state
+            .db
+            .retire_node_pool_identity(10, "Node_A", 0, 1, "retired")
+            .await
+            .unwrap());
+        assert_eq!(
+            authenticate_node(&state, &credential_headers(&secret, "Node_A"))
+                .await
+                .unwrap_err(),
+            NodeAuthError::Unauthorized,
+        );
+        let mut legacy = HeaderMap::new();
+        legacy.insert(AUTHORIZATION, "Bearer legacy-token".parse().unwrap());
+        legacy.insert(NODE_ID_HEADER, "Node_A".parse().unwrap());
+        assert_eq!(
+            authenticate_node(&state, &legacy).await.unwrap_err(),
+            NodeAuthError::Forbidden
+        );
+        legacy.insert(NODE_ID_HEADER, "Node_B".parse().unwrap());
+        assert!(matches!(
+            authenticate_node(&state, &legacy).await.unwrap(),
+            AuthenticatedNodeIdentity::LegacyHomeGroup { .. }
+        ));
     }
 
     #[tokio::test]

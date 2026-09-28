@@ -1,6 +1,6 @@
 # ADR 0002 - Node Pool V1
 
-Status: **IMPLEMENTED / INDEPENDENT REVIEW PASSED / LINUX RUNTIME ACCEPTANCE PASSED / RC v1.3.0 / NOT RELEASED / NOT DEPLOYED**
+Status: **NODE POOL V1 RELEASED IN v1.3.0 / V2 CONTINUATION IN PROGRESS / PRODUCTION NOT INSPECTED**
 
 ## Decision
 
@@ -26,6 +26,27 @@ RT-001 restart safety: isolated Linux acceptance found that a migrated Node coul
 
 ## Operational Boundary
 
-Upgrade from stable `v1.1.26` to candidate `v1.3.0` applies additive SQLite Migration 58 or PostgreSQL revision 42 and performs idempotent Node Pool metadata backfill. Existing concrete identities and Bindings remain in place; installing the Panel alone does not deliver config, advance Node revisions, or restart Nodes. An existing Group-Token Node remains Home-only until it is upgraded to a Node version with runtime auth reload support and completes the exact-node credential migration. New Nodes use the hidden Pool anchor and receive their Permanent Credential during SSH or Manual Bootstrap.
+Upgrade from `v1.1.26` to published `v1.3.0` applies additive SQLite Migration 58 or PostgreSQL revision 42 and performs idempotent Node Pool metadata backfill. Existing concrete identities and Bindings remain in place; installing the Panel alone does not deliver config, advance Node revisions, or restart Nodes. An existing Group-Token Node remains Home-only until it is upgraded to a Node version with runtime auth reload support and completes the exact-node credential migration. New Nodes use the hidden Pool anchor and receive their Permanent Credential during SSH or Manual Bootstrap.
 
-This ADR describes Node Pool V1 source integrated on `main` at `95f230bf73e730b92b9023f01e5fad1c2e7d9763`, RT-001 fix `fe8068f55578b6cacb040d4ac72ceaaf271c8321`, and the `v1.3.0` candidate source. The Owner reports that stable `v1.1.26` is deployed to production; that deployment has not been independently verified. Node Pool V1 and RT-001 remain unreleased and undeployed; no production access occurred during candidate preparation.
+This ADR describes Node Pool V1 source integrated on `main` at `95f230bf73e730b92b9023f01e5fad1c2e7d9763`, RT-001 fix `fe8068f55578b6cacb040d4ac72ceaaf271c8321`, and the published `v1.3.0` release. The Owner previously reported `v1.1.26` production deployment; current production version was not inspected. V2 continuation is unreleased and undeployed; no production access occurred during its implementation.
+
+## Node Management V2 continuation
+
+Group Token is historical compatibility only. New provisioning must create an
+exact Permanent Credential before success and must not create a new Legacy
+identity. Historical migration uses an administrator-authorized TOFU bootstrap
+bound to exactly one live Lifecycle connection for the exact concrete identity.
+The random bootstrap material is sent only to that connection and is persisted
+privately by the Node before acknowledgement. A duplicate or replaced
+connection invalidates the attempt; the system never resends the secret to a
+new connection. After the durable ACK, the existing Claim/Credential machinery
+is authorized over the same channel. Lost authorization frames resume from
+durable state without resending the secret.
+
+For V2 Carrier routing, one provider line may target multiple concrete Nodes. New targets use a separately encoded exact-node DNS key and independently owned provider record ID; old single-node keys remain compatible. The default-line owner and rule attribution do not change. Unknown external records fail closed. DNS membership follows traffic-serving evidence with failure/recovery hysteresis, and control-channel loss alone does not remove an A record. This remains implementation work, not a released Node Pool V1 behavior.
+
+This trust boundary proves continuity of the selected live control connection,
+not the historical physical host. Once the exact Permanent Credential is
+verified and migration completion is recorded, Legacy config/control authority
+is permanently retired for that Node. Restarts and future upgrades never fall
+back to Group Token; sibling historical Nodes sharing the token are unaffected.

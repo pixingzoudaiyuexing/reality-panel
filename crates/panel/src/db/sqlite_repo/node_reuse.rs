@@ -96,6 +96,18 @@ impl NodeReuseRepository for SqliteRepository {
             ));
         }
 
+        let retired: Option<String> = sqlx::query_scalar(
+            "SELECT retirement_state FROM node_pool_nodes WHERE identity_group_id = ? AND node_id = ?",
+        )
+        .bind(home_group_id)
+        .bind(node_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if retired.as_deref() == Some("RETIRED") {
+            return Ok(NodeReuseBindingCreateResult::Rejected(
+                NodeReuseBindingCreateRejection::NodeRetired,
+            ));
+        }
         let active: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM node_credentials AS current \
              WHERE current.home_group_id = ? AND current.node_id = ? \
@@ -115,6 +127,29 @@ impl NodeReuseRepository for SqliteRepository {
             tx.rollback().await?;
             return Ok(NodeReuseBindingCreateResult::Rejected(
                 NodeReuseBindingCreateRejection::ActiveCredentialMissing,
+            ));
+        }
+        let ambiguous: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM node_reuse_bindings
+                WHERE reusing_group_id = ? AND node_id = ? AND home_group_id <> ?)
+             OR EXISTS (SELECT 1 FROM node_pool_nodes
+                WHERE identity_group_id = ? AND node_id = ? AND retirement_state = 'ACTIVE')
+             OR EXISTS (SELECT 1 FROM kvs WHERE key = ?)",
+        )
+        .bind(reusing_group_id)
+        .bind(node_id.as_str())
+        .bind(home_group_id)
+        .bind(reusing_group_id)
+        .bind(node_id.as_str())
+        .bind(format!(
+            "node_status:{reusing_group_id}:{}",
+            node_id.as_str()
+        ))
+        .fetch_optional(&mut *tx)
+        .await?;
+        if ambiguous.is_some() {
+            return Ok(NodeReuseBindingCreateResult::Rejected(
+                NodeReuseBindingCreateRejection::AmbiguousGroupNodeId,
             ));
         }
 

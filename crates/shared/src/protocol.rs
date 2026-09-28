@@ -1080,6 +1080,48 @@ pub struct NodeLifecycleAck {
     pub action: NodeLifecycleAction,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NodeMigrationBootstrap {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub operation_id: String,
+    pub identity_group_id: i64,
+    pub node_id: String,
+    pub claim_id: String,
+    pub claim_secret: String,
+    pub expires_at: String,
+}
+
+impl std::fmt::Debug for NodeMigrationBootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeMigrationBootstrap")
+            .field("operation_id", &self.operation_id)
+            .field("identity_group_id", &self.identity_group_id)
+            .field("node_id", &self.node_id)
+            .field("claim_id", &self.claim_id)
+            .field("claim_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeMigrationBootstrapAck {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub operation_id: String,
+    pub claim_id: String,
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeMigrationBootstrapAuthorized {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub operation_id: String,
+    pub claim_id: String,
+    pub node_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeLifecycleEventStatus {

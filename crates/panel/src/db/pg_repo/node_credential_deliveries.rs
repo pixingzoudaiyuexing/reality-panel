@@ -212,6 +212,16 @@ impl NodeCredentialDeliveryRepository for PgRepository {
             tx.rollback().await?;
             return Ok(NodeCredentialDeliveryPrepareResult::Invalid);
         }
+        let retired: Option<String> = sqlx::query_scalar(
+            "SELECT retirement_state FROM node_pool_nodes WHERE identity_group_id = $1 AND node_id = $2",
+        )
+        .bind(request.home_group_id)
+        .bind(request.node_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if retired.as_deref() == Some("RETIRED") {
+            return Ok(NodeCredentialDeliveryPrepareResult::Invalid);
+        }
 
         let Some(claim) = fetch_claim_tx(&mut tx, &request.claim_id).await? else {
             tx.rollback().await?;
@@ -393,6 +403,16 @@ impl NodeCredentialDeliveryRepository for PgRepository {
         let mut tx = self.pool.begin().await?;
         if !lock_home_group(&mut tx, request.home_group_id).await? {
             tx.rollback().await?;
+            return Ok(NodeCredentialDeliveryActivateResult::Invalid);
+        }
+        let retired: Option<String> = sqlx::query_scalar(
+            "SELECT retirement_state FROM node_pool_nodes WHERE identity_group_id = $1 AND node_id = $2",
+        )
+        .bind(request.home_group_id)
+        .bind(request.node_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if retired.as_deref() == Some("RETIRED") {
             return Ok(NodeCredentialDeliveryActivateResult::Invalid);
         }
 

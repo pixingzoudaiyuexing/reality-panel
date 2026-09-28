@@ -1,5 +1,6 @@
 mod acme_dns01;
 mod auth_reload;
+mod automatic_migration;
 mod bbr;
 mod config;
 mod diagnose;
@@ -493,6 +494,7 @@ async fn run() {
         eprintln!("FATAL: invalid permanent Credential identity: {error}");
         std::process::exit(1);
     }
+    automatic_migration::resume_authorized(&node_id).await;
     let config = auth_reload::wait_for_startup_auth(config, &node_id).await;
     let (auth_sender, auth_receiver) = tokio::sync::watch::channel(config.clone());
     tokio::spawn(auth_reload::watch_auth(
@@ -548,6 +550,9 @@ async fn run() {
 
         match poller::fetch_config(&config, &node_id).await {
             poller::FetchResult::Ok(resp) => {
+                if automatic_migration::legacy_config_auth_blocked(&node_id, &config.auth) {
+                    continue;
+                }
                 match reconciler::ReconciliationInput::validated_panel_snapshot(resp) {
                     Ok(input) => {
                         let result = reconciler

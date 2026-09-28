@@ -32,7 +32,8 @@ The repository currently contains support for:
 - Lite-node related behavior;
 - GitHub Release based publishing;
 - exact-concrete-node Node Reuse with admin Preflight and guarded runtime delivery (released in `v1.1.26`; Owner reports production deployment);
-- Node Pool V1, integrated and independently reviewed on `main`, with RT-001 runtime acceptance passed; RC `v1.3.0` source is prepared but not released or deployed.
+- Node Pool V1 and RT-001, independently reviewed and runtime-accepted, published in `v1.3.0`; production deployment was not verified in the V2 task.
+- Node Management V2 is being implemented on an isolated branch. New Nodes are Pool-native and receive exact Permanent Credentials; automatic migration is only for historical Legacy Nodes.
 
 ## Non-goals / boundaries
 
@@ -48,8 +49,9 @@ The repository currently contains support for:
 
 - Config Protocol is currently 10.
 - Lifecycle Protocol is currently 1.
-- Current stable release is `v1.1.26`; the Owner reports it has been deployed to production (not independently verified in this task).
-- Current release candidate source is `v1.3.0`; it is not released or deployed.
+- Current published stable release is `v1.3.0`, verified from GitHub Release metadata on 2026-09-29. The Owner previously reported `v1.1.26` production deployment; current production version was not inspected.
+- Node Management V2 is isolated implementation work and has not been released or deployed.
+- Group Token is historical compatibility only and must not be the identity credential for newly provisioned Nodes.
 - Production release artifacts are built and published from the tagged checkout.
 - Existing SQLite deployment remains supported; PostgreSQL support is also present.
 - Project-level decisions proposed by Codex require Primary acceptance before becoming canonical project knowledge.

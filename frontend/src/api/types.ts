@@ -411,7 +411,10 @@ export interface RelayDnsRecordView {
 
 export interface RelayReadyNode {
   node_id: string;
+  identity_group_id?: number;
+  display_name?: string;
   public_ipv4: string | null;
+  public_ipv6?: string | null;
   online: boolean;
   ready: boolean;
   ready_reasons: string[];
@@ -443,6 +446,7 @@ export interface CarrierLineBinding {
   line_id: string;
   mode: CarrierLineMode;
   node_id?: string | null;
+  identity_group_id?: number | null;
 }
 
 export interface CarrierPolicy {
@@ -726,7 +730,61 @@ export interface PoolNode {
   migration_pending?: boolean;
   migration_claim_id?: string | null;
   auth_reload_supported: boolean;
+  automatic_migration_supported?: boolean;
   memberships: { group_id: number; group_name: string; native: boolean }[];
+}
+
+export interface NodeHealthSnapshot {
+  identity_group_id: number;
+  node_id: string;
+  display_name: string;
+  as_of: string;
+  state: 'HEALTHY' | 'DEGRADED' | 'OFFLINE' | 'UNKNOWN';
+  telemetry: {
+    last_seen: string | null;
+    age_seconds: number | null;
+    fresh: boolean;
+    cpu: number | null;
+    mem: number | null;
+    disk_usage_percent: number | null;
+    upload_bps: number | null;
+    download_bps: number | null;
+    connections: number | null;
+    public_ipv4: string | null;
+    public_ipv6: string | null;
+    node_version: string | null;
+  };
+  control_connected: boolean;
+  control?: { connected: boolean; last_connected_at: string | null; last_disconnected_at: string | null };
+  runtime: { reconciliation: ReconciliationStatus | null; active_listener_rule_ids: number[] | null; listener_errors?: ListenerError[] | null };
+  group_readiness: { group_id: number; group_name: string; ready: boolean; reasons: string[] }[];
+}
+
+export interface NodeRetirementPreview {
+  identity_group_id: number;
+  node_id: string;
+  display_name: string;
+  public_ipv4: string | null;
+  public_ipv6: string | null;
+  last_seen: string | null;
+  online: boolean;
+  control_connected: boolean;
+  credential_active: boolean;
+  memberships: { group_id: number; group_name: string; native: boolean }[];
+  blockers: string[];
+  warnings: string[];
+  retirement_version: number;
+}
+
+export interface RetiredPoolNode {
+  identity_group_id: number;
+  node_id: string;
+  display_name: string;
+  retirement_state: 'RETIRED';
+  retired_at: string;
+  retired_by: number;
+  retirement_reason: string;
+  retirement_version: number;
 }
 
 export interface NodeReusePreview {
@@ -775,6 +833,8 @@ export interface NodeStatus {
   group_id: number;
   /** Per-node identity. Null/undefined for legacy single-node status rows. */
   node_id?: string | null;
+  verified_concrete_node?: boolean;
+  auth_reload_supported?: boolean;
   /** Present in the API response but not the legacy type; both Nodes and
    *  Dashboard pages render it. Optional for safety on older payloads. */
   group_name?: string;
@@ -1084,6 +1144,8 @@ export interface SharedNodeSummary {
   region?: string | null;
   line_type?: string | null;
   node_id: string;
+  node_key?: string;
+  display_name?: string | null;
   online: boolean;
   public_ip?: string | null;
   /** v0.4.15: dual-stack public IPs + node-level GeoIP. */
@@ -1124,8 +1186,14 @@ export interface SharedNodeSummary {
  *  hence the broad optionality. `online` is always server-supplied now. */
 export interface NodeDisplayRow {
   group_id: number;
+  verified_concrete_node?: boolean;
+  auth_reload_supported?: boolean;
+  identity_group_id?: number;
+  health_state?: NodeHealthSnapshot['state'];
   group_name?: string | null;
+  display_name?: string | null;
   node_id?: string | null;
+  node_key?: string;
   online?: boolean;
   /** Live Lifecycle-compatible WS capability. Independent of status freshness. */
   lifecycle_online?: boolean;
@@ -1201,6 +1269,7 @@ export interface NodeOperation {
   architecture?: string;
   sha256?: string;
   logs?: string;
+  convergence_phase?: 'PREPARING_NODE' | 'UPGRADING' | 'RESTARTING' | 'MIGRATING_IDENTITY' | 'VERIFYING' | 'COMPLETE' | 'FAILED';
 }
 
 export interface NodeArtifactInfo {

@@ -32,8 +32,8 @@ const translations: Record<string, string> = {
 const t = ((key: string) => translations[key] ?? key) as Tfn;
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
 const nodes: RelayReadyNode[] = [
-  { node_id: 'node-a', public_ipv4: '203.0.113.5', online: true, ready: true, ready_reasons: [], preferred: true },
-  { node_id: 'node-b', public_ipv4: '203.0.113.6', online: false, ready: false, ready_reasons: ['CONTROL_CHANNEL_OFFLINE'], preferred: false },
+  { node_id: 'node-a', identity_group_id: 10, public_ipv4: '203.0.113.5', online: true, ready: true, ready_reasons: [], preferred: true },
+  { node_id: 'node-b', identity_group_id: 10, public_ipv4: '203.0.113.6', online: false, ready: false, ready_reasons: ['CONTROL_CHANNEL_OFFLINE'], preferred: false },
 ];
 const catalog: CarrierLineCatalog = {
   stale: false,
@@ -92,9 +92,10 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     expect(screen.getByLabelText('node-b carrierLine')).toBeEnabled();
   });
 
-  it('moves one unique line between Relays', () => {
-    expect(assignCarrierLines(view.active_policy.bindings, 'node-a', ['default', 'Dianxin'], view.default_node_id)).toEqual([
-      { line_id: 'Dianxin', mode: 'node', node_id: 'node-a' },
+  it('assigns one line to a second Node without removing the first', () => {
+    expect(assignCarrierLines(view.active_policy.bindings, 'node-a', 10, ['default', 'Dianxin'], view.default_node_id)).toEqual([
+      { line_id: 'Dianxin', mode: 'node', node_id: 'node-b' },
+      { line_id: 'Dianxin', mode: 'node', node_id: 'node-a', identity_group_id: 10 },
     ]);
   });
 
@@ -102,7 +103,7 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     expect(assignCarrierLines([
       { line_id: 'default', mode: 'follow_default', node_id: null },
       { line_id: 'Dianxin', mode: 'node', node_id: 'node-b' },
-    ], 'node-a', [], 'node-a')).toEqual([
+    ], 'node-a', 10, [], 'node-a')).toEqual([
       { line_id: 'Dianxin', mode: 'node', node_id: 'node-b' },
     ]);
   });

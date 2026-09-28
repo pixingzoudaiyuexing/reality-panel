@@ -30,6 +30,33 @@ beforeEach(() => {
 });
 
 describe('Node Bootstrap deployment modes', () => {
+  it('retries a rolled-back deployment with the original identity after password re-entry', async () => {
+    const user = userEvent.setup();
+    const failed = { id: 'same-task', group_id: 7, host: 'node-a', stage: 'FAILED', status: 'FAILED', message: 'POOL_CREDENTIAL_PREPARE_FAILED', profile: 'reality_camouflage', lite_mode: true, retry_available: true };
+    mockGet.mockImplementation((url: string) => Promise.resolve(ok(url.endsWith('/logs') ? [] : failed)));
+    mockPost.mockImplementation((url: string) => {
+      if (url.endsWith('/fingerprint')) return Promise.resolve(ok({ fingerprint: 'SHA256:original', os: 'Debian', architecture: 'x86_64' }));
+      if (url === '/admin/node-deployments') return Promise.resolve(ok({ ...failed, status: 'PENDING', stage: 'PENDING' }));
+      if (url === '/admin/node-deployments/same-task/retry') return Promise.resolve(ok({ ...failed, status: 'PENDING', stage: 'PENDING' }));
+      return Promise.reject(new Error('unexpected request'));
+    });
+    renderPage();
+    await user.click(screen.getByText('nodeBootstrapInstallLite'));
+    await user.type(screen.getByLabelText('nodeBootstrapHost 1'), 'node-a');
+    await user.type(screen.getByLabelText('nodeBootstrapPassword 1'), 'first-private-password');
+    await user.click(screen.getByRole('button', { name: /nodeBootstrapTestConnection/ }));
+    await screen.findByText('nodeBootstrapRowPASSED');
+    await user.click(screen.getByRole('button', { name: /nodeBootstrapDeploy/ }));
+    const retry = await screen.findByRole('button', { name: /nodeBootstrapRetryOriginal/ }, { timeout: 3000 });
+    expect(retry).toBeDisabled();
+    await user.type(screen.getByLabelText('nodeBootstrapPassword 1'), 'retry-private-password');
+    await user.click(retry);
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments/same-task/retry', expect.objectContaining({
+      confirmed_fingerprint: 'SHA256:original', lite_mode: true,
+    })));
+    expect(mockPost.mock.calls.filter(([url]) => url === '/admin/node-deployments')).toHaveLength(1);
+  });
+
   it('deploys into the pool without requiring a business group', async () => {
     renderPage();
     expect(screen.queryByText('relay-group')).not.toBeInTheDocument();

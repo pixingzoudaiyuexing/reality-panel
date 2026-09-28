@@ -7,6 +7,7 @@ fn startup_auth_at<F>(
     panel_url: &str,
     node_id: &str,
     descriptor_path: &Path,
+    migration_requires_exact_auth: bool,
     load_descriptor: F,
 ) -> Result<NodeRuntimeAuth, String>
 where
@@ -14,7 +15,10 @@ where
 {
     match std::fs::symlink_metadata(descriptor_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(environment_auth.clone())
+            if migration_requires_exact_auth {
+                return Err("authorized migration requires durable exact authentication".into());
+            }
+            return Ok(environment_auth.clone());
         }
         Err(_) => return Err("runtime authentication descriptor cannot be inspected".into()),
         Ok(_) => {}
@@ -38,6 +42,7 @@ pub async fn wait_for_startup_auth(config: NodeConfig, node_id: &str) -> NodeCon
             &config.panel_url,
             node_id,
             descriptor_path,
+            crate::automatic_migration::requires_exact_auth(node_id),
             NodeRuntimeAuth::load_reload_descriptor,
         ) {
             Ok(auth) => {
@@ -140,10 +145,20 @@ mod tests {
             "https://panel.example",
             "Node_A",
             &descriptor,
+            false,
             |_| panic!("must not load"),
         )
         .unwrap();
         assert!(no_descriptor.credential_id().is_none());
+        assert!(startup_auth_at(
+            &legacy,
+            "https://panel.example",
+            "Node_A",
+            &descriptor,
+            true,
+            |_| panic!("must not load")
+        )
+        .is_err());
 
         std::fs::write(&descriptor, b"present").unwrap();
         assert!(startup_auth_at(
@@ -151,6 +166,7 @@ mod tests {
             "https://panel.example",
             "Node_A",
             &descriptor,
+            false,
             |_| Err("invalid descriptor".into())
         )
         .is_err());
@@ -165,6 +181,7 @@ mod tests {
             "https://panel.example",
             "Node_A",
             &descriptor,
+            true,
             |_| Ok((credential, 10)),
         )
         .unwrap();
@@ -175,6 +192,7 @@ mod tests {
             "https://panel.example",
             "Node_B",
             &descriptor,
+            false,
             |_| Err("identity mismatch".into())
         )
         .is_err());

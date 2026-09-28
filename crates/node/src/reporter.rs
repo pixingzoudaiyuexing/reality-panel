@@ -2386,6 +2386,7 @@ pub async fn report_status(
         .header("X-Node-ID", node_id)
         .json(&report)
         .header("X-Node-Auth-Reload", "1")
+        .header("X-Node-Automatic-Migration", "1")
         .send()
         .await
     {

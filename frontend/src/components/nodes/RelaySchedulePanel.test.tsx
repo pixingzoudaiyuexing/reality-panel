@@ -147,7 +147,7 @@ describe('RelaySchedulePanel', () => {
   it('creates a one-time schedule with RFC3339 execute_at and node_id', async () => {
     await renderPanel();
     await openCreate();
-    await choose('目标线路', /64\.118\.144\.159 · node-b/);
+    await choose('目标线路', /64\.118\.144\.159 · /);
     fireEvent.change(screen.getByLabelText('执行时间'), { target: { value: '2026-09-01T08:00' } });
     fireEvent.click(screen.getByRole('button', { name: '保 存' }));
 
@@ -163,7 +163,7 @@ describe('RelaySchedulePanel', () => {
   it('creates a daily payload with fixed offset fields', async () => {
     await renderPanel();
     await openCreate();
-    await choose('目标线路', /64\.118\.154\.53 · node-a/);
+    await choose('目标线路', /64\.118\.154\.53 · /);
     await choose('计划类型', '每天');
     fireEvent.change(await screen.findByLabelText('时间'), { target: { value: '08:30' } });
     await chooseOffset('UTC+08:00');
@@ -176,7 +176,7 @@ describe('RelaySchedulePanel', () => {
   it('creates a weekly payload with fixed offset fields', async () => {
     await renderPanel();
     await openCreate();
-    await choose('目标线路', /64\.118\.154\.53 · node-a/);
+    await choose('目标线路', /64\.118\.154\.53 · /);
     await choose('计划类型', '每周');
     fireEvent.change(await screen.findByLabelText('时间'), { target: { value: '20:00' } });
     await chooseOffset('UTC-05:00');

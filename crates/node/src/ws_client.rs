@@ -376,6 +376,50 @@ async fn connect_and_run(
                             }
                             continue;
                         }
+                        if let Ok(message) = serde_json::from_str::<
+                            relay_shared::protocol::NodeMigrationBootstrap,
+                        >(&text) {
+                            if message.msg_type == "node_migration_bootstrap" {
+                                if !config.panel_url.trim().starts_with("https://") {
+                                    tracing::warn!("migration bootstrap requires HTTPS Panel origin");
+                                    continue;
+                                }
+                                if !matches!(config.auth, crate::config::NodeRuntimeAuth::LegacyGroupToken { .. }) {
+                                    tracing::warn!("migration bootstrap ignored for credential-authenticated Node");
+                                    continue;
+                                }
+                                match crate::automatic_migration::persist(&message, node_id) {
+                                    Ok(ack) => {
+                                        let payload = serde_json::to_string(&ack).expect("bootstrap ack serializes");
+                                        if ws_stream.send(Message::Text(payload.into())).await.is_err() {
+                                            return WsExit::Disconnected;
+                                        }
+                                    }
+                                    Err(error) => tracing::warn!("migration bootstrap rejected: {error}"),
+                                }
+                                continue;
+                            }
+                        }
+                        if let Ok(message) = serde_json::from_str::<
+                            relay_shared::protocol::NodeMigrationBootstrapAuthorized,
+                        >(&text) {
+                            if message.msg_type == "node_migration_bootstrap_authorized" {
+                                match crate::automatic_migration::authorize(&message, node_id) {
+                                    Ok(()) => {
+                                        let id = node_id.to_string();
+                                        tokio::spawn(async move {
+                                            crate::automatic_migration::retry_pending(&id).await;
+                                        });
+                                    }
+                                    Err(error) => tracing::warn!("migration authorization rejected: {error}"),
+                                }
+                                continue;
+                            }
+                        }
+                        if is_migration_control_message(&text) {
+                            tracing::warn!("malformed migration control message rejected");
+                            continue;
+                        }
                         if let Ok(resp) =
                             serde_json::from_str::<relay_shared::protocol::NodeConfigSnapshot>(&text)
                         {
@@ -383,7 +427,8 @@ async fn connect_and_run(
                                 "websocket: received config ({} listeners), applying",
                                 resp.listeners.len()
                             );
-                            if apply_snapshot(manager, camouflage, reconciler, resp).await {
+                            if !crate::automatic_migration::legacy_config_auth_blocked(node_id, &config.auth)
+                                && apply_snapshot(manager, camouflage, reconciler, resp).await {
                                 tracing::info!("websocket: config applied and committed as LKG");
                                 sync_panel_certificates(
                                     panel_certificate_sync,
@@ -399,7 +444,8 @@ async fn connect_and_run(
                             tracing::info!("websocket: config_changed received, re-fetching");
                             match poller::fetch_config(config, node_id).await {
                                 poller::FetchResult::Ok(resp) => {
-                                    if apply_snapshot(manager, camouflage, reconciler, resp).await {
+                                    if !crate::automatic_migration::legacy_config_auth_blocked(node_id, &config.auth)
+                                        && apply_snapshot(manager, camouflage, reconciler, resp).await {
                                         tracing::info!("websocket: config applied after config_changed");
                                         sync_panel_certificates(
                                             panel_certificate_sync,
@@ -686,6 +732,18 @@ async fn sync_panel_certificates(
     }
 }
 
+fn is_migration_control_message(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|message| {
+            message
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|kind| kind.starts_with("node_migration_bootstrap"))
+}
+
 /// WebSocket snapshots intentionally share the HTTP poll's apply-then-commit
 /// path. The cache is never updated merely because a socket delivered JSON.
 async fn apply_snapshot(
@@ -721,6 +779,15 @@ async fn apply_snapshot_at(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn migration_message_detection_uses_top_level_type_not_rule_content() {
+        assert!(super::is_migration_control_message(
+            r#"{"type":"node_migration_bootstrap","invalid":true}"#
+        ));
+        assert!(!super::is_migration_control_message(
+            r#"{"listeners":[],"name":"node_migration_bootstrap"}"#
+        ));
+    }
     use super::{
         apply_snapshot_at, boot_confirmation_ack, derive_ws_url, spawn_lifecycle_work,
         wait_backoff_or_auth_change,

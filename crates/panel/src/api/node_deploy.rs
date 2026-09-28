@@ -10,6 +10,7 @@ use crate::api::provisioning::{
     reported_capabilities, ProvisioningArtifact, ProvisioningBundle, ProvisioningProfile,
 };
 use crate::api::AppState;
+use crate::db::repo::{GroupRepository, ResourceScope};
 use async_trait::async_trait;
 use axum::extract::{Path, State};
 use axum::Json;
@@ -101,12 +102,15 @@ pub struct DeploymentStatus {
     pub profile: ProvisioningProfile,
     pub lite_mode: bool,
     pub capabilities: Option<ProvisioningCapabilities>,
+    pub retry_available: bool,
     pub updated_at: String,
 }
 
 struct Task {
     status: DeploymentStatus,
     logs: Vec<DeploymentLog>,
+    confirmed_fingerprint: Option<String>,
+    retry_allowed: bool,
 }
 
 #[derive(Clone)]
@@ -131,6 +135,48 @@ impl Default for DeploymentRegistry {
 }
 
 impl DeploymentRegistry {
+    async fn bind_fingerprint(&self, id: &str, fingerprint: &str) {
+        if let Some(task) = self.tasks.lock().await.get_mut(id) {
+            task.confirmed_fingerprint = Some(fingerprint.into());
+        }
+    }
+
+    async fn allow_retry(&self, id: &str) {
+        if let Some(task) = self.tasks.lock().await.get_mut(id) {
+            task.retry_allowed = true;
+            task.status.retry_available = true;
+        }
+    }
+
+    async fn requeue(&self, id: &str, host: &str, fingerprint: &str) -> Option<DeploymentStatus> {
+        let mut tasks = self.tasks.lock().await;
+        let task = tasks.get_mut(id)?;
+        if task.status.stage != DeploymentStage::Failed
+            || !task.retry_allowed
+            || task.status.host != host
+            || task.confirmed_fingerprint.as_deref() != Some(fingerprint)
+        {
+            return None;
+        }
+        task.retry_allowed = false;
+        task.status.retry_available = false;
+        task.status.stage = DeploymentStage::Pending;
+        task.status.status = "PENDING".into();
+        task.status.message = "retrying the same durable Node identity".into();
+        task.status.updated_at = now();
+        Some(task.status.clone())
+    }
+    pub async fn has_active_for_node(&self, group_id: i64, node_id: &str) -> bool {
+        self.tasks.lock().await.values().any(|task| {
+            task.status.group_id == group_id
+                && task.status.node_id.as_deref().unwrap_or(&task.status.id) == node_id
+                && !matches!(
+                    task.status.stage,
+                    DeploymentStage::Success | DeploymentStage::Failed
+                )
+        })
+    }
+
     async fn insert(
         &self,
         group_id: i64,
@@ -151,6 +197,7 @@ impl DeploymentRegistry {
             profile,
             lite_mode,
             capabilities: None,
+            retry_available: false,
             updated_at: now.clone(),
         };
         let log = DeploymentLog {
@@ -163,6 +210,8 @@ impl DeploymentRegistry {
             Task {
                 status: status.clone(),
                 logs: vec![log],
+                confirmed_fingerprint: None,
+                retry_allowed: false,
             },
         );
         status
@@ -619,6 +668,10 @@ pub async fn start_deployment(
         .deployments
         .insert(group.id, ssh.host.clone(), req.profile, req.lite_mode)
         .await;
+    state
+        .deployments
+        .bind_fingerprint(&status.id, &fingerprint)
+        .await;
     crate::service::audit::record(
         &state,
         Some(admin.user_id),
@@ -654,6 +707,68 @@ pub async fn deployment_status(
         Some(status) => Json(ApiResponse::success(status)),
         None => error(404, "deployment task not found"),
     }
+}
+
+pub async fn retry_deployment(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<StartDeploymentRequest>,
+) -> Json<ApiResponse<DeploymentStatus>> {
+    let ssh = match validate_ssh(req.host, req.port, req.username, req.password) {
+        Ok(ssh) => ssh,
+        Err(message) => return error(400, message),
+    };
+    let fingerprint = match validate_fingerprint(&req.confirmed_fingerprint) {
+        Ok(fingerprint) => fingerprint,
+        Err(message) => return error(400, message),
+    };
+    let Some(previous) = state.deployments.status(&id).await else {
+        return error(404, "deployment task not found");
+    };
+    if req.group_id != 0 || req.profile != previous.profile || req.lite_mode != previous.lite_mode {
+        return error(409, "retry must preserve the original deployment options");
+    }
+    let Some(panel_url) = effective_public_panel_url(&state)
+        .await
+        .filter(|url| url.starts_with("https://"))
+    else {
+        return error(409, "node credential bootstrap requires an HTTPS Panel URL");
+    };
+    let group = match state.db.node_pool_system_group_id().await {
+        Ok(Some(anchor)) if anchor == previous.group_id => {
+            match GroupRepository::find_by_id(state.db.as_ref(), anchor, &ResourceScope::All).await
+            {
+                Ok(Some(group)) => group,
+                _ => return error(409, "original Pool identity is unavailable"),
+            }
+        }
+        _ => return error(409, "original Pool identity is unavailable"),
+    };
+    let Some(status) = state
+        .deployments
+        .requeue(&id, &ssh.host, &fingerprint)
+        .await
+    else {
+        return error(
+            409,
+            "deployment retry requires confirmed rollback and the original SSH host key",
+        );
+    };
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        run_task(
+            task_state,
+            id,
+            ssh,
+            fingerprint,
+            group.token,
+            panel_url,
+            admin.user_id,
+        )
+        .await;
+    });
+    Json(ApiResponse::success(status))
 }
 
 pub async fn deployment_logs(
@@ -881,6 +996,9 @@ async fn run_task(
 
     if let Some(err) = failure {
         let mut message = public_error(&err, &secrets);
+        if !mutation_started.load(AtomicOrdering::SeqCst) {
+            state.deployments.allow_retry(&id).await;
+        }
         if mutation_started.load(AtomicOrdering::SeqCst)
             && !transaction_committed.load(AtomicOrdering::SeqCst)
         {
@@ -901,6 +1019,7 @@ async fn run_task(
             .await
             {
                 Ok(Ok(())) => {
+                    state.deployments.allow_retry(&id).await;
                     state
                         .deployments
                         .update(
@@ -2035,6 +2154,82 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
         assert_eq!(claim.node_id, task.id);
         assert_eq!(claim.home_group_id, anchor.id);
         assert_eq!(runner.commit_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn deployment_retry_requires_rollback_original_host_key_and_single_requeue() {
+        let registry = DeploymentRegistry::default();
+        let task = registry
+            .insert(
+                7,
+                "node.example".into(),
+                ProvisioningProfile::RealityCamouflage,
+                true,
+            )
+            .await;
+        registry.bind_fingerprint(&task.id, "SHA256:original").await;
+        registry
+            .update(
+                &task.id,
+                DeploymentStage::Failed,
+                "FAILED",
+                "injected",
+                &secrets(),
+            )
+            .await;
+        assert!(registry
+            .requeue(&task.id, "node.example", "SHA256:original")
+            .await
+            .is_none());
+        registry.allow_retry(&task.id).await;
+        assert!(registry
+            .requeue(&task.id, "other.example", "SHA256:original")
+            .await
+            .is_none());
+        assert!(registry
+            .requeue(&task.id, "node.example", "SHA256:other")
+            .await
+            .is_none());
+        let restarted = registry
+            .requeue(&task.id, "node.example", "SHA256:original")
+            .await
+            .unwrap();
+        assert_eq!(restarted.id, task.id);
+        assert_eq!(restarted.stage, DeploymentStage::Pending);
+        assert!(registry
+            .requeue(&task.id, "node.example", "SHA256:original")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn pool_bootstrap_retry_reuses_original_claim_authorization() {
+        let state = test_state(DeploymentRegistry::default()).await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-token")
+            .await
+            .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let first =
+            super::super::provisioning::pool_credential_bootstrap_config(&state, &id, anchor.id, 1)
+                .await
+                .unwrap();
+        let second =
+            super::super::provisioning::pool_credential_bootstrap_config(&state, &id, anchor.id, 1)
+                .await
+                .unwrap();
+        assert_eq!(first, second);
+        let node_id = crate::node_identity::ReuseEligibleNodeId::parse(&id).unwrap();
+        assert_eq!(
+            state
+                .db
+                .list_node_credential_claims_for_identity(anchor.id, &node_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     async fn seed_node_capabilities(state: &AppState, capabilities: ProvisioningCapabilities) {

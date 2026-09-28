@@ -291,6 +291,44 @@ pub(crate) async fn production_claim_transport_allowed(
     claim_transport_allowed(&public_url, peer, headers, &trusted_proxy_ips)
 }
 
+pub(crate) async fn production_claim_transport_failure(
+    state: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> Option<&'static str> {
+    let trusted_proxy_ips = match trusted_proxy_ips_from_env() {
+        Some(ips) => ips,
+        None => return Some("TRUSTED_PROXY_IPS_MISSING_OR_INVALID"),
+    };
+    let public_url = match effective_public_panel_url(state).await {
+        Some(url) => url,
+        None => return Some("PUBLIC_PANEL_URL_MISSING_OR_INVALID"),
+    };
+    if !configured_public_url_is_https(&public_url) {
+        return Some("PUBLIC_PANEL_URL_NOT_HTTPS");
+    }
+    if !trusted_proxy_ips.contains(&peer.ip()) {
+        return Some("SOCKET_PEER_NOT_TRUSTED_PROXY");
+    }
+    if !exactly_https_forwarded_proto(headers) {
+        return Some("X_FORWARDED_PROTO_NOT_EXACTLY_HTTPS");
+    }
+    None
+}
+
+pub(crate) async fn claim_transport_failure_message(
+    state: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> String {
+    format!(
+        "POOL_CREDENTIAL_TRANSPORT_REJECTED:{}",
+        production_claim_transport_failure(state, peer, headers)
+            .await
+            .unwrap_or("UNKNOWN")
+    )
+}
+
 fn valid_claim_id(claim_id: &str) -> bool {
     uuid::Uuid::parse_str(claim_id)
         .map(|parsed| parsed.to_string() == claim_id)
@@ -320,11 +358,8 @@ pub async fn create_claim(
     Json(req): Json<CreateNodeClaimRequest>,
 ) -> Response {
     if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Concrete Node Claim requires the configured trusted HTTPS ingress",
-        );
+        let reason = claim_transport_failure_message(&state, peer, &headers).await;
+        return sensitive_error(StatusCode::SERVICE_UNAVAILABLE, 503, &reason);
     }
     create_claim_after_transport(admin, state, req, "admin-api").await
 }
@@ -337,11 +372,8 @@ pub(crate) async fn create_pool_migration_claim(
     request: CreateNodeClaimRequest,
 ) -> Response {
     if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Concrete Node Claim requires the configured trusted HTTPS ingress",
-        );
+        let reason = claim_transport_failure_message(&state, peer, &headers).await;
+        return sensitive_error(StatusCode::SERVICE_UNAVAILABLE, 503, &reason);
     }
     create_claim_after_transport(admin, state, request, "node-pool-migration").await
 }
@@ -461,11 +493,8 @@ pub async fn claim_status(
     headers: HeaderMap,
 ) -> Response {
     if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Concrete Node Claim requires the configured trusted HTTPS ingress",
-        );
+        let reason = claim_transport_failure_message(&state, peer, &headers).await;
+        return sensitive_error(StatusCode::SERVICE_UNAVAILABLE, 503, &reason);
     }
     claim_status_after_transport(admin, state, claim_id).await
 }
@@ -535,11 +564,8 @@ pub async fn cancel_claim(
     headers: HeaderMap,
 ) -> Response {
     if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Concrete Node Claim requires the configured trusted HTTPS ingress",
-        );
+        let reason = claim_transport_failure_message(&state, peer, &headers).await;
+        return sensitive_error(StatusCode::SERVICE_UNAVAILABLE, 503, &reason);
     }
     cancel_claim_after_transport(admin, state, claim_id).await
 }
@@ -641,11 +667,8 @@ pub async fn claim_node(
     Json(req): Json<ClaimNodeRequest>,
 ) -> Response {
     if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Concrete Node Claim requires the configured trusted HTTPS ingress",
-        );
+        let reason = claim_transport_failure_message(&state, peer, &headers).await;
+        return sensitive_error(StatusCode::SERVICE_UNAVAILABLE, 503, &reason);
     }
     claim_node_after_transport(state, claim_id, headers, req).await
 }
