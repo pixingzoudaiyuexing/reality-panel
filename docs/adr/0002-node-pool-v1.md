@@ -1,6 +1,6 @@
 # ADR 0002 - Node Pool V1
 
-Status: **NODE POOL V1 RELEASED IN v1.3.0 / V2 CONTINUATION IN PROGRESS / PRODUCTION NOT INSPECTED**
+Status: **NODE POOL V1 RELEASED IN v1.3.0 / V2 INTEGRATED AND REVIEWED, v1.4.0 UNRELEASED / PRODUCTION NOT INSPECTED**
 
 ## Decision
 
@@ -28,7 +28,7 @@ RT-001 restart safety: isolated Linux acceptance found that a migrated Node coul
 
 Upgrade from `v1.1.26` to published `v1.3.0` applies additive SQLite Migration 58 or PostgreSQL revision 42 and performs idempotent Node Pool metadata backfill. Existing concrete identities and Bindings remain in place; installing the Panel alone does not deliver config, advance Node revisions, or restart Nodes. An existing Group-Token Node remains Home-only until it is upgraded to a Node version with runtime auth reload support and completes the exact-node credential migration. New Nodes use the hidden Pool anchor and receive their Permanent Credential during SSH or Manual Bootstrap.
 
-This ADR describes Node Pool V1 source integrated on `main` at `95f230bf73e730b92b9023f01e5fad1c2e7d9763`, RT-001 fix `fe8068f55578b6cacb040d4ac72ceaaf271c8321`, and the published `v1.3.0` release. The Owner previously reported `v1.1.26` production deployment; current production version was not inspected. V2 continuation is unreleased and undeployed; no production access occurred during its implementation.
+This ADR describes Node Pool V1 source integrated on `main` at `95f230bf73e730b92b9023f01e5fad1c2e7d9763`, RT-001 fix `fe8068f55578b6cacb040d4ac72ceaaf271c8321`, and the published `v1.3.0` release. The Owner previously reported `v1.1.26` production deployment; current production version was not inspected. V2 continuation is integrated and independently reviewed at `e55560b2fa619024362df4efa29e83b4755930df`, but `v1.4.0` is unreleased and undeployed; no production access occurred during its implementation.
 
 ## Node Management V2 continuation
 
@@ -43,7 +43,7 @@ new connection. After the durable ACK, the existing Claim/Credential machinery
 is authorized over the same channel. Lost authorization frames resume from
 durable state without resending the secret.
 
-For V2 Carrier routing, one provider line may target multiple concrete Nodes. New targets use a separately encoded exact-node DNS key and independently owned provider record ID; old single-node keys remain compatible. The default-line owner and rule attribution do not change. Unknown external records fail closed. DNS membership follows traffic-serving evidence with failure/recovery hysteresis, and control-channel loss alone does not remove an A record. This remains implementation work, not a released Node Pool V1 behavior.
+For V2 Carrier routing, one provider line may target multiple concrete Nodes when each A value has a separate provider record ID. New targets use a separately encoded exact-node DNS key; old single-node keys remain compatible. The default-line owner and rule attribution do not change. Unknown external records fail closed. A provider record grouping multiple A values under one ID is unsupported and fails closed with `CARRIER_MULTI_A_PROVIDER_UNSUPPORTED`. DNS membership follows traffic-serving evidence with failure/recovery hysteresis, and control-channel loss alone does not remove an A record. This is integrated V2 source, not a released Node Pool V1 behavior.
 
 This trust boundary proves continuity of the selected live control connection,
 not the historical physical host. Once the exact Permanent Credential is

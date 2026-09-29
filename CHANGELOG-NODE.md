@@ -7,11 +7,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## [1.4.0] - Unreleased
+## [1.4.0] - Release Candidate (unreleased)
 
-- Reports automatic identity-migration capability separately from authentication hot reload.
-- Persists administrator-authorized migration privately, retries completion after lost acknowledgement, and prevents Legacy config from replacing working LKG during the transition.
-- No Node binary for this version has been released or deployed.
+- Reports automatic historical identity-migration capability separately from authentication hot reload. A published `v1.3.0` Node upgrades its binary once before using the new automatic flow.
+- Persists the administrator-authorized exact-node bootstrap material privately before acknowledgement. A lost authorization or completion ACK resumes from durable state without sending the secret to a replacement connection or creating a second identity.
+- After exact Permanent Credential verification, startup uses its durable credential authority before HTTP/WS config traffic. An authorized migration cannot fall back to Legacy Group-Token config on retry or restart; invalid auth material blocks control traffic while forwarding listeners and Last Known Good configuration remain intact.
+- Newly provisioned SSH and Manual Bootstrap Nodes finish with Permanent Credential authentication and no Legacy Group Token in their final runtime environment. Future upgrades reuse that credential.
+- Config Protocol remains `10`; Lifecycle Protocol remains `1`. The implementation is integrated and independently reviewed, but the `1.4.0` Node binary has not been tagged, released or deployed.
 
 ## [1.3.0] - Release Candidate (2026-09-28)
 

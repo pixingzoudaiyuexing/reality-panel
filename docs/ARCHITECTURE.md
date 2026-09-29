@@ -1,6 +1,6 @@
 # Reality Panel — Current Architecture
 
-This document describes the current source design. Node Reuse product completion was released in `v1.1.26` after independent review and Primary acceptance. The Owner reports that release deployed to production; this task has not independently verified the deployment. Node Pool V1 and RT-001 passed independent review and isolated Debian runtime acceptance, and their GitHub Release `v1.3.0` was published on 2026-09-28. Node Management V2 remains isolated, unreviewed, unreleased implementation work. Current production version was not inspected.
+This document describes the current source design. Node Reuse product completion was released in `v1.1.26` after independent review and Primary acceptance. The Owner reported that release deployed to production; the current production version was not inspected. Node Pool V1 and RT-001 passed independent review and isolated Debian runtime acceptance, and their GitHub Release `v1.3.0` was published on 2026-09-28. Node Management V2 is integrated on `main` at `e55560b2fa619024362df4efa29e83b4755930df` after Primary and independent Gemini review; source version `1.4.0` remains unreleased and undeployed.
 
 ## Control plane and data plane
 
@@ -64,7 +64,7 @@ Groups can select an effective Relay node.
 Carrier policy is group-level. Its persisted model contains:
 - `default_node_id`
 - a list of line bindings with `line_id`
-- each binding can follow the default or name a concrete `node_id`
+- each binding can follow the default or name an exact concrete Node; a line can have multiple exact targets when the provider gives each A value its own record ID
 
 This is not per-rule Carrier routing.
 
@@ -103,6 +103,8 @@ Certificate failure must not casually replace an existing working certificate/ru
 Relay lifecycle commands run over the authenticated control channel. The implementation includes controlled restart/update/uninstall behavior and systemd-managed production assumptions.
 
 A node's identity uses the existing persistent node ID mechanism. Node Reuse V1 does not introduce a new hardware/stable identity framework.
+
+V2 retirement is a guarded transition from active identity to a retired tombstone, not a long-lived RETIRING phase. It revokes the exact active Permanent Credential; explicit restore does not recreate former business memberships or routing.
 
 ## Persistence
 

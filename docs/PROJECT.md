@@ -33,13 +33,13 @@ The repository currently contains support for:
 - GitHub Release based publishing;
 - exact-concrete-node Node Reuse with admin Preflight and guarded runtime delivery (released in `v1.1.26`; Owner reports production deployment);
 - Node Pool V1 and RT-001, independently reviewed and runtime-accepted, published in `v1.3.0`; production deployment was not verified in the V2 task.
-- Node Management V2 is being implemented on an isolated branch. New Nodes are Pool-native and receive exact Permanent Credentials; automatic migration is only for historical Legacy Nodes.
+- Node Management V2 is integrated on `main` at `e55560b2fa619024362df4efa29e83b4755930df` after Primary and independent Gemini review. Its `1.4.0` source is a release candidate, not a published release. New Nodes are Pool-native and receive exact Permanent Credentials; automatic migration is only for historical Legacy Nodes.
 
 ## Non-goals / boundaries
 
 - The Panel is not a packet forwarding hop.
 - Relay does not terminate the real Reality TLS session.
-- Carrier routing remains group-level. The current model is a default node plus `line_id -> node_id` overrides, not per-rule Carrier targets.
+- Carrier routing remains group-level, not per-rule. One provider line may target multiple exact Nodes only when each A value has a distinct provider record ID; grouped multi-value records fail closed.
 - Failover remains group-level / same-group.
 - Cross-group failover is not part of Node Reuse V1.
 - Docker is not the formal automatic production release path.
@@ -50,7 +50,7 @@ The repository currently contains support for:
 - Config Protocol is currently 10.
 - Lifecycle Protocol is currently 1.
 - Current published stable release is `v1.3.0`, verified from GitHub Release metadata on 2026-09-29. The Owner previously reported `v1.1.26` production deployment; current production version was not inspected.
-- Node Management V2 is isolated implementation work and has not been released or deployed.
+- Node Management V2 is integrated and independently reviewed but `v1.4.0` has not been tagged, released or deployed.
 - Group Token is historical compatibility only and must not be the identity credential for newly provisioned Nodes.
 - Production release artifacts are built and published from the tagged checkout.
 - Existing SQLite deployment remains supported; PostgreSQL support is also present.

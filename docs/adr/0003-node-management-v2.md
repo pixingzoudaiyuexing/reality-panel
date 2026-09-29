@@ -1,6 +1,6 @@
 # ADR 0003 - Node Management V2
 
-Status: IMPLEMENTED ON ISOLATED BRANCH / INDEPENDENT REVIEW PENDING / NOT INTEGRATED OR RELEASED
+Status: INTEGRATED ON MAIN AT `e55560b2fa619024362df4efa29e83b4755930df` / PRIMARY AND INDEPENDENT GEMINI REVIEW PASSED / v1.4.0 NOT TAGGED OR RELEASED
 
 ## Decision
 
@@ -18,4 +18,4 @@ Carrier policy permits multiple exact Node targets on one provider line when DNS
 
 ## Compatibility And Gate
 
-The additive retirement schema is SQLite Migration 59 and PostgreSQL revision 43. Schema upgrade and metadata projection do not deliver config, advance existing revision authority, rotate credentials, change LKG, or restart forwarding. Config Protocol remains 10 and Lifecycle Protocol remains 1. Isolated Linux evidence covers fresh SSH credential provisioning, safe failure/retry, current and published-Node migration, and forwarding continuity. This implementation is not integrated, released or deployed. Its exact final HEAD requires independent Gemini review before integration.
+The additive retirement schema is SQLite Migration 59 and PostgreSQL revision 43. Schema upgrade and metadata projection do not deliver config, advance existing revision authority, rotate credentials, change LKG, or restart forwarding. Config Protocol remains 10 and Lifecycle Protocol remains 1. Isolated Linux evidence covers fresh SSH credential provisioning, safe failure/retry, current and published-Node migration, and forwarding continuity. The exact implementation HEAD passed Primary and Formal Independent Gemini review and was fast-forwarded to `main`. No `v1.4.0` tag, release or deployment has occurred; current production version was not inspected.

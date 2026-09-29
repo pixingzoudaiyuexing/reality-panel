@@ -7,11 +7,21 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
-## [1.4.0] - Unreleased
+## [1.4.0] - Release Candidate (unreleased)
 
-- Node Management V2 adds exact-node health and retirement, automatic one-time migration of historical Group-Token Nodes, and permanent-credential-only provisioning for new Nodes.
-- Carrier routing supports multiple independently owned A records per provider line, with exact-node targets, serving-health hysteresis, and per-record transaction rollback.
-- No release, tag, integration, or production deployment has been performed for this version.
+### Node management
+
+- Node Pool remains the global catalog for concrete `(identity_group_id, node_id)` identities. Persistent display names and exact native/reused Group membership projection let administrators identify the same Node across Groups without changing existing ownership or traffic attribution.
+- Node Status uses one request-scoped health observation for telemetry, control connection and Group-specific readiness. Failed reads show unavailable instead of stale readiness; historical Group-only reports remain visible as UNKNOWN without gaining exact-node authority.
+- Historical `v1.3.0` Group-Token Nodes can upgrade once to the `1.4.0` binary, then complete administrator-authorized automatic identity migration over their exact live Lifecycle connection. Durable completion retires that Node's Legacy config authority; a lost acknowledgement or restart cannot send it back to Home-only Legacy config or erase working LKG. Sibling historical Nodes sharing the token remain unaffected.
+- Fresh SSH and Manual Bootstrap Nodes enter the Pool with a durable Permanent Credential, never finishing in Group-Token mode. Secret-free Claim/prepare/activate/verify diagnostics and same-identity retry after confirmed rollback make failed provisioning recoverable.
+- Guarded retirement revokes the exact active Permanent Credential and leaves a persistent tombstone. A retired identity cannot silently reappear; explicit restore does not restore former business memberships or routing.
+
+### Carrier and compatibility
+
+- One Carrier line can advertise multiple exact Nodes when each A value has its own Panel-owned provider `record_id`. Health-driven DNS membership uses 90-second failure and 20-second recovery windows; exact ownership checks, read-back and target-scoped rollback protect other Nodes' records. Ambiguous `node_id`-only routing writes fail closed.
+- A provider record containing multiple A values under one `record_id` is **not** independently manageable: Carrier preflight/reconciliation fails closed with `CARRIER_MULTI_A_PROVIDER_UNSUPPORTED` before an unsafe update or delete. This release does not claim arbitrary multi-value RRset support.
+- Additive SQLite Migration 59 and PostgreSQL schema revision 43 preserve existing identities and history. Config Protocol remains `10`; Lifecycle Protocol remains `1`. The V2 implementation is integrated on `main` and passed Primary and independent Gemini review; `v1.4.0` has not been tagged, released or deployed.
 
 ## [1.3.0] - Release Candidate (2026-09-28)
 

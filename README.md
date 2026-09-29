@@ -2,7 +2,7 @@
 
 > 面向 Reality SNI 中转场景的自托管控制面板：集中管理 Relay 节点、SNI 转发、DNS、证书、伪装站与节点生命周期，同时尽量让数据面不依赖 Panel 持续在线。
 
-**当前已发布版：`v1.3.0`** · **V2 开发源码：`1.4.0`（未发布）** · **Config Protocol：`10`** · **生产部署：Debian 12 / amd64 / systemd** · **License：AGPL-3.0**
+**当前已发布版：`v1.3.0`** · **V2 发布候选源码：`1.4.0`（未发布）** · **Config Protocol：`10`** · **生产部署：Debian 12 / amd64 / systemd** · **License：AGPL-3.0**
 
 ---
 
@@ -92,6 +92,7 @@ Panel 可以集中管理 Relay Node：
 - 一键更新
 - Panel / Node 版本兼容性检查
 - 多 Relay 共同承载同一个入口 Group
+- 节点池显示名称、精确分组成员、统一健康状态与受保护的节点退役 / 显式恢复
 
 Node 安装包与 Panel 使用同一 GitHub Release，部署时会校验版本、架构与 SHA-256。
 
@@ -117,9 +118,10 @@ Reality Panel 可以通过 DNSMgr 自动维护 Reality SNI 对应的 DNS 记录�
 
 - **不单独配置**：交给 DNS Provider 自己决定继承 / 默认行为
 - **跟随默认 Relay**：随着 Group 的首选 Relay 一起切换
-- **指定 Relay**：固定到一个指定且已就绪的 Relay
+- **指定 Relay**：选择一个或多个已就绪的具体 Relay（取决于 DNS Provider 的记录表示）
 
 同一 Reality Rule 可以同时维护默认记录和多个线路记录。
+同一运营商线路可使用多个具体 Node，但每个 A 值必须由 DNS Provider 表示为独立的 `record_id`。如果一个记录 ID 包含多个 A 值，Panel 会以 `CARRIER_MULTI_A_PROVIDER_UNSUPPORTED` 拒绝危险的修改，不会删除其他 Node 的地址。
 
 ### Relay Preference
 
@@ -269,7 +271,7 @@ Reality Panel 更适合下面这类结构：
 | 安装权限 | root |
 | Panel 默认端口 | `18888` |
 | 当前已发布版 | `v1.3.0` |
-| V2 开发源码 | `1.4.0`（尚未发布或部署） |
+| V2 发布候选源码 | `1.4.0`（已集成并通过独立审查，尚未发布或部署） |
 | Config Protocol | `10` |
 
 Docker 文件仍可能保留在仓库中作为开发 / 兼容资产，但 **Docker 已不再属于正式自动发布流程**。生产安装以 GitHub Release 的 systemd 二进制资产为准。
