@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONTRACT="$ROOT/scripts/release-version-contract.sh"
-TAG="${1:-v1.3.0}"
+TAG="${1:-v$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/crates/panel/Cargo.toml" | head -n1)}"
 
 bash "$CONTRACT" "$TAG"
 
@@ -54,3 +54,26 @@ fi
 grep -Fq "CHANGELOG-NODE.md must contain exactly one release heading for ${TAG#v} (found 2)" "$tmp/node-duplicate.out"
 
 printf '[OK] Duplicate exact release headings are rejected; similar version headings remain distinct\n'
+
+awk '!/^DEFAULT_RELEASE_TAG=/' "$ROOT/install.sh" > "$tmp/installer-absent.sh"
+cp "$ROOT/install.sh" "$tmp/installer-duplicate.sh"
+printf 'DEFAULT_RELEASE_TAG=""\n' >> "$tmp/installer-duplicate.sh"
+sed 's/^DEFAULT_RELEASE_TAG=.*/DEFAULT_RELEASE_TAG="v0.0.1"/' "$ROOT/install.sh" > "$tmp/installer-pinned.sh"
+for kind in absent duplicate pinned; do
+    if INSTALLER_SOURCE="$tmp/installer-$kind.sh" bash "$ROOT/scripts/release-check.sh" "${TAG#v}" >"$tmp/marker-$kind.out" 2>&1; then
+        printf '[FAIL] Invalid source installer marker passed: %s\n' "$kind" >&2
+        exit 1
+    fi
+    grep -Fq 'source installer must contain exactly one empty DEFAULT_RELEASE_TAG marker' "$tmp/marker-$kind.out"
+done
+awk '!/sed -i .*DEFAULT_RELEASE_TAG/' "$ROOT/.github/workflows/binary-release.yml" > "$tmp/workflow-no-injection.yml"
+awk '!/grep -Fxc.*RELEASE_TAG/' "$ROOT/.github/workflows/binary-release.yml" > "$tmp/workflow-no-verification.yml"
+awk '!/grep -c.*DEFAULT_RELEASE_TAG/' "$ROOT/.github/workflows/binary-release.yml" > "$tmp/workflow-no-uniqueness.yml"
+for kind in injection verification uniqueness; do
+    if RELEASE_WORKFLOW="$tmp/workflow-no-$kind.yml" bash "$ROOT/scripts/release-check.sh" "${TAG#v}" >"$tmp/workflow-$kind.out" 2>&1; then
+        printf '[FAIL] Incomplete workflow staging passed: %s\n' "$kind" >&2
+        exit 1
+    fi
+    grep -Fq 'release workflow does not' "$tmp/workflow-$kind.out"
+done
+printf '[OK] Missing, duplicate or pinned source markers and incomplete workflow injection are rejected\n'

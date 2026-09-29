@@ -67,7 +67,8 @@ parse() {
         FAKE_PUBLIC_IP="${FAKE_PUBLIC_IP:-}" \
         FAKE_IPIFY_FAIL="${FAKE_IPIFY_FAIL:-0}" \
         FAKE_OCCUPIED_PORT="${FAKE_OCCUPIED_PORT:-}" \
-        bash "$ROOT/install.sh" "$@"
+        TARGET_VERSION="${TEST_TARGET_VERSION:-}" \
+        bash "${TEST_ENTRYPOINT:-$ROOT/install.sh}" "$@"
 }
 
 out="$(FAKE_LATEST_TAG=v1.0.0 FAKE_PUBLIC_IP=203.0.113.10 parse)"
@@ -157,4 +158,67 @@ grep -Fq 'PANEL_CERTIFICATE_STATE_DIR=$DATA_ROOT/certificates' "$ROOT/deploy.sh"
 grep -Fq 'PANEL_CERTBOT_BINARY_PATH=/usr/bin/certbot' "$ROOT/deploy.sh"
 grep -Fq 'PANEL_CERTIFICATE_CHECK_INTERVAL_SECS=60' "$ROOT/deploy.sh"
 
+grep -Fqx 'DEFAULT_RELEASE_TAG=""' "$ROOT/install.sh" || fail "source installer has no empty release marker"
+staged="${STAGED_INSTALLER_UNDER_TEST:-$TMP/staged-install.sh}"
+if [ -z "${STAGED_INSTALLER_UNDER_TEST:-}" ]; then
+    sed 's/^DEFAULT_RELEASE_TAG=.*/DEFAULT_RELEASE_TAG="v1.4.0"/' "$ROOT/install.sh" > "$staged"
+    chmod +x "$staged"
+fi
+[ "$(grep -Fxc 'DEFAULT_RELEASE_TAG="v1.4.0"' "$staged")" = 1 ] || fail "staged installer marker is not exactly v1.4.0"
+
+out="$(TEST_ENTRYPOINT="$staged" parse --public-panel-url https://panel.example.com)"
+grep -Fqx 'command=install' <<< "$out"
+grep -Fqx 'target_version=v1.4.0' <<< "$out"
+! grep -Fq '/releases/latest' "$CURL_LOG" || fail "bundled default queried latest"
+out="$(TEST_ENTRYPOINT="$staged" parse install --public-panel-url https://panel.example.com)"
+grep -Fqx 'target_version=v1.4.0' <<< "$out"
+! grep -Fq '/releases/latest' "$CURL_LOG" || fail "bundled install queried latest"
+
+out="$(TEST_ENTRYPOINT="$staged" FAKE_LATEST_TAG=v1.5.0 parse update --public-panel-url https://panel.example.com)"
+grep -Fqx 'target_version=v1.5.0' <<< "$out"
+[ "$(grep -Fc '/releases/latest' "$CURL_LOG")" = 1 ] || fail "bundled updater was pinned"
+
+for args in 'v1.2.3' 'install v1.2.3' 'install --version v1.2.3' 'update v1.2.3' 'update --version v1.2.3'; do
+    # Each form must override both the environment and the bundled default.
+    read -r -a version_args <<< "$args"
+    out="$(TEST_ENTRYPOINT="$staged" TEST_TARGET_VERSION=v1.2.7 parse "${version_args[@]}" --public-panel-url https://panel.example.com)"
+    grep -Fqx 'target_version=v1.2.3' <<< "$out" || fail "CLI did not override environment: $args"
+    ! grep -Fq '/releases/latest' "$CURL_LOG" || fail "explicit version queried latest: $args"
+done
+for mode in install update; do
+    out="$(TEST_ENTRYPOINT="$staged" TEST_TARGET_VERSION=v1.2.7 parse "$mode" --public-panel-url https://panel.example.com)"
+    grep -Fqx 'target_version=v1.2.7' <<< "$out" || fail "environment lost to bundled default: $mode"
+    ! grep -Fq '/releases/latest' "$CURL_LOG" || fail "environment version queried latest: $mode"
+done
+
+for invalid in not-a-tag '' 'v1.4.0;echo'; do
+    if TEST_ENTRYPOINT="$staged" parse install --version "$invalid" --public-panel-url https://panel.example.com >"$TMP/invalid.out" 2>&1; then
+        fail "invalid explicit version succeeded"
+    fi
+    ! grep -Fq '/releases/latest' "$CURL_LOG" || fail "invalid explicit version fell back to latest"
+done
+out="$(TEST_ENTRYPOINT="$staged" TEST_TARGET_VERSION=invalid parse --version v1.2.3 --public-panel-url https://panel.example.com)"
+grep -Fqx 'target_version=v1.2.3' <<< "$out"
+
+# Exercise the installed updater wrapper with only its filesystem path redirected.
+sed "s#installer=\"/usr/local/lib/reality-panel/install.sh\"#installer=\"$staged\"#" "$ROOT/update.sh" > "$TMP/installed-update.sh"
+out="$(TEST_ENTRYPOINT="$TMP/installed-update.sh" FAKE_LATEST_TAG=v1.5.0 parse --public-panel-url https://panel.example.com)"
+grep -Fqx 'command=update' <<< "$out"
+grep -Fqx 'target_version=v1.5.0' <<< "$out"
+[ "$(grep -Fc '/releases/latest' "$CURL_LOG")" = 1 ] || fail "installed updater was pinned"
+out="$(TEST_ENTRYPOINT="$TMP/installed-update.sh" parse v1.4.0 --public-panel-url https://panel.example.com)"
+grep -Fqx 'target_version=v1.4.0' <<< "$out"
+! grep -Fq '/releases/latest' "$CURL_LOG" || fail "explicit installed update queried latest"
+
+: > "$CURL_LOG"
+if env PATH="$FAKE:$PATH" REALITY_PANEL_OS_RELEASE_FILE="$TMP/os-release" CURL_LOG="$CURL_LOG" \
+    TARGET_VERSION="" PUBLIC_PANEL_URL=https://panel.example.com \
+    bash "$staged" >"$TMP/staged-missing.out" 2>"$TMP/staged-missing.err"; then
+    fail "missing bundled exact release unexpectedly succeeded"
+fi
+grep -Fq 'Unable to download SHA256SUMS for exact release v1.4.0' "$TMP/staged-missing.err"
+! grep -Fq '/releases/latest' "$CURL_LOG" || fail "missing bundled release fell back to latest"
+grep -Fqx 'DEFAULT_RELEASE_TAG=""' "$ROOT/install.sh" || fail "test staging mutated source installer"
+
+printf 'bundled install / latest updater / CLI-environment precedence contract: PASS\n'
 printf 'installer entrypoint contract: PASS\n'

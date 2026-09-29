@@ -6,6 +6,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="${1:-}"
 PANEL_CHANGELOG="${PANEL_CHANGELOG:-$ROOT/CHANGELOG.md}"
 NODE_CHANGELOG="${NODE_CHANGELOG:-$ROOT/CHANGELOG-NODE.md}"
+INSTALLER_SOURCE="${INSTALLER_SOURCE:-$ROOT/install.sh}"
+RELEASE_WORKFLOW="${RELEASE_WORKFLOW:-$ROOT/.github/workflows/binary-release.yml}"
 
 fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 ok() { printf '[OK] %s\n' "$*"; }
@@ -41,6 +43,17 @@ if ! grep -Fq "stable release is \`v$VERSION\`" "$ROOT/docs/VERSIONS.md" && \
     fail "docs/VERSIONS.md does not declare v$VERSION as stable or candidate"
 fi
 grep -q 'pixingzoudaiyuexing/reality-panel' "$ROOT/install.sh" || fail "installer repository is not Reality Panel"
+[ "$(grep -c '^DEFAULT_RELEASE_TAG=' "$INSTALLER_SOURCE")" = 1 ] && \
+    [ "$(grep -Fxc 'DEFAULT_RELEASE_TAG=""' "$INSTALLER_SOURCE")" = 1 ] || \
+    fail "source installer must contain exactly one empty DEFAULT_RELEASE_TAG marker"
+grep -Fq 'test "$(grep -c '\''^DEFAULT_RELEASE_TAG='\'' release-dist/install.sh)" -eq 1' "$RELEASE_WORKFLOW" || \
+    fail "release workflow does not reject duplicate installer markers"
+grep -Fq 'test "$(grep -Fxc '\''DEFAULT_RELEASE_TAG=""'\'' release-dist/install.sh)" -eq 1' "$RELEASE_WORKFLOW" || \
+    fail "release workflow does not verify the source installer marker"
+grep -Fq 'sed -i "s/^DEFAULT_RELEASE_TAG=.*/DEFAULT_RELEASE_TAG=\"$RELEASE_TAG\"/" release-dist/install.sh' "$RELEASE_WORKFLOW" || \
+    fail "release workflow does not inject the staged installer tag"
+grep -Fq 'test "$(grep -Fxc "DEFAULT_RELEASE_TAG=\"$RELEASE_TAG\"" release-dist/install.sh)" -eq 1' "$RELEASE_WORKFLOW" || \
+    fail "release workflow does not verify exact staged installer injection"
 grep -q "tags:" "$ROOT/.github/workflows/binary-release.yml" || fail "tag-only release workflow missing"
 grep -q "cargo build --release --locked" "$ROOT/.github/workflows/binary-release.yml" || fail "release build is not locked"
 grep -q 'reality-panel-linux-amd64' "$ROOT/.github/workflows/binary-release.yml" || fail "Panel asset missing"

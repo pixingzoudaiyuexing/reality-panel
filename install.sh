@@ -3,6 +3,7 @@
 set -euo pipefail
 
 REPOSITORY="pixingzoudaiyuexing/reality-panel"
+DEFAULT_RELEASE_TAG=""
 INSTALL_ROOT="/opt/relay-panel"
 CONFIG_ROOT="/etc/relay-panel"
 DATA_ROOT="/var/lib/relay-panel"
@@ -22,7 +23,10 @@ Usage:
   install.sh update [VERSION]
   install.sh uninstall [--yes] [--purge]
 
-Install and update without VERSION select the latest stable GitHub Release.
+Source installers with no CLI or TARGET_VERSION select latest stable Release.
+A release-bundled installer defaults fresh install to its bundled release.
+Update with no CLI or TARGET_VERSION selects latest, never the bundled default.
+Explicit VERSION overrides TARGET_VERSION; TARGET_VERSION overrides defaults.
 VERSION may be a stable or prerelease tag such as v1.0.0 or v1.1.0-rc.1.
 New installations listen on port 18888 by default. Uninstall preserves
 configuration and data unless --purge is explicitly supplied.
@@ -136,6 +140,7 @@ local_uninstall() {
 
 command_name=install
 target_version="${TARGET_VERSION:-}"
+version_was_explicit=0
 panel_port="${PANEL_PORT:-18888}"
 public_url="${PUBLIC_PANEL_URL:-}"
 port_was_explicit=0
@@ -153,6 +158,7 @@ case "${1:-}" in
     v*)
         valid_release_tag "$1" || fail "Invalid release tag: $1"
         target_version="$1"
+        version_was_explicit=1
         shift
         ;;
     *) fail "Unknown command or release tag: $1" ;;
@@ -184,11 +190,23 @@ command -v systemctl >/dev/null 2>&1 || fail "systemd is required."
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --version) [ "$#" -ge 2 ] || fail "--version requires a value"; target_version="$2"; shift 2 ;;
+        --version)
+            [ "$#" -ge 2 ] || fail "--version requires a value"
+            valid_release_tag "$2" || fail "Invalid release tag: $2"
+            target_version="$2"
+            version_was_explicit=1
+            shift 2
+            ;;
         --port) [ "$#" -ge 2 ] || fail "--port requires a value"; panel_port="$2"; port_was_explicit=1; shift 2 ;;
         --public-panel-url) [ "$#" -ge 2 ] || fail "--public-panel-url requires a value"; public_url="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
-        v*) [ -z "$target_version" ] || fail "Multiple release versions were provided"; target_version="$1"; shift ;;
+        v*)
+            [ "$version_was_explicit" -eq 0 ] || fail "Multiple release versions were provided"
+            valid_release_tag "$1" || fail "Invalid release tag: $1"
+            target_version="$1"
+            version_was_explicit=1
+            shift
+            ;;
         *) fail "Unknown option: $1" ;;
     esac
 done
@@ -206,6 +224,9 @@ if [ ! -e "$env_file" ] && ss -H -ltn "sport = :$panel_port" 2>/dev/null | grep 
     fail "Panel port $panel_port is already in use. Re-run with --port <PORT>."
 fi
 
+if [ -z "$target_version" ] && [ "$command_name" = install ]; then
+    target_version="$DEFAULT_RELEASE_TAG"
+fi
 if [ -z "$target_version" ]; then
     info "Resolving latest stable Reality Panel release..."
     latest_url="$(curl --proto '=https' --tlsv1.2 -fsSL -o /dev/null -w '%{url_effective}' \

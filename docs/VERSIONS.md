@@ -32,6 +32,14 @@ manifest. The systemd updater only trusts GitHub Release assets. Existing Docker
 images remain available for compatibility deployments, but Docker is no longer
 part of the automatic release workflow.
 
+The source/raw installer has an empty `DEFAULT_RELEASE_TAG` and defaults to
+latest stable. Release assembly injects the exact tag only into the staged
+installer and requires exactly one marker before and after injection. Bundled
+fresh `install` defaults to that tag; `update` ignores it and keeps resolving
+latest stable. Explicit CLI versions override `TARGET_VERSION`, which overrides
+the bundled fresh-install default. The installed updater remains latest-stable
+by default and accepts an explicit tag.
+
 ## Version locations
 
 - `crates/panel/Cargo.toml` and `crates/node/Cargo.toml` carry the matching
