@@ -1,6 +1,6 @@
 # Reality Panel — Current Architecture
 
-This document describes the current source design. Node Reuse product completion was released in `v1.1.26` after independent review and Primary acceptance. The Owner reported that release deployed to production; the current production version was not inspected. Node Pool V1 and RT-001 passed independent review and isolated Debian runtime acceptance, and their GitHub Release `v1.3.0` was published on 2026-09-28. Node Management V2 is integrated on `main` at `e55560b2fa619024362df4efa29e83b4755930df` after Primary and independent Gemini review; source version `1.4.0` remains unreleased and undeployed.
+This document describes the current source design. Node Reuse product completion was released in `v1.1.26` after independent review and Primary acceptance. The Owner reported that release deployed to production; the current production version was not inspected. Node Pool V1 and RT-001 passed independent review and isolated Debian runtime acceptance, and their GitHub Release `v1.3.0` was published on 2026-09-28. Node Management V2 is integrated on `main` at `e55560b2fa619024362df4efa29e83b4755930df` after Primary and independent Gemini review. The `1.4.0` release source is finalized; publication and deployment are separate steps, and no production deployment is claimed here.
 
 ## Control plane and data plane
 

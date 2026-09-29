@@ -7,7 +7,7 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
-## [1.4.0] - Release Candidate (unreleased)
+## [1.4.0] - 2026-09-29
 
 ### Node management
 
@@ -21,7 +21,7 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 - One Carrier line can advertise multiple exact Nodes when each A value has its own Panel-owned provider `record_id`. Health-driven DNS membership uses 90-second failure and 20-second recovery windows; exact ownership checks, read-back and target-scoped rollback protect other Nodes' records. Ambiguous `node_id`-only routing writes fail closed.
 - A provider record containing multiple A values under one `record_id` is **not** independently manageable: Carrier preflight/reconciliation fails closed with `CARRIER_MULTI_A_PROVIDER_UNSUPPORTED` before an unsafe update or delete. This release does not claim arbitrary multi-value RRset support.
-- Additive SQLite Migration 59 and PostgreSQL schema revision 43 preserve existing identities and history. Config Protocol remains `10`; Lifecycle Protocol remains `1`. The V2 implementation is integrated on `main` and passed Primary and independent Gemini review; `v1.4.0` has not been tagged, released or deployed.
+- Additive SQLite Migration 59 and PostgreSQL schema revision 43 preserve existing identities and history. Config Protocol remains `10`; Lifecycle Protocol remains `1`. Node Management V2 and the RC-140-001 release-path fix are integrated on `main` and passed Primary and independent reviews. No production deployment is claimed here.
 
 ## [1.3.0] - Release Candidate (2026-09-28)
 

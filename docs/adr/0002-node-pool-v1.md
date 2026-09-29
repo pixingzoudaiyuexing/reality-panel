@@ -1,6 +1,6 @@
 # ADR 0002 - Node Pool V1
 
-Status: **NODE POOL V1 RELEASED IN v1.3.0 / V2 INTEGRATED AND REVIEWED, v1.4.0 UNRELEASED / PRODUCTION NOT INSPECTED**
+Status: **NODE POOL V1 RELEASED IN v1.3.0 / V2 INTEGRATED AND REVIEWED, v1.4.0 RELEASE SOURCE FINALIZED / PRODUCTION NOT INSPECTED**
 
 ## Decision
 
@@ -28,7 +28,7 @@ RT-001 restart safety: isolated Linux acceptance found that a migrated Node coul
 
 Upgrade from `v1.1.26` to published `v1.3.0` applies additive SQLite Migration 58 or PostgreSQL revision 42 and performs idempotent Node Pool metadata backfill. Existing concrete identities and Bindings remain in place; installing the Panel alone does not deliver config, advance Node revisions, or restart Nodes. An existing Group-Token Node remains Home-only until it is upgraded to a Node version with runtime auth reload support and completes the exact-node credential migration. New Nodes use the hidden Pool anchor and receive their Permanent Credential during SSH or Manual Bootstrap.
 
-This ADR describes Node Pool V1 source integrated on `main` at `95f230bf73e730b92b9023f01e5fad1c2e7d9763`, RT-001 fix `fe8068f55578b6cacb040d4ac72ceaaf271c8321`, and the published `v1.3.0` release. The Owner previously reported `v1.1.26` production deployment; current production version was not inspected. V2 continuation is integrated and independently reviewed at `e55560b2fa619024362df4efa29e83b4755930df`, but `v1.4.0` is unreleased and undeployed; no production access occurred during its implementation.
+This ADR describes Node Pool V1 source integrated on `main` at `95f230bf73e730b92b9023f01e5fad1c2e7d9763`, RT-001 fix `fe8068f55578b6cacb040d4ac72ceaaf271c8321`, and the published `v1.3.0` release. The Owner previously reported `v1.1.26` production deployment; current production version was not inspected. V2 continuation is integrated and independently reviewed at `e55560b2fa619024362df4efa29e83b4755930df`; its `v1.4.0` release source is finalized. No production access occurred during its implementation.
 
 ## Node Management V2 continuation
 

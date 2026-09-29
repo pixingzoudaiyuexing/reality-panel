@@ -1,13 +1,15 @@
 # Release Contract
 
 Reality Panel uses one release tag and one compatibility version for the Panel
-and Node. The latest verified GitHub Release is `v1.3.0`. The integrated Node
-Management V2 release candidate is `v1.4.0`, so a released `v1.3.0` Node can
+and Node. At the 2026-09-29 pre-tag source freeze, the latest verified GitHub
+Release was `v1.3.0`; consult GitHub Releases for subsequent publication. The
+finalized release candidate is `v1.4.0`, so a released `v1.3.0` Node can
 install the newer automatic-migration-capable binary through the monotonic
 lifecycle updater. The implementation HEAD `e55560b2fa619024362df4efa29e83b4755930df`
-passed Primary and Formal Independent Gemini review; `v1.4.0` is not tagged,
-released or deployed. The Owner previously reported `v1.1.26` production
-deployment; current production version was not inspected.
+passed Primary and Formal Independent Gemini review; the integrated RC-140-001
+release-preparation HEAD `1ed93c1fc9db5232da3f39040c28cbee93f9cf99`
+passed focused Primary and independent review. The Owner previously reported
+`v1.1.26` production deployment; current production version was not inspected.
 Config Protocol remains `10` and Lifecycle Protocol remains `1`.
 
 ## Release assets
@@ -43,13 +45,13 @@ by default and accepts an explicit tag.
 ## Version locations
 
 - `crates/panel/Cargo.toml` and `crates/node/Cargo.toml` carry the matching
-  unreleased candidate version `1.4.0`.
+  release source version `1.4.0`.
 - `Cargo.lock` records both package versions.
 - `crates/panel/src/config.rs` reads the Panel package version by default.
 - `scripts/relay-node-install.sh` is a legacy compatibility script only.
 - `.github/workflows/binary-release.yml` publishes systemd release assets.
 
-Validate version alignment before a later, separately authorized release:
+Validate version alignment for the exact-tag release workflow:
 
 ```bash
 bash scripts/release-version-contract.sh v1.4.0

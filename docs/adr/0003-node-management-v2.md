@@ -1,6 +1,6 @@
 # ADR 0003 - Node Management V2
 
-Status: INTEGRATED ON MAIN AT `e55560b2fa619024362df4efa29e83b4755930df` / PRIMARY AND INDEPENDENT GEMINI REVIEW PASSED / v1.4.0 NOT TAGGED OR RELEASED
+Status: INTEGRATED ON MAIN AT `e55560b2fa619024362df4efa29e83b4755930df` / PRIMARY AND INDEPENDENT GEMINI REVIEW PASSED / v1.4.0 RELEASE SOURCE FINALIZED
 
 ## Decision
 
@@ -10,7 +10,7 @@ Global health combines current telemetry, control connection, reconciliation and
 
 New SSH and Manual Bootstrap Nodes use the hidden Pool anchor and must persist an exact Permanent Credential before success. SSH bootstrap reports a fixed, secret-free failure stage. A retry after confirmed rollback reuses the original deployment ID, Claim and credential continuation; a fresh deployment ID cannot silently replace an existing persistent Node ID. Trusted HTTPS reverse-proxy ingress requires the configured immediate proxy peer and exactly one `X-Forwarded-Proto: https` header.
 
-Historical Group-Token Nodes use one administrator-authorized, unique live Lifecycle connection for one-time migration. This is continuity of the selected live connection, not proof of historical physical host ownership. The Node persists the bootstrap secret before ACK, redeems it through the existing Claim/Credential flow, and records completion only after the Panel confirms exact credential authentication. An authorized migration blocks Legacy config from replacing LKG during retry or restart. A published `v1.3.0` Node does not understand this automatic flow, so the unreleased V2 source uses version `1.4.0` and a distinct capability report: it upgrades the binary once, then migrates. Future upgrades reuse the Permanent Credential.
+Historical Group-Token Nodes use one administrator-authorized, unique live Lifecycle connection for one-time migration. This is continuity of the selected live connection, not proof of historical physical host ownership. The Node persists the bootstrap secret before ACK, redeems it through the existing Claim/Credential flow, and records completion only after the Panel confirms exact credential authentication. An authorized migration blocks Legacy config from replacing LKG during retry or restart. A published `v1.3.0` Node does not understand this automatic flow, so the V2 release source uses version `1.4.0` and a distinct capability report: it upgrades the binary once, then migrates. Future upgrades reuse the Permanent Credential.
 
 Retirement is a soft tombstone for the exact identity. Preview checks memberships, routing references, unfinished Claims and lifecycle work; committing retirement revokes the active exact Credential atomically. Historical traffic, credentials and audit records remain. The shared Group Token cannot cryptographically revoke one historical physical machine. Restore requires an explicit action and does not recreate business memberships.
 
@@ -18,4 +18,4 @@ Carrier policy permits multiple exact Node targets on one provider line when DNS
 
 ## Compatibility And Gate
 
-The additive retirement schema is SQLite Migration 59 and PostgreSQL revision 43. Schema upgrade and metadata projection do not deliver config, advance existing revision authority, rotate credentials, change LKG, or restart forwarding. Config Protocol remains 10 and Lifecycle Protocol remains 1. Isolated Linux evidence covers fresh SSH credential provisioning, safe failure/retry, current and published-Node migration, and forwarding continuity. The exact implementation HEAD passed Primary and Formal Independent Gemini review and was fast-forwarded to `main`. No `v1.4.0` tag, release or deployment has occurred; current production version was not inspected.
+The additive retirement schema is SQLite Migration 59 and PostgreSQL revision 43. Schema upgrade and metadata projection do not deliver config, advance existing revision authority, rotate credentials, change LKG, or restart forwarding. Config Protocol remains 10 and Lifecycle Protocol remains 1. Isolated Linux evidence covers fresh SSH credential provisioning, safe failure/retry, current and published-Node migration, and forwarding continuity. The exact implementation HEAD passed Primary and Formal Independent Gemini review and was fast-forwarded to `main`. RC-140-001 also passed focused Primary and independent review; the `v1.4.0` release source is finalized for the exact-tag workflow. Production deployment was not inspected during this decision.

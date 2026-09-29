@@ -33,7 +33,7 @@ The repository currently contains support for:
 - GitHub Release based publishing;
 - exact-concrete-node Node Reuse with admin Preflight and guarded runtime delivery (released in `v1.1.26`; Owner reports production deployment);
 - Node Pool V1 and RT-001, independently reviewed and runtime-accepted, published in `v1.3.0`; production deployment was not verified in the V2 task.
-- Node Management V2 is integrated on `main` at `e55560b2fa619024362df4efa29e83b4755930df` after Primary and independent Gemini review. Its `1.4.0` source is a release candidate, not a published release. New Nodes are Pool-native and receive exact Permanent Credentials; automatic migration is only for historical Legacy Nodes.
+- Node Management V2 is integrated on `main` at `e55560b2fa619024362df4efa29e83b4755930df` after Primary and independent Gemini review. The reviewed RC-140-001 release-preparation HEAD is `1ed93c1fc9db5232da3f39040c28cbee93f9cf99`; the `1.4.0` release source is finalized from it. New Nodes are Pool-native and receive exact Permanent Credentials; automatic migration is only for historical Legacy Nodes.
 
 ## Non-goals / boundaries
 
@@ -49,8 +49,8 @@ The repository currently contains support for:
 
 - Config Protocol is currently 10.
 - Lifecycle Protocol is currently 1.
-- Current published stable release is `v1.3.0`, verified from GitHub Release metadata on 2026-09-29. The Owner previously reported `v1.1.26` production deployment; current production version was not inspected.
-- Node Management V2 is integrated and independently reviewed but `v1.4.0` has not been tagged, released or deployed.
+- At the 2026-09-29 pre-tag source freeze, the latest published stable release was `v1.3.0`; consult GitHub Releases for subsequent publication. The Owner previously reported `v1.1.26` production deployment; current production version was not inspected.
+- Node Management V2 and RC-140-001 passed their required Primary and independent reviews. Formal release assets are built from the exact tagged checkout; no production deployment is asserted by this source freeze.
 - Group Token is historical compatibility only and must not be the identity credential for newly provisioned Nodes.
 - Production release artifacts are built and published from the tagged checkout.
 - Existing SQLite deployment remains supported; PostgreSQL support is also present.
