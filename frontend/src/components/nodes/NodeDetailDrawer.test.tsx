@@ -2,12 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import type { NodeDisplayRow, ReconciliationState } from '../../api/types';
 
-const { mockGet } = vi.hoisted(() => ({ mockGet: vi.fn() }));
+const { mockGet, mockDelete } = vi.hoisted(() => ({ mockGet: vi.fn(), mockDelete: vi.fn() }));
 
-// NodeDetailDrawer calls api.delete on the admin "delete status" action, so the
-// client must be mocked before importing the component.
 vi.mock('../../api/client', () => ({
-  default: { get: mockGet, delete: vi.fn().mockResolvedValue({ code: 0 }) },
+  default: { get: mockGet, delete: mockDelete },
 }));
 
 import { NodeDetailDrawer } from './NodeDetailDrawer';
@@ -25,10 +23,10 @@ const baseRow: NodeDisplayRow = {
 
 describe('NodeDetailDrawer desensitization', () => {
   beforeEach(() => {
-    mockGet.mockReset();
+    mockGet.mockReset(); mockDelete.mockReset(); mockDelete.mockResolvedValue({ code: 0 });
     mockGet.mockImplementation((url: string) => Promise.resolve({
       code: 0,
-      data: url === '/groups' ? [] : {
+      data: url === '/groups' || url === '/admin/node-pool/nodes' ? [] : {
         ready: false, bindings: [], sync_state: 'NOT_READY',
         expected_fingerprint: null, expected_revision: null, preview: null, blockers: [],
       },
@@ -44,9 +42,18 @@ describe('NodeDetailDrawer desensitization', () => {
     expect(screen.queryByText('nodeStatusDelete')).not.toBeInTheDocument();
   });
 
-  it('offers clear status only for an offline node', () => {
+  it('offers clear status only for an offline legacy node', async () => {
     render(<NodeDetailDrawer row={{ ...baseRow, online: false }} open onClose={vi.fn()} isAdmin panelProtocol={2} />);
-    expect(screen.getByText('nodeStatusDelete')).toBeInTheDocument();
+    expect(await screen.findByText('nodeStatusDelete')).toBeInTheDocument();
+  });
+
+  it('offers true deletion for an online Pool-native node', async () => {
+    mockGet.mockImplementation((url: string) => Promise.resolve({ code: 0, data:
+      url === '/admin/node-pool/nodes' ? [{ pool_native: true, identity_group_id: 1, node_id: 'node-abc', memberships: [] }]
+        : url === '/groups' ? [] : { ready: false, bindings: [], sync_state: 'NOT_READY' } }));
+    render(<NodeDetailDrawer row={baseRow} open onClose={vi.fn()} isAdmin panelProtocol={2} />);
+    expect(await screen.findByText('poolDelete')).toBeInTheDocument();
+    expect(screen.queryByText('nodeStatusDelete')).not.toBeInTheDocument();
   });
 
   it('shows TCP and UDP separately while preserving zero and unknown', () => {

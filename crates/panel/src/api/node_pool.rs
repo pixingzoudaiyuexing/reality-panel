@@ -279,6 +279,50 @@ pub async fn rename_node(
     }
 }
 
+/// Admin-only local retirement. This works for an offline server and never
+/// claims that software on the remote host has been uninstalled.
+pub async fn delete_node(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    Path((group_id, node_id)): Path<(i64, String)>,
+) -> Response {
+    if ReuseEligibleNodeId::parse(&node_id).is_err() {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    match state.db.node_pool_system_group_id().await {
+        Ok(Some(anchor)) if anchor == group_id => {}
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return unavailable(),
+    }
+    match node_pool::retire_node(&state, group_id, &node_id).await {
+        Ok(Some(needs_attention)) => {
+            crate::api::node_ops::supersede_uninstall_after_admin_delete(
+                &state, group_id, &node_id,
+            )
+            .await;
+            crate::service::audit::record(
+                &state,
+                Some(admin.user_id),
+                "delete_pool_node",
+                "node",
+                &node_id,
+                &format!("identity_group_id={group_id}"),
+            )
+            .await;
+            Json(ApiResponse::success(serde_json::json!({
+                "warnings": ["EXTERNAL_DNS_NEEDS_ATTENTION"],
+                "routing_interrupted": needs_attention
+            })))
+            .into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            tracing::warn!(group_id, node_id, "node retirement failed: {error}");
+            unavailable()
+        }
+    }
+}
+
 pub async fn group_nodes(
     _admin: AdminOnly,
     State(state): State<AppState>,
@@ -547,6 +591,374 @@ mod tests {
             .header("Content-Type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn deleting_offline_pool_node_revokes_auth_and_cannot_resurrect_from_status() {
+        let (state, pool) = fixture().await;
+        sqlx::query("INSERT INTO device_groups(id,name,group_type,token,uid) VALUES (30,'z3','in','z3-token',1)")
+            .execute(&pool).await.unwrap();
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-token")
+            .await
+            .unwrap();
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let secret = active_credential(&pool, anchor.id, id, "retired-credential").await;
+        for group in [20, 30] {
+            crate::service::node_reuse::create_binding(state.db.as_ref(), group, anchor.id, id)
+                .await
+                .unwrap();
+        }
+        state
+            .db
+            .set(
+                "relay_preference:20",
+                &serde_json::json!({
+                    "preferred_node_id": id, "pending_node_id": id, "state": "switching",
+                    "started_at": "2026-09-30T00:00:00Z", "last_error": null,
+                    "dns_records": [], "carrier_policy": {"default_node_id":id, "bindings":[]},
+                    "pending_carrier_policy": null, "transaction_kind":"preferred_switch"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .set(
+                &format!("node_status:{}:{id}", anchor.id),
+                r#"{"last_seen":"2000-01-01T00:00:00Z","verified_concrete_node":true}"#,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .set(
+                &format!("node_config_revision:{}:{id}", anchor.id),
+                "current",
+            )
+            .await
+            .unwrap();
+        let historical = format!("node_config_rule_sources:{}:{id}:7", anchor.id);
+        state.db.set(&historical, r#"{"100":20}"#).await.unwrap();
+        let before = node_pool::list_nodes(state.db.as_ref()).await.unwrap();
+        let node = before.iter().find(|node| node.node_id == id).unwrap();
+        assert!(node.pool_native && !node.online && node.safe_to_add);
+        assert_eq!(node.memberships.len(), 2);
+        let (_other_conn, mut other_rx) = state
+            .node_connections
+            .register(anchor.id, Some("other-node".into()))
+            .await;
+        let (_retired_conn, mut retired_rx) = state
+            .node_connections
+            .register(anchor.id, Some(id.into()))
+            .await;
+
+        let app = crate::api::routes().with_state(state.clone());
+        let delete = Request::builder()
+            .method("DELETE")
+            .uri(format!("/admin/node-pool/nodes/{}/{id}", anchor.id))
+            .header("Authorization", format!("Bearer {}", jwt(1, true)))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(delete).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert!(
+            retired_rx.recv().await.is_none(),
+            "retired WS sender is closed"
+        );
+        assert!(
+            other_rx.try_recv().is_err(),
+            "sibling WS remains registered"
+        );
+        assert!(node_pool::list_nodes(state.db.as_ref())
+            .await
+            .unwrap()
+            .iter()
+            .all(|n| n.node_id != id));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM node_reuse_bindings WHERE home_group_id=? AND node_id=?"
+            )
+            .bind(anchor.id)
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(state.db.get(&historical).await.unwrap().is_some());
+        let preference = crate::service::relay_preference::load_preference(state.db.as_ref(), 20)
+            .await
+            .unwrap();
+        assert_eq!(preference.preferred_node_id, None);
+        assert_eq!(preference.pending_node_id, None);
+        assert_eq!(preference.carrier_policy.default_node_id, None);
+        assert!(state
+            .db
+            .get(&format!("node_config_revision:{}:{id}", anchor.id))
+            .await
+            .unwrap()
+            .is_none());
+        let parsed = ReuseEligibleNodeId::parse(id).unwrap();
+        assert!(
+            !state
+                .db
+                .set_verified_node_status_if_active(
+                    anchor.id,
+                    &parsed,
+                    "retired-credential",
+                    r#"{"last_seen":"2026-09-30T00:00:00Z"}"#
+                )
+                .await
+                .unwrap(),
+            "a report authenticated before retirement cannot write after it"
+        );
+        assert!(state
+            .db
+            .get(&format!("node_status:{}:{id}", anchor.id))
+            .await
+            .unwrap()
+            .is_none());
+        let credential_headers = |builder: axum::http::request::Builder| {
+            builder
+                .header(
+                    "Authorization",
+                    format!("RelayNodeCredential {}", secret.to_wire_value()),
+                )
+                .header("X-Node-Credential-ID", "retired-credential")
+                .header("X-Node-ID", id)
+        };
+        let config = credential_headers(Request::builder())
+            .uri("/node/config")
+            .header(
+                "X-Config-Protocol-Version",
+                relay_shared::protocol::CONFIG_PROTOCOL_VERSION,
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(config).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let status = credential_headers(Request::builder()).method("POST").uri("/node/report_status")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"cpu_usage":0,"mem_usage":0,"active_connections":0,"uptime_secs":1,"node_id":"12345678-1234-1234-1234-123456789abc"}"#)).unwrap();
+        let response = app.clone().oneshot(status).await.unwrap();
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
+            401
+        );
+        // WS and HTTP share authenticate_node; the route's WebSocketUpgrade
+        // extractor needs a real socket and rejects an in-memory oneshot with 426.
+        let ws_headers = credential_headers(Request::builder())
+            .body(Body::empty())
+            .unwrap()
+            .into_parts()
+            .0
+            .headers;
+        assert!(matches!(
+            crate::api::node_auth::authenticate_node(&state, &ws_headers).await,
+            Err(crate::api::node_auth::NodeAuthError::Unauthorized)
+        ));
+
+        // Simulate an already-authenticated report finishing after retirement.
+        state
+            .db
+            .set(&format!("node_status:{}:{id}", anchor.id), "{}")
+            .await
+            .unwrap();
+        node_pool::reconcile_metadata(state.db.as_ref())
+            .await
+            .unwrap();
+        assert!(node_pool::list_nodes(state.db.as_ref())
+            .await
+            .unwrap()
+            .iter()
+            .all(|n| n.node_id != id));
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime("retired-credential")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn retirement_cancels_pending_bootstrap_and_reinstall_uses_fresh_identity() {
+        let (state, pool) = fixture().await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-token")
+            .await
+            .unwrap();
+        let old_id = "12345678-1234-1234-1234-123456789abc";
+        let new_id = "12345678-1234-1234-1234-123456789abd";
+        active_credential(&pool, anchor.id, old_id, "old-credential").await;
+        node_pool::list_nodes(state.db.as_ref()).await.unwrap();
+        let now = "2026-09-30T00:00:00Z";
+        sqlx::query("INSERT INTO manual_bootstrap_enrollments(id,secret_verifier,group_id,profile,state,created_by,created_at,updated_at,expires_at)
+                     VALUES (?, 'test-verifier', ?, 'reality_camouflage','CLAIMED',1,?,?,?)")
+            .bind(old_id).bind(anchor.id).bind(now).bind(now).bind(now)
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO node_credential_claims(claim_id,home_group_id,node_id,secret_verifier_format,secret_verifier_version,secret_verifier_data,state,expires_at,claimant_nonce_verifier_format,claimant_nonce_verifier_version,claimant_nonce_verifier_data,approved_by,approval_ref,created_at,updated_at,claimed_at,credential_pending_at)
+                     VALUES (?, ?, ?, 'rp-node-claim-sha256',1,?, 'CREDENTIAL_PENDING',?, 'rp-node-claim-nonce-sha256',1,?,1,?,?,?, ?,?)")
+            .bind(old_id).bind(anchor.id).bind(old_id).bind(vec![1_u8;32]).bind(now)
+            .bind(vec![2_u8;32]).bind(format!("node-pool-bootstrap:{old_id}"))
+            .bind(now).bind(now).bind(now).bind(now)
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO node_credential_deliveries(claim_id,home_group_id,node_id,credential_id,credential_verifier_format,credential_verifier_version,credential_verifier_data,delivery_nonce_verifier_format,delivery_nonce_verifier_version,delivery_nonce_verifier_data,state,authorized_at,expires_at,updated_at)
+                     VALUES (?,?,?,'pending-credential','rp-node-sha256',1,?,'rp-node-delivery-nonce-sha256',1,?,'PREPARED',?,?,?)")
+            .bind(old_id).bind(anchor.id).bind(old_id).bind(vec![3_u8;32]).bind(vec![4_u8;32])
+            .bind(now).bind(now).bind(now).execute(&pool).await.unwrap();
+
+        assert!(node_pool::retire_node(&state, anchor.id, old_id)
+            .await
+            .unwrap()
+            .is_some());
+        let claim: String =
+            sqlx::query_scalar("SELECT state FROM node_credential_claims WHERE claim_id=?")
+                .bind(old_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let delivery: String =
+            sqlx::query_scalar("SELECT state FROM node_credential_deliveries WHERE claim_id=?")
+                .bind(old_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let enrollment: String =
+            sqlx::query_scalar("SELECT state FROM manual_bootstrap_enrollments WHERE id=?")
+                .bind(old_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (claim.as_str(), delivery.as_str(), enrollment.as_str()),
+            ("CANCELLED", "CANCELLED", "FAILED")
+        );
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime("old-credential")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(node_pool::list_nodes(state.db.as_ref())
+            .await
+            .unwrap()
+            .iter()
+            .all(|node| node.node_id != old_id));
+        active_credential(&pool, anchor.id, new_id, "new-credential").await;
+        let current = node_pool::list_nodes(state.db.as_ref()).await.unwrap();
+        assert!(current
+            .iter()
+            .any(|node| node.node_id == new_id && node.pool_native && node.safe_to_add));
+        assert!(current.iter().all(|node| node.node_id != old_id));
+        assert!(
+            node_pool::retire_node(&state, anchor.id, old_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "repeated retirement must not touch the reinstalled Node"
+        );
+    }
+
+    #[tokio::test]
+    async fn online_pool_node_can_be_deleted_without_remote_ack() {
+        let (state, pool) = fixture().await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-token")
+            .await
+            .unwrap();
+        let id = "POOL_ONLINE";
+        active_credential(&pool, anchor.id, id, "online-credential").await;
+        state.db.set(&format!("node_status:{}:{id}", anchor.id),
+            &serde_json::json!({"last_seen":chrono::Utc::now().to_rfc3339(),"verified_concrete_node":true}).to_string())
+            .await.unwrap();
+        let before = node_pool::list_nodes(state.db.as_ref()).await.unwrap();
+        assert!(before.iter().any(|node| node.node_id == id && node.online));
+        let (_, mut channel) = state
+            .node_connections
+            .register(anchor.id, Some(id.into()))
+            .await;
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/admin/node-pool/nodes/{}/{id}", anchor.id))
+            .header("Authorization", format!("Bearer {}", jwt(1, true)))
+            .body(Body::empty())
+            .unwrap();
+        let response = crate::api::routes()
+            .with_state(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(channel.recv().await.is_none());
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime("online-credential")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(node_pool::list_nodes(state.db.as_ref())
+            .await
+            .unwrap()
+            .iter()
+            .all(|node| node.node_id != id));
+    }
+
+    #[tokio::test]
+    async fn retirement_database_error_rolls_back_credential_and_membership() {
+        let (state, pool) = fixture().await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-token")
+            .await
+            .unwrap();
+        let id = "POOL_ROLLBACK";
+        active_credential(&pool, anchor.id, id, "rollback-credential").await;
+        crate::service::node_reuse::create_binding(state.db.as_ref(), 20, anchor.id, id)
+            .await
+            .unwrap();
+        node_pool::list_nodes(state.db.as_ref()).await.unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_pool_retire BEFORE DELETE ON node_pool_nodes
+                     BEGIN SELECT RAISE(ABORT, 'injected pool deletion error'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let parsed = ReuseEligibleNodeId::parse(id).unwrap();
+        assert!(state
+            .db
+            .retire_pool_native_node(anchor.id, &parsed)
+            .await
+            .is_err());
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime("rollback-credential")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            state
+                .db
+                .list_reusing_group_ids_for_node(anchor.id, id)
+                .await
+                .unwrap(),
+            vec![20]
+        );
+        assert!(node_pool::list_nodes(state.db.as_ref())
+            .await
+            .unwrap()
+            .iter()
+            .any(|node| node.node_id == id));
     }
 
     #[tokio::test]

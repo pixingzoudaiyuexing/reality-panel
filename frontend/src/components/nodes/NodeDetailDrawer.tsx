@@ -1,11 +1,12 @@
  
+import { useEffect, useState } from 'react';
 import { Drawer, Descriptions, Tag, Button, Popconfirm, message } from 'antd';
 import { DeleteOutlined } from '@ant-design/icons';
 import { formatPercent, formatBytes, formatBps, formatUptime } from '../../utils/format';
 import { useI18n } from '../../i18n/context';
 import { CountryFlag } from './CountryFlag';
 import { GroupMembershipSummary } from './GroupMembershipSummary';
-import type { NodeDisplayRow, ReconciliationState } from '../../api/types';
+import type { ApiEnvelope, NodeDisplayRow, PoolNode, ReconciliationState } from '../../api/types';
 import api from '../../api/client';
 
 interface Props {
@@ -48,21 +49,36 @@ const displayTimestamp = (value?: string | null) => {
 export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, onDeleted }: Props) {
   const { t } = useI18n();
   const labels = { d: t('uptimeDay'), h: t('uptimeHour'), m: t('uptimeMinute'), s: t('uptimeSecond') };
+  const [poolNative, setPoolNative] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!open || !isAdmin || !row?.node_id) return;
+    let active = true;
+    setPoolNative(null);
+    void api.get<unknown, ApiEnvelope<PoolNode[]>>('/admin/node-pool/nodes').then(response => {
+      if (active) setPoolNative(!!response.data?.some(node => node.pool_native &&
+        node.identity_group_id === row.group_id && node.node_id === row.node_id));
+    }).catch(() => { if (active) setPoolNative(null); });
+    return () => { active = false; };
+  }, [open, isAdmin, row?.group_id, row?.node_id]);
 
   const handleDelete = async () => {
     if (!row) return;
     const gid = row.group_id;
     const nid = row.node_id;
-    const url = nid
+    const url = poolNative && nid
+      ? `/admin/node-pool/nodes/${gid}/${encodeURIComponent(nid)}`
+      : nid
       ? `/nodes/${gid}?node_id=${encodeURIComponent(nid)}`
       : `/nodes/${gid}`;
     try {
-      await api.delete(url);
-      message.success(t('nodeStatusDeleted'));
+      const result = await api.delete<unknown, ApiEnvelope<{ warnings?: string[] }>>(url);
+      if (result.code !== 0) throw new Error();
+      message.success(t(poolNative ? 'poolDeleted' : 'nodeStatusDeleted'));
+      if (poolNative && result.data?.warnings?.length) message.warning(t('poolDnsAttention'));
       onDeleted?.();
       onClose();
     } catch {
-      message.error(t('nodeStatusDeleteFailed'));
+      message.error(t(poolNative ? 'poolDeleteFailed' : 'nodeStatusDeleteFailed'));
     }
   };
 
@@ -176,10 +192,12 @@ export function NodeDetailDrawer({ row, open, onClose, isAdmin, panelProtocol, o
       {isAdmin && row?.node_id && /^[A-Za-z0-9_-]{1,128}$/.test(row.node_id) ? (
         <GroupMembershipSummary key={`${row.group_id}:${row.node_id}`} homeGroupId={row.group_id} nodeId={row.node_id} open={open} />
       ) : null}
-      {isAdmin && row && row.online === false && (
+      {isAdmin && row && poolNative !== null && (poolNative || row.online === false) && (
         <div style={{ marginTop: 16 }}>
-          <Popconfirm title={t('nodeStatusDeleteConfirm')} onConfirm={handleDelete}>
-            <Button danger icon={<DeleteOutlined />}>{t('nodeStatusDelete')}</Button>
+          <Popconfirm title={poolNative ? t('poolDeleteConfirm').replace('{name}', row.node_id || '-') : t('nodeStatusDeleteConfirm')}
+            description={poolNative ? <>{t('poolDeleteImpact')}{row.online && <p>{t('poolDeleteOnlineImpact')}</p>}</> : undefined}
+            onConfirm={handleDelete}>
+            <Button danger icon={<DeleteOutlined />}>{t(poolNative ? 'poolDelete' : 'nodeStatusDelete')}</Button>
           </Popconfirm>
         </div>
       )}

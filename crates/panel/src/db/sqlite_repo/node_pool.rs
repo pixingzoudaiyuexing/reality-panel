@@ -38,11 +38,19 @@ impl NodePoolRepository for SqliteRepository {
         })?;
         sqlx::query(
             "INSERT INTO node_pool_nodes (identity_group_id, node_id)
-            SELECT id, ? FROM device_groups WHERE id = ?
+            SELECT id, ? FROM device_groups WHERE id = ? AND (
+                id != COALESCE((SELECT group_id FROM node_pool_system_anchor WHERE singleton = 1), -1)
+                OR EXISTS (SELECT 1 FROM node_credentials
+                           WHERE home_group_id = id AND node_id = ?
+                             AND activated_at IS NOT NULL AND revoked_at IS NULL)
+                OR EXISTS (SELECT 1 FROM node_reuse_bindings
+                           WHERE home_group_id = id AND node_id = ?))
             ON CONFLICT (identity_group_id, node_id) DO NOTHING",
         )
         .bind(node_id)
         .bind(group_id)
+        .bind(node_id)
+        .bind(node_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -64,6 +72,121 @@ impl NodePoolRepository for SqliteRepository {
         .execute(&self.pool)
         .await?
         .rows_affected())
+    }
+
+    async fn retire_pool_native_node(
+        &self,
+        group_id: i64,
+        node_id: &crate::node_identity::ReuseEligibleNodeId,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        // Own the SQLite writer slot before inspecting any identity state.
+        sqlx::query("UPDATE device_groups SET name = name WHERE id = ?")
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM node_pool_nodes WHERE identity_group_id = ? AND node_id = ?
+             AND identity_group_id = (SELECT group_id FROM node_pool_system_anchor WHERE singleton = 1)",
+        )
+        .bind(group_id)
+        .bind(node_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if exists.is_none() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        sqlx::query(
+            "UPDATE manual_bootstrap_enrollments SET state='FAILED',
+             last_error_category='NODE_RETIRED', updated_at=?
+             WHERE id=? AND group_id=? AND state IN ('PENDING','CLAIMED','VERIFYING','LOCAL_COMMITTED')",
+        )
+        .bind(&now)
+        .bind(node_id.as_str())
+        .bind(group_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE node_credential_deliveries SET state='CANCELLED', cancelled_at=?, updated_at=?
+             WHERE home_group_id=? AND node_id=? AND state='PREPARED'",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(group_id)
+        .bind(node_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE node_credential_claims SET state='CANCELLED', cancelled_at=?, updated_at=?
+             WHERE home_group_id=? AND node_id=? AND state IN ('APPROVED','CLAIMED','CREDENTIAL_PENDING')",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(group_id)
+        .bind(node_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE node_credentials SET revoked_at=datetime('now'), updated_at=datetime('now')
+             WHERE home_group_id=? AND node_id=? AND revoked_at IS NULL",
+        )
+        .bind(group_id)
+        .bind(node_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM node_reuse_bindings WHERE home_group_id=? AND node_id=?")
+            .bind(group_id)
+            .bind(node_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        for key in [
+            format!("node_status:{group_id}:{}", node_id.as_str()),
+            format!("node_config_revision:{group_id}:{}", node_id.as_str()),
+        ] {
+            sqlx::query("DELETE FROM kvs WHERE key=?")
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("DELETE FROM node_pool_nodes WHERE identity_group_id=? AND node_id=?")
+            .bind(group_id)
+            .bind(node_id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn set_verified_node_status_if_active(
+        &self,
+        group_id: i64,
+        node_id: &crate::node_identity::ReuseEligibleNodeId,
+        credential_id: &str,
+        status: &str,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE device_groups SET name=name WHERE id=?")
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+        let written = sqlx::query(
+            "INSERT INTO kvs (key,value)
+             SELECT ?,? WHERE EXISTS (
+                 SELECT 1 FROM node_credentials AS current
+                 WHERE current.home_group_id=? AND current.node_id=? AND current.credential_id=?
+                   AND current.activated_at IS NOT NULL AND current.revoked_at IS NULL
+                   AND current.generation=(SELECT MAX(history.generation) FROM node_credentials AS history
+                       WHERE history.home_group_id=current.home_group_id AND history.node_id=current.node_id
+                       AND history.activated_at IS NOT NULL))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        )
+        .bind(format!("node_status:{group_id}:{}", node_id.as_str()))
+        .bind(status).bind(group_id).bind(node_id.as_str()).bind(credential_id)
+        .execute(&mut *tx).await?.rows_affected() == 1;
+        tx.commit().await?;
+        Ok(written)
     }
 
     async fn node_pool_system_group_id(&self) -> Result<Option<i64>, DbError> {

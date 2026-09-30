@@ -184,6 +184,64 @@ pub(crate) async fn has_active_durable_uninstall(
     }))
 }
 
+/// Admin Delete may retire an unreachable Node while an uninstall is waiting
+/// indefinitely for remote confirmation. Preserve the operation as failed,
+/// since the remote result is unknown, and release its local routing gate.
+pub(crate) async fn supersede_uninstall_after_admin_delete(
+    state: &AppState,
+    group_id: i64,
+    node_id: &str,
+) {
+    let _guard = DURABLE_UNINSTALL_LOCK.lock().await;
+    let mut ended = Vec::new();
+    let Ok(rows) = state.db.scan_prefix(DURABLE_UNINSTALL_PREFIX).await else {
+        return;
+    };
+    for (_, raw) in rows {
+        let Ok(mut durable) = serde_json::from_str::<DurableUninstallOperation>(&raw) else {
+            continue;
+        };
+        if durable.operation.group_id != group_id
+            || durable.operation.node_id != node_id
+            || durable.operation.status.terminal()
+        {
+            continue;
+        }
+        durable.operation.status = OperationStatus::Failed;
+        durable.operation.message =
+            "Panel identity deleted by administrator; remote uninstall result unknown".into();
+        durable.operation.updated_at = now();
+        if let Err(error) = store_durable_uninstall(state, &durable).await {
+            tracing::warn!(
+                group_id,
+                node_id,
+                "could not persist superseded uninstall: {error}"
+            );
+            continue;
+        }
+        state.node_operations.restore_uninstall(&durable);
+        if let Err(error) = crate::service::relay_preference::release_uninstall_gate(
+            state.db.as_ref(),
+            group_id,
+            node_id,
+            &durable.operation.id,
+        )
+        .await
+        {
+            tracing::warn!(
+                group_id,
+                node_id,
+                "could not release superseded uninstall gate: {error}"
+            );
+        }
+        ended.push(durable.operation);
+    }
+    drop(_guard);
+    for operation in ended {
+        audit_terminal_operation(state, &operation).await;
+    }
+}
+
 impl NodeOperationRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -1321,7 +1379,7 @@ pub async fn receive_uninstall_result(
         {
             return StatusCode::FORBIDDEN.into_response();
         }
-        if durable.operation.status == OperationStatus::Success {
+        if durable.operation.status.terminal() {
             state.node_operations.restore_uninstall(&durable);
             return success(durable.operation());
         }
@@ -1435,7 +1493,18 @@ async fn cleanup_uninstalled_node(
     state: &AppState,
     group_id: i64,
     node_id: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    if state
+        .db
+        .node_pool_system_group_id()
+        .await
+        .map_err(|e| e.to_string())?
+        == Some(group_id)
+    {
+        return crate::service::node_pool::retire_node(state, group_id, node_id)
+            .await
+            .map(|attention| attention.unwrap_or(false));
+    }
     let status_key = format!("node_status:{group_id}:{node_id}");
     if let Some(raw) = state
         .db
@@ -1471,7 +1540,7 @@ async fn cleanup_uninstalled_node(
     crate::service::relay_schedule::delete_schedules_for_node(state.db.as_ref(), group_id, node_id)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(false)
 }
 
 async fn finalize_durable_uninstall(
@@ -1491,20 +1560,24 @@ async fn finalize_durable_uninstall(
             state.node_operations.restore_uninstall(&durable);
             return Ok(durable.operation());
         }
-        if let Err(error) = cleanup_uninstalled_node(
+        let needs_attention = match cleanup_uninstalled_node(
             state,
             durable.operation.group_id,
             &durable.operation.node_id,
         )
         .await
         {
-            durable.operation.status = OperationStatus::Verifying;
-            durable.operation.message = format!("Panel state cleanup failed; retrying: {error}");
-            durable.operation.updated_at = now();
-            store_durable_uninstall(state, &durable).await?;
-            state.node_operations.restore_uninstall(&durable);
-            return Err(error);
-        }
+            Ok(needs_attention) => needs_attention,
+            Err(error) => {
+                durable.operation.status = OperationStatus::Verifying;
+                durable.operation.message =
+                    format!("Panel state cleanup failed; retrying: {error}");
+                durable.operation.updated_at = now();
+                store_durable_uninstall(state, &durable).await?;
+                state.node_operations.restore_uninstall(&durable);
+                return Err(error);
+            }
+        };
         match crate::service::relay_preference::release_uninstall_gate(
             state.db.as_ref(),
             durable.operation.group_id,
@@ -1520,6 +1593,12 @@ async fn finalize_durable_uninstall(
         durable.panel_cleanup_complete = true;
         durable.operation.status = OperationStatus::Success;
         durable.operation.message = format!("{}; Panel state cleaned", durable.operation.message);
+        if needs_attention {
+            durable
+                .operation
+                .message
+                .push_str("; EXTERNAL_DNS_NEEDS_ATTENTION");
+        }
         durable.operation.updated_at = now();
         store_durable_uninstall(state, &durable).await?;
         state.node_operations.restore_uninstall(&durable);
@@ -1549,7 +1628,7 @@ pub async fn record_uninstall_disconnect(state: &AppState, group_id: i64, node_i
             };
             if durable.operation.group_id != group_id
                 || durable.operation.node_id != node_id
-                || durable.operation.status == OperationStatus::Success
+                || durable.operation.status.terminal()
             {
                 continue;
             }
@@ -1622,6 +1701,9 @@ pub async fn audit_terminal_operation(state: &AppState, operation: &NodeOperatio
     }
     if operation.action == NodeLifecycleAction::Uninstall
         && operation.status == OperationStatus::Failed
+        && !operation
+            .message
+            .starts_with("Panel identity deleted by administrator")
         && !persist_pre_destructive_uninstall_failure(state, operation).await
     {
         return;
@@ -3114,6 +3196,166 @@ mod tests {
         for secret_name in ["NODE_TOKEN", "Authorization", "Bearer", "password"] {
             assert!(!detail.contains(secret_name));
         }
+    }
+
+    #[tokio::test]
+    async fn pool_uninstall_retires_only_after_verified_cleanup_and_disconnect() {
+        let (state, pool) = test_state().await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-token")
+            .await
+            .unwrap();
+        let id = "POOL_UNINSTALL";
+        let node = crate::node_identity::ReuseEligibleNodeId::parse(id).unwrap();
+        sqlx::query("INSERT INTO node_credentials(credential_id,home_group_id,node_id,generation,verifier_format,verifier_version,verifier_data,activated_at) VALUES ('uninstall-active',?, ?,1,'rp-node-sha256',1,?,datetime('now'))")
+            .bind(anchor.id).bind(id).bind(vec![7_u8;32]).execute(&pool).await.unwrap();
+        state
+            .db
+            .register_node_pool_identity(anchor.id, id)
+            .await
+            .unwrap();
+        let operation = state
+            .node_operations
+            .start(
+                anchor.id,
+                id.into(),
+                NodeLifecycleAction::Uninstall,
+                Some("1.3.0".into()),
+                None,
+                None,
+                None,
+                Some(1),
+            )
+            .unwrap();
+        seed_durable_uninstall(&state, &operation, false, false).await;
+        assert_eq!(
+            finalize_durable_uninstall(&state, &operation.id)
+                .await
+                .unwrap()
+                .status,
+            OperationStatus::Verifying
+        );
+        assert!(state
+            .db
+            .find_current_active_node_credential_for_identity(anchor.id, &node)
+            .await
+            .unwrap()
+            .is_some());
+        let mut durable = load_durable_uninstall(&state, &operation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        durable.saw_disconnect = true;
+        store_durable_uninstall(&state, &durable).await.unwrap();
+        assert_eq!(
+            finalize_durable_uninstall(&state, &operation.id)
+                .await
+                .unwrap()
+                .status,
+            OperationStatus::Verifying,
+            "disconnect alone never retires an identity"
+        );
+        durable.cleanup_confirmed = true;
+        durable.destructive_started = true;
+        store_durable_uninstall(&state, &durable).await.unwrap();
+        assert_eq!(
+            finalize_durable_uninstall(&state, &operation.id)
+                .await
+                .unwrap()
+                .status,
+            OperationStatus::Success
+        );
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime("uninstall-active")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(crate::service::node_pool::list_nodes(state.db.as_ref())
+            .await
+            .unwrap()
+            .iter()
+            .all(|entry| entry.node_id != id));
+        assert_eq!(
+            finalize_durable_uninstall(&state, &operation.id)
+                .await
+                .unwrap()
+                .status,
+            OperationStatus::Success,
+            "the persisted result is idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_delete_after_stalled_uninstall_preserves_failure_history() {
+        let (state, pool) = test_state().await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-token")
+            .await
+            .unwrap();
+        let id = "POOL_STALLED";
+        sqlx::query("INSERT INTO node_credentials(credential_id,home_group_id,node_id,generation,verifier_format,verifier_version,verifier_data,activated_at) VALUES ('stalled-active',?, ?,1,'rp-node-sha256',1,?,datetime('now'))")
+            .bind(anchor.id).bind(id).bind(vec![7_u8;32]).execute(&pool).await.unwrap();
+        state
+            .db
+            .register_node_pool_identity(anchor.id, id)
+            .await
+            .unwrap();
+        let operation = state
+            .node_operations
+            .start(
+                anchor.id,
+                id.into(),
+                NodeLifecycleAction::Uninstall,
+                Some("1.3.0".into()),
+                None,
+                None,
+                None,
+                Some(1),
+            )
+            .unwrap();
+        seed_durable_uninstall(&state, &operation, false, false).await;
+        assert!(has_active_durable_uninstall(&state, anchor.id, id)
+            .await
+            .unwrap());
+        assert!(
+            crate::service::node_pool::retire_node(&state, anchor.id, id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        supersede_uninstall_after_admin_delete(&state, anchor.id, id).await;
+        let ended = load_durable_uninstall(&state, &operation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ended.operation.status, OperationStatus::Failed);
+        assert!(ended
+            .operation
+            .message
+            .contains("remote uninstall result unknown"));
+        assert!(!has_active_durable_uninstall(&state, anchor.id, id)
+            .await
+            .unwrap());
+        record_uninstall_disconnect(&state, anchor.id, id).await;
+        assert_eq!(
+            load_durable_uninstall(&state, &operation.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .operation
+                .status,
+            OperationStatus::Failed
+        );
+        assert_eq!(
+            finalize_durable_uninstall(&state, &operation.id)
+                .await
+                .unwrap()
+                .status,
+            OperationStatus::Failed
+        );
     }
 
     #[tokio::test]

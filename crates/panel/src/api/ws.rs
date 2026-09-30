@@ -304,6 +304,22 @@ impl NodeConnections {
         let mut map = self.inner.write().await;
         map.remove(&group_id).map(|conns| conns.len()).unwrap_or(0)
     }
+
+    /// Drop only this concrete Node's control channels after retiring its
+    /// credential. Other Nodes under the same identity group keep running.
+    pub async fn close_node(&self, group_id: i64, node_id: &str) -> usize {
+        let mut map = self.inner.write().await;
+        let Some(conns) = map.get_mut(&group_id) else {
+            return 0;
+        };
+        let before = conns.len();
+        conns.retain(|_, entry| entry.node_id.as_deref() != Some(node_id));
+        let removed = before - conns.len();
+        if conns.is_empty() {
+            map.remove(&group_id);
+        }
+        removed
+    }
 }
 
 /// 判断认证后的 Node 是否允许进入 WS 控制面。
@@ -463,6 +479,15 @@ async fn handle_node_ws(
             lifecycle_capable,
         )
         .await;
+    if let Some(verified) = verified_credential.as_ref() {
+        if !matches!(
+            verified_credential_still_active(&state, verified).await,
+            Ok(true)
+        ) {
+            node_connections.unregister(group_id, conn_id).await;
+            return;
+        }
+    }
     if let Some(node_id) = lifecycle_node_id.as_deref() {
         for operation in node_operations.connected(
             group_id,

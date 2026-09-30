@@ -698,6 +698,22 @@ pub trait NodePoolRepository: Send + Sync {
         node_id: &str,
         name: &str,
     ) -> Result<u64, DbError>;
+    /// Retire one Pool-native identity atomically with its live credentials,
+    /// pending enrollment authority, memberships, and current status.
+    async fn retire_pool_native_node(
+        &self,
+        group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+    ) -> Result<bool, DbError>;
+    /// Persist a verified status only while that exact credential remains
+    /// current. Serializes with retirement to reject in-flight reports.
+    async fn set_verified_node_status_if_active(
+        &self,
+        group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+        credential_id: &str,
+        status: &str,
+    ) -> Result<bool, DbError>;
     async fn node_pool_system_group_id(&self) -> Result<Option<i64>, DbError>;
     async fn ensure_node_pool_system_group(
         &self,

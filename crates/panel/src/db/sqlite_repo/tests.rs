@@ -15,6 +15,39 @@ use crate::db::schema::{run_migrations, SCHEMA_SQL};
 use relay_shared::protocol::TrafficEntry;
 
 #[tokio::test]
+async fn pool_retirement_revokes_and_prevents_registry_recreation() {
+    let db = repo().await;
+    let anchor = db
+        .ensure_node_pool_system_group(1, "pool-test-token")
+        .await
+        .unwrap();
+    let id = crate::node_identity::ReuseEligibleNodeId::parse("POOL_OLD").unwrap();
+    sqlx::query("INSERT INTO node_credentials(credential_id,home_group_id,node_id,generation,verifier_format,verifier_version,verifier_data,activated_at) VALUES ('pool-old',?,'POOL_OLD',1,'rp-node-sha256',1,?,datetime('now'))")
+        .bind(anchor.id).bind(vec![7_u8;32]).execute(&db.pool).await.unwrap();
+    db.register_node_pool_identity(anchor.id, id.as_str())
+        .await
+        .unwrap();
+    assert!(db
+        .set_verified_node_status_if_active(anchor.id, &id, "pool-old", "{}")
+        .await
+        .unwrap());
+    assert!(db.retire_pool_native_node(anchor.id, &id).await.unwrap());
+    assert!(!db
+        .set_verified_node_status_if_active(anchor.id, &id, "pool-old", "{}")
+        .await
+        .unwrap());
+    db.register_node_pool_identity(anchor.id, id.as_str())
+        .await
+        .unwrap();
+    assert!(db.list_node_pool_records().await.unwrap().is_empty());
+    assert!(db
+        .find_active_node_credential_for_runtime("pool-old")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn node_pool_metadata_contract() {
     let db = repo().await;
     seed_group(&db, 71).await;

@@ -249,6 +249,7 @@ pub async fn record_migration_completion(
 }
 
 pub async fn reconcile_metadata(db: &dyn Repository) -> Result<(), DbError> {
+    let system_group = db.node_pool_system_group_id().await?;
     let mut identities: BTreeSet<ConcreteNodeIdentity> = db
         .discover_node_pool_identities()
         .await?
@@ -256,7 +257,10 @@ pub async fn reconcile_metadata(db: &dyn Repository) -> Result<(), DbError> {
         .collect();
     for (key, _) in db.scan_prefix("node_status:").await? {
         if let Some((home_group_id, Some(node_id))) = crate::api::stats::parse_status_key(&key) {
-            if ReuseEligibleNodeId::parse(node_id).is_ok() {
+            // A report authenticated just before retirement can finish after
+            // revocation. Pool identities must come from live credential or
+            // binding authority, never from that stale status alone.
+            if Some(home_group_id) != system_group && ReuseEligibleNodeId::parse(node_id).is_ok() {
                 identities.insert(ConcreteNodeIdentity {
                     home_group_id,
                     node_id: node_id.into(),
@@ -271,6 +275,83 @@ pub async fn reconcile_metadata(db: &dyn Repository) -> Result<(), DbError> {
         }
     }
     Ok(())
+}
+
+/// Retire current Pool authority; retain historical traffic, metrics, audits,
+/// operation receipts and per-revision traffic attribution.
+pub async fn retire_node(
+    state: &crate::api::AppState,
+    group_id: i64,
+    node_id: &str,
+) -> Result<Option<bool>, String> {
+    let node_id = ReuseEligibleNodeId::parse(node_id).map_err(|_| "invalid node identity")?;
+    if state
+        .db
+        .node_pool_system_group_id()
+        .await
+        .map_err(|e| e.to_string())?
+        != Some(group_id)
+    {
+        return Ok(None);
+    }
+    if !state
+        .db
+        .list_node_pool_records()
+        .await
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|record| record.identity_group_id == group_id && record.node_id == node_id.as_str())
+    {
+        return Ok(None);
+    }
+
+    // Existing policy helpers remove every direct Node ID reference. Do this
+    // before the atomic identity retirement so a routing failure leaves an
+    // intact, retryable Node instead of a deleted Node with live references.
+    let mut group_ids = state
+        .db
+        .list_groups(&ResourceScope::All)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|group| group.id)
+        .collect::<Vec<_>>();
+    group_ids.push(group_id);
+    let mut needs_attention = false;
+    for id in group_ids {
+        needs_attention |= crate::service::relay_preference::retire_node_assignment(
+            state.db.as_ref(),
+            id,
+            node_id.as_str(),
+        )
+        .await?;
+        crate::service::relay_failover::remove_excluded_node(
+            state.db.as_ref(),
+            id,
+            node_id.as_str(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        crate::service::relay_schedule::delete_schedules_for_node(
+            state.db.as_ref(),
+            id,
+            node_id.as_str(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    let retired = state
+        .db
+        .retire_pool_native_node(group_id, &node_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if retired {
+        state
+            .node_connections
+            .close_node(group_id, node_id.as_str())
+            .await;
+    }
+    Ok(retired.then_some(needs_attention))
 }
 
 pub async fn list_nodes(db: &dyn Repository) -> Result<Vec<PoolNode>, DbError> {
@@ -469,7 +550,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let db = SqliteRepository::new(pool);
+        let db = SqliteRepository::new(pool.clone());
         let anchor = db
             .ensure_node_pool_system_group(1, "pool-test-token")
             .await
@@ -510,10 +591,16 @@ mod tests {
         db.register_node_pool_identity(anchor.id, "POOL_NEW")
             .await
             .unwrap();
+        assert!(
+            list_nodes(&db).await.unwrap().is_empty(),
+            "an unauthenticated Pool status cannot establish identity"
+        );
+        sqlx::query("INSERT INTO node_credentials(credential_id,home_group_id,node_id,generation,verifier_format,verifier_version,verifier_data,activated_at) VALUES ('pool-new',?,'POOL_NEW',1,'rp-node-sha256',1,?,datetime('now'))")
+            .bind(anchor.id).bind(vec![9_u8;32]).execute(&pool).await.unwrap();
         let nodes = list_nodes(&db).await.unwrap();
         assert_eq!(nodes.len(), 1);
         assert!(!nodes[0].migration_required);
-        assert!(!nodes[0].credential_ready);
+        assert!(nodes[0].credential_ready);
     }
 
     #[tokio::test]

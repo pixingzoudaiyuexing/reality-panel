@@ -738,8 +738,25 @@ pub async fn report_status(
         });
         // Status persistence is best-effort: the original used .ok() to swallow
         // any DB error so a transient failure never broke the report cycle.
-        let status_persisted = match state.db.set(&status_key, &status.to_string()).await {
-            Ok(()) => true,
+        let saved = if let Some(verified) = identity.verified() {
+            state
+                .db
+                .set_verified_node_status_if_active(
+                    verified.home_group_id,
+                    &verified.node_id,
+                    &verified.credential_id,
+                    &status.to_string(),
+                )
+                .await
+        } else {
+            state
+                .db
+                .set(&status_key, &status.to_string())
+                .await
+                .map(|()| true)
+        };
+        let status_persisted = match saved {
+            Ok(saved) => saved,
             Err(error) => {
                 tracing::warn!("report_status: kvs set failed: {}", error);
                 false

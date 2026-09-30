@@ -87,7 +87,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route(
             "/admin/node-pool/nodes/{identity_group_id}/{node_id}",
-            axum::routing::patch(node_pool::rename_node),
+            axum::routing::patch(node_pool::rename_node).delete(node_pool::delete_node),
         )
         .route(
             "/admin/groups/{group_id}/pool-nodes",
