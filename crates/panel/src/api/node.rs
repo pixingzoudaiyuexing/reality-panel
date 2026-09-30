@@ -2515,6 +2515,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_native_node_delivers_all_business_groups_and_keeps_offline_membership() {
+        let (mut state, pool) = seeded_state().await;
+        state.config.node_reuse_runtime_enabled = true;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-config-token")
+            .await
+            .unwrap();
+        state
+            .db
+            .register_node_pool_identity(anchor.id, "POOL_N1")
+            .await
+            .unwrap();
+        let secret = install_active_runtime_credential(
+            &pool,
+            "pool-config-credential",
+            anchor.id,
+            "POOL_N1",
+            0xb3,
+        )
+        .await;
+        for (group_id, name) in [(20, "z1"), (30, "z3")] {
+            sqlx::query(
+                "INSERT INTO device_groups (id, name, group_type, token, uid)
+                 VALUES (?, ?, 'in', ?, 2)",
+            )
+            .bind(group_id)
+            .bind(name)
+            .bind(format!("tok-{group_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (rule_id, group_id) in [
+            (201, 20),
+            (202, 20),
+            (203, 20),
+            (204, 20),
+            (301, 30),
+            (302, 30),
+        ] {
+            sqlx::query(
+                "INSERT INTO forward_rules
+                 (id, name, uid, listen_port, device_group_in, target_addr, target_port)
+                 VALUES (?, ?, 2, ?, ?, '127.0.0.1', 80)",
+            )
+            .bind(rule_id)
+            .bind(format!("g{rule_id}"))
+            .bind(20000 + rule_id)
+            .bind(group_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        for group_id in [20, 30] {
+            crate::service::node_reuse::create_binding(
+                state.db.as_ref(),
+                group_id,
+                anchor.id,
+                "POOL_N1",
+            )
+            .await
+            .unwrap();
+        }
+        let pool_node = crate::service::node_pool::list_nodes(state.db.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|node| node.node_id == "POOL_N1")
+            .unwrap();
+        assert!(pool_node.pool_native);
+        assert!(pool_node.safe_to_add);
+        assert!(!pool_node.online);
+        assert_eq!(
+            pool_node
+                .memberships
+                .iter()
+                .map(|group| group.group_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z1", "z3"],
+        );
+
+        let get_snapshot = || {
+            get_config(
+                State(state.clone()),
+                credential_config_headers("pool-config-credential", &secret, "POOL_N1"),
+            )
+        };
+        let response = get_snapshot().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let combined: NodeConfigSnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            combined
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![201, 202, 203, 204, 301, 302],
+        );
+        let certificate_state_dir = std::path::PathBuf::from(state.config.certificate_state_dir());
+        let ws = crate::api::ws::build_config_snapshot_for_node(
+            state.db.as_ref(),
+            &certificate_state_dir,
+            anchor.id,
+            Some("POOL_N1"),
+            true,
+            true,
+        )
+        .await
+        .expect("Pool-native WS snapshot");
+        assert_eq!(ws.config_revision, combined.config_revision);
+        assert_eq!(ws.config_fingerprint, combined.config_fingerprint);
+        assert_eq!(
+            serde_json::to_value(&ws.config).unwrap(),
+            serde_json::to_value(&combined.config).unwrap(),
+        );
+
+        crate::service::node_reuse::delete_binding(state.db.as_ref(), 30, anchor.id, "POOL_N1")
+            .await
+            .unwrap();
+        let response = get_snapshot().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let single: NodeConfigSnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            single
+                .config
+                .listeners
+                .iter()
+                .map(|listener| listener.rule_id)
+                .collect::<Vec<_>>(),
+            vec![201, 202, 203, 204],
+        );
+        assert!(single.config_revision > combined.config_revision);
+        let pool_node = crate::service::node_pool::list_nodes(state.db.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|node| node.node_id == "POOL_N1")
+            .unwrap();
+        assert_eq!(pool_node.memberships.len(), 1);
+        assert_eq!(pool_node.memberships[0].group_name, "z1");
+    }
+
+    #[tokio::test]
     async fn node_reuse_runtime_enabled_delivers_exact_node_effective_config_and_converges_revocation(
     ) {
         let (mut state, pool) = seeded_state().await;

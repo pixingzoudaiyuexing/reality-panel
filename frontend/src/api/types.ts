@@ -710,6 +710,7 @@ export interface NodeReuseBindingStatus {
 export interface PoolNode {
   identity_group_id: number;
   node_id: string;
+  pool_native: boolean;
   display_name: string;
   public_ipv4: string | null;
   public_ipv6: string | null;

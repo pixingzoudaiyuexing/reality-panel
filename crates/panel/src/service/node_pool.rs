@@ -16,6 +16,7 @@ pub struct PoolMembership {
 pub struct PoolNode {
     pub identity_group_id: i64,
     pub node_id: String,
+    pub pool_native: bool,
     pub display_name: String,
     pub public_ipv4: Option<String>,
     pub public_ipv6: Option<String>,
@@ -330,6 +331,7 @@ pub async fn list_nodes(db: &dyn Repository) -> Result<Vec<PoolNode>, DbError> {
         result.push(PoolNode {
             identity_group_id: record.identity_group_id,
             node_id: record.node_id,
+            pool_native: Some(record.identity_group_id) == system_group,
             display_name: record.display_name,
             public_ipv4: field("public_ipv4").or_else(|| field("public_ip")),
             public_ipv6: field("public_ipv6"),
