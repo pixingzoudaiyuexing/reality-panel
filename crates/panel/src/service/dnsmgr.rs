@@ -3363,6 +3363,115 @@ async fn reconcile_delete(
     audits
 }
 
+/// Advisory create-time inspection. Reads only: never adopt ownership, repair
+/// bindings, enqueue reconciliation, or request an overwrite confirmation.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DomainPreflightCategory {
+    Absent,
+    PanelCompatibleA,
+    ExternalA,
+    Cname,
+    UnmanagedZone,
+    Unconfigured,
+    ProviderReadFailure,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DomainPreflightRecord {
+    pub record_type: String,
+    pub values: Vec<String>,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DomainPreflight {
+    pub fqdn: String,
+    pub category: DomainPreflightCategory,
+    pub records: Vec<DomainPreflightRecord>,
+}
+
+pub(crate) async fn domain_preflight(
+    db: &dyn Repository,
+    input: &str,
+) -> Result<DomainPreflight, &'static str> {
+    let fqdn = normalize_fqdn(input).map_err(|_| "INVALID_FQDN")?;
+    if fqdn.as_str().starts_with("*.") {
+        return Err("INVALID_FQDN");
+    }
+    let mut result = DomainPreflight {
+        fqdn: fqdn.as_str().into(),
+        category: DomainPreflightCategory::ProviderReadFailure,
+        records: Vec::new(),
+    };
+    let client = match load_client(db).await {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            result.category = DomainPreflightCategory::Unconfigured;
+            return Ok(result);
+        }
+        Err(_) => return Ok(result),
+    };
+    let zone = match resolve_zone(&client, &fqdn).await {
+        ZoneResolution::ZoneResolved(zone) => zone,
+        ZoneResolution::NoMatchingZone => {
+            result.category = DomainPreflightCategory::UnmanagedZone;
+            return Ok(result);
+        }
+        ZoneResolution::UpstreamFailure(_) => return Ok(result),
+    };
+    let detail = match client.get_domain(zone.domain_id).await {
+        Ok(detail) => detail,
+        Err(_) => return Ok(result),
+    };
+    let line = resolve_mutation_line(&ProviderLine::default(), &detail).unwrap_or_default();
+    let records = match discover_records(&client, &zone, DnsRecordType::A, &line).await {
+        RecordDiscovery::NoRecord => {
+            result.category = DomainPreflightCategory::Absent;
+            return Ok(result);
+        }
+        RecordDiscovery::SingleMatchingRecord(record) => vec![record],
+        RecordDiscovery::MultipleMatchingRecords(records) => records,
+        RecordDiscovery::ConflictingRecordType(records) => {
+            result.category = DomainPreflightCategory::Cname;
+            records
+        }
+        RecordDiscovery::UpstreamFailure(_) => return Ok(result),
+    };
+    result.records = records
+        .iter()
+        .map(|r| DomainPreflightRecord {
+            record_type: r.record.record_type.clone(),
+            values: r.record.values.clone(),
+            line: r.line.raw_id.clone(),
+        })
+        .collect();
+    if result.category == DomainPreflightCategory::Cname {
+        return Ok(result);
+    }
+    result.category = DomainPreflightCategory::ExternalA;
+    let rules = db
+        .list_rules(&ResourceScope::All)
+        .await
+        .map_err(|_| "DATABASE_ERROR")?;
+    let raw_records = records.iter().map(|r| r.record.clone()).collect::<Vec<_>>();
+    for rule in rules.iter().filter(|r| {
+        r.sni
+            .as_deref()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case(fqdn.as_str()))
+    }) {
+        let binding = db
+            .find_dns_record_binding_for_rule(rule.id, fqdn.as_str(), "A", &line.key)
+            .await
+            .map_err(|_| "DATABASE_ERROR")?;
+        if record_sets::owns_set(binding.as_ref(), &fqdn, &zone, &line, &raw_records) {
+            result.category = DomainPreflightCategory::PanelCompatibleA;
+            break;
+        }
+    }
+    Ok(result)
+}
+
 pub(crate) async fn load_client(db: &dyn Repository) -> Result<Option<DnsMgrClient>, DnsMgrError> {
     let settings = db
         .get(DNSMGR_CONFIG_KEY)
@@ -8035,6 +8144,118 @@ mod tests {
         .await
         .unwrap();
         SqliteRepository::new(pool)
+    }
+
+    #[tokio::test]
+    async fn domain_preflight_is_read_only_for_absent_external_cname_and_owned_a() {
+        for (records, category, owned) in [
+            (vec![], DomainPreflightCategory::Absent, false),
+            (
+                vec![record("external", "A", "192.0.2.20", "default_view")],
+                DomainPreflightCategory::ExternalA,
+                false,
+            ),
+            (
+                vec![record(
+                    "cname",
+                    "CNAME",
+                    "other.example.com",
+                    "default_view",
+                )],
+                DomainPreflightCategory::Cname,
+                false,
+            ),
+            (
+                vec![record("owned", "A", "192.0.2.10", "default_view")],
+                DomainPreflightCategory::PanelCompatibleA,
+                true,
+            ),
+        ] {
+            let db = ensure_db().await;
+            let mock = spawn_ensure_mock(
+                records.clone(),
+                MutationBehavior::Apply,
+                MutationBehavior::Apply,
+            )
+            .await;
+            db.set(
+                DNSMGR_CONFIG_KEY,
+                &serde_json::to_string(&DnsMgrSettings {
+                    enabled: true,
+                    base_url: mock.base_url.clone(),
+                    uid: 7,
+                    api_key: "test-key".into(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            if owned {
+                insert_binding(&db, "owned", "192.0.2.10").await;
+            }
+            let before = db
+                .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "default")
+                .await
+                .unwrap()
+                .map(|b| (b.record_id, b.updated_at));
+            let result = domain_preflight(&db, "op1.example.com").await.unwrap();
+            assert_eq!(result.category, category);
+            assert_eq!(*mock.state.records.lock().unwrap(), records);
+            assert_eq!(mock.state.total_mutations(), 0);
+            let after = db
+                .find_dns_record_binding_for_rule(100, "op1.example.com", "A", "default")
+                .await
+                .unwrap()
+                .map(|b| (b.record_id, b.updated_at));
+            assert_eq!(before, after);
+        }
+    }
+
+    #[tokio::test]
+    async fn domain_preflight_failure_never_becomes_absent_or_confirmation() {
+        let db = ensure_db().await;
+        assert_eq!(
+            domain_preflight(&db, "op1.example.com")
+                .await
+                .unwrap()
+                .category,
+            DomainPreflightCategory::Unconfigured
+        );
+        assert_eq!(
+            domain_preflight(&db, "http://bad/name").await.unwrap_err(),
+            "INVALID_FQDN"
+        );
+        let mock =
+            spawn_ensure_mock(vec![], MutationBehavior::Apply, MutationBehavior::Apply).await;
+        db.set(
+            DNSMGR_CONFIG_KEY,
+            &serde_json::to_string(&DnsMgrSettings {
+                enabled: true,
+                base_url: mock.base_url.clone(),
+                uid: 7,
+                api_key: "test-key".into(),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            domain_preflight(&db, "outside.invalid")
+                .await
+                .unwrap()
+                .category,
+            DomainPreflightCategory::UnmanagedZone
+        );
+        mock.state.read_failure.store(true, Ordering::SeqCst);
+        let result = domain_preflight(&db, "op1.example.com").await.unwrap();
+        assert_eq!(
+            result.category,
+            DomainPreflightCategory::ProviderReadFailure
+        );
+        assert!(result.records.is_empty());
+        assert_eq!(mock.state.total_mutations(), 0);
+        let public = serde_json::to_string(&result).unwrap();
+        assert!(!public.contains("test-key") && !public.contains("confirmation"));
     }
 
     async fn insert_binding(db: &SqliteRepository, record_id: &str, desired_value: &str) {

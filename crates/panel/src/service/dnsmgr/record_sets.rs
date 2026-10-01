@@ -287,7 +287,7 @@ fn values_of(records: &[DnsMgrRecord]) -> Result<BTreeSet<Ipv4Addr>, ()> {
         .collect()
 }
 
-fn owns_set(
+pub(super) fn owns_set(
     binding: Option<&DnsRecordBinding>,
     fqdn: &NormalizedFqdn,
     zone: &ResolvedZone,

@@ -1,6 +1,16 @@
 import type { Dict } from './zh-CN';
 
 export const enUS: Dict = {
+  domainCheck: 'Check domain',
+  domainCheckAbsent: 'No A/CNAME record found. Panel can create it later.',
+  domainCheckOwned: 'A Panel-managed A record already exists.',
+  domainCheckExternal: 'External A records exist. You can create the Rule; overriding them later requires confirmation.',
+  domainCheckCname: 'A CNAME exists. You can create the Rule; changing CNAME to A later requires confirmation.',
+  domainCheckUnmanaged: 'No manageable matching zone is available in the Provider.',
+  domainCheckUnconfigured: 'DNS automation is unconfigured or disabled.',
+  domainCheckFailed: 'Provider read failed. Domain status is unknown; retry the check.',
+  domainCheckReadonly: 'This check reads the default line only and does not modify DNS or authorize later changes.',
+
   // Brand
   brand: 'RealityPanel',
   subtitle: 'TCP/UDP forwarding management',

@@ -39,18 +39,94 @@ uninstall_panel() {
             confirm UNINSTALL "Local Panel data and configuration will be retained."
         fi
     fi
-    systemctl disable --now relay-panel.service >/dev/null 2>&1 || true
-    rm -f -- "$SERVICE_FILE" "$UPDATE_COMMAND"
-    rm -rf -- "$INSTALL_ROOT/releases" "$INSTALL_ROOT/current" \
-        "$INSTALL_ROOT/public" "$INSTALL_ROOT/node-assets" "$SCRIPT_ROOT"
-    rmdir "$INSTALL_ROOT" 2>/dev/null || true
-    systemctl daemon-reload || true
+    [ "$(id -u)" -eq 0 ] || fail "Run as root."
+    # Refuse symlinked roots/ancestors before either deleting children or invoking
+    # installed helpers. Never follow a product-looking path into foreign state.
+    local managed ancestor account_owned=0 account_entry="" account_uid="" group_owned=0 owned_gid=""
+    for managed in "$INSTALL_ROOT" "$CONFIG_ROOT" "$DATA_ROOT" "$SCRIPT_ROOT" \
+        "$UPDATE_COMMAND" "$CONFIG_ROOT/installer-account" /etc/systemd/system/relay-panel.service; do
+        ancestor="$managed"
+        while [ "$ancestor" != / ] && [ -n "$ancestor" ]; do
+            [ ! -L "$ancestor" ] || fail "Refusing symlinked uninstall path: $ancestor"
+            ancestor="$(dirname "$ancestor")"
+        done
+    done
     if [ "$purge" -eq 1 ]; then
+        account_entry="$(getent passwd relay-panel || true)"
+        if [ -n "$account_entry" ]; then
+            local account_name account_password account_gid account_gecos account_home account_shell
+            IFS=: read -r account_name account_password account_uid account_gid account_gecos account_home account_shell <<< "$account_entry"
+            if [ "$account_name" = relay-panel ] && [[ "$account_uid" =~ ^[0-9]+$ ]] && \
+               [ "$account_uid" -gt 0 ] && [ "$account_uid" -lt 1000 ] && \
+               [ "$account_home" = "$DATA_ROOT" ] && \
+               { [ "$account_shell" = /usr/sbin/nologin ] || [ "$account_shell" = /sbin/nologin ]; }; then
+                if [ -f "$CONFIG_ROOT/installer-account" ] && \
+                    [ "$(cat "$CONFIG_ROOT/installer-account")" = "$account_uid:$account_gid" ]; then
+                    account_owned=1
+                elif [ -f /etc/systemd/system/relay-panel.service ] && \
+                    grep -Fqx 'User=relay-panel' /etc/systemd/system/relay-panel.service && \
+                    grep -Fq "$INSTALL_ROOT/" /etc/systemd/system/relay-panel.service; then
+                    # Legacy installers had no marker. A matching system account
+                    # plus an actual product service establishes conservative ownership.
+                    account_owned=1
+                fi
+            fi
+        fi
+    fi
+    if [ "$purge" -eq 1 ]; then
+        if [ "$account_owned" -eq 1 ]; then
+            # Persist legacy ownership evidence before deleting its service so
+            # a failed account cleanup can be retried after files are gone.
+            install -d -m 0750 "$CONFIG_ROOT"
+            printf '%s:%s\n' "$account_uid" "$account_gid" > "$CONFIG_ROOT/installer-account"
+            chmod 0600 "$CONFIG_ROOT/installer-account"
+        fi
+        if [ -f "$CONFIG_ROOT/installer-account" ]; then
+            local ownership_record group_entry group_name group_password group_gid group_members
+            ownership_record="$(cat "$CONFIG_ROOT/installer-account")"
+            if [[ "$ownership_record" =~ ^[0-9]+:[0-9]+$ ]]; then
+                owned_gid="${ownership_record#*:}"
+                group_entry="$(getent group relay-panel || true)"
+                IFS=: read -r group_name group_password group_gid group_members <<< "$group_entry"
+                if [ "$group_name" = relay-panel ] && [ "$group_gid" = "$owned_gid" ] && [ -z "$group_members" ]; then group_owned=1; fi
+            fi
+        fi
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl cat relay-panel.service >/dev/null 2>&1; then
+            systemctl disable --now relay-panel.service || fail "Could not stop/disable Panel; installation retained."
+            if systemctl is-active --quiet relay-panel.service; then
+                fail "Panel is still running; installation retained."
+            fi
+        fi
+    else
+        fail "systemctl is required to verify that the Panel has stopped."
+    fi
+    rm -f -- /etc/systemd/system/relay-panel.service "$UPDATE_COMMAND"
+    # The complete install root includes legacy binaries, staging releases,
+    # certificate state and failed-update artifacts as well as current assets.
+    rm -rf -- "$INSTALL_ROOT" "$SCRIPT_ROOT"
+    systemctl daemon-reload || fail "Panel files removed but systemd reload failed; retry uninstall."
+    systemctl reset-failed relay-panel.service >/dev/null 2>&1 || true
+    if [ "$purge" -eq 1 ]; then
+        if [ "$account_owned" -eq 1 ]; then
+            userdel relay-panel || fail "Panel data removed but owned account cleanup failed; retry after checking account."
+        elif [ -n "$account_entry" ]; then
+            warn "Account relay-panel ownership is unproven; preserved the existing account."
+        fi
+        if [ "$group_owned" -eq 1 ]; then
+            # Preserve a group still used by another account, including primary GIDs.
+            if getent passwd | awk -F: -v gid="$owned_gid" '$4 == gid { found=1 } END { exit !found }'; then
+                warn "Group relay-panel is still used by another account; preserved shared group."
+            else
+                groupdel relay-panel || fail "Owned group cleanup failed; retry uninstall."
+            fi
+        fi
         rm -rf -- "$CONFIG_ROOT" "$DATA_ROOT"
-        info "Reality Panel and local data removed."
+        info "Reality Panel binaries, configuration, and local data removed."
         info "Panel local data was purged."
     else
-        info "Reality Panel removed; retained $CONFIG_ROOT and $DATA_ROOT."
+        info "Reality Panel removed; configuration remains in $CONFIG_ROOT and data in $DATA_ROOT."
     fi
     info "Remote Relay nodes were not contacted."
     success "卸载成功"
@@ -83,11 +159,19 @@ node_version="$($release_dir/reality-node-linux-amd64 --version | awk '{print $N
 [ "$panel_version" = "$version" ] || fail "Panel binary version $panel_version does not match $version"
 [ "$node_version" = "$version" ] || fail "Node binary version $node_version does not match $version"
 
-id relay-panel >/dev/null 2>&1 || useradd --system --home-dir "$DATA_ROOT" --shell /usr/sbin/nologin relay-panel
+account_created=0
+if ! id relay-panel >/dev/null 2>&1; then
+    useradd --system --home-dir "$DATA_ROOT" --shell /usr/sbin/nologin relay-panel
+    account_created=1
+fi
 install -d -m 0755 "$INSTALL_ROOT" "$INSTALL_ROOT/releases"
 install -d -o relay-panel -g relay-panel -m 0750 "$DATA_ROOT"
 install -d -o relay-panel -g relay-panel -m 0700 "$DATA_ROOT/certificates"
 install -d -m 0750 "$CONFIG_ROOT"
+if [ "$account_created" -eq 1 ]; then
+    printf '%s:%s\n' "$(id -u relay-panel)" "$(id -g relay-panel)" > "$CONFIG_ROOT/installer-account"
+    chmod 0600 "$CONFIG_ROOT/installer-account"
+fi
 
 env_file="$CONFIG_ROOT/relay-panel.env"
 created_default_admin=0

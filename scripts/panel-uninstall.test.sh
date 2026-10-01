@@ -21,9 +21,19 @@ cat > "$FAKE/systemctl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'systemctl %s\n' "$*" >> "${HARNESS_LOG:?}"
+[ "${HARNESS_STOP_FAIL:-0}" != 1 ] || { [ "${1:-}" != disable ] || exit 1; }
+if [ "${1:-}" = is-active ]; then exit 3; fi
 exit 0
 EOF
-chmod +x "$FAKE/systemctl"
+cat > "$FAKE/id" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" != -u ] || printf '0\n'
+EOF
+cat > "$FAKE/getent" <<'EOF'
+#!/usr/bin/env bash
+exit 2
+EOF
+chmod +x "$FAKE/systemctl" "$FAKE/id" "$FAKE/getent"
 
 # Substitute only the fixed absolute paths in a temporary copy. The guard
 # checks remain in place with their expected test paths, so the harness cannot
@@ -66,6 +76,8 @@ make_install() {
     "$INSTALL_ROOT/node-assets" "$CONFIG_ROOT" "$DATA_ROOT" \
     "$SCRIPT_ROOT" "$(dirname "$UPDATE_COMMAND")" "$(dirname "$SERVICE_FILE")"
   printf 'local runtime\n' > "$INSTALL_ROOT/current"
+  mkdir -p "$INSTALL_ROOT/certificates" "$INSTALL_ROOT/.staging-fixture"
+  printf 'legacy binary\n' > "$INSTALL_ROOT/relay-panel"
   printf 'JWT_SECRET=fixture\nPANEL_KEY=fixture\n' > "$CONFIG_ROOT/relay-panel.env"
   printf 'database\n' > "$DATA_ROOT/data.db"
   printf 'update\n' > "$UPDATE_COMMAND"
@@ -108,7 +120,7 @@ ok "--yes purge removes only the local Panel deployment"
 # Missing and partial installations are safe and idempotent.
 : > "$LOG"
 run_uninstall --yes
-if grep -Evq '^systemctl (disable --now relay-panel\.service|daemon-reload)$' "$LOG"; then
+if grep -Evq '^systemctl (cat relay-panel\.service|disable --now relay-panel\.service|is-active --quiet relay-panel\.service|daemon-reload|reset-failed relay-panel\.service)$' "$LOG"; then
   fail "already absent uninstall performed unexpected cleanup"
 fi
 mkdir -p "$INSTALL_ROOT/releases"
@@ -116,6 +128,25 @@ printf 'partial\n' > "$INSTALL_ROOT/releases/partial.txt"
 run_uninstall --yes
 [ ! -e "$INSTALL_ROOT" ] || fail "partial install was not removed"
 ok "missing and partial installs are idempotent"
+
+# A failed stop must not delete the installation or announce success.
+make_install
+if HARNESS_STOP_FAIL=1 run_uninstall --yes --purge >"$TMP/failed.out" 2>&1; then
+  fail "failed service stop was reported as uninstall success"
+fi
+[ -e "$INSTALL_ROOT/current" ] || fail "stop failure deleted runtime"
+! grep -Fq '✓ 卸载成功' "$TMP/failed.out" || fail "partial failure advertised success"
+# Symlinked roots must never expose another installation's files to cleanup.
+rm -rf -- "$INSTALL_ROOT"
+mkdir -p "$UNRELATED/releases"
+printf 'foreign\n' > "$UNRELATED/releases/keep"
+ln -s "$UNRELATED" "$INSTALL_ROOT"
+if run_uninstall --yes --purge >"$TMP/link.out" 2>&1; then
+  fail "symlinked installation root was accepted"
+fi
+[ -f "$UNRELATED/releases/keep" ] || fail "followed symlink into unrelated data"
+rm "$INSTALL_ROOT"
+ok "stop failure and foreign symlink preservation"
 
 bash -n "$ROOT/install.sh" "$ROOT/deploy.sh" "$ROOT/update.sh"
 grep -Fq 'Remote Relay nodes were not contacted' "$ROOT/install.sh" || \

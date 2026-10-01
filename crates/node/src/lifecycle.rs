@@ -28,6 +28,7 @@ const UNINSTALL_REMOVE_DIRS: &[&str] = &[
     "/etc/relay-node",
     "/opt/relay-node",
     "/var/www/relay-panel-certbot",
+    "/run/relay-node",
 ];
 const UNINSTALL_SYSTEMCTL_ARGS: &[&str] = &["disable", "--now", "relay-node.service"];
 const OPENLIST_IMAGE: &str =
@@ -632,6 +633,37 @@ pub(crate) async fn execute(
     }
 }
 
+// All cleanup paths are fixed product paths. Refuse a symlink at any
+// component: a product-looking directory must never route deletion elsewhere.
+fn validate_cleanup_path(root: &Path, path: &Path) -> Result<(), String> {
+    if !path.starts_with(root) {
+        return Err("cleanup path escaped root".into());
+    }
+    let mut current = root.to_path_buf();
+    for component in path
+        .strip_prefix(root)
+        .map_err(|e| e.to_string())?
+        .components()
+    {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err("invalid cleanup path component".into());
+        }
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlinked cleanup path {}",
+                    current.display()
+                ))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("inspect cleanup path: {e}")),
+        }
+    }
+    Ok(())
+}
+
 fn remove_if_exists(path: &Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -642,10 +674,12 @@ fn remove_if_exists(path: &Path) -> Result<(), String> {
 
 fn remove_marked_file(root: &Path, path: &str, markers: &[&str]) -> Result<bool, String> {
     let path = root.join(path.trim_start_matches('/'));
+    validate_cleanup_path(root, &path)?;
     if !path.exists() {
         return Ok(false);
     }
-    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents =
+        std::fs::read_to_string(&path).map_err(|e| format!("read managed configuration: {e}"))?;
     if !markers.iter().any(|marker| contents.contains(marker)) {
         return Ok(false);
     }
@@ -732,8 +766,9 @@ fn openlist_cleanup_plan(root: &Path, inspection: Option<&str>) -> OpenListClean
                     .into(),
             );
         };
-        if !inspection.contains(OPENLIST_IMAGE)
-            || !inspection.contains(&format!("{OPENLIST_DATA_PATH}:/opt/openlist/data;"))
+        if inspection != "ABSENT"
+            && (!inspection.contains(OPENLIST_IMAGE)
+                || !inspection.contains(&format!("{OPENLIST_DATA_PATH}:/opt/openlist/data;")))
         {
             return OpenListCleanupPlan::Preserve(
                 "OpenList container no longer matches its ownership marker; resources were preserved"
@@ -756,6 +791,27 @@ fn remove_owned_openlist(root: &Path) -> Result<Option<String>, String> {
     if root != Path::new("/") {
         return Ok(None);
     }
+    let marker = rooted(root, OPENLIST_OWNERSHIP_PATH);
+    validate_cleanup_path(root, &marker)?;
+    let ownership = match std::fs::read(&marker) {
+        Ok(raw) => serde_json::from_slice::<OpenListOwnership>(&raw)
+            .map_err(|e| format!("invalid OpenList ownership: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read OpenList ownership: {e}")),
+    };
+    if ownership.version != 1
+        || ownership.container_name != OPENLIST_CONTAINER
+        || ownership.image != OPENLIST_IMAGE
+        || ownership.data_path != OPENLIST_DATA_PATH
+    {
+        return Err("OpenList ownership marker does not match managed resources".into());
+    }
+    if !ownership.container_created && !ownership.data_dir_created {
+        remove_if_exists(&marker)?;
+        return Ok(Some(
+            "pre-existing OpenList container and data preserved".into(),
+        ));
+    }
     let output = Command::new("docker")
         .args([
             "inspect",
@@ -764,16 +820,33 @@ fn remove_owned_openlist(root: &Path) -> Result<Option<String>, String> {
             OPENLIST_CONTAINER,
         ])
         .output();
-    let inspection = output.as_ref().ok().and_then(|output| {
+    let mut inspection = output.as_ref().ok().and_then(|output| {
         output
             .status
             .success()
             .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
     });
+    if inspection.is_none() && ownership.container_created {
+        let listed = Command::new("docker")
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                &format!("name=^/{OPENLIST_CONTAINER}$"),
+                "--format",
+                "{{.Names}}",
+            ])
+            .output()
+            .map_err(|e| format!("inspect OpenList presence: {e}"))?;
+        if !listed.status.success() || !String::from_utf8_lossy(&listed.stdout).trim().is_empty() {
+            return Err("cannot verify owned OpenList container cleanup; retry required".into());
+        }
+        inspection = Some("ABSENT".into());
+    }
     match openlist_cleanup_plan(root, inspection.as_deref()) {
-        OpenListCleanupPlan::Preserve(message) => Ok(Some(message)),
+        OpenListCleanupPlan::Preserve(message) => Err(message),
         OpenListCleanupPlan::Remove { container, data } => {
-            if container && inspection.is_some() {
+            if container && inspection.as_deref().is_some_and(|value| value != "ABSENT") {
                 let status = Command::new("docker")
                     .args(["rm", "-f", OPENLIST_CONTAINER])
                     .status();
@@ -839,6 +912,11 @@ fn managed_nginx_runtime_absent(config_dump: &str) -> bool {
         "# RelayPanel managed bootstrap camouflage fallback",
         "# RelayPanel managed stream root; do not edit",
         "/etc/nginx/relay-panel-stream.d/relay-panel-sni.conf",
+        "/etc/nginx/stream.d/relay-panel-sni.conf",
+        "# RelayPanel managed Lite fallback",
+        "# generated by relay-node; global HTTP",
+        "/etc/nginx/relay-panel-certs/fallback.crt",
+        "/etc/nginx/relay-panel-certs/fallback.key",
     ]
     .iter()
     .all(|marker| !config_dump.contains(marker))
@@ -865,7 +943,79 @@ fn verify_nginx_runtime_cleanup(snapshot: &[(PathBuf, Vec<u8>)]) -> Result<(), S
             .then_some(())
             .ok_or_else(|| format!("{program} {} exited unsuccessfully", args.join(" ")))
     })?;
-    Err("Reality-managed Nginx listener remains in the active configuration".into())
+    Err("Reality-managed Nginx listener or certificate reference remains in the active configuration".into())
+}
+
+fn managed_docker_nginx_name(env: &str) -> Result<Option<String>, String> {
+    for line in env.lines() {
+        let Some(value) = line.strip_prefix("NGINX_SNI_TEST_CMD=") else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['\'', '"']);
+        if !value.starts_with("docker ") {
+            return Ok(None);
+        }
+        let parts = value.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 5
+            || parts[0] != "docker"
+            || parts[1] != "exec"
+            || parts[3..] != ["nginx", "-t"]
+            || !parts[2]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        {
+            return Err("unrecognized Docker Nginx runtime; resources preserved".into());
+        }
+        return Ok(Some(parts[2].into()));
+    }
+    Ok(None)
+}
+
+fn docker_nginx_owned(inspection: &str) -> bool {
+    inspection.starts_with("nginx-sni|")
+        && inspection.split('|').nth(1).is_some_and(|mounts| {
+            mounts
+                .split(';')
+                .any(|mount| mount == "/opt/relay-node/nginx/nginx.conf:/etc/nginx/nginx.conf")
+        })
+}
+
+fn inspect_docker_nginx(root: &Path) -> Result<Option<String>, String> {
+    let env = match std::fs::read_to_string(rooted(root, "/etc/relay-node/relay-node.env")) {
+        Ok(env) => env,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read Nginx runtime configuration: {e}")),
+    };
+    let Some(name) = managed_docker_nginx_name(&env)? else {
+        return Ok(None);
+    };
+    if root != Path::new("/") {
+        return Ok(Some(name));
+    }
+    let listed = Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name=^/{name}$"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .map_err(|e| format!("inspect Docker Nginx: {e}"))?;
+    if !listed.status.success() {
+        return Err("Docker Nginx presence could not be verified".into());
+    }
+    if String::from_utf8_lossy(&listed.stdout).trim().is_empty() {
+        return Ok(Some(name));
+    }
+    let output = Command::new("docker").args(["inspect", "-f", "{{index .Config.Labels \"io.reality-panel.managed\"}}|{{range .Mounts}}{{.Source}}:{{.Destination}};{{end}}", &name]).output().map_err(|e| e.to_string())?;
+    if !output.status.success()
+        || !docker_nginx_owned(String::from_utf8_lossy(&output.stdout).trim())
+    {
+        return Err("Docker Nginx ownership is unproven; container and files preserved".into());
+    }
+    Ok(Some(name))
 }
 
 fn uninstall_managed(root: &Path) -> Result<UninstallCleanupReport, String> {
@@ -874,10 +1024,32 @@ fn uninstall_managed(root: &Path) -> Result<UninstallCleanupReport, String> {
         "/etc/nginx/nginx.conf",
         "/etc/nginx/relay-panel-stream.conf",
         "/etc/nginx/relay-panel-stream.d/relay-panel-sni.conf",
+        "/etc/nginx/stream.d/relay-panel-sni.conf",
         "/etc/nginx/conf.d/relay-panel-fallback.conf",
         "/etc/nginx/conf.d/relay-panel-acme.conf",
         "/etc/nginx/conf.d/relay-panel-lite-fallback.conf",
     ];
+    for path in nginx_paths
+        .iter()
+        .chain(UNINSTALL_REMOVE_FILES)
+        .chain(UNINSTALL_REMOVE_DIRS)
+        .chain(
+            [
+                "/var/lib/relay-panel/node-claims",
+                "/var/lib/relay-panel/openlist",
+                "/var/lib/relay-panel/xiaoya-byoa",
+                "/var/lib/relay-panel/xiaoya-byoa-ownership.json",
+                "/var/lib/relay-panel/uninstall-completions",
+                "/var/lib/relay-panel/uninstall-finalizer",
+                "/etc/sysctl.d/99-reality-panel-bbr.conf",
+                "/etc/modules-load.d/reality-panel-bbr.conf",
+            ]
+            .iter(),
+        )
+    {
+        validate_cleanup_path(root, &rooted(path))?;
+    }
+    let docker_nginx = inspect_docker_nginx(root)?;
     let nginx_snapshot = nginx_paths
         .iter()
         .filter_map(|path| {
@@ -885,7 +1057,7 @@ fn uninstall_managed(root: &Path) -> Result<UninstallCleanupReport, String> {
             std::fs::read(&path).ok().map(|bytes| (path, bytes))
         })
         .collect::<Vec<_>>();
-    if root == Path::new("/") {
+    if root == Path::new("/") && rooted("/etc/systemd/system/relay-node.service").exists() {
         let status = Command::new("systemctl")
             .args(UNINSTALL_SYSTEMCTL_ARGS)
             .status();
@@ -893,14 +1065,20 @@ fn uninstall_managed(root: &Path) -> Result<UninstallCleanupReport, String> {
             return Err("stop and disable relay-node.service failed".into());
         }
     }
-    for path in UNINSTALL_REMOVE_FILES {
-        remove_if_exists(&rooted(path))?;
-    }
-    remove_marked_file(
+    let removed_sni = remove_marked_file(
         root,
         "/etc/nginx/relay-panel-stream.d/relay-panel-sni.conf",
         &["# generated by relay-node; do not edit"],
     )?;
+    let legacy_sni = remove_marked_file(
+        root,
+        "/etc/nginx/stream.d/relay-panel-sni.conf",
+        &["# generated by relay-node; do not edit"],
+    )?;
+    if legacy_sni || removed_sni {
+        validate_cleanup_path(root, &rooted("/var/log/nginx/sni-router.log"))?;
+        remove_if_exists(&rooted("/var/log/nginx/sni-router.log"))?;
+    }
     let removed_stream_root = remove_marked_file(
         root,
         "/etc/nginx/relay-panel-stream.conf",
@@ -929,12 +1107,59 @@ fn uninstall_managed(root: &Path) -> Result<UninstallCleanupReport, String> {
         "/var/www/fallback/index.html",
         &["<!-- RelayPanel managed Lite fallback -->"],
     )?;
+    remove_marked_file(
+        root,
+        "/etc/letsencrypt/renewal-hooks/deploy/relay-panel-nginx-reload.sh",
+        &["# managed by Reality Panel; renewal hook"],
+    )?;
+    remove_marked_file(
+        root,
+        "/etc/cron.d/relay-panel-certbot-renew",
+        &["# managed by Reality Panel; certbot renewal"],
+    )?;
     let lite_marker = rooted("/etc/relay-panel/lite-mode");
     if std::fs::read_to_string(&lite_marker).is_ok_and(|value| value.trim() == "lite") {
         remove_if_exists(&lite_marker)?;
     }
-    if removed_stream_root {
+    if removed_stream_root || !rooted("/etc/nginx/relay-panel-stream.conf").exists() {
+        // Also repair a retry after an interrupted deletion of the stream root.
         remove_stream_include(root)?;
+    }
+    // Validate/reload while certs and runtime files still exist so rollback
+    // can restore a usable Nginx configuration on either test or reload failure.
+    if root == Path::new("/") && !nginx_snapshot.is_empty() {
+        validate_and_reload_nginx(&nginx_snapshot, run_checked)?;
+        verify_nginx_runtime_cleanup(&nginx_snapshot)?;
+    }
+    if root == Path::new("/") {
+        if let Some(name) = &docker_nginx {
+            // docker rm -f is idempotent for an already absent verified target.
+            let output = Command::new("docker")
+                .args([
+                    "ps",
+                    "-a",
+                    "--filter",
+                    &format!("name=^/{name}$"),
+                    "--format",
+                    "{{.Names}}",
+                ])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                return Err("recheck Docker Nginx presence failed".into());
+            }
+            if !String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+                run_checked("docker", &["rm", "-f", name])?;
+            }
+        }
+        crate::bbr::cleanup()?;
+    }
+    let openlist_note = remove_owned_openlist(root)?;
+    if root == Path::new("/") {
+        crate::xiaoya::uninstall_owned()?;
+    }
+    for path in UNINSTALL_REMOVE_FILES {
+        remove_if_exists(&rooted(path))?;
     }
     for path in UNINSTALL_REMOVE_DIRS {
         let path = rooted(path);
@@ -960,19 +1185,7 @@ fn uninstall_managed(root: &Path) -> Result<UninstallCleanupReport, String> {
         if !daemon_reload.is_ok_and(|status| status.success()) {
             return Err("systemd daemon-reload failed after relay-node service removal".into());
         }
-        validate_and_reload_nginx(&nginx_snapshot, |program, args| {
-            let status = Command::new(program)
-                .args(args)
-                .status()
-                .map_err(|error| format!("execute {program}: {error}"))?;
-            status
-                .success()
-                .then_some(())
-                .ok_or_else(|| format!("{program} {} exited unsuccessfully", args.join(" ")))
-        })?;
-        verify_nginx_runtime_cleanup(&nginx_snapshot)?;
     }
-    let openlist_note = remove_owned_openlist(root)?;
     Ok(UninstallCleanupReport {
         message: openlist_note.map_or_else(
             || "Reality Panel managed node resources removed".into(),
@@ -1059,6 +1272,14 @@ fn cleanup_uninstall_finalizer<F>(
 where
     F: FnMut(&str, &[&str]) -> Result<(), String>,
 {
+    for path in [
+        UNINSTALL_FINALIZER_SERVICE_PATH,
+        UNINSTALL_FINALIZER_TIMER_PATH,
+        UNINSTALL_FINALIZER_BINARY,
+    ] {
+        validate_cleanup_path(root, &rooted(root, path))?;
+    }
+    validate_cleanup_path(root, receipt_path)?;
     run(
         "systemctl",
         &["disable", "--now", UNINSTALL_FINALIZER_TIMER],
@@ -1066,15 +1287,38 @@ where
     for path in [
         UNINSTALL_FINALIZER_SERVICE_PATH,
         UNINSTALL_FINALIZER_TIMER_PATH,
-        UNINSTALL_FINALIZER_BINARY,
     ] {
         remove_if_exists(&rooted(root, path))?;
     }
+    if let Err(error) = run("systemctl", &["daemon-reload"]) {
+        // Keep the receipt and executable; restore the retry entrypoints before
+        // returning a partial failure. Never lose the only recovery material.
+        write_atomic_file(
+            &rooted(root, UNINSTALL_FINALIZER_SERVICE_PATH),
+            finalizer_service(receipt_path).as_bytes(),
+            0o644,
+        )?;
+        write_atomic_file(
+            &rooted(root, UNINSTALL_FINALIZER_TIMER_PATH),
+            finalizer_timer().as_bytes(),
+            0o644,
+        )?;
+        let _ = run("systemctl", &["daemon-reload"]);
+        let _ = run("systemctl", &["enable", "--now", UNINSTALL_FINALIZER_TIMER]);
+        return Err(error);
+    }
+    let timer_stamp = rooted(
+        root,
+        "/var/lib/systemd/timers/stamp-relay-node-uninstall-finalizer.timer",
+    );
+    validate_cleanup_path(root, &timer_stamp)?;
+    remove_if_exists(&timer_stamp)?;
+    remove_if_exists(&rooted(root, UNINSTALL_FINALIZER_BINARY))?;
     remove_if_exists(receipt_path)?;
-    run("systemctl", &["daemon-reload"])?;
     for path in [
         UNINSTALL_RECEIPT_DIR,
         UNINSTALL_FINALIZER_DIR,
+        "/var/lib/relay-panel/node-claims",
         "/var/lib/relay-panel",
     ] {
         let _ = std::fs::remove_dir(rooted(root, path));
@@ -1201,6 +1445,9 @@ where
     {
         return Ok(false);
     }
+    if !receipt.cleanup_success {
+        return Ok(false);
+    }
     receipt.panel_acknowledged = true;
     write_private_json(receipt_path, &receipt)?;
     Ok(true)
@@ -1248,11 +1495,22 @@ fn cleanup_uninstalled_credentials(root: &Path, job: &UninstallJob) -> Result<()
     {
         return Ok(());
     }
-    let managed_dir = Path::new("/var/lib/relay-panel/node-claims").join(&job.node_id);
-    if secret_file != &managed_dir.join("node-credential.secret") {
+    let Some(managed_dir) = secret_file.parent() else {
+        return Ok(());
+    };
+    let Ok(relative) = managed_dir.strip_prefix("/var/lib/relay-panel/node-claims") else {
+        return Ok(());
+    };
+    let Some(claim_id) = relative.to_str() else {
+        return Ok(());
+    };
+    if !valid_id(claim_id)
+        || secret_file.file_name().and_then(|s| s.to_str()) != Some("node-credential.secret")
+    {
         return Ok(());
     }
     let descriptor_path = rooted(root, crate::config::RUNTIME_AUTH_DESCRIPTOR);
+    validate_cleanup_path(root, &descriptor_path)?;
     match std::fs::read(&descriptor_path) {
         Ok(raw) => {
             #[derive(Deserialize)]
@@ -1277,6 +1535,7 @@ fn cleanup_uninstalled_credentials(root: &Path, job: &UninstallJob) -> Result<()
         Err(error) => return Err(format!("read runtime auth during uninstall: {error}")),
     }
     let managed_dir = rooted(root, &managed_dir.to_string_lossy());
+    validate_cleanup_path(root, &managed_dir)?;
     match std::fs::remove_dir_all(&managed_dir) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1328,6 +1587,31 @@ pub(crate) fn run_helper_from_args(args: &[String]) -> Option<Result<(), String>
         None => return Some(Err("invalid uninstall job".into())),
     };
     let receipt_path = uninstall_receipt_path(Path::new("/"), &job.operation_id);
+    if !valid_id(&job.operation_id) || !valid_id(&job.node_id) {
+        return Some(Err("invalid uninstall job identity".into()));
+    }
+    for managed in UNINSTALL_REMOVE_FILES
+        .iter()
+        .chain(UNINSTALL_REMOVE_DIRS)
+        .chain(
+            [
+                "/etc/nginx/nginx.conf",
+                "/etc/nginx/relay-panel-stream.conf",
+                "/etc/nginx/conf.d/relay-panel-fallback.conf",
+                "/var/lib/relay-panel/node-claims",
+            ]
+            .iter(),
+        )
+    {
+        if let Err(error) = validate_cleanup_path(Path::new("/"), Path::new(managed)) {
+            let _ = report_uninstall_once(&job, false, false, &error);
+            return Some(Err(error));
+        }
+    }
+    if let Err(error) = inspect_docker_nginx(Path::new("/")) {
+        let _ = report_uninstall_once(&job, false, false, &error);
+        return Some(Err(error));
+    }
     let binary = match std::env::current_exe() {
         Ok(binary) => binary,
         Err(error) => return Some(Err(format!("locate uninstall finalizer binary: {error}"))),
@@ -1716,7 +2000,7 @@ mod tests {
             } else {
                 "uninstall-old-auth"
             });
-            let state_dir = root.join("var/lib/relay-panel/node-claims/node-b");
+            let state_dir = root.join("var/lib/relay-panel/node-claims/claim-b");
             std::fs::create_dir_all(&state_dir).unwrap();
             std::fs::write(state_dir.join("node-credential.secret"), b"test-secret").unwrap();
             let descriptor = root.join("var/lib/relay-panel/node-claims/runtime-auth.json");
@@ -1725,7 +2009,7 @@ mod tests {
                 serde_json::json!({
                     "node_id":"node-b", "identity_group_id":3,
                     "credential_id":if replaced {"new-credential"} else {"old-credential"},
-                    "secret_file":"/var/lib/relay-panel/node-claims/node-b/node-credential.secret"
+                    "secret_file":"/var/lib/relay-panel/node-claims/claim-b/node-credential.secret"
                 })
                 .to_string(),
             )
@@ -1741,7 +2025,7 @@ mod tests {
                         auth: PersistedNodeAuth::PermanentCredential {
                             credential_id: "old-credential".into(),
                             secret_file:
-                                "/var/lib/relay-panel/node-claims/node-b/node-credential.secret"
+                                "/var/lib/relay-panel/node-claims/claim-b/node-credential.secret"
                                     .into(),
                         },
                     },
@@ -1942,6 +2226,162 @@ mod tests {
         ] {
             assert!(!managed_nginx_runtime_absent(managed));
         }
+    }
+
+    #[test]
+    fn finalizer_reload_failure_preserves_executable_receipt_and_restores_retry_units() {
+        let root = test_dir("finalizer-reload-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source-node");
+        std::fs::write(&source, b"test binary").unwrap();
+        let path = uninstall_receipt_path(&root, "retry");
+        write_private_json(
+            &path,
+            &UninstallCompletionReceipt {
+                job: UninstallJob {
+                    operation_id: "retry".into(),
+                    node_id: "node-a".into(),
+                    panel_url: "https://panel.example".into(),
+                    auth: PersistedNodeAuth::LegacyGroupToken {
+                        token: "test-token".into(),
+                    },
+                },
+                panel_acknowledged: true,
+                cleanup_success: true,
+                destructive_started: true,
+                message: "complete".into(),
+            },
+        )
+        .unwrap();
+        install_uninstall_finalizer(&root, &source, &path, |_, _| Ok(())).unwrap();
+        let mut failed = false;
+        assert!(cleanup_uninstall_finalizer(&root, &path, |_, args| {
+            if args == ["daemon-reload"] && !failed {
+                failed = true;
+                return Err("injected reload failure".into());
+            }
+            Ok(())
+        })
+        .is_err());
+        for file in [
+            UNINSTALL_FINALIZER_BINARY,
+            UNINSTALL_FINALIZER_SERVICE_PATH,
+            UNINSTALL_FINALIZER_TIMER_PATH,
+        ] {
+            assert!(rooted(&root, file).exists());
+        }
+        assert!(path.exists());
+        cleanup_uninstall_finalizer(&root, &path, |_, _| Ok(())).unwrap();
+        assert!(!path.exists() && !rooted(&root, UNINSTALL_FINALIZER_BINARY).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn docker_nginx_cleanup_requires_label_and_exact_product_mount() {
+        assert!(docker_nginx_owned(
+            "nginx-sni|/opt/relay-node/nginx/nginx.conf:/etc/nginx/nginx.conf;"
+        ));
+        assert!(!docker_nginx_owned(
+            "|/opt/relay-node/nginx/nginx.conf:/etc/nginx/nginx.conf;"
+        ));
+        assert!(!docker_nginx_owned(
+            "nginx-sni|/foreign/nginx.conf:/etc/nginx/nginx.conf;"
+        ));
+        assert_eq!(
+            managed_docker_nginx_name("NGINX_SNI_TEST_CMD='docker exec relay-node-nginx nginx -t'")
+                .unwrap(),
+            Some("relay-node-nginx".into())
+        );
+        assert!(
+            managed_docker_nginx_name("NGINX_SNI_TEST_CMD='docker exec ../foreign nginx -t'")
+                .is_err()
+        );
+        assert!(
+            managed_docker_nginx_name("NGINX_SNI_TEST_CMD='docker exec x nginx -t; rm -rf /'")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn uninstall_rejects_foreign_symlink_before_deleting_runtime() {
+        let root = test_dir("uninstall-symlink");
+        let foreign = test_dir("foreign-node");
+        std::fs::create_dir_all(root.join("opt")).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("keep"), "foreign").unwrap();
+        std::os::unix::fs::symlink(&foreign, root.join("opt/relay-node")).unwrap();
+        assert!(uninstall_managed(&root).unwrap_err().contains("symlink"));
+        assert!(foreign.join("keep").exists());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(foreign).unwrap();
+    }
+
+    #[test]
+    fn interrupted_stream_root_cleanup_is_repaired_on_retry() {
+        let root = test_dir("uninstall-stream-retry");
+        std::fs::create_dir_all(root.join("etc/nginx")).unwrap();
+        std::fs::write(
+            root.join("etc/nginx/nginx.conf"),
+            "events {}\ninclude /etc/nginx/relay-panel-stream.conf;\nhttp {}\n",
+        )
+        .unwrap();
+        uninstall_managed(&root).unwrap();
+        assert!(!std::fs::read_to_string(root.join("etc/nginx/nginx.conf"))
+            .unwrap()
+            .contains("relay-panel-stream"));
+        uninstall_managed(&root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn acknowledged_partial_failure_keeps_receipt_and_retry_material() {
+        let root = test_dir("uninstall-partial-ack");
+        let path = uninstall_receipt_path(&root, "partial");
+        write_private_json(
+            &path,
+            &UninstallCompletionReceipt {
+                job: UninstallJob {
+                    operation_id: "partial".into(),
+                    node_id: "node-a".into(),
+                    panel_url: "https://panel.example".into(),
+                    auth: PersistedNodeAuth::LegacyGroupToken {
+                        token: "test-token".into(),
+                    },
+                },
+                panel_acknowledged: false,
+                cleanup_success: false,
+                destructive_started: true,
+                message: "pending".into(),
+            },
+        )
+        .unwrap();
+        assert!(!finalizer_tick(
+            &root,
+            &path,
+            || Err("injected partial failure".into()),
+            |_, success, _, _| {
+                assert!(!success);
+                Ok(())
+            },
+            |_, _| panic!("do not remove finalizer after incomplete cleanup")
+        )
+        .unwrap());
+        assert!(path.exists());
+        assert!(finalizer_tick(
+            &root,
+            &path,
+            || Ok(UninstallCleanupReport {
+                message: "complete".into()
+            }),
+            |_, success, _, _| {
+                assert!(success);
+                Ok(())
+            },
+            |_, _| Ok(())
+        )
+        .unwrap());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -9,6 +10,15 @@ const AVAILABLE_CONGESTION_PATH: &str = "/proc/sys/net/ipv4/tcp_available_conges
 const QDISC_PATH: &str = "/proc/sys/net/core/default_qdisc";
 const SYSCTL_PATH: &str = "/etc/sysctl.d/99-reality-panel-bbr.conf";
 const MODULES_PATH: &str = "/etc/modules-load.d/reality-panel-bbr.conf";
+const STATE_PATH: &str = "/etc/relay-node/bbr-host-state.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HostState {
+    version: u8,
+    congestion: String,
+    qdisc: String,
+}
+
 const MANAGED_HEADER: &str = "# managed by Reality Panel; do not edit\n";
 const SYSCTL_CONTENT: &str = "# managed by Reality Panel; do not edit\nnet.ipv4.tcp_congestion_control=bbr\nnet.core.default_qdisc=fq\n";
 const MODULES_CONTENT: &str = "# managed by Reality Panel; do not edit\ntcp_bbr\nsch_fq\n";
@@ -41,6 +51,7 @@ trait BbrHost {
     fn apply_value(&mut self, path: &str, value: &str) -> Result<(), String>;
     fn read_managed_file(&self, path: &str) -> Result<Option<String>, String>;
     fn write_managed_file(&mut self, path: &str, contents: &str) -> Result<(), String>;
+    fn remove_managed_file(&mut self, path: &str) -> Result<(), String>;
 }
 
 struct SystemBbrHost;
@@ -78,6 +89,7 @@ impl BbrHost for SystemBbrHost {
 
     fn read_managed_file(&self, path: &str) -> Result<Option<String>, String> {
         let path = Path::new(path);
+        validate_managed_path(path)?;
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_file() => fs::read_to_string(path)
                 .map(Some)
@@ -90,6 +102,13 @@ impl BbrHost for SystemBbrHost {
 
     fn write_managed_file(&mut self, path: &str, contents: &str) -> Result<(), String> {
         write_managed_file(Path::new(path), contents.as_bytes())
+    }
+    fn remove_managed_file(&mut self, path: &str) -> Result<(), String> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("remove {path}: {error}")),
+        }
     }
 }
 
@@ -118,6 +137,7 @@ fn try_ensure<H: BbrHost>(host: &mut H) -> Result<EnsureOutcome, String> {
     )?;
 
     if already_enabled {
+        save_baseline(host, &old_congestion, &old_qdisc)?;
         persist_if_changed(host, SYSCTL_PATH, SYSCTL_CONTENT)?;
         return Ok(EnsureOutcome::AlreadyEnabled);
     }
@@ -147,6 +167,7 @@ fn try_ensure<H: BbrHost>(host: &mut H) -> Result<EnsureOutcome, String> {
         )?;
     }
 
+    save_baseline(host, &old_congestion, &old_qdisc)?;
     if old_qdisc != "fq" {
         host.apply_value(QDISC_PATH, "fq")?;
     }
@@ -186,6 +207,66 @@ fn try_ensure<H: BbrHost>(host: &mut H) -> Result<EnsureOutcome, String> {
     Ok(EnsureOutcome::Enabled)
 }
 
+fn save_baseline<H: BbrHost>(host: &mut H, congestion: &str, qdisc: &str) -> Result<(), String> {
+    if host.read_managed_file(STATE_PATH)?.is_none() {
+        let state = HostState {
+            version: 1,
+            congestion: congestion.into(),
+            qdisc: qdisc.into(),
+        };
+        host.write_managed_file(
+            STATE_PATH,
+            &serde_json::to_string(&state).map_err(|e| e.to_string())?,
+        )?;
+    }
+    Ok(())
+}
+
+/// Remove only exact product persistence; restore known tuning only if it
+/// still equals our value. Never guess pre-install values for legacy hosts.
+pub(crate) fn cleanup() -> Result<(), String> {
+    cleanup_with(&mut SystemBbrHost)
+}
+
+fn cleanup_with<H: BbrHost>(host: &mut H) -> Result<(), String> {
+    let state = host
+        .read_managed_file(STATE_PATH)?
+        .map(|raw| {
+            serde_json::from_str::<HostState>(&raw)
+                .map_err(|e| format!("invalid BBR rollback state: {e}"))
+        })
+        .transpose()?;
+    if let Some(state) = &state {
+        if state.version != 1
+            || [&state.congestion, &state.qdisc]
+                .iter()
+                .any(|v| v.is_empty() || !v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        {
+            return Err("invalid BBR rollback values".into());
+        }
+        for (path, ours, original) in [
+            (CONGESTION_PATH, "bbr", &state.congestion),
+            (QDISC_PATH, "fq", &state.qdisc),
+        ] {
+            if host.read_value(path)? == ours && original != ours {
+                host.apply_value(path, original)?;
+            }
+        }
+    }
+    for (path, expected) in [
+        (SYSCTL_PATH, SYSCTL_CONTENT),
+        (MODULES_PATH, MODULES_CONTENT),
+    ] {
+        if host.read_managed_file(path)?.as_deref() == Some(expected) {
+            host.remove_managed_file(path)?;
+        }
+    }
+    if state.is_some() {
+        host.remove_managed_file(STATE_PATH)?;
+    }
+    Ok(())
+}
+
 fn validate_managed_slot(path: &str, current: Option<&str>, expected: &str) -> Result<(), String> {
     let Some(current) = current else {
         return Ok(());
@@ -205,7 +286,20 @@ fn persist_if_changed<H: BbrHost>(host: &mut H, path: &str, contents: &str) -> R
     host.write_managed_file(path, contents)
 }
 
+fn validate_managed_path(path: &Path) -> Result<(), String> {
+    for ancestor in path.ancestors() {
+        if ancestor.is_symlink() {
+            return Err(format!(
+                "refusing symlinked BBR path {}",
+                ancestor.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn write_managed_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    validate_managed_path(path)?;
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if !metadata.file_type().is_file() {
             return Err(format!("refusing non-file managed path {}", path.display()));
@@ -249,6 +343,7 @@ mod tests {
         load_failures: HashSet<String>,
         applied: Vec<(String, String)>,
         writes: Vec<(String, String)>,
+        fail_apply: Option<String>,
     }
 
     impl FakeHost {
@@ -264,6 +359,7 @@ mod tests {
                 load_failures: HashSet::new(),
                 applied: Vec::new(),
                 writes: Vec::new(),
+                fail_apply: None,
             }
         }
     }
@@ -293,6 +389,9 @@ mod tests {
         }
 
         fn apply_value(&mut self, path: &str, value: &str) -> Result<(), String> {
+            if self.fail_apply.as_deref() == Some(path) {
+                return Err("injected sysctl failure".into());
+            }
             self.values.insert(path.into(), value.into());
             self.applied.push((path.into(), value.into()));
             Ok(())
@@ -307,6 +406,10 @@ mod tests {
             self.writes.push((path.into(), contents.into()));
             Ok(())
         }
+        fn remove_managed_file(&mut self, path: &str) -> Result<(), String> {
+            self.files.remove(path);
+            Ok(())
+        }
     }
 
     #[test]
@@ -316,7 +419,11 @@ mod tests {
         assert!(host.applied.is_empty());
         assert!(host.loaded.is_empty());
         assert_eq!(
-            host.writes,
+            host.writes
+                .iter()
+                .filter(|(path, _)| path != STATE_PATH)
+                .cloned()
+                .collect::<Vec<_>>(),
             vec![(SYSCTL_PATH.into(), SYSCTL_CONTENT.into())]
         );
 
@@ -378,5 +485,45 @@ mod tests {
         assert!(outcome.is_warning());
         assert_eq!(host.files[SYSCTL_PATH], "operator configuration\n");
         assert!(host.applied.is_empty());
+    }
+    #[test]
+    fn cleanup_partial_failure_keeps_baseline_and_retries_without_guessing() {
+        let mut host = FakeHost::new("cubic", "fq_codel", "reno cubic bbr");
+        ensure_with(&mut host);
+        host.fail_apply = Some(QDISC_PATH.into());
+        assert!(cleanup_with(&mut host).is_err());
+        assert_eq!(host.values[CONGESTION_PATH], "cubic");
+        assert!(host.files.contains_key(STATE_PATH));
+        host.fail_apply = None;
+        cleanup_with(&mut host).unwrap();
+        assert_eq!(host.values[QDISC_PATH], "fq_codel");
+        assert!(host.files.is_empty());
+    }
+
+    #[test]
+    fn cleanup_restores_once_and_preserves_operator_changes() {
+        let mut host = FakeHost::new("cubic", "fq_codel", "reno cubic bbr");
+        assert_eq!(ensure_with(&mut host), EnsureOutcome::Enabled);
+        let original = host.files[STATE_PATH].clone();
+        ensure_with(&mut host);
+        assert_eq!(host.files[STATE_PATH], original);
+        host.values.insert(QDISC_PATH.into(), "cake".into());
+        cleanup_with(&mut host).unwrap();
+        assert_eq!(host.values[CONGESTION_PATH], "cubic");
+        assert_eq!(host.values[QDISC_PATH], "cake");
+        assert!(host.files.is_empty());
+        cleanup_with(&mut host).unwrap();
+    }
+
+    #[test]
+    fn legacy_cleanup_removes_ours_without_guessing_original_tuning() {
+        let mut host = FakeHost::new("bbr", "fq", "bbr");
+        host.files.insert(SYSCTL_PATH.into(), SYSCTL_CONTENT.into());
+        host.files
+            .insert(MODULES_PATH.into(), "operator modules\n".into());
+        cleanup_with(&mut host).unwrap();
+        assert!(host.applied.is_empty());
+        assert!(!host.files.contains_key(SYSCTL_PATH));
+        assert_eq!(host.files[MODULES_PATH], "operator modules\n");
     }
 }

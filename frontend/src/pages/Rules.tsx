@@ -1,3 +1,4 @@
+import { DomainPreflight } from '../components/nodes/DomainPreflight';
 import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Popover, Tag, Alert, Typography, Dropdown, Switch, Tabs, Tooltip, Pagination, Collapse } from 'antd';
 import type { MenuProps } from 'antd';
 import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, SearchOutlined, MoreOutlined } from '@ant-design/icons';
@@ -1119,6 +1120,7 @@ export default function Rules() {
   const createTransport = Form.useWatch('public_transport', createForm);
   const editTransport = Form.useWatch('public_transport', { form: editForm, preserve: true });
   const createIsSni = createTransport === 'nginx_sni';
+  const createSni = String(Form.useWatch('sni', { form: createForm, preserve: true }) ?? '').trim();
   const editIsSni = editTransport === 'nginx_sni';
   const createCamouflage = Form.useWatch('camouflage_enabled', createForm) === true;
   const editCamouflage = Form.useWatch('camouflage_enabled', { form: editForm, preserve: true }) === true;
@@ -1536,6 +1538,7 @@ export default function Rules() {
                     >
                       <Input placeholder="op1.example.com" />
                     </Form.Item>
+                    {isAdmin && <DomainPreflight key={createSni} fqdn={createSni} t={t} />}
                     <CamouflageFormFields
                       enabled={createCamouflage}
                       initialValue={false}

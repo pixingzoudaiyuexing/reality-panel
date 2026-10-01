@@ -34,6 +34,23 @@ async fn save(state: &AppState, settings: &DnsMgrSettings) -> Result<(), ()> {
         })
 }
 
+#[derive(Deserialize)]
+pub struct DomainPreflightRequest {
+    pub fqdn: String,
+}
+
+pub async fn preflight_rule_domain(
+    _admin: AdminOnly,
+    State(state): State<AppState>,
+    Json(request): Json<DomainPreflightRequest>,
+) -> Json<ApiResponse<crate::service::dnsmgr::DomainPreflight>> {
+    match crate::service::dnsmgr::domain_preflight(state.db.as_ref(), &request.fqdn).await {
+        Ok(result) => Json(ApiResponse::success(result)),
+        Err("INVALID_FQDN") => Json(err(400, "INVALID_FQDN")),
+        Err(_) => Json(err(500, "DATABASE_ERROR")),
+    }
+}
+
 /// GET /api/v1/admin/settings/dnsmgr
 pub async fn get_dnsmgr_settings(
     _admin: AdminOnly,

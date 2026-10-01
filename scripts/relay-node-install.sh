@@ -338,9 +338,13 @@ start_nginx_docker_container() {
         docker pull "$SNI_NGINX_DOCKER_IMAGE"
     fi
 
-    docker rm -f "$SNI_NGINX_DOCKER_NAME" >/dev/null 2>&1 || true
+    if docker container inspect "$SNI_NGINX_DOCKER_NAME" >/dev/null 2>&1; then
+        [ "$(docker inspect -f '{{index .Config.Labels "io.reality-panel.managed"}}' "$SNI_NGINX_DOCKER_NAME")" = nginx-sni ] || fail "Existing Nginx container is not Reality-owned; preserved."
+        docker rm -f "$SNI_NGINX_DOCKER_NAME" >/dev/null
+    fi
     docker run -d \
         --name "$SNI_NGINX_DOCKER_NAME" \
+        --label io.reality-panel.managed=nginx-sni \
         --restart unless-stopped \
         --network host \
         -v "${NGINX_DOCKER_CONF}:/etc/nginx/nginx.conf:ro" \
@@ -397,6 +401,7 @@ configure_certbot_renew_hook() {
     if [ "$SNI_NGINX_MODE" = "docker" ]; then
         cat > "$hook" <<HOOKEOF
 #!/usr/bin/env bash
+# managed by Reality Panel; renewal hook
 set -euo pipefail
 if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -Fxq '${SNI_NGINX_DOCKER_NAME}'; then
     docker exec '${SNI_NGINX_DOCKER_NAME}' nginx -s reload || docker restart '${SNI_NGINX_DOCKER_NAME}'
@@ -409,6 +414,7 @@ HOOKEOF
     else
         cat > "$hook" <<'HOOKEOF'
 #!/usr/bin/env bash
+# managed by Reality Panel; renewal hook
 set -euo pipefail
 if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files nginx.service >/dev/null 2>&1; then
     systemctl reload nginx || systemctl restart nginx
@@ -441,6 +447,7 @@ enable_certbot_auto_renewal() {
     if [ "$enabled" != "1" ]; then
         mkdir -p /etc/cron.d
         cat > /etc/cron.d/relay-panel-certbot-renew <<'CRONEOF'
+# managed by Reality Panel; certbot renewal
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 17 3,15 * * * root certbot renew --quiet

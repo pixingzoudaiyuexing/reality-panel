@@ -446,6 +446,34 @@ fn replace_container<D: DockerClient>(
     Ok(())
 }
 
+/// Retire only resources whose durable marker and live Docker identity match.
+pub(crate) fn uninstall_owned() -> Result<(), String> {
+    uninstall_with(&mut SystemDocker, &XiaoyaPaths::production())
+}
+
+fn uninstall_with<D: DockerClient>(docker: &mut D, paths: &XiaoyaPaths) -> Result<(), String> {
+    let Some(marker) = read_marker(paths)? else {
+        return Ok(());
+    };
+    marker.validate()?;
+    for path in [&paths.marker, &paths.data] {
+        if path.is_symlink() {
+            return Err("refusing symlinked Xiaoya cleanup path".into());
+        }
+    }
+    if let Some(container) = inspect_container(docker)? {
+        container.validate_owned_identity()?;
+        docker.execute(&strings(&["rm", "-f", XIAOYA_CONTAINER]))?;
+    }
+    match fs::remove_dir_all(&paths.data) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("remove owned Xiaoya data: {e}")),
+    }
+    fs::remove_file(&paths.marker).map_err(|e| format!("remove Xiaoya ownership marker: {e}"))?;
+    Ok(())
+}
+
 fn rollback_image<D: DockerClient>(
     docker: &mut D,
     paths: &XiaoyaPaths,
@@ -781,6 +809,69 @@ mod tests {
             }]
         }]))
         .unwrap()
+    }
+
+    #[test]
+    fn uninstall_owned_xiaoya_removes_only_verified_resources_and_is_idempotent() {
+        let (root, paths) = test_paths("xiaoya-uninstall");
+        fs::create_dir_all(&paths.data).unwrap();
+        fs::write(paths.data.join("db"), "owned").unwrap();
+        write_marker(&paths, &OwnershipMarker::new()).unwrap();
+        let mut docker = FakeDocker::new(
+            vec![
+                output(format!("{XIAOYA_CONTAINER}\n")),
+                output(inspection_json(true, "image", true)),
+                output(Vec::new()),
+            ],
+            true,
+        );
+        uninstall_with(&mut docker, &paths).unwrap();
+        assert!(!paths.data.exists() && !paths.marker.exists());
+        assert_eq!(
+            docker.commands.last().unwrap(),
+            &strings(&["rm", "-f", XIAOYA_CONTAINER])
+        );
+        uninstall_with(&mut docker, &paths).unwrap();
+        assert_eq!(docker.commands.len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uninstall_preserves_foreign_container_and_retains_marker_after_partial_failure() {
+        for owned in [false, true] {
+            let (root, paths) = test_paths("xiaoya-uninstall-failure");
+            fs::create_dir_all(&paths.data).unwrap();
+            fs::write(paths.data.join("keep"), "resource").unwrap();
+            write_marker(&paths, &OwnershipMarker::new()).unwrap();
+            let mut outputs = vec![
+                output(format!("{XIAOYA_CONTAINER}\n")),
+                output(inspection_json(true, "image", owned)),
+            ];
+            if owned {
+                outputs.push(Err("injected Docker removal failure".into()));
+            }
+            let mut docker = FakeDocker::new(outputs, true);
+            assert!(uninstall_with(&mut docker, &paths).is_err());
+            assert!(paths.marker.exists() && paths.data.join("keep").exists());
+            if !owned {
+                assert!(!docker
+                    .commands
+                    .iter()
+                    .any(|args| args.first().is_some_and(|v| v == "rm")));
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn uninstall_without_marker_does_not_access_byoa_docker_or_data() {
+        let (root, paths) = test_paths("xiaoya-byoa-preserve");
+        fs::create_dir_all(&paths.data).unwrap();
+        fs::write(paths.data.join("foreign"), "foreign").unwrap();
+        let mut docker = FakeDocker::new(vec![], true);
+        uninstall_with(&mut docker, &paths).unwrap();
+        assert!(paths.data.join("foreign").exists() && docker.commands.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

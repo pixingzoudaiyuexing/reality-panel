@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reality Panel release installer/updater/uninstaller for Debian 12 amd64.
+# Reality Panel release installer/updater/uninstaller for Debian/Ubuntu amd64.
 set -euo pipefail
 
 REPOSITORY="pixingzoudaiyuexing/reality-panel"
@@ -114,16 +114,89 @@ local_uninstall() {
         fi
     fi
 
+    [ "$(id -u)" -eq 0 ] || fail "Run as root."
+    # Refuse symlinked roots/ancestors before either deleting children or invoking
+    # installed helpers. Never follow a product-looking path into foreign state.
+    local managed ancestor account_owned=0 account_entry="" account_uid="" group_owned=0 owned_gid=""
+    for managed in "$INSTALL_ROOT" "$CONFIG_ROOT" "$DATA_ROOT" "$SCRIPT_ROOT" \
+        "$UPDATE_COMMAND" "$CONFIG_ROOT/installer-account" /etc/systemd/system/relay-panel.service; do
+        ancestor="$managed"
+        while [ "$ancestor" != / ] && [ -n "$ancestor" ]; do
+            [ ! -L "$ancestor" ] || fail "Refusing symlinked uninstall path: $ancestor"
+            ancestor="$(dirname "$ancestor")"
+        done
+    done
+    if [ "$purge" -eq 1 ]; then
+        account_entry="$(getent passwd relay-panel || true)"
+        if [ -n "$account_entry" ]; then
+            local account_name account_password account_gid account_gecos account_home account_shell
+            IFS=: read -r account_name account_password account_uid account_gid account_gecos account_home account_shell <<< "$account_entry"
+            if [ "$account_name" = relay-panel ] && [[ "$account_uid" =~ ^[0-9]+$ ]] && \
+               [ "$account_uid" -gt 0 ] && [ "$account_uid" -lt 1000 ] && \
+               [ "$account_home" = "$DATA_ROOT" ] && \
+               { [ "$account_shell" = /usr/sbin/nologin ] || [ "$account_shell" = /sbin/nologin ]; }; then
+                if [ -f "$CONFIG_ROOT/installer-account" ] && \
+                    [ "$(cat "$CONFIG_ROOT/installer-account")" = "$account_uid:$account_gid" ]; then
+                    account_owned=1
+                elif [ -f /etc/systemd/system/relay-panel.service ] && \
+                    grep -Fqx 'User=relay-panel' /etc/systemd/system/relay-panel.service && \
+                    grep -Fq "$INSTALL_ROOT/" /etc/systemd/system/relay-panel.service; then
+                    # Legacy installers had no marker. A matching system account
+                    # plus an actual product service establishes conservative ownership.
+                    account_owned=1
+                fi
+            fi
+        fi
+    fi
+    if [ "$purge" -eq 1 ]; then
+        if [ "$account_owned" -eq 1 ]; then
+            # Persist legacy ownership evidence before deleting its service so
+            # a failed account cleanup can be retried after files are gone.
+            install -d -m 0750 "$CONFIG_ROOT"
+            printf '%s:%s\n' "$account_uid" "$account_gid" > "$CONFIG_ROOT/installer-account"
+            chmod 0600 "$CONFIG_ROOT/installer-account"
+        fi
+        if [ -f "$CONFIG_ROOT/installer-account" ]; then
+            local ownership_record group_entry group_name group_password group_gid group_members
+            ownership_record="$(cat "$CONFIG_ROOT/installer-account")"
+            if [[ "$ownership_record" =~ ^[0-9]+:[0-9]+$ ]]; then
+                owned_gid="${ownership_record#*:}"
+                group_entry="$(getent group relay-panel || true)"
+                IFS=: read -r group_name group_password group_gid group_members <<< "$group_entry"
+                if [ "$group_name" = relay-panel ] && [ "$group_gid" = "$owned_gid" ] && [ -z "$group_members" ]; then group_owned=1; fi
+            fi
+        fi
+    fi
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl disable --now relay-panel.service >/dev/null 2>&1 || true
+        if systemctl cat relay-panel.service >/dev/null 2>&1; then
+            systemctl disable --now relay-panel.service || fail "Could not stop/disable Panel; installation retained."
+            if systemctl is-active --quiet relay-panel.service; then
+                fail "Panel is still running; installation retained."
+            fi
+        fi
+    else
+        fail "systemctl is required to verify that the Panel has stopped."
     fi
     rm -f -- /etc/systemd/system/relay-panel.service "$UPDATE_COMMAND"
-    rm -rf -- "$INSTALL_ROOT/releases" "$INSTALL_ROOT/current" \
-        "$INSTALL_ROOT/public" "$INSTALL_ROOT/node-assets" "$SCRIPT_ROOT"
-    rmdir "$INSTALL_ROOT" 2>/dev/null || true
-    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true
-
+    # The complete install root includes legacy binaries, staging releases,
+    # certificate state and failed-update artifacts as well as current assets.
+    rm -rf -- "$INSTALL_ROOT" "$SCRIPT_ROOT"
+    systemctl daemon-reload || fail "Panel files removed but systemd reload failed; retry uninstall."
+    systemctl reset-failed relay-panel.service >/dev/null 2>&1 || true
     if [ "$purge" -eq 1 ]; then
+        if [ "$account_owned" -eq 1 ]; then
+            userdel relay-panel || fail "Panel data removed but owned account cleanup failed; retry after checking account."
+        elif [ -n "$account_entry" ]; then
+            warn "Account relay-panel ownership is unproven; preserved the existing account."
+        fi
+        if [ "$group_owned" -eq 1 ]; then
+            # Preserve a group still used by another account, including primary GIDs.
+            if getent passwd | awk -F: -v gid="$owned_gid" '$4 == gid { found=1 } END { exit !found }'; then
+                warn "Group relay-panel is still used by another account; preserved shared group."
+            else
+                groupdel relay-panel || fail "Owned group cleanup failed; retry uninstall."
+            fi
+        fi
         rm -rf -- "$CONFIG_ROOT" "$DATA_ROOT"
         info "Reality Panel binaries, configuration, and local data removed."
         info "Panel local data was purged."
@@ -160,6 +233,12 @@ esac
 
 case "$command_name" in
     uninstall)
+        [ "$(id -u)" -eq 0 ] || fail "Run as root."
+        helper_path="$SCRIPT_ROOT/deploy.sh"
+        while [ "$helper_path" != / ]; do
+            [ ! -L "$helper_path" ] || fail "Refusing symlinked uninstall helper"
+            helper_path="$(dirname "$helper_path")"
+        done
         if [ -x "$SCRIPT_ROOT/deploy.sh" ]; then
             exec "$SCRIPT_ROOT/deploy.sh" uninstall "$@"
         fi
@@ -178,9 +257,13 @@ os_release_file="${REALITY_PANEL_OS_RELEASE_FILE:-/etc/os-release}"
 # 在子 shell 中读取系统信息，避免 Debian 的 VERSION 污染目标发布版本。
 os_id="$(. "$os_release_file"; printf '%s' "${ID:-}")"
 os_version_id="$(. "$os_release_file"; printf '%s' "${VERSION_ID:-}")"
-[ "$os_id" = "debian" ] && [ "$os_version_id" = "12" ] || \
-    fail "The supported v1 host is Debian 12 amd64."
+case "$os_id:$os_version_id" in
+    debian:12|debian:13|ubuntu:22.04|ubuntu:24.04) ;;
+    *) fail "Supported hosts: Debian 12/13 or Ubuntu 22.04/24.04 amd64." ;;
+esac
+command -v apt-get >/dev/null 2>&1 || fail "apt-get is required."
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required."
+systemctl show --property=Version --value >/dev/null 2>&1 || fail "A running systemd manager is required."
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -260,4 +343,4 @@ chmod +x "$tmp/install.sh" "$tmp/update.sh" "$tmp/deploy.sh" \
     "$tmp/reality-panel-linux-amd64" "$tmp/reality-node-linux-amd64"
 
 RELEASE_DIR="$tmp" RELEASE_VERSION="$target_version" PUBLIC_PANEL_URL="$public_url" PANEL_PORT="$panel_port" \
-    exec "$tmp/deploy.sh" "$command_name"
+    "$tmp/deploy.sh" "$command_name"

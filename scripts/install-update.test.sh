@@ -21,7 +21,7 @@ cat > "$FAKE/id" <<'EOF'
 EOF
 cat > "$FAKE/uname" <<'EOF'
 #!/usr/bin/env bash
-case "${1:-}" in -s) printf 'Linux\n' ;; -m) printf 'x86_64\n' ;; esac
+case "${1:-}" in -s) printf 'Linux\n' ;; -m) printf '%s\n' "${FAKE_ARCH:-x86_64}" ;; esac
 EOF
 cat > "$FAKE/systemctl" <<'EOF'
 #!/usr/bin/env bash
@@ -158,3 +158,19 @@ grep -Fq 'PANEL_CERTBOT_BINARY_PATH=/usr/bin/certbot' "$ROOT/deploy.sh"
 grep -Fq 'PANEL_CERTIFICATE_CHECK_INTERVAL_SECS=60' "$ROOT/deploy.sh"
 
 printf 'installer entrypoint contract: PASS\n'
+
+for distro in debian:12 debian:13 ubuntu:22.04 ubuntu:24.04; do
+    printf 'ID=%s\nVERSION_ID=%s\n' "${distro%:*}" "${distro#*:}" > "$TMP/os-release"
+    parse v1.3.0 --public-panel-url https://panel.example.com > /dev/null || fail "$distro rejected"
+done
+printf 'ID=fedora\nVERSION_ID=42\n' > "$TMP/os-release"
+if parse v1.3.0 --public-panel-url https://panel.example.com > /dev/null 2>&1; then fail "unsupported distro accepted"; fi
+printf 'ID=debian\nVERSION_ID=13\n' > "$TMP/os-release"
+if FAKE_ARCH=aarch64 parse v1.3.0 --public-panel-url https://panel.example.com > /dev/null 2>&1; then fail "unsupported arch accepted"; fi
+# An executable named systemctl must additionally report a functional systemd manager.
+cat > "$FAKE/systemctl" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+if parse v1.3.0 --public-panel-url https://panel.example.com > /dev/null 2>&1; then fail "nonfunctional systemd accepted"; fi
+echo "OS capability matrix: PASS"

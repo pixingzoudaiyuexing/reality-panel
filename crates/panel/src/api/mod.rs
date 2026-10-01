@@ -490,6 +490,10 @@ pub fn routes() -> Router<AppState> {
             axum::routing::post(admin::test_dnsmgr_connection),
         )
         .route(
+            "/admin/rules/domain-preflight",
+            axum::routing::post(admin::preflight_rule_domain),
+        )
+        .route(
             "/admin/rules/dns-status",
             axum::routing::get(admin::list_rule_dns_statuses),
         )

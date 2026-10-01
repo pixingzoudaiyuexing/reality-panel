@@ -1,4 +1,13 @@
 export const zhCN = {
+  domainCheck: '检查域名',
+  domainCheckAbsent: '未发现 A/CNAME 记录，可由 Panel 后续创建。',
+  domainCheckOwned: '已存在 Panel 管理的 A 记录。',
+  domainCheckExternal: '已存在外部 A 记录。可继续创建 Rule，后续覆盖需确认。',
+  domainCheckCname: '已存在 CNAME。可继续创建 Rule，后续 CNAME → A 需确认。',
+  domainCheckUnmanaged: 'Provider 中没有匹配的可管理 Zone。',
+  domainCheckUnconfigured: 'DNS 自动化未配置或未启用。',
+  domainCheckFailed: 'Provider 读取失败，暂时无法确认域名状态，请重试。',
+  domainCheckReadonly: '此次检查仅查看默认线路，不修改 DNS；不代表后续变更已获授权。',
   // Brand
   brand: 'RealityPanel',
   subtitle: 'TCP/UDP 转发管理',
