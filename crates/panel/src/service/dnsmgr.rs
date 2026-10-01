@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 mod record_sets;
-pub(crate) use record_sets::{confirmation_token, prepare_carrier_dns};
+pub(crate) use record_sets::{confirmation_token, pending_confirmation_lines, prepare_carrier_dns};
 pub(crate) use record_sets::{decode_dns_values, encode_dns_values, valid_dns_values};
 
 const DISCOVERY_PAGE_LIMIT: u16 = 100;
@@ -962,6 +962,20 @@ pub(crate) async fn ensure_record_absent(
     client: &DnsMgrClient,
     input: &DeleteRecordInput,
 ) -> DeleteRecordResult {
+    match crate::service::relay_preference::dns_rollback_provider_snapshot(
+        db,
+        input.rule_id,
+        &input.fqdn,
+        &input.line.key,
+    )
+    .await
+    {
+        Ok(Some(snapshot)) => {
+            return record_sets::restore_provider_snapshot(db, client, input, &snapshot).await
+        }
+        Ok(None) => {}
+        Err(_) => return DeleteRecordResult::Failed(EnsureRecordFailure::Database),
+    }
     if input.record_type == DnsRecordType::A
         && record_sets::uses_set_reconciliation(
             db,
@@ -1767,10 +1781,26 @@ pub(crate) enum LineDesiredError {
     InvalidValue,
 }
 
+/// Original provider data needed by the existing routing journal to undo a
+/// confirmed CNAME replacement. Provider-generated record IDs may change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsProviderSnapshot {
+    pub zone_id: u64,
+    pub records: Vec<DnsProviderSnapshotRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsProviderSnapshotRecord {
+    pub record_type: String,
+    pub values: std::collections::BTreeSet<String>,
+    pub ttl: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LineRecordSnapshot {
     Absent,
     PanelOwned { value: String, record_id: String },
+    ConfirmedCname { snapshot: DnsProviderSnapshot },
 }
 
 #[derive(Debug)]
@@ -6289,6 +6319,9 @@ mod tests {
     }
 
     struct MockDnsState {
+        reject_add_at: AtomicUsize,
+        temporary_delete_at: AtomicUsize,
+        reject_writes: std::sync::atomic::AtomicBool,
         provider_type: Mutex<String>,
         read_failure: std::sync::atomic::AtomicBool,
         records: Mutex<Vec<DnsMgrRecord>>,
@@ -6331,6 +6364,9 @@ mod tests {
         update_behavior: MutationBehavior,
     ) -> EnsureMock {
         let state = Arc::new(MockDnsState {
+            reject_add_at: AtomicUsize::new(0),
+            temporary_delete_at: AtomicUsize::new(0),
+            reject_writes: std::sync::atomic::AtomicBool::new(false),
             provider_type: Mutex::new("provider".into()),
             read_failure: std::sync::atomic::AtomicBool::new(false),
             records: Mutex::new(records),
@@ -6430,6 +6466,11 @@ mod tests {
     ) -> Response {
         let attempt = state.add_attempts.fetch_add(1, Ordering::SeqCst) + 1;
         *state.last_add_form.lock().unwrap() = Some(form.clone());
+        if state.reject_writes.load(Ordering::SeqCst)
+            || state.reject_add_at.load(Ordering::SeqCst) == attempt
+        {
+            return Json(json!({"code": -1, "msg": "injected mutation rejection"})).into_response();
+        }
         if *state.provider_type.lock().unwrap() == "huawei"
             && state.records.lock().unwrap().iter().any(|r| {
                 r.host == *form.get("name").unwrap()
@@ -6480,7 +6521,10 @@ mod tests {
         State(state): State<Arc<MockDnsState>>,
         Form(form): Form<HashMap<String, String>>,
     ) -> Response {
-        state.delete_attempts.fetch_add(1, Ordering::SeqCst);
+        let attempt = state.delete_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if state.temporary_delete_at.load(Ordering::SeqCst) == attempt {
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         let behavior = *state.delete_behavior.lock().unwrap();
         if matches!(
             behavior,
@@ -6523,6 +6567,7 @@ mod tests {
             .split(',')
             .map(str::to_owned)
             .collect();
+        record.ttl = form.get("ttl").unwrap().parse().unwrap();
         record
     }
 

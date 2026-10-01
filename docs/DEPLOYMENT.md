@@ -69,6 +69,11 @@ This iteration validates adapter/integration contracts against an HTTP mock.
 No authorized external DNS test zone/credential was supplied, so the new Multi-A
 round-trip against a live provider remains NOT VERIFIED.
 
+New binaries read legacy scalar policy/binding data. Earlier binaries cannot
+interpret Multi-A arrays or the optional typed CNAME rollback snapshot. Avoid
+downgrading while a routing transaction is pending; this is source compatibility,
+not a release or deployment authorization.
+
 The Huawei DNSMgr provider control plane has been tested with parent and child
 records, multiple lines per Rule, updates, safe deletion, and Panel outages.
 Actual parent/child/default precedence is still pending validation from trusted

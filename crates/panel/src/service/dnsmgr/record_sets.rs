@@ -204,6 +204,31 @@ pub(crate) async fn prepare_carrier_dns(
     Ok((Vec::new(), warnings))
 }
 
+/// Confirming provider drift is an apply operation even when the saved policy
+/// has not changed. Feed only those exact approved lines into the existing journal.
+pub(crate) async fn pending_confirmation_lines(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<BTreeSet<String>, crate::db::error::DbError> {
+    let mut lines = BTreeSet::new();
+    for rule_id in eligible_rule_ids_for_group(db, group_id).await? {
+        for (_, raw) in db
+            .scan_prefix(&format!("dns_confirmed_overwrite:{rule_id}:"))
+            .await?
+        {
+            let approval: ConfirmedOverwrite = serde_json::from_str(&raw).map_err(|e| {
+                crate::db::error::DbError::Other(sqlx::Error::Protocol(e.to_string()))
+            })?;
+            lines.insert(if approval.confirmation.line_key == DEFAULT_LINE_KEY {
+                "default".into()
+            } else {
+                approval.confirmation.line_id
+            });
+        }
+    }
+    Ok(lines)
+}
+
 pub(crate) fn confirmation_token(conflicts: &[DnsOverwriteConfirmation]) -> String {
     use sha2::{Digest, Sha256};
     format!(
@@ -279,10 +304,11 @@ fn owns_set(
             && b.record_type == "A"
             && b.line_key == line.key
             && (line.key == DEFAULT_LINE_KEY || b.line == line.raw_id)
-            && decode_strings(&b.record_id).ok()
-                == Some(records.iter().map(|r| r.record_id.clone()).collect())
-            && decode_dns_values(&b.desired_value).ok() == values_of(records).ok()
-            && values_of(records).is_ok()
+            // A failed multi-record deletion may leave a known subset. IDs AND
+            // values must both remain within the last verified scope; any
+            // external/new record or drifted value still needs confirmation.
+            && decode_strings(&b.record_id).is_ok_and(|known| records.iter().all(|r|known.contains(&r.record_id)))
+            && decode_dns_values(&b.desired_value).is_ok_and(|known|values_of(records).is_ok_and(|current|current.is_subset(&known)))
     })
 }
 
@@ -538,7 +564,8 @@ async fn reconcile_set(
                         .map_err(EnsureRecordFailure::Upstream)?;
                 }
             }
-            for value in desired.difference(&retained) {
+            let missing = desired.difference(&retained).copied().collect::<Vec<_>>();
+            for value in missing {
                 client
                     .create_record(
                         zone.domain_id,
@@ -552,6 +579,37 @@ async fn reconcile_set(
                     )
                     .await
                     .map_err(EnsureRecordFailure::Upstream)?;
+                retained.insert(value);
+                // DNSMgr does not return IDs from create. Record each accepted
+                // and verified partial set in the existing binding before the
+                // next mutation, so a later failure has safe rollback provenance.
+                let progress = read_set(client, &zone, &line)
+                    .await
+                    .map_err(EnsureRecordFailure::Upstream)?;
+                if values_of(&progress).ok().as_ref() != Some(&retained) {
+                    return Err(EnsureRecordFailure::PostWriteNotVerified);
+                }
+                let mut progress_input = input.clone();
+                progress_input.expected_value =
+                    encode_dns_values(retained.iter().map(ToString::to_string).collect());
+                let progress_ids =
+                    encode_dns_values(progress.iter().map(|r| r.record_id.clone()).collect());
+                let progress_binding = db
+                    .find_dns_record_binding_for_rule(input.rule_id, fqdn.as_str(), "A", &line.key)
+                    .await
+                    .map_err(|_| EnsureRecordFailure::Database)?;
+                persist_verified_binding(
+                    db,
+                    &progress_input,
+                    &fqdn,
+                    &zone,
+                    &line,
+                    &progress_ids,
+                    progress_binding.as_ref(),
+                    true,
+                )
+                .await
+                .map_err(|e| e.as_ensure_failure())?;
             }
         }
     }
@@ -562,6 +620,10 @@ async fn reconcile_set(
         return Err(EnsureRecordFailure::PostWriteNotVerified);
     }
     let ids = encode_dns_values(actual.iter().map(|r| r.record_id.clone()).collect());
+    let binding = db
+        .find_dns_record_binding_for_rule(input.rule_id, fqdn.as_str(), "A", &line.key)
+        .await
+        .map_err(|_| EnsureRecordFailure::Database)?;
     persist_verified_binding(db, input, &fqdn, &zone, &line, &ids, binding.as_ref(), true)
         .await
         .map_err(|e| match e {
@@ -602,6 +664,19 @@ pub(super) async fn inspect_set(
             .as_ref()
             .is_some_and(|a| override_matches(a, fqdn, zone, line, &records, None))
     {
+        if records
+            .iter()
+            .any(|record| record.record_type.eq_ignore_ascii_case("CNAME"))
+        {
+            let records = provider_snapshot_records(&records)
+                .map_err(|_| LineRecordSnapshotError::InvalidRule)?;
+            return Ok(Some(LineRecordSnapshot::ConfirmedCname {
+                snapshot: DnsProviderSnapshot {
+                    zone_id: zone.domain_id,
+                    records,
+                },
+            }));
+        }
         let a_values = records
             .iter()
             .filter(|r| r.record_type.eq_ignore_ascii_case("A"))
@@ -622,4 +697,114 @@ pub(super) async fn inspect_set(
         }));
     }
     Ok(None)
+}
+
+fn provider_snapshot_records(
+    records: &[DnsMgrRecord],
+) -> Result<Vec<DnsProviderSnapshotRecord>, ()> {
+    let mut snapshots = records
+        .iter()
+        .map(|r| {
+            Ok(DnsProviderSnapshotRecord {
+                record_type: r.record_type.to_ascii_uppercase(),
+                values: r.values.iter().cloned().collect(),
+                ttl: u32::try_from(r.ttl).map_err(|_| ())?,
+            })
+        })
+        .collect::<Result<Vec<_>, ()>>()?;
+    snapshots.sort_by(|a, b| {
+        (&a.record_type, &a.values, a.ttl).cmp(&(&b.record_type, &b.values, b.ttl))
+    });
+    Ok(snapshots)
+}
+
+pub(super) async fn restore_provider_snapshot(
+    db: &dyn Repository,
+    client: &DnsMgrClient,
+    input: &DeleteRecordInput,
+    snapshot: &DnsProviderSnapshot,
+) -> DeleteRecordResult {
+    let result = restore_snapshot_inner(db, client, input, snapshot).await;
+    match result {
+        Ok(()) => DeleteRecordResult::AlreadyAbsent, // Panel A is absent; original CNAME is restored.
+        Err(EnsureRecordFailure::Upstream(error)) if error.is_ambiguous_write() => {
+            DeleteRecordResult::MutationOutcomeUnknown
+        }
+        Err(error) => DeleteRecordResult::Failed(error),
+    }
+}
+
+async fn restore_snapshot_inner(
+    db: &dyn Repository,
+    client: &DnsMgrClient,
+    input: &DeleteRecordInput,
+    snapshot: &DnsProviderSnapshot,
+) -> Result<(), EnsureRecordFailure> {
+    let fqdn = normalize_fqdn(&input.fqdn).map_err(EnsureRecordFailure::InvalidInput)?;
+    if !delete_is_authorized(db, input, &fqdn)
+        .await
+        .map_err(|_| EnsureRecordFailure::Database)?
+    {
+        return Err(EnsureRecordFailure::InvalidRule);
+    }
+    let zone = match resolve_zone(client, &fqdn).await {
+        ZoneResolution::ZoneResolved(zone) if zone.domain_id == snapshot.zone_id => zone,
+        ZoneResolution::UpstreamFailure(e) => return Err(EnsureRecordFailure::Upstream(e)),
+        _ => return Err(EnsureRecordFailure::NoMatchingZone),
+    };
+    let detail = client
+        .get_domain(zone.domain_id)
+        .await
+        .map_err(EnsureRecordFailure::Upstream)?;
+    let line = resolve_mutation_line(&input.line, &detail)
+        .ok_or(EnsureRecordFailure::ProviderLineUnavailable)?;
+    let current = read_set(client, &zone, &line)
+        .await
+        .map_err(EnsureRecordFailure::Upstream)?;
+    let binding = db
+        .find_dns_record_binding_for_rule(input.rule_id, fqdn.as_str(), "A", &line.key)
+        .await
+        .map_err(|_| EnsureRecordFailure::Database)?;
+    if provider_snapshot_records(&current).ok().as_ref() != Some(&snapshot.records) {
+        if !current.is_empty() && !owns_set(binding.as_ref(), &fqdn, &zone, &line, &current) {
+            return Err(EnsureRecordFailure::OwnershipUnverified);
+        }
+        for record in &current {
+            client
+                .delete_record(zone.domain_id, &record.record_id)
+                .await
+                .map_err(EnsureRecordFailure::Upstream)?;
+        }
+        for record in &snapshot.records {
+            // CNAME replacement captures the exact typed provider snapshot in
+            // the existing journal, including TTL. Never infer it from an A IP.
+            for value in &record.values {
+                client
+                    .create_record(
+                        zone.domain_id,
+                        &DnsMgrRecordMutation {
+                            host: zone.host.clone(),
+                            record_type: record.record_type.clone(),
+                            value: value.clone(),
+                            line: line.raw_id.clone(),
+                            ttl: record.ttl,
+                        },
+                    )
+                    .await
+                    .map_err(EnsureRecordFailure::Upstream)?;
+            }
+        }
+    }
+    let actual = read_set(client, &zone, &line)
+        .await
+        .map_err(EnsureRecordFailure::Upstream)?;
+    if provider_snapshot_records(&actual).ok().as_ref() != Some(&snapshot.records) {
+        return Err(EnsureRecordFailure::PostWriteNotVerified);
+    }
+    if let Some(binding) = binding {
+        set_binding_state(db, binding.id, "MISSING", None)
+            .await
+            .map_err(|_| EnsureRecordFailure::Database)?;
+    }
+    Ok(())
 }

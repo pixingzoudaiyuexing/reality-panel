@@ -258,6 +258,8 @@ pub struct RelayDnsTransactionRecord {
     pub target_record_id: Option<String>,
     #[serde(default)]
     pub rollback_record_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_provider_snapshot: Option<crate::service::dnsmgr::DnsProviderSnapshot>,
     #[serde(default)]
     pub target_state: Option<String>,
     #[serde(default)]
@@ -1292,6 +1294,34 @@ pub(crate) async fn dns_transaction_authorizes(
     }))
 }
 
+pub(crate) async fn dns_rollback_provider_snapshot(
+    db: &dyn Repository,
+    rule_id: i64,
+    fqdn: &str,
+    line_key: &str,
+) -> Result<Option<crate::service::dnsmgr::DnsProviderSnapshot>, DbError> {
+    let Some(rule) = RuleRepository::find_rule_by_id(db, rule_id, &ResourceScope::All).await?
+    else {
+        return Ok(None);
+    };
+    let preference = load_preference(db, rule.device_group_in)
+        .await
+        .map_err(|e| DbError::Other(sqlx::Error::Protocol(e.to_string())))?;
+    if preference.state != RelayPreferencePhase::RollingBack {
+        return Ok(None);
+    }
+    Ok(preference
+        .dns_records
+        .iter()
+        .find(|r| {
+            r.rule_id == rule_id
+                && r.fqdn == fqdn
+                && r.line_key == line_key
+                && r.rollback_action == RelayDnsAction::Delete
+        })
+        .and_then(|r| r.rollback_provider_snapshot.clone()))
+}
+
 pub(crate) async fn stored_node_public_ipv4(
     db: &dyn Repository,
     group_id: i64,
@@ -2112,11 +2142,21 @@ fn map_mode_snapshot_error(
 
 fn snapshot_rollback(
     snapshot: crate::service::dnsmgr::LineRecordSnapshot,
-) -> (RelayDnsAction, Option<String>, Option<String>) {
+) -> (
+    RelayDnsAction,
+    Option<String>,
+    Option<String>,
+    Option<crate::service::dnsmgr::DnsProviderSnapshot>,
+) {
     match snapshot {
-        crate::service::dnsmgr::LineRecordSnapshot::Absent => (RelayDnsAction::Delete, None, None),
+        crate::service::dnsmgr::LineRecordSnapshot::Absent => {
+            (RelayDnsAction::Delete, None, None, None)
+        }
         crate::service::dnsmgr::LineRecordSnapshot::PanelOwned { value, record_id } => {
-            (RelayDnsAction::Upsert, Some(value), Some(record_id))
+            (RelayDnsAction::Upsert, Some(value), Some(record_id), None)
+        }
+        crate::service::dnsmgr::LineRecordSnapshot::ConfirmedCname { snapshot } => {
+            (RelayDnsAction::Delete, None, None, Some(snapshot))
         }
     }
 }
@@ -2236,7 +2276,8 @@ async fn build_mode_transition_records(
             )
             .await
             .map_err(|error| map_mode_snapshot_error(*rule_id, "default", error))?;
-            let (rollback_action, rollback_value, rollback_record_id) = snapshot_rollback(snapshot);
+            let (rollback_action, rollback_value, rollback_record_id, rollback_provider_snapshot) =
+                snapshot_rollback(snapshot);
             records.push(RelayDnsTransactionRecord {
                 rule_id: *rule_id,
                 fqdn: fqdn.clone(),
@@ -2248,6 +2289,7 @@ async fn build_mode_transition_records(
                 rollback_value,
                 target_record_id: None,
                 rollback_record_id,
+                rollback_provider_snapshot,
                 target_state: None,
                 target_error: None,
             });
@@ -2264,7 +2306,8 @@ async fn build_mode_transition_records(
                 crate::service::dnsmgr::inspect_line_record(db, client, *rule_id, &change.line_id)
                     .await
                     .map_err(|error| map_mode_snapshot_error(*rule_id, &change.line_id, error))?;
-            let (rollback_action, rollback_value, rollback_record_id) = snapshot_rollback(snapshot);
+            let (rollback_action, rollback_value, rollback_record_id, rollback_provider_snapshot) =
+                snapshot_rollback(snapshot);
             let (target_action, target_value) = match change.new.as_ref() {
                 Some(_) => match targets.get(&change.line_id).cloned().flatten() {
                     Some(value) => (RelayDnsAction::Upsert, Some(value)),
@@ -2283,6 +2326,7 @@ async fn build_mode_transition_records(
                 rollback_value,
                 target_record_id: None,
                 rollback_record_id,
+                rollback_provider_snapshot,
                 target_state: None,
                 target_error: None,
             });
@@ -2368,8 +2412,26 @@ pub async fn start_carrier_policy_apply(
     let active_policy = carrier_policy_without_default_authority(&preference.carrier_policy);
     validate_carrier_members(db, node_connections, group_id, &requested).await?;
     let removed_legacy_default = active_policy != preference.carrier_policy;
-    let changes = carrier_policy_transaction_diff(&active_policy, &requested);
-    let default_changed = active_policy.default_node_id != requested.default_node_id;
+    let mut changes = carrier_policy_transaction_diff(&active_policy, &requested);
+    let confirmed_lines = crate::service::dnsmgr::pending_confirmation_lines(db, group_id).await?;
+    let old_lines = carrier_bindings_by_line(&active_policy);
+    let new_lines = carrier_bindings_by_line(&requested);
+    for line_id in &confirmed_lines {
+        if line_id != "default"
+            && !changes.iter().any(|change| &change.line_id == line_id)
+            && (old_lines.contains_key(line_id.as_str())
+                || new_lines.contains_key(line_id.as_str()))
+        {
+            changes.push(CarrierPolicyChange {
+                line_id: line_id.clone(),
+                old: old_lines.get(line_id.as_str()).cloned(),
+                new: new_lines.get(line_id.as_str()).cloned(),
+            });
+        }
+    }
+    changes.sort_by(|a, b| a.line_id.cmp(&b.line_id));
+    let default_changed = active_policy.default_node_id != requested.default_node_id
+        || confirmed_lines.contains("default");
     if active_mode != RoutingMode::Carrier {
         preference.carrier_policy = requested;
         preference.pending_carrier_policy = None;
@@ -2521,14 +2583,8 @@ pub async fn start_carrier_policy_apply(
         )
         .await
         .map_err(|error| map_snapshot_error(*rule_id, "default", error))?;
-        let (rollback_action, rollback_value, rollback_record_id) = match snapshot {
-            crate::service::dnsmgr::LineRecordSnapshot::Absent => {
-                (RelayDnsAction::Delete, None, None)
-            }
-            crate::service::dnsmgr::LineRecordSnapshot::PanelOwned { value, record_id } => {
-                (RelayDnsAction::Upsert, Some(value), Some(record_id))
-            }
-        };
+        let (rollback_action, rollback_value, rollback_record_id, rollback_provider_snapshot) =
+            snapshot_rollback(snapshot);
         records.push(RelayDnsTransactionRecord {
             rule_id: *rule_id,
             fqdn: fqdn.clone(),
@@ -2540,6 +2596,7 @@ pub async fn start_carrier_policy_apply(
             rollback_value,
             target_record_id: None,
             rollback_record_id,
+            rollback_provider_snapshot,
             target_state: None,
             target_error: None,
         });
@@ -2555,14 +2612,8 @@ pub async fn start_carrier_policy_apply(
                 crate::service::dnsmgr::inspect_line_record(db, &client, *rule_id, &change.line_id)
                     .await
                     .map_err(|error| map_snapshot_error(*rule_id, &change.line_id, error))?;
-            let (rollback_action, rollback_value, rollback_record_id) = match snapshot {
-                crate::service::dnsmgr::LineRecordSnapshot::Absent => {
-                    (RelayDnsAction::Delete, None, None)
-                }
-                crate::service::dnsmgr::LineRecordSnapshot::PanelOwned { value, record_id } => {
-                    (RelayDnsAction::Upsert, Some(value), Some(record_id))
-                }
-            };
+            let (rollback_action, rollback_value, rollback_record_id, rollback_provider_snapshot) =
+                snapshot_rollback(snapshot);
             let (target_action, target_value) = match change.new.as_ref() {
                 Some(_) => match targets.get(&change.line_id).cloned().flatten() {
                     Some(value) => (RelayDnsAction::Upsert, Some(value)),
@@ -2581,6 +2632,7 @@ pub async fn start_carrier_policy_apply(
                 rollback_value,
                 target_record_id: None,
                 rollback_record_id,
+                rollback_provider_snapshot,
                 target_state: None,
                 target_error: None,
             });
@@ -3417,6 +3469,7 @@ async fn build_dns_transaction_records(
             rollback_value,
             target_record_id: None,
             rollback_record_id: None,
+            rollback_provider_snapshot: None,
             target_state: None,
             target_error: None,
         });
@@ -3462,14 +3515,8 @@ async fn append_follow_default_transaction_records(
                             "rule {rule_id} line {line_id}: {error:?}"
                         ))
                     })?;
-            let (rollback_action, rollback_value, rollback_record_id) = match snapshot {
-                crate::service::dnsmgr::LineRecordSnapshot::Absent => {
-                    (RelayDnsAction::Delete, None, None)
-                }
-                crate::service::dnsmgr::LineRecordSnapshot::PanelOwned { value, record_id } => {
-                    (RelayDnsAction::Upsert, Some(value), Some(record_id))
-                }
-            };
+            let (rollback_action, rollback_value, rollback_record_id, rollback_provider_snapshot) =
+                snapshot_rollback(snapshot);
             records.push(RelayDnsTransactionRecord {
                 rule_id: *rule_id,
                 fqdn: fqdn.clone(),
@@ -3481,6 +3528,7 @@ async fn append_follow_default_transaction_records(
                 rollback_value,
                 target_record_id: None,
                 rollback_record_id,
+                rollback_provider_snapshot,
                 target_state: None,
                 target_error: None,
             });
@@ -5866,6 +5914,7 @@ mod tests {
                 rollback_value: Some("203.0.113.5".into()),
                 target_record_id: None,
                 rollback_record_id: None,
+                rollback_provider_snapshot: None,
                 target_state: None,
                 target_error: None,
             });
@@ -6202,6 +6251,7 @@ mod tests {
                     rollback_value: None,
                     target_record_id: Some("record-new".into()),
                     rollback_record_id: None,
+                    rollback_provider_snapshot: None,
                     target_state: Some("PROPAGATED".into()),
                     target_error: None,
                 },
@@ -6216,6 +6266,7 @@ mod tests {
                     rollback_value: Some("192.0.2.30".into()),
                     target_record_id: None,
                     rollback_record_id: Some("record-old".into()),
+                    rollback_provider_snapshot: None,
                     target_state: None,
                     target_error: None,
                 },
@@ -6982,6 +7033,7 @@ mod tests {
             rollback_value: rollback_value.map(str::to_string),
             target_record_id: None,
             rollback_record_id: None,
+            rollback_provider_snapshot: None,
             target_state: None,
             target_error: None,
         }
@@ -7067,6 +7119,7 @@ mod tests {
             rollback_value: Some("203.0.113.6".into()),
             target_record_id: None,
             rollback_record_id: None,
+            rollback_provider_snapshot: None,
             target_state: None,
             target_error: None,
         };

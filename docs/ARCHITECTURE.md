@@ -82,6 +82,8 @@ DNSMgr automation reconciles an IPv4 set per Rule/FQDN/provider line:
 - unknown A or CNAME records require an administrator preview and confirmation of the exact observed and desired sets before any provider write;
 - changed snapshots require a new confirmation; provider read failures remain technical errors;
 - every mutation requires exact set read-back, scoped to the selected provider line;
+- the existing routing journal captures the original typed CNAME snapshot (values, TTL, zone) for confirmed replacement rollback; retries can resume from a known subset of verified A IDs/values, while any unknown record still requires attention;
+- confirming provider drift applies the approved line even if Carrier policy is unchanged;
 - partial/missing IPv4 produces an actionable incomplete result; zero values retain provider Last Known Good until an address is available;
 - deleting a Node completes local retirement even if external DNS fails. Existing sync rows expose needs-attention and handle provider retries.
 

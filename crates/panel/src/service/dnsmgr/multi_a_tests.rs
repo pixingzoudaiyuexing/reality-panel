@@ -779,4 +779,206 @@ mod multi_a_acceptance {
             .iter()
             .any(|r| r.identity_group_id == f.anchor && r.node_id == "n1"));
     }
+    #[tokio::test]
+    async fn confirmed_cname_is_restored_if_a_later_carrier_line_fails() {
+        for (partial_delete_failure, unknown_after_partial_delete) in
+            [(false, false), (true, false), (true, true)]
+        {
+            let f = fixture().await;
+            let original = record("external-cname", "CNAME", "original.example.net", "unicom");
+            f.mock
+                .state
+                .records
+                .lock()
+                .unwrap()
+                .extend([original.clone(), record("keep", "A", "8.8.8.8", "telecom")]);
+            let p = policy(
+                "n1",
+                &[("mobile", "n1"), ("unicom", "n2"), ("unicom", "n6")],
+            );
+            let mut body = serde_json::to_value(&p).unwrap();
+            body["mode"] = json!("carrier");
+            let (_, preview) = http(&f, "PUT", "/groups/10/routing-apply", body.clone()).await;
+            body["dns_confirmation"] = preview["data"]["dns_confirmation"].clone();
+            assert_eq!(
+                http(&f, "PUT", "/groups/10/routing-apply", body).await.0,
+                axum::http::StatusCode::OK
+            );
+            let sync =
+                f.db.find_dns_record_sync(100, "dnsmgr:unicom")
+                    .await
+                    .unwrap()
+                    .unwrap();
+            reconcile_one(f.db.as_ref(), sync, &f.mock.client).await;
+            assert_eq!(
+                actual_values(&f, "op1", "unicom"),
+                expected(&["2.2.2.2", "6.6.6.6"])
+            );
+            f.mock.state.reject_writes.store(true, Ordering::SeqCst);
+            reconcile_group(&f, 10).await;
+            assert_eq!(
+                preference::load_preference(f.db.as_ref(), 10)
+                    .await
+                    .unwrap()
+                    .state,
+                preference::RelayPreferencePhase::RollingBack
+            );
+            f.mock.state.reject_writes.store(false, Ordering::SeqCst);
+            if partial_delete_failure {
+                f.mock.state.temporary_delete_at.store(
+                    f.mock.state.delete_attempts.load(Ordering::SeqCst) + 2,
+                    Ordering::SeqCst,
+                );
+            }
+            reconcile_group(&f, 10).await;
+            if partial_delete_failure {
+                assert_eq!(
+                    preference::load_preference(f.db.as_ref(), 10)
+                        .await
+                        .unwrap()
+                        .state,
+                    preference::RelayPreferencePhase::RollingBack
+                );
+                assert_eq!(
+                    actual_values(&f, "op1", "unicom").len(),
+                    1,
+                    "one known A deletion succeeded before the transient failure"
+                );
+                if unknown_after_partial_delete {
+                    f.mock.state.records.lock().unwrap().push(record(
+                        "foreign-after-partial",
+                        "A",
+                        "9.9.9.9",
+                        "unicom",
+                    ));
+                    let mutations = f.mock.state.total_mutations();
+                    reconcile_group(&f, 10).await;
+                    assert_eq!(
+                        f.mock.state.total_mutations(),
+                        mutations,
+                        "rollback must not remove an unknown record"
+                    );
+                    assert!(f
+                        .mock
+                        .state
+                        .records
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|r| r.record_id == "foreign-after-partial"));
+                    assert_eq!(
+                        preference::load_preference(f.db.as_ref(), 10)
+                            .await
+                            .unwrap()
+                            .state,
+                        preference::RelayPreferencePhase::FailedManualIntervention
+                    );
+                    continue;
+                }
+                reconcile_group(&f, 10).await;
+            }
+            let actual = f.mock.state.records.lock().unwrap().clone();
+            let restored = actual
+                .iter()
+                .filter(|r| r.line == "unicom")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                restored.len(),
+                1,
+                "rollback must restore the confirmed original CNAME"
+            );
+            assert_eq!(restored[0].record_type, "CNAME");
+            assert_eq!(restored[0].values, original.values);
+            assert_eq!(restored[0].ttl, original.ttl);
+            assert!(actual.iter().any(|r| r.record_id == "keep"));
+            assert_eq!(
+                preference::load_preference(f.db.as_ref(), 10)
+                    .await
+                    .unwrap()
+                    .state,
+                preference::RelayPreferencePhase::FailedRolledBack
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmed_overwrite_applies_even_when_carrier_policy_is_unchanged() {
+        let f = fixture().await;
+        f.mock.state.records.lock().unwrap().push(record(
+            "external-default",
+            "CNAME",
+            "old.example.net",
+            "default",
+        ));
+        let mut body = serde_json::to_value(policy("n1", &[])).unwrap();
+        body["mode"] = json!("carrier");
+        let (_, preview) = http(&f, "PUT", "/groups/10/routing-apply", body.clone()).await;
+        body["dns_confirmation"] = preview["data"]["dns_confirmation"].clone();
+        assert_eq!(
+            http(&f, "PUT", "/groups/10/routing-apply", body).await.0,
+            axum::http::StatusCode::OK
+        );
+        reconcile_group(&f, 10).await;
+        assert_eq!(actual_values(&f, "op1", "default"), expected(&["1.1.1.1"]));
+        assert_eq!(
+            preference::load_preference(f.db.as_ref(), 10)
+                .await
+                .unwrap()
+                .state,
+            preference::RelayPreferencePhase::Idle
+        );
+    }
+    #[tokio::test]
+    async fn confirmed_cname_restores_after_only_the_first_a_create_succeeds() {
+        let f = fixture().await;
+        let original = record("external-cname", "CNAME", "original.example.net", "unicom");
+        f.mock.state.records.lock().unwrap().push(original.clone());
+        let mut body =
+            serde_json::to_value(policy("n1", &[("unicom", "n2"), ("unicom", "n6")])).unwrap();
+        body["mode"] = json!("carrier");
+        let (_, preview) = http(&f, "PUT", "/groups/10/routing-apply", body.clone()).await;
+        body["dns_confirmation"] = preview["data"]["dns_confirmation"].clone();
+        assert_eq!(
+            http(&f, "PUT", "/groups/10/routing-apply", body).await.0,
+            axum::http::StatusCode::OK
+        );
+        f.mock.state.reject_add_at.store(2, Ordering::SeqCst);
+        let sync =
+            f.db.find_dns_record_sync(100, "dnsmgr:unicom")
+                .await
+                .unwrap()
+                .unwrap();
+        reconcile_one(f.db.as_ref(), sync, &f.mock.client).await;
+        assert_eq!(actual_values(&f, "op1", "unicom"), expected(&["2.2.2.2"]));
+        preference::finalize_switching_group_for_test(f.db.as_ref(), &f.connections, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            preference::load_preference(f.db.as_ref(), 10)
+                .await
+                .unwrap()
+                .state,
+            preference::RelayPreferencePhase::RollingBack
+        );
+        reconcile_group(&f, 10).await;
+        let actual = f.mock.state.records.lock().unwrap().clone();
+        let restored = actual
+            .iter()
+            .filter(|r| r.line == "unicom")
+            .collect::<Vec<_>>();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored[0].record_type, "CNAME",
+            "partial forward mutation must also restore original CNAME"
+        );
+        assert_eq!(restored[0].values, original.values);
+        assert_eq!(restored[0].ttl, original.ttl);
+        assert_eq!(
+            preference::load_preference(f.db.as_ref(), 10)
+                .await
+                .unwrap()
+                .state,
+            preference::RelayPreferencePhase::FailedRolledBack
+        );
+    }
 }
