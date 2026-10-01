@@ -143,6 +143,14 @@ class Host:
     def stop_and_detach(self, work):
         self.run(['systemctl','stop','relay-node.service'])
         for name in OWNED_TREES: remove_owned(self.path(name))
+        # These generated files describe the detached identity's old runtime.
+        # The complete snapshot restores them on rollback; Bootstrap recreates
+        # its initial fallback before new Memberships deliver business Rules.
+        for name in ['/etc/relay-panel/camouflage-sites.json',
+                     '/etc/nginx/relay-panel-stream.d',
+                     '/etc/nginx/conf.d/relay-panel-fallback.conf',
+                     '/etc/nginx/conf.d/relay-panel-acme.conf']:
+            remove_owned(self.path(name))
         # Existing managed Nginx still references these same-host TLS assets.
         # Preserve certificates only; old identity, credentials and LKG stay detached.
         certificates=work/'backup/0/certificates'
