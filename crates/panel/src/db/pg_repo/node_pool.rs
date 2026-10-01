@@ -87,7 +87,7 @@ impl NodePoolRepository for PgRepository {
         if locked.is_none() {
             return Ok(NodePoolRetirement::default());
         }
-        let exists: Option<i64> = sqlx::query_scalar(
+        let exists: Option<i32> = sqlx::query_scalar(
             "SELECT 1 FROM node_pool_nodes WHERE identity_group_id = $1 AND node_id = $2
              AND identity_group_id = (SELECT group_id FROM node_pool_system_anchor WHERE singleton = 1)",
         )
