@@ -7,8 +7,9 @@ use relay_shared::protocol::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tokio::sync::mpsc;
@@ -1292,7 +1293,7 @@ where
     ] {
         remove_if_exists(&rooted(root, path))?;
     }
-    if let Err(error) = run("systemctl", &["daemon-reload"]) {
+    if let Err(error) = run("systemctl", &["daemon-reload"]).and_then(|_| retire_credentials()) {
         // Keep the receipt and executable; restore the retry entrypoints before
         // returning a partial failure. Never lose the only recovery material.
         write_atomic_file(
@@ -1315,7 +1316,6 @@ where
     );
     validate_cleanup_path(root, &timer_stamp)?;
     remove_if_exists(&timer_stamp)?;
-    retire_credentials()?;
     remove_if_exists(&rooted(root, UNINSTALL_FINALIZER_BINARY))?;
     remove_if_exists(receipt_path)?;
     for path in [
@@ -1531,6 +1531,33 @@ fn cleanup_uninstalled_credentials(root: &Path, job: &UninstallJob) -> Result<()
     {
         return Ok(());
     }
+    let claims_root = rooted(root, "/var/lib/relay-panel/node-claims");
+    let lock_path = claims_root.join("migration.lock");
+    validate_cleanup_path(root, &lock_path)?;
+    let migration_lock = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+    {
+        Ok(file) => {
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            // The existing bootstrap helper owns an empty private lock file.
+            if !metadata.is_file()
+                || metadata.len() != 0
+                || metadata.mode() & 0o777 != 0o600
+                || metadata.uid() != unsafe { libc::geteuid() }
+            {
+                return Err("unexpected migration lock ownership".into());
+            }
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err("credential migration is active; retry uninstall".into());
+            }
+            Some(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("read migration lock: {error}")),
+    };
     let descriptor_path = rooted(root, crate::config::RUNTIME_AUTH_DESCRIPTOR);
     validate_cleanup_path(root, &descriptor_path)?;
     match std::fs::read(&descriptor_path) {
@@ -1559,10 +1586,22 @@ fn cleanup_uninstalled_credentials(root: &Path, job: &UninstallJob) -> Result<()
     let managed_dir = rooted(root, &managed_dir.to_string_lossy());
     validate_cleanup_path(root, &managed_dir)?;
     match std::fs::remove_dir_all(&managed_dir) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("remove uninstalled credential state: {error}")),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("remove uninstalled credential state: {error}")),
     }
+    if migration_lock.is_some() {
+        let only_lock = std::fs::read_dir(&claims_root)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+            .iter()
+            .all(|entry| entry.file_name() == "migration.lock");
+        if only_lock {
+            remove_if_exists(&lock_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn run_checked(program: &str, args: &[&str]) -> Result<(), String> {
@@ -2050,6 +2089,8 @@ mod tests {
             let state_dir = root.join("var/lib/relay-panel/node-claims/claim-b");
             std::fs::create_dir_all(&state_dir).unwrap();
             std::fs::write(state_dir.join("node-credential.secret"), b"test-secret").unwrap();
+            let lock_path = root.join("var/lib/relay-panel/node-claims/migration.lock");
+            write_atomic_file(&lock_path, b"", 0o600).unwrap();
             let descriptor = root.join("var/lib/relay-panel/node-claims/runtime-auth.json");
             std::fs::write(
                 &descriptor,
@@ -2112,6 +2153,9 @@ mod tests {
                 |_, _| Ok(())
             )
             .unwrap());
+            assert_eq!(lock_path.exists(), replaced);
+            assert_eq!(state_dir.exists(), replaced);
+            assert_eq!(descriptor.exists(), replaced);
             let _ = std::fs::remove_dir_all(root);
         }
     }
@@ -2327,6 +2371,62 @@ mod tests {
         assert!(path.exists());
         cleanup_uninstall_finalizer(&root, &path, |_, _| Ok(()), || Ok(())).unwrap();
         assert!(!path.exists() && !rooted(&root, UNINSTALL_FINALIZER_BINARY).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_or_foreign_migration_lock_preserves_credentials_until_retry() {
+        let root = test_dir("active-migration-lock");
+        let secret = rooted(
+            &root,
+            "/var/lib/relay-panel/node-claims/claim-a/node-credential.secret",
+        );
+        write_atomic_file(&secret, b"test-secret", 0o600).unwrap();
+        let lock_path = root.join("var/lib/relay-panel/node-claims/migration.lock");
+        write_atomic_file(&lock_path, b"foreign state", 0o600).unwrap();
+        let job = UninstallJob {
+            operation_id: "operation-a".into(),
+            node_id: "node-a".into(),
+            panel_url: "https://panel.example".into(),
+            auth: PersistedNodeAuth::PermanentCredential {
+                credential_id: "credential-a".into(),
+                secret_file: "/var/lib/relay-panel/node-claims/claim-a/node-credential.secret"
+                    .into(),
+            },
+        };
+        assert!(cleanup_uninstalled_credentials(&root, &job).is_err());
+        assert!(secret.exists());
+        write_atomic_file(&lock_path, b"", 0o600).unwrap();
+        let held = std::fs::File::open(&lock_path).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(cleanup_uninstalled_credentials(&root, &job).is_err());
+        assert!(secret.exists());
+        drop(held);
+        cleanup_uninstalled_credentials(&root, &job).unwrap();
+        assert!(!secret.exists() && !lock_path.exists());
+        cleanup_uninstalled_credentials(&root, &job).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn credential_cleanup_failure_restores_finalizer_retry_units() {
+        let root = test_dir("credential-retry-units");
+        let receipt = uninstall_receipt_path(&root, "retry");
+        write_atomic_file(&receipt, b"receipt", 0o600).unwrap();
+        write_atomic_file(&rooted(&root, UNINSTALL_FINALIZER_BINARY), b"binary", 0o700).unwrap();
+        assert!(cleanup_uninstall_finalizer(
+            &root,
+            &receipt,
+            |_, _| Ok(()),
+            || Err("migration busy".into())
+        )
+        .is_err());
+        assert!(receipt.exists());
+        assert!(rooted(&root, UNINSTALL_FINALIZER_SERVICE_PATH).exists());
+        assert!(rooted(&root, UNINSTALL_FINALIZER_TIMER_PATH).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
