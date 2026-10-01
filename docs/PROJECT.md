@@ -38,7 +38,7 @@ The repository currently contains support for:
 
 - The Panel is not a packet forwarding hop.
 - Relay does not terminate the real Reality TLS session.
-- Carrier routing remains group-level. The current model is a default node plus `line_id -> node_id` overrides, not per-rule Carrier targets.
+- Carrier routing remains group-level. The current model is a default node plus `line_id -> member node_ids` selections (serialized as repeated distinct-node bindings), not per-rule Carrier targets.
 - Failover remains group-level / same-group.
 - Cross-group failover is not part of Node Reuse V1.
 - Docker is not the formal automatic production release path.

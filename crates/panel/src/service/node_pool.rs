@@ -309,6 +309,17 @@ pub async fn retire_node(
     let _preference = crate::service::relay_preference::RELAY_PREFERENCE_MUTATION_LOCK
         .lock()
         .await;
+    let mut affected_groups = std::collections::BTreeSet::new();
+    for (key, raw) in state
+        .db
+        .scan_prefix(crate::service::relay_preference::RELAY_PREFERENCE_KEY_PREFIX)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        affected_groups.extend(
+            routing_reference_groups(&key, &raw, node_id.as_str()).map_err(|e| e.to_string())?,
+        );
+    }
     let _schedule = crate::service::relay_schedule::RELAY_SCHEDULE_MUTATION_LOCK
         .lock()
         .await;
@@ -326,7 +337,25 @@ pub async fn retire_node(
             .close_node(group_id, node_id.as_str())
             .await;
     }
-    Ok(retired.retired.then_some(retired.needs_attention))
+    drop(_failover);
+    drop(_schedule);
+    drop(_preference);
+    drop(_authority);
+    let mut needs_attention = retired.needs_attention;
+    if retired.retired {
+        for group in affected_groups {
+            if let Err(error) = crate::service::dnsmgr::schedule_group_after_membership_change(
+                state.db.as_ref(),
+                group,
+            )
+            .await
+            {
+                needs_attention = true;
+                tracing::warn!(group, "node deleted; external DNS needs attention: {error}");
+            }
+        }
+    }
+    Ok(retired.retired.then_some(needs_attention))
 }
 
 /// Transform a stored routing value inside the identity retirement transaction.

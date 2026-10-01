@@ -464,11 +464,20 @@ export interface RoutingModeView {
 
 export type RoutingApplyRequest =
   | { mode: 'normal'; default_node_id: string }
-  | { mode: 'carrier'; default_node_id: string | null; bindings: CarrierLineBinding[] }
+  | { mode: 'carrier'; default_node_id: string | null; bindings: CarrierLineBinding[]; dns_confirmation?: string }
   | { mode: 'schedule' }
   | { mode: 'failover'; health_check_port: number; failure_after_seconds: number };
 
 export interface RoutingApplyResult {
+  confirmation_required?: boolean;
+  dns_confirmation?: string;
+  conflicts?: Array<{
+    rule_id: number; fqdn: string; line_id: string; line_key: string;
+    current: Array<{ record_id: string; record_type: string; values: string[] }>;
+    desired: string[];
+  }>;
+  dns_complete?: boolean;
+  warnings?: string[];
   config_saved: boolean;
   activation_requested: boolean;
   activation_succeeded: boolean;

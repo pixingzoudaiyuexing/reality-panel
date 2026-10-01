@@ -1,6 +1,6 @@
 # Reality Panel — Status
 
-Last verified in source: 2026-09-28
+Last verified in source: 2026-10-01
 
 ## Current phase
 
@@ -36,3 +36,24 @@ Primary finding P-001 separated ACTIVE credentials from durable legacy migration
 ## Next stage
 
 Next: Primary review of the `v1.3.0` candidate source commit and RC review package. Tagging, GitHub Release publication, release assets, and deployment remain separate authorized steps.
+
+## Authorized branch continuation (2026-10-01)
+
+The current engineering task is on `codex/carrier-multinode-dns-multia`, based on
+Node Lifecycle Completion `05e135094562d91e1920520a781207e47f7bfcfb`, which retains
+Pool-native Multi-Group `3dc147edd108906767d0e5447e79cd31f899750b`.
+
+Carrier lines now accept multiple distinct Group Member Nodes. Desired DNS is a
+deduplicated IPv4 set, with individual-record and Huawei RRset adapter handling.
+Default remains scalar; Carrier never filters EffectiveConfig Rules. Offline
+preserves selections/last-known addresses; missing IP permits save and reports
+incomplete. Unknown A/CNAME requires exact current/desired confirmation, while
+provider read failure remains an error. Remove/Delete prunes selections and
+schedules existing DNS reconciliation; external failure never undoes retirement.
+
+No new migration, dependency, config protocol, identity or lifecycle framework
+is introduced. No push, integration into `main`, release or Production deployment
+is authorized for this task. Formal independent review applies to the exact
+implementation HEAD before any later integration. Adapter/integration validation
+uses an HTTP provider mock. No external DNS TEST credential/zone was supplied,
+so live-provider Multi-A acceptance remains NOT VERIFIED.

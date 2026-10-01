@@ -92,9 +92,10 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     expect(screen.getByLabelText('node-b carrierLine')).toBeEnabled();
   });
 
-  it('moves one unique line between Relays', () => {
+  it('assigns the same line to another Relay without removing the first', () => {
     expect(assignCarrierLines(view.active_policy.bindings, 'node-a', ['default', 'Dianxin'], view.default_node_id)).toEqual([
       { line_id: 'Dianxin', mode: 'node', node_id: 'node-a' },
+      { line_id: 'Dianxin', mode: 'node', node_id: 'node-b' },
     ]);
   });
 

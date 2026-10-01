@@ -20,6 +20,88 @@ pub struct SetCarrierAffinityRequest {
     pub default_node_id: Option<String>,
     #[serde(default)]
     pub bindings: Vec<crate::service::relay_preference::CarrierLineBinding>,
+    #[serde(default)]
+    pub dns_confirmation: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct RoutingApplyEnvelope {
+    #[serde(flatten)]
+    pub request: crate::service::relay_preference::RoutingApplyRequest,
+    #[serde(default)]
+    pub dns_confirmation: Option<String>,
+}
+
+async fn carrier_dns_preflight(
+    state: &AppState,
+    group_id: i64,
+    policy: &crate::service::relay_preference::CarrierPolicy,
+    confirmation: Option<&str>,
+) -> Result<Vec<String>, Response> {
+    use crate::service::{dnsmgr, relay_preference};
+    let policy = policy.clone().normalize().map_err(|error| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse::<()>::error(
+                422,
+                &format!("invalid carrier policy: {error:?}"),
+            )),
+        )
+            .into_response()
+    })?;
+    relay_preference::validate_carrier_members(
+        state.db.as_ref(),
+        &state.node_connections,
+        group_id,
+        &policy,
+    )
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse::<()>::error(422, &error.to_string())),
+        )
+            .into_response()
+    })?;
+    let preference = relay_preference::load_preference(state.db.as_ref(), group_id)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    if matches!(
+        preference.state,
+        relay_preference::RelayPreferencePhase::Switching
+            | relay_preference::RelayPreferencePhase::RollingBack
+    ) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiResponse::<()>::error(409, "TRANSACTION_IN_PROGRESS")),
+        )
+            .into_response());
+    }
+    let (conflicts, warnings) =
+        dnsmgr::prepare_carrier_dns(state.db.as_ref(), group_id, &policy, confirmation)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ApiResponse::<()>::error(
+                        502,
+                        &format!("DNS_PROVIDER_READ_FAILED: {error}"),
+                    )),
+                )
+                    .into_response()
+            })?;
+    if !conflicts.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiResponse::success(serde_json::json!({
+                "confirmation_required":true,"business_error_code":"DNS_CONFIRMATION_REQUIRED",
+                "dns_confirmation":dnsmgr::confirmation_token(&conflicts),"conflicts":conflicts,
+                "config_saved":false,"warnings":warnings,
+            }))),
+        )
+            .into_response());
+    }
+    Ok(warnings)
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,11 +331,34 @@ pub async fn apply_routing(
     admin: AdminOnly,
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
-    Json(request): Json<crate::service::relay_preference::RoutingApplyRequest>,
+    Json(envelope): Json<RoutingApplyEnvelope>,
 ) -> Response {
     if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
         return response;
     }
+    let request = envelope.request;
+    let warnings = if let crate::service::relay_preference::RoutingApplyRequest::Carrier {
+        default_node_id,
+        bindings,
+    } = &request
+    {
+        match carrier_dns_preflight(
+            &state,
+            group_id,
+            &crate::service::relay_preference::CarrierPolicy {
+                default_node_id: default_node_id.clone(),
+                bindings: bindings.clone(),
+            },
+            envelope.dns_confirmation.as_deref(),
+        )
+        .await
+        {
+            Ok(warnings) => warnings,
+            Err(response) => return response,
+        }
+    } else {
+        Vec::new()
+    };
     let target_mode = request.target_mode();
     match crate::service::relay_preference::apply_routing_configuration(
         state.db.as_ref(),
@@ -279,7 +384,11 @@ pub async fn apply_routing(
                 ),
             )
             .await;
-            Json(ApiResponse::success(result)).into_response()
+            let mut payload =
+                serde_json::to_value(result).expect("routing apply result serialization");
+            payload["dns_complete"] = serde_json::json!(warnings.is_empty());
+            payload["warnings"] = serde_json::json!(warnings);
+            Json(ApiResponse::success(payload)).into_response()
         }
         Err(failure) => {
             let code = failure
@@ -479,6 +588,17 @@ pub async fn set_carrier_affinity(
         default_node_id: request.default_node_id,
         bindings: request.bindings,
     };
+    let warnings = match carrier_dns_preflight(
+        &state,
+        group_id,
+        &policy,
+        request.dns_confirmation.as_deref(),
+    )
+    .await
+    {
+        Ok(warnings) => warnings,
+        Err(response) => return response,
+    };
     let outcome = match crate::service::relay_preference::start_carrier_policy_apply(
         state.db.as_ref(),
         &state.node_connections,
@@ -525,7 +645,12 @@ pub async fn set_carrier_affinity(
     )
     .await
     {
-        Ok(view) => Json(ApiResponse::success(view)).into_response(),
+        Ok(view) => {
+            let mut payload = serde_json::to_value(view).expect("carrier view serialization");
+            payload["dns_complete"] = serde_json::json!(warnings.is_empty());
+            payload["warnings"] = serde_json::json!(warnings);
+            Json(ApiResponse::success(payload)).into_response()
+        }
         Err(error) => {
             tracing::error!(group_id, "carrier affinity response failed: {error}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()

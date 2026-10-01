@@ -253,9 +253,26 @@ pub async fn delete_binding(
     node_id: &str,
 ) -> Result<BindingMutationResult, NodeReuseServiceError> {
     validate_binding_identity(reusing_group_id, home_group_id, node_id)?;
+    let _authority = crate::service::relay_failover::lock_automatic_policy().await;
+    let _preference = crate::service::relay_preference::RELAY_PREFERENCE_MUTATION_LOCK
+        .lock()
+        .await;
     let deleted = db
         .delete_node_reuse_binding(reusing_group_id, home_group_id, node_id)
         .await?;
+    drop(_preference);
+    drop(_authority);
+    if deleted != 0 {
+        if let Err(error) =
+            crate::service::dnsmgr::schedule_group_after_membership_change(db, reusing_group_id)
+                .await
+        {
+            tracing::warn!(
+                reusing_group_id,
+                "membership removed; DNS needs attention: {error}"
+            );
+        }
+    }
     Ok(BindingMutationResult {
         outcome: if deleted == 0 {
             BindingMutationOutcome::Missing

@@ -17,13 +17,12 @@ export function assignCarrierLines(
   defaultNodeId?: string | null,
 ): CarrierLineBinding[] {
   const mutableSelected = selected.filter(isCarrierMutableLineId);
-  const selectedSet = new Set(mutableSelected);
   const next = mutableCarrierBindings(bindings).filter((binding) => {
     const effectiveNodeId = binding.mode === 'node' ? binding.node_id : defaultNodeId;
-    return effectiveNodeId !== nodeId && !selectedSet.has(binding.line_id);
+    return effectiveNodeId !== nodeId && !(binding.mode === 'follow_default' && mutableSelected.includes(binding.line_id));
   });
   next.push(...mutableSelected.map((lineId) => ({ line_id: lineId, mode: 'node' as const, node_id: nodeId })));
-  return next.sort((left, right) => left.line_id < right.line_id ? -1 : left.line_id > right.line_id ? 1 : 0);
+  return next.sort((left, right) => `${left.line_id}:${left.node_id ?? ''}`.localeCompare(`${right.line_id}:${right.node_id ?? ''}`));
 }
 
 export interface CatalogTreeNode {

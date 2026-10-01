@@ -54,8 +54,20 @@ reads the DNSMgr line catalog and presents three states for each provider line:
   records apply. Reality Panel does not claim provider inheritance semantics.
 - **Follow default:** the line uses the Group's preferred Relay and moves with
   a successful Preferred Relay switch.
-- **Specific Relay:** the line uses the selected Ready Relay and remains
-  isolated from Preferred Relay switches.
+- **Specific Relays:** one line may select several Group Member Nodes. Offline
+  nodes keep their last-known public IPv4; the default remains a single node.
+
+Multi-A uses the existing binding/sync tables without migration. Per-record
+providers receive separate A mutations; Huawei receives one comma-separated
+RRset value and returns a value array. Unknown A/CNAME conflicts require a
+current/desired preview and exact-snapshot confirmation; a failed provider read
+cannot be bypassed. Missing IPv4 permits policy save with an incomplete warning.
+Remove/Delete prunes selections and reuses existing DNS reconciliation. External
+DNS errors never undo local Node retirement.
+
+This iteration validates adapter/integration contracts against an HTTP mock.
+No authorized external DNS test zone/credential was supplied, so the new Multi-A
+round-trip against a live provider remains NOT VERIFIED.
 
 The Huawei DNSMgr provider control plane has been tested with parent and child
 records, multiple lines per Rule, updates, safe deletion, and Panel outages.

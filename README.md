@@ -101,12 +101,12 @@ Reality Panel 可以通过 DNSMgr 自动维护 Reality SNI 对应的 DNS 记录�
 
 主要安全边界：
 
-- 只修改 Panel 能证明归属自己的记录
+- Panel 已确认归属的记录自动收敛；未知 A / CNAME 先展示当前与期望集合，由管理员确认覆盖
 - 不静默接管已有外部记录
-- DNS 冲突时 fail closed
+- Provider 读取失败直接报错；确认后若记录变化，需要重新确认
 - Provider mutation 后进行 read-back 验证
 - 删除前重新确认记录身份和值
-- DNS 状态不明确时不提交新的拓扑切换
+- 同一域名与运营商线路支持多个 A 值，缩容只清理对应线路
 - Panel / DNSMgr 暂时不可用时，不主动破坏已经工作的 Relay 数据面
 
 ### Carrier Affinity / 运营商线路绑定
@@ -117,7 +117,13 @@ Reality Panel 可以通过 DNSMgr 自动维护 Reality SNI 对应的 DNS 记录�
 
 - **不单独配置**：交给 DNS Provider 自己决定继承 / 默认行为
 - **跟随默认 Relay**：随着 Group 的首选 Relay 一起切换
-- **指定 Relay**：固定到一个指定且已就绪的 Relay
+- **指定 Relay**：可同时选择多个当前 Group Member Nodes，同线路生成去重后的多值 A 集合
+
+默认线路仍只选择一个 Node。Carrier 不改变 Rule 下发；所有 Member Nodes
+继续执行全部 Group Rules。Offline 保留 Carrier 和最后已知公网 IPv4。
+选中节点缺少 IP 时可保存策略，可用值继续应用并显示未完成提示；全部缺 IP
+不宣称 DNS 成功，也不清空现有可用记录。Remove Group / Delete 会清理相应
+Carrier 选择。外部 DNS 失败不会阻止 Node Delete，需按同步状态处理残留记录。
 
 同一 Reality Rule 可以同时维护默认记录和多个线路记录。
 
@@ -125,7 +131,7 @@ Reality Panel 可以通过 DNSMgr 自动维护 Reality SNI 对应的 DNS 记录�
 
 每个入口 Group 可以配置首选 Relay。
 
-切换时 Panel 会先确认目标 Relay 的就绪状态，再进入 DNS / 拓扑变更流程。失败时不会直接覆盖旧的可用状态。
+Normal / Schedule / Failover 切换时 Panel 会先确认目标 Relay 的就绪状态，再进入 DNS / 拓扑变更流程。Carrier 使用管理员选择与最后已知 IP，不自动按短时在线状态移除节点。失败时不会直接覆盖旧的可用状态。
 
 ### 定时 Relay 切换
 

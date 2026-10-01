@@ -10824,3 +10824,67 @@ fn pg_new_dns_binding(rule_id: i64, record_id: &str) -> NewDnsRecordBinding {
         created_at: "2026-08-26 00:00:00".into(),
     }
 }
+
+#[tokio::test]
+async fn pg_carrier_membership_multi_selection_cleanup_is_atomic() {
+    let Some(db) = repo("carrier_multi_cleanup").await else {
+        return;
+    };
+    seed_group(&db, 10).await;
+    seed_group(&db, 20).await;
+    for id in ["n2", "n6"] {
+        db.insert_node_reuse_binding(20, 10, id).await.unwrap();
+    }
+    let policy = serde_json::json!({"default_node_id":"n2", "bindings":[
+        {"line_id":"unicom","mode":"node","node_id":"n2"},
+        {"line_id":"unicom","mode":"node","node_id":"n6"},
+        {"line_id":"mobile","mode":"follow_default","node_id":null}
+    ]});
+    let raw = serde_json::to_string(&crate::service::relay_preference::RelayPreferenceState {
+        preferred_node_id: Some("n2".into()),
+        carrier_policy: serde_json::from_value(policy).unwrap(),
+        ..Default::default()
+    })
+    .unwrap();
+    db.set("relay_preference:20", &raw).await.unwrap();
+    assert_eq!(db.delete_node_reuse_binding(20, 10, "n6").await.unwrap(), 1);
+    let saved = crate::service::relay_preference::load_preference(&db, 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        saved
+            .carrier_policy
+            .bindings
+            .iter()
+            .filter(|b| b.line_id == "unicom")
+            .count(),
+        1
+    );
+    assert_eq!(saved.carrier_policy.default_node_id.as_deref(), Some("n2"));
+    assert!(db
+        .find_node_reuse_binding(20, 10, "n2")
+        .await
+        .unwrap()
+        .is_some());
+    // Parsing/persistence failure must roll back Membership as well as Carrier cleanup.
+    db.set("relay_preference:20", "{malformed").await.unwrap();
+    assert!(db.delete_node_reuse_binding(20, 10, "n2").await.is_err());
+    assert!(db
+        .find_node_reuse_binding(20, 10, "n2")
+        .await
+        .unwrap()
+        .is_some());
+    db.set(
+        "relay_preference:20",
+        &serde_json::to_string(&saved).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(db.delete_node_reuse_binding(20, 10, "n2").await.unwrap(), 1);
+    let saved = crate::service::relay_preference::load_preference(&db, 20)
+        .await
+        .unwrap();
+    assert!(saved.carrier_policy.default_node_id.is_none());
+    assert!(saved.carrier_policy.bindings.is_empty());
+    cleanup(&db).await;
+}

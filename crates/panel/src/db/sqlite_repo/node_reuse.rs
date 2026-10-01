@@ -218,15 +218,53 @@ impl NodeReuseRepository for SqliteRepository {
         home_group_id: i64,
         node_id: &str,
     ) -> Result<u64, DbError> {
-        Ok(sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE device_groups SET id=id WHERE id=?")
+            .bind(reusing_group_id)
+            .execute(&mut *tx)
+            .await?;
+        let deleted = sqlx::query(
             "DELETE FROM node_reuse_bindings \
              WHERE reusing_group_id = ? AND home_group_id = ? AND node_id = ?",
         )
         .bind(reusing_group_id)
         .bind(home_group_id)
         .bind(node_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
-        .rows_affected())
+        .rows_affected();
+        let survivors: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM node_reuse_bindings WHERE reusing_group_id=? AND node_id=?",
+        )
+        .bind(reusing_group_id)
+        .bind(node_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let native: Option<String> = sqlx::query_scalar("SELECT value FROM kvs WHERE key=?")
+            .bind(format!("node_status:{reusing_group_id}:{node_id}"))
+            .fetch_optional(&mut *tx)
+            .await?;
+        if deleted != 0 && survivors == 0 && native.is_none() {
+            let key = format!("relay_preference:{reusing_group_id}");
+            if let Some(raw) = sqlx::query_scalar::<_, String>("SELECT value FROM kvs WHERE key=?")
+                .bind(&key)
+                .fetch_optional(&mut *tx)
+                .await?
+            {
+                let (updated, _) = crate::service::node_pool::retire_routing_value(
+                    &key,
+                    &raw,
+                    node_id,
+                    &[reusing_group_id],
+                )?;
+                sqlx::query("UPDATE kvs SET value=? WHERE key=?")
+                    .bind(updated)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(deleted)
     }
 }

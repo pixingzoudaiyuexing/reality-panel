@@ -49,10 +49,15 @@ Groups can select an effective Relay node.
 
 Carrier policy is group-level. Its persisted model contains:
 - `default_node_id`
-- a list of line bindings with `line_id`
+- a list of line bindings with `line_id`; distinct nodes may share a line
 - each binding can follow the default or name a concrete `node_id`
 
-This is not per-rule Carrier routing.
+Carrier selections are current Group members and affect DNS only. All Group
+members retain all effective Group Rules. Offline nodes keep their last-known
+public IPv4. Membership removal and Pool retirement prune current selections
+atomically; the existing DNS worker then shrinks or removes the owned A set.
+Default remains one node. A selected node without IPv4 does not block policy
+save: available values apply, with an incomplete warning for missing values.
 
 ### Scheduled switching
 
@@ -70,11 +75,15 @@ Node tokens and lifecycle operations are group/node ownership concerns. Node Reu
 
 ## DNS
 
-DNSMgr automation is designed around explicit ownership and fail-closed mutation:
-- Panel only changes records it can prove it owns;
-- external records are not silently taken over;
-- provider mutation is followed by read-back;
-- uncertain DNS state blocks topology changes instead of blindly replacing known-good state.
+DNSMgr automation reconciles an IPv4 set per Rule/FQDN/provider line:
+- existing binding/sync rows retain provenance and verified provider IDs;
+- a singleton retains scalar storage; multi-values/IDs use canonical JSON arrays in existing TEXT fields, without a migration;
+- per-record adapters create individual A values; the Huawei adapter writes one comma-encoded RRset and reads its value array back;
+- unknown A or CNAME records require an administrator preview and confirmation of the exact observed and desired sets before any provider write;
+- changed snapshots require a new confirmation; provider read failures remain technical errors;
+- every mutation requires exact set read-back, scoped to the selected provider line;
+- partial/missing IPv4 produces an actionable incomplete result; zero values retain provider Last Known Good until an address is available;
+- deleting a Node completes local retirement even if external DNS fails. Existing sync rows expose needs-attention and handle provider retries.
 
 ## Certificates
 

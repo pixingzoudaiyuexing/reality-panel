@@ -201,6 +201,42 @@ describe('RelayPreferencePanel routing function UX', () => {
     expect(screen.queryByRole('dialog', { name: 'routingModeConfirmTitle' })).toBeNull();
   });
 
+  it.each(['cancel', 'dnsConfirmOverwrite'])('shows current and desired DNS and handles %s', async (action) => {
+    await renderPanel(preference({ active_routing_mode: 'carrier' }));
+    mockPut.mockRejectedValueOnce({ response: { status: 409, data: {
+      code: 409, message: 'DNS_CONFIRMATION_REQUIRED', data: {
+        confirmation_required: true, dns_confirmation: 'observed-snapshot', config_saved: false,
+        conflicts: [{ rule_id: 1, fqdn: 'entry.example.test', line_id: 'unicom', line_key: 'dnsmgr:unicom',
+          current: [{ record_id: 'external', record_type: 'CNAME', values: ['old.example.test'] }],
+          desired: ['2.2.2.2', '6.6.6.6'] }],
+      },
+    } } });
+    fireEvent.click(screen.getByRole('button', { name: 'carrier-apply' }));
+    const dialog = await screen.findByRole('dialog', { name: 'dnsOverwriteConfirmTitle' });
+    expect(dialog).toHaveTextContent('CNAME old.example.test');
+    expect(dialog).toHaveTextContent('A 2.2.2.2, 6.6.6.6');
+    expect(mockPut).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(dialog).getByRole('button', { name: action }));
+    if (action === 'cancel') {
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'dnsOverwriteConfirmTitle' })).toBeNull());
+      expect(mockPut).toHaveBeenCalledTimes(1);
+    } else {
+      await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(2));
+      expect(mockPut).toHaveBeenLastCalledWith('/groups/10/routing-apply', {
+        mode: 'carrier', default_node_id: 'node-a', bindings: [], dns_confirmation: 'observed-snapshot',
+      }, { timeout: 120000 });
+    }
+  });
+
+  it('reports a provider read error without offering an overwrite', async () => {
+    await renderPanel(preference({ active_routing_mode: 'carrier' }));
+    mockPut.mockRejectedValueOnce({ response: { status: 502, data: { code: 502, message: 'DNS_PROVIDER_READ_FAILED: unavailable', data: null } } });
+    fireEvent.click(screen.getByRole('button', { name: 'carrier-apply' }));
+    expect(await screen.findByText('dnsProviderReadFailed')).toBeInTheDocument();
+    expect(screen.queryByRole('dialog', { name: 'dnsOverwriteConfirmTitle' })).toBeNull();
+    expect(mockPut).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps a successful routing result when the read-model refresh fails', async () => {
     const success = vi.spyOn(message, 'success');
     const warning = vi.spyOn(message, 'warning');

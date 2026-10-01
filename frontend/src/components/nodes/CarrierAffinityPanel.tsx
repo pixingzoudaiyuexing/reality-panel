@@ -31,7 +31,7 @@ interface Props {
 function normalize(defaultNodeId: string | null | undefined, bindings: CarrierLineBinding[]): string {
   return JSON.stringify({ default_node_id: defaultNodeId ?? null, bindings: [...bindings]
     .map((binding) => ({ line_id: binding.line_id, mode: binding.mode, node_id: binding.node_id ?? null }))
-    .sort((left, right) => left.line_id < right.line_id ? -1 : left.line_id > right.line_id ? 1 : 0) });
+    .sort((left, right) => `${left.line_id}:${left.node_id ?? ''}`.localeCompare(`${right.line_id}:${right.node_id ?? ''}`)) });
 }
 
 function transactionLabel(view: CarrierAffinityView, t: Tfn) {
@@ -151,6 +151,16 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
     draft.forEach((binding) => ids.add(binding.line_id));
     return buildCarrierLineOptions(ids, names);
   }, [catalog, draft, names]);
+  const lineSelections = useMemo(() => {
+    const selections = new Map<string, string[]>();
+    for (const binding of draft) {
+      const nodeId = binding.mode === 'node' ? binding.node_id : draftDefaultNodeId;
+      if (nodeId && isCarrierMutableLineId(binding.line_id)) {
+        selections.set(binding.line_id, [...(selections.get(binding.line_id) ?? []), nodeId]);
+      }
+    }
+    return [...selections.entries()];
+  }, [draft, draftDefaultNodeId]);
 
   useEffect(() => {
     onDirtyChange?.(dirty);
@@ -188,6 +198,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
         </Space>
         <Button size="small" type="primary" icon={<SaveOutlined />} loading={saving} disabled={(activeMode === 'carrier' && !dirty) || mutationLocked || catalogUnavailable || disabled} onClick={() => void save()}>{t(activeMode === 'carrier' ? 'routingSaveChanges' : 'routingSaveAndActivate')}</Button>
       </div>
+      <Text type="secondary">{t('carrierMultiNodeHint')}</Text>
       {transactionBusy ? <Alert type="info" showIcon title={t('carrierBusy')} style={{ margin: '10px 0' }} /> : null}
       {catalog?.stale ? <Alert type="warning" showIcon title={t('carrierCatalogStale')} style={{ margin: '10px 0' }} /> : null}
       {(catalog?.issues ?? []).map((issue, index) => <CarrierCatalogIssueAlert key={`${issue.kind}-${index}`} issue={issue} t={t} />)}
@@ -217,6 +228,9 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
           ))}
         </div>
       )}
+      <Space wrap aria-label={t('carrierLineSelections')}>
+        {lineSelections.map(([line, nodeIds]) => <Tag key={line} color={nodeIds.length > 1 ? 'blue' : undefined}>{names.get(line) ?? line} → {nodeIds.join(', ')}</Tag>)}
+      </Space>
       <Text type="secondary" className="rp-provider-decides-note">{t('carrierUnconfiguredHint')}</Text>
     </section>
   );

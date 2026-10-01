@@ -223,15 +223,42 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
     try {
       let response: ApiEnvelope<RoutingApplyResult>;
       try {
-        response = await api.put<unknown, ApiEnvelope<RoutingApplyResult>>(
-          `/groups/${groupId}/routing-apply`,
-          request,
-          { timeout: ROUTING_APPLY_TIMEOUT_MS },
-        );
+        let currentRequest = request;
+        for (;;) {
+          try {
+            response = await api.put<unknown, ApiEnvelope<RoutingApplyResult>>(
+              `/groups/${groupId}/routing-apply`, currentRequest,
+              { timeout: ROUTING_APPLY_TIMEOUT_MS },
+            );
+            break;
+          } catch (error) {
+            const result = (error as { response?: { data?: ApiEnvelope<RoutingApplyResult> } }).response?.data?.data;
+            if (!result?.confirmation_required || !result.dns_confirmation || request.mode !== 'carrier') throw error;
+            const confirmed = await new Promise<boolean>((resolve) => Modal.confirm({
+              title: t('dnsOverwriteConfirmTitle'),
+              content: <Space orientation="vertical" style={{ width: '100%' }}>
+                <Text>{t('dnsOverwriteConfirmDescription')}</Text>
+                {(result.conflicts ?? []).map((conflict) => <div key={`${conflict.rule_id}:${conflict.line_key}`}>
+                  <Text strong>{conflict.fqdn} · {conflict.line_id}</Text>
+                  <div>{t('dnsCurrentRecords')}: {conflict.current.map((record) => `${record.record_type} ${record.values.join(', ')}`).join('; ')}</div>
+                  <div>{t('dnsDesiredRecords')}: {conflict.desired.length ? `A ${conflict.desired.join(', ')}` : t('dnsNoTargets')}</div>
+                </div>)}
+              </Space>,
+              okText: t('dnsConfirmOverwrite'), cancelText: t('cancel'),
+              okButtonProps: { danger: true }, onOk: () => resolve(true), onCancel: () => resolve(false),
+            }));
+            if (!confirmed) return null;
+            currentRequest = { ...request, dns_confirmation: result.dns_confirmation };
+          }
+        }
         if (response.code !== 0 || !response.data) throw new Error(response.message);
       } catch (error) {
         const payload = (error as { response?: { data?: ApiEnvelope<RoutingApplyResult> } }).response?.data;
         const result = payload?.data;
+        if (payload?.message?.startsWith('DNS_PROVIDER_READ_FAILED')) {
+          message.error(t('dnsProviderReadFailed'));
+          return null;
+        }
         if (result) {
           await refreshPreferenceView().catch(() => null);
           if (result.config_saved) {
@@ -249,6 +276,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
       }
 
       if (response.data.config_saved) setModeDirty(mode, false);
+      if (response.data.dns_complete === false) message.warning(`${t('dnsTargetsIncomplete')} ${(response.data.warnings ?? []).join('; ')}`);
       message.success(t(response.data.transition_state === 'switching'
         ? response.data.activation_requested ? 'routingActivationStarted' : 'routingConfigurationApplying'
         : response.data.activation_requested

@@ -533,6 +533,23 @@ impl DnsMgrRecordValue {
     }
 }
 
+/// DNSMgr's Huawei adapter accepts one comma-separated RRset value and returns
+/// an array. Other supported adapters use individual record mutations.
+/// Keep provider serialization here; the reconciler's desired state is a set.
+pub(crate) fn a_record_uses_rrset(provider_type: Option<&str>) -> bool {
+    provider_type.is_some_and(|provider| provider.eq_ignore_ascii_case("huawei"))
+}
+
+pub(crate) fn a_record_mutation_value(
+    values: &std::collections::BTreeSet<std::net::Ipv4Addr>,
+) -> String {
+    values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DnsMgrRecordMutation {
     pub host: String,

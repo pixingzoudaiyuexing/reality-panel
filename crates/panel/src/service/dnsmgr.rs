@@ -21,6 +21,10 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+mod record_sets;
+pub(crate) use record_sets::{confirmation_token, prepare_carrier_dns};
+pub(crate) use record_sets::{decode_dns_values, encode_dns_values, valid_dns_values};
+
 const DISCOVERY_PAGE_LIMIT: u16 = 100;
 const DNSMGR_DEFAULT_WRITE_TTL: u32 = 600;
 const DNS_SYNC_TICK: Duration = Duration::from_secs(30);
@@ -707,6 +711,11 @@ pub(crate) async fn ensure_record(
     client: &DnsMgrClient,
     input: &EnsureRecordInput,
 ) -> EnsureRecordResult {
+    if input.record_type == DnsRecordType::A
+        && record_sets::uses_set_reconciliation(db, input).await
+    {
+        return record_sets::ensure_a_set(db, client, input).await;
+    }
     if input.rule_id <= 0 || !matches!(input.record_type, DnsRecordType::A | DnsRecordType::Aaaa) {
         return EnsureRecordResult::Failed(EnsureRecordFailure::InvalidInput(
             DnsDiscoveryError::UnsupportedRecordType(input.record_type),
@@ -953,6 +962,21 @@ pub(crate) async fn ensure_record_absent(
     client: &DnsMgrClient,
     input: &DeleteRecordInput,
 ) -> DeleteRecordResult {
+    if input.record_type == DnsRecordType::A
+        && record_sets::uses_set_reconciliation(
+            db,
+            &EnsureRecordInput {
+                rule_id: input.rule_id,
+                fqdn: input.fqdn.clone(),
+                record_type: input.record_type,
+                expected_value: String::new(),
+                line: input.line.clone(),
+            },
+        )
+        .await
+    {
+        return record_sets::delete_a_set(db, client, input).await;
+    }
     if input.rule_id <= 0 || !matches!(input.record_type, DnsRecordType::A | DnsRecordType::Aaaa) {
         return DeleteRecordResult::Failed(EnsureRecordFailure::InvalidInput(
             DnsDiscoveryError::UnsupportedRecordType(input.record_type),
@@ -1147,7 +1171,7 @@ async fn delete_is_authorized(
         return Ok(false);
     };
     if input.line.key == DEFAULT_LINE_KEY {
-        return crate::service::relay_preference::dns_transaction_authorizes(
+        if crate::service::relay_preference::dns_transaction_authorizes(
             db,
             input.rule_id,
             fqdn.as_str(),
@@ -1155,7 +1179,27 @@ async fn delete_is_authorized(
             "DELETE",
             None,
         )
-        .await;
+        .await?
+        {
+            return Ok(true);
+        }
+        // Membership retirement can leave Carrier unconfigured without a
+        // topology transaction. Only that current desired state authorizes
+        // removal of the existing Panel-owned default A record.
+        let pref = crate::service::relay_preference::load_preference(db, rule.device_group_in)
+            .await
+            .map_err(|e| crate::db::error::DbError::Other(sqlx::Error::Protocol(e.to_string())))?;
+        if pref.active_routing_mode != Some(crate::service::relay_preference::RoutingMode::Carrier)
+            || pref.carrier_policy.default_node_id.is_some()
+            || pref.preferred_node_id.is_some()
+            || !rule_is_dns_eligible(&rule)
+            || normalize_fqdn(rule.sni.as_deref().unwrap_or_default())
+                .ok()
+                .as_ref()
+                != Some(fqdn)
+        {
+            return Ok(false);
+        }
     }
     if (!rule_is_dns_eligible(&rule)
         || normalize_fqdn(rule.sni.as_deref().unwrap_or_default().trim())
@@ -1832,13 +1876,7 @@ pub(crate) async fn derive_dns_desired(
         });
     };
 
-    let Ok(ip) = expected_value.parse::<IpAddr>() else {
-        return Ok(DnsDesiredResolution::ConfigurationError {
-            desired: Some(desired),
-            category: "INVALID_RELAY_IPV4",
-        });
-    };
-    if !ip.is_ipv4() || ip.is_loopback() || ip.is_unspecified() {
+    if !valid_dns_values(&expected_value) {
         return Ok(DnsDesiredResolution::ConfigurationError {
             desired: Some(desired),
             category: "INVALID_RELAY_IPV4",
@@ -1907,7 +1945,13 @@ async fn persist_desired(
             )
             .await?;
         }
-        Some(sync) if force_schedule || sync.state == "DISABLED" => {
+        Some(sync)
+            if force_schedule
+                || sync.state == "DISABLED"
+                || (sync.state == "FAILED"
+                    && sync.last_error_category.as_deref()
+                        == Some("CARRIER_TARGET_IPV4_UNAVAILABLE")) =>
+        {
             db.schedule_dns_record_sync(
                 desired.rule_id,
                 &desired.line.key,
@@ -1975,10 +2019,7 @@ pub(crate) async fn schedule_transaction_line(
     }
     if action == "UPSERT" {
         let value = value.ok_or(LineDesiredError::InvalidValue)?;
-        let ip = value
-            .parse::<Ipv4Addr>()
-            .map_err(|_| LineDesiredError::InvalidValue)?;
-        if ip.is_loopback() || ip.is_unspecified() {
+        if !valid_dns_values(value) {
             return Err(LineDesiredError::InvalidValue);
         }
     } else if value.is_some() {
@@ -2178,6 +2219,11 @@ async fn inspect_line_record_inner(
         .await
         .map_err(LineRecordSnapshotError::Provider)?;
     let line = resolve_mutation_line(&requested, &detail).unwrap_or(requested);
+    if let Some(snapshot) =
+        record_sets::inspect_set(db, client, rule_id, &fqdn, &zone, &line).await?
+    {
+        return Ok(snapshot);
+    }
     let binding = db
         .find_dns_record_binding_for_rule(rule_id, fqdn.as_str(), "A", &line.key)
         .await
@@ -2245,10 +2291,12 @@ async fn line_desired_for_rule(
         .filter(rule_is_dns_eligible)
         .ok_or(LineDesiredError::InvalidRule)?;
     if let Some(value) = expected_value {
-        let ip = value
-            .parse::<Ipv4Addr>()
-            .map_err(|_| LineDesiredError::InvalidValue)?;
-        if ip.is_loopback() || ip.is_unspecified() {
+        let values = decode_dns_values(value).map_err(|_| LineDesiredError::InvalidValue)?;
+        if values.is_empty()
+            || values
+                .iter()
+                .any(|ip| ip.is_loopback() || ip.is_unspecified())
+        {
             return Err(LineDesiredError::InvalidValue);
         }
     }
@@ -2326,7 +2374,11 @@ async fn persist_line_desired(
             })
         }
         Some(sync)
-            if force_schedule || matches!(sync.state.as_str(), "NOT_ELIGIBLE" | "DISABLED") =>
+            if force_schedule
+                || matches!(sync.state.as_str(), "NOT_ELIGIBLE" | "DISABLED")
+                || (sync.state == "FAILED"
+                    && sync.last_error_category.as_deref()
+                        == Some("CARRIER_TARGET_IPV4_UNAVAILABLE")) =>
         {
             db.schedule_dns_record_sync(
                 desired.rule_id,
@@ -2355,6 +2407,56 @@ async fn persist_resolution(
     resolution: DnsDesiredResolution,
     force_schedule: bool,
 ) -> Result<(), crate::db::error::DbError> {
+    if !matches!(
+        resolution,
+        DnsDesiredResolution::Frozen | DnsDesiredResolution::NotEligible
+    ) {
+        if let Some(rule) = RuleRepository::find_rule_by_id(db, rule_id, &ResourceScope::All)
+            .await?
+            .filter(rule_is_dns_eligible)
+        {
+            let pref = crate::service::relay_preference::load_preference(db, rule.device_group_in)
+                .await
+                .map_err(|e| {
+                    crate::db::error::DbError::Other(sqlx::Error::Protocol(e.to_string()))
+                })?;
+            if pref.active_routing_mode
+                == Some(crate::service::relay_preference::RoutingMode::Carrier)
+            {
+                let default = pref
+                    .carrier_policy
+                    .default_node_id
+                    .as_deref()
+                    .or(pref.preferred_node_id.as_deref());
+                let incomplete = match default {
+                    Some(id) => !matches!(
+                        crate::service::relay_preference::stored_node_public_ipv4(
+                            db,
+                            rule.device_group_in,
+                            id
+                        )
+                        .await?,
+                        crate::service::relay_preference::RelayDnsTarget::Resolved(_)
+                    ),
+                    None => true,
+                };
+                if incomplete {
+                    persist_carrier_desired(db, rule_id).await?;
+                    let result = if default.is_none() {
+                        project_line_desired(db, rule_id, DEFAULT_LINE_KEY, "DELETE", None).await
+                    } else {
+                        project_incomplete_line(db, rule_id, DEFAULT_LINE_KEY).await
+                    };
+                    result.map_err(|e| {
+                        crate::db::error::DbError::Other(sqlx::Error::Protocol(format!(
+                            "Carrier default projection failed: {e:?}"
+                        )))
+                    })?;
+                    return Ok(());
+                }
+            }
+        }
+    }
     match resolution {
         DnsDesiredResolution::Frozen => {}
         DnsDesiredResolution::NotEligible => {
@@ -2445,12 +2547,13 @@ async fn persist_carrier_desired(
     {
         let result = match desired.action {
             crate::service::relay_preference::RelayDnsAction::Upsert => {
-                let Some(value) = desired.value.as_deref() else {
-                    return Err(crate::db::error::DbError::Other(sqlx::Error::Protocol(
-                        "carrier UPSERT desired value is missing".into(),
-                    )));
-                };
-                project_line_desired(db, rule_id, &desired.line_id, "UPSERT", Some(value)).await
+                match desired.value.as_deref() {
+                    Some(value) => {
+                        project_line_desired(db, rule_id, &desired.line_id, "UPSERT", Some(value))
+                            .await
+                    }
+                    None => project_incomplete_line(db, rule_id, &desired.line_id).await,
+                }
             }
             crate::service::relay_preference::RelayDnsAction::Delete => {
                 project_line_desired(db, rule_id, &desired.line_id, "DELETE", None).await
@@ -2475,6 +2578,43 @@ async fn project_line_desired(
     let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
     let desired = line_desired_for_rule(db, rule_id, line, value).await?;
     persist_line_desired(db, &desired, action, value, false).await
+}
+
+async fn project_incomplete_line(
+    db: &dyn Repository,
+    rule_id: i64,
+    raw_line_id: &str,
+) -> Result<(), LineDesiredError> {
+    let line = canonical_provider_line(raw_line_id).ok_or(LineDesiredError::InvalidLine)?;
+    let desired = line_desired_for_rule(db, rule_id, line, None).await?;
+    // Preserve the last generated value for diagnosis/LKG, but never let it
+    // run as a complete desired state while selected targets lack addresses.
+    let previous = db
+        .find_dns_record_sync(rule_id, &desired.line.key)
+        .await
+        .map_err(|_| LineDesiredError::Database)?
+        .filter(|sync| sync.fqdn == desired.fqdn && sync.desired_action == "UPSERT")
+        .and_then(|sync| sync.expected_value);
+    persist_line_desired(
+        db,
+        &desired,
+        "UPSERT",
+        Some(previous.as_deref().unwrap_or("[]")),
+        false,
+    )
+    .await?;
+    db.schedule_dns_record_sync(
+        rule_id,
+        &desired.line.key,
+        "FAILED",
+        "UNKNOWN",
+        Some("CARRIER_TARGET_IPV4_UNAVAILABLE"),
+        None,
+        &utc_now(),
+    )
+    .await
+    .map_err(|_| LineDesiredError::Database)?;
+    Ok(())
 }
 
 pub(crate) async fn project_carrier_line_desired(
@@ -2580,6 +2720,55 @@ pub async fn schedule_all_eligible(db: &dyn Repository) -> Result<(), crate::db:
     for rule in db.list_rules(&ResourceScope::All).await? {
         schedule_rule(db, rule.id).await?;
     }
+    Ok(())
+}
+
+pub(crate) async fn schedule_group_after_membership_change(
+    db: &dyn Repository,
+    group_id: i64,
+) -> Result<(), crate::db::error::DbError> {
+    let preference = crate::service::relay_preference::load_preference(db, group_id)
+        .await
+        .map_err(|e| crate::db::error::DbError::Other(sqlx::Error::Protocol(e.to_string())))?;
+    for id in eligible_rule_ids_for_group(db, group_id).await? {
+        schedule_rule(db, id).await?;
+        // Current status/config errors must not leave removed Carrier lines behind.
+        persist_carrier_desired(db, id).await?;
+        if preference.active_routing_mode
+            == Some(crate::service::relay_preference::RoutingMode::Carrier)
+            && preference.carrier_policy.default_node_id.is_none()
+            && preference.preferred_node_id.is_none()
+        {
+            project_line_desired(db, id, DEFAULT_LINE_KEY, "DELETE", None)
+                .await
+                .map_err(|e| {
+                    crate::db::error::DbError::Other(sqlx::Error::Protocol(format!(
+                        "default removal projection failed: {e:?}"
+                    )))
+                })?;
+        } else if preference.active_routing_mode
+            == Some(crate::service::relay_preference::RoutingMode::Carrier)
+        {
+            if let Some(node_id) = preference.carrier_policy.default_node_id.as_deref() {
+                if !matches!(
+                    crate::service::relay_preference::stored_node_public_ipv4(
+                        db, group_id, node_id
+                    )
+                    .await?,
+                    crate::service::relay_preference::RelayDnsTarget::Resolved(_)
+                ) {
+                    project_incomplete_line(db, id, DEFAULT_LINE_KEY)
+                        .await
+                        .map_err(|e| {
+                            crate::db::error::DbError::Other(sqlx::Error::Protocol(format!(
+                                "default incomplete projection failed: {e:?}"
+                            )))
+                        })?;
+                }
+            }
+        }
+    }
+    notify_reconcile();
     Ok(())
 }
 
@@ -3231,6 +3420,7 @@ pub fn spawn(state: AppState) {
 
 #[cfg(test)]
 mod tests {
+    include!("dnsmgr/multi_a_tests.rs");
     use super::*;
     use crate::db::repo::{DnsRecordBindingRepository, DnsRecordSyncRepository, KvsRepository};
     use crate::db::schema::SCHEMA_SQL;
@@ -6099,6 +6289,8 @@ mod tests {
     }
 
     struct MockDnsState {
+        provider_type: Mutex<String>,
+        read_failure: std::sync::atomic::AtomicBool,
         records: Mutex<Vec<DnsMgrRecord>>,
         record_lines: Mutex<Vec<DnsMgrRecordLine>>,
         add_behavior: MutationBehavior,
@@ -6139,6 +6331,8 @@ mod tests {
         update_behavior: MutationBehavior,
     ) -> EnsureMock {
         let state = Arc::new(MockDnsState {
+            provider_type: Mutex::new("provider".into()),
+            read_failure: std::sync::atomic::AtomicBool::new(false),
             records: Mutex::new(records),
             record_lines: Mutex::new(vec![
                 DnsMgrRecordLine {
@@ -6188,10 +6382,10 @@ mod tests {
         }
     }
 
-    async fn mock_domains() -> Json<serde_json::Value> {
+    async fn mock_domains(State(state): State<Arc<MockDnsState>>) -> Json<serde_json::Value> {
         Json(json!({
             "total": 1,
-            "rows": [{"id": 7, "name": "example.com", "type": "provider"}]
+            "rows": [{"id": 7, "name": "example.com", "type": *state.provider_type.lock().unwrap()}]
         }))
     }
 
@@ -6208,15 +6402,18 @@ mod tests {
             "data": {
                 "id": 7,
                 "name": "example.com",
-                "type": "provider",
+                "type": *state.provider_type.lock().unwrap(),
                 "minTTL": 1200,
                 "recordLine": record_lines
             }
         }))
     }
 
-    async fn mock_records(State(state): State<Arc<MockDnsState>>) -> Json<serde_json::Value> {
+    async fn mock_records(State(state): State<Arc<MockDnsState>>) -> Response {
         state.list_attempts.fetch_add(1, Ordering::SeqCst);
+        if state.read_failure.load(Ordering::SeqCst) {
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         let rows = state
             .records
             .lock()
@@ -6224,7 +6421,7 @@ mod tests {
             .iter()
             .map(record_json)
             .collect::<Vec<_>>();
-        Json(json!({"total": rows.len(), "rows": rows}))
+        Json(json!({"total": rows.len(), "rows": rows})).into_response()
     }
 
     async fn mock_add_record(
@@ -6233,6 +6430,15 @@ mod tests {
     ) -> Response {
         let attempt = state.add_attempts.fetch_add(1, Ordering::SeqCst) + 1;
         *state.last_add_form.lock().unwrap() = Some(form.clone());
+        if *state.provider_type.lock().unwrap() == "huawei"
+            && state.records.lock().unwrap().iter().any(|r| {
+                r.host == *form.get("name").unwrap()
+                    && r.line == *form.get("line").unwrap()
+                    && r.record_type == *form.get("type").unwrap()
+            })
+        {
+            return Json(json!({"code": -1, "msg": "duplicate RRset"})).into_response();
+        }
         if matches!(
             state.add_behavior,
             MutationBehavior::Apply | MutationBehavior::TransportAfterApply
@@ -6304,12 +6510,20 @@ mod tests {
     }
 
     fn record_from_form(record_id: &str, form: &HashMap<String, String>) -> DnsMgrRecord {
-        record(
+        let mut record = record(
             record_id,
             form.get("type").unwrap(),
             form.get("value").unwrap(),
             form.get("line").unwrap(),
-        )
+        );
+        record.host = form.get("name").unwrap().clone();
+        record.values = form
+            .get("value")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        record
     }
 
     fn record_json(record: &DnsMgrRecord) -> serde_json::Value {
