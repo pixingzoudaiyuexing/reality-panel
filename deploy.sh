@@ -47,7 +47,14 @@ uninstall_panel() {
         "$UPDATE_COMMAND" "$CONFIG_ROOT/installer-account" /etc/systemd/system/relay-panel.service; do
         ancestor="$managed"
         while [ "$ancestor" != / ] && [ -n "$ancestor" ]; do
-            [ ! -L "$ancestor" ] || fail "Refusing symlinked uninstall path: $ancestor"
+            if [ -L "$ancestor" ]; then
+                # The installer creates this exact leaf shortcut. Unlink it
+                # without following the target; keep checking its ancestors.
+                if [ "$ancestor" != "$UPDATE_COMMAND" ] || \
+                   [ "$(readlink "$ancestor")" != "$SCRIPT_ROOT/update.sh" ]; then
+                    fail "Refusing symlinked uninstall path: $ancestor"
+                fi
+            fi
             ancestor="$(dirname "$ancestor")"
         done
     done

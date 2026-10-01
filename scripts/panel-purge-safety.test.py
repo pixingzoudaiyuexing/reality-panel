@@ -40,6 +40,17 @@ for entry in ['install.sh', 'deploy.sh']:
         foreign = root / 'foreign'; foreign.mkdir(); (foreign / 'keep').write_text('foreign')
         account = 'relay-panel:x:999:999::' + replacements[PATHS[2]] + ':/usr/sbin/nologin'
         seed()
+        shortcut = Path(replacements['/usr/local/sbin/reality-panel-update'])
+        shortcut.parent.mkdir(parents=True, exist_ok=True)
+        shortcut.symlink_to(foreign / 'keep')
+        result = run(ACCOUNT=account)
+        assert result.returncode != 0 and shortcut.is_symlink() and (foreign / 'keep').exists()
+        assert Path(replacements[PATHS[0]], 'relay-panel').exists()
+        shortcut.unlink()
+        # Real installer contract: absolute shortcut to the owned update script.
+        update_script = Path(replacements['/usr/local/lib/reality-panel']) / 'update.sh'
+        update_script.write_text('owned update helper')
+        shortcut.symlink_to(update_script)
         result = run(ACCOUNT=account, STOP_FAIL='1')
         assert result.returncode != 0 and Path(replacements[PATHS[0]], 'relay-panel').exists(), result.stdout
         result = run(ACCOUNT=account, USERDEL_FAIL='1')
@@ -47,6 +58,7 @@ for entry in ['install.sh', 'deploy.sh']:
         result = run(ACCOUNT=account)
         assert result.returncode == 0, result.stderr
         assert not any(Path(replacements[p]).exists() for p in PATHS[:4])
+        assert not shortcut.exists() and not shortcut.is_symlink()
         assert 'userdel relay-panel' in log.read_text()
         assert (foreign / 'keep').read_text() == 'foreign'
         assert run().returncode == 0
