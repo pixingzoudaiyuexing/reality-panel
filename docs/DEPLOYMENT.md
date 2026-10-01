@@ -65,14 +65,20 @@ cannot be bypassed. Missing IPv4 permits policy save with an incomplete warning.
 Remove/Delete prunes selections and reuses existing DNS reconciliation. External
 DNS errors never undo local Node retirement.
 
-This iteration validates adapter/integration contracts against an HTTP mock.
-No authorized external DNS test zone/credential was supplied, so the new Multi-A
-round-trip against a live provider remains NOT VERIFIED.
+Authorized Huawei/DNSMgr TEST runtime acceptance completed on 2026-10-01.
+The public HTTPS TEST Panel follow-up used two physical Pool-native Relays and
+verified certificate-backed forwarding, Carrier Multi-A, member removal/re-add,
+and local Node retirement with config/WS/status credential rejection. Inbound
+Group expanded details expose the existing routing controls for Pool members.
+Owner browser sign-off, Release, and production deployment remain separate gates.
 
 New binaries read legacy scalar policy/binding data. Earlier binaries cannot
-interpret Multi-A arrays or the optional typed CNAME rollback snapshot. Avoid
-downgrading while a routing transaction is pending; this is source compatibility,
-not a release or deployment authorization.
+interpret Multi-A arrays or the optional typed CNAME rollback snapshot. Do not
+run an earlier binary directly against a database that has written Multi-A data,
+even after the current set shrinks to one address. A downgrade requires restoring
+a compatible pre-upgrade database backup; no converter is provided. Never
+downgrade during a pending routing transaction. This compatibility boundary does
+not authorize a release or deployment.
 
 The Huawei DNSMgr provider control plane has been tested with parent and child
 records, multiple lines per Rule, updates, safe deletion, and Panel outages.
