@@ -140,9 +140,17 @@ class Host:
         for key in ['net.ipv4.tcp_congestion_control','net.core.default_qdisc']:
             kernel[key]=self.run(['sysctl','-n',key]).stdout.decode().strip()
         private_json(work/'snapshot.json',{'present':present,'kernel':kernel})
-    def stop_and_detach(self):
+    def stop_and_detach(self, work):
         self.run(['systemctl','stop','relay-node.service'])
         for name in OWNED_TREES: remove_owned(self.path(name))
+        # Existing managed Nginx still references these same-host TLS assets.
+        # Preserve certificates only; old identity, credentials and LKG stay detached.
+        certificates=work/'backup/0/certificates'
+        safe_path(certificates)
+        if certificates.exists():
+            destination=self.path('/opt/relay-node/certificates')
+            destination.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+            shutil.copytree(certificates,destination,symlinks=True)
     def install(self, work):
         self.run(['bash',str(work/'bundle/relay-node-bootstrap.sh'),str(work/'bundle/config.env'),str(work/'bundle/relay-node-linux-amd64'),str(work/'bootstrap-transaction')])
     def rollback(self, work):
@@ -214,7 +222,7 @@ class Runner:
         self.host.run([str(self.work/'bundle/relay-node-linux-amd64'),'--version'])
         self.client.action(self.op,'preflight') # Real public forwarding before old service stop.
         self.host.capture(self.work)
-        self.phase('4/10 STOP OLD');self.destructive=True;self.host.stop_and_detach()
+        self.phase('4/10 STOP OLD');self.destructive=True;self.host.stop_and_detach(self.work)
         self.phase('5/10 INSTALL CURRENT');self.host.install(self.work)
         self.phase('6/10 RESTORE MEMBERSHIPS')
         self.wait_action('restore',{'NODE_OFFLINE','NODE_STATUS_MISSING','NEW_CREDENTIAL_NOT_ACTIVE','PUBLIC_IPV4_NOT_REPORTED'})

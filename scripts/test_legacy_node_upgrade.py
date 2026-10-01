@@ -13,7 +13,7 @@ class Host:
     def run(self,args): return None
     def old_auth(self, identity): return {'Authorization':'in-memory-test'}
     def capture(self, work): self.events.append('snapshot')
-    def stop_and_detach(self): self.events.append('stop')
+    def stop_and_detach(self, work): self.events.append('stop')
     def install(self, work):
         self.events.append('install')
         if self.fault=='bootstrap': raise module.Failure('HOST_COMMAND_FAILED_BASH')
@@ -93,6 +93,32 @@ class Boundaries(unittest.TestCase):
         host,client=self.run_case('lost-finalize-ack')
         self.assertNotIn('host-rollback',host.events);self.assertIn('complete',host.events)
         self.assertEqual(client.finalizes,2)
+    def test_detach_preserves_tls_assets_without_old_identity_or_auth(self):
+        with tempfile.TemporaryDirectory(dir=pathlib.Path(tempfile.gettempdir()).resolve()) as tmp:
+            root=pathlib.Path(tmp);work=root/'var/lib/relay-panel/legacy-v130-upgrade/test'
+            work.mkdir(parents=True,mode=0o700)
+            opt=root/'opt/relay-node';cert=opt/'certificates/generations/valid';cert.mkdir(parents=True)
+            (cert/'fullchain.pem').write_text('test certificate')
+            (cert/'privkey.pem').write_text('test private key');(cert/'privkey.pem').chmod(0o600)
+            (opt/'node-id').write_text('old');(opt/'relay-node').write_text('old binary');(opt/'config-cache.json').write_text('old config')
+            env=root/'etc/relay-node';env.mkdir(parents=True);(env/'relay-node.env').write_text('old credential')
+            claims=root/'var/lib/relay-panel/node-claims';claims.mkdir(parents=True);(claims/'runtime-auth.json').write_text('old descriptor')
+            nginx=root/'etc/nginx/conf.d';nginx.mkdir(parents=True)
+            conf=nginx/'relay-panel-fallback.conf';conf.write_text('ssl_certificate /opt/relay-node/certificates/generations/valid/fullchain.pem;')
+            host=module.Host(root)
+            with patch.object(host,'run',return_value=types.SimpleNamespace(stdout=b'test\n')):
+                host.capture(work)
+                host.stop_and_detach(work)
+                self.assertEqual((cert/'fullchain.pem').read_text(),'test certificate')
+                self.assertEqual((cert/'privkey.pem').stat().st_mode&0o777,0o600)
+                self.assertFalse((opt/'node-id').exists());self.assertFalse((opt/'relay-node').exists());self.assertFalse((opt/'config-cache.json').exists())
+                self.assertFalse(env.exists());self.assertFalse(claims.exists())
+                self.assertIn('/opt/relay-node/certificates/',conf.read_text())
+                host.rollback(work)
+                self.assertEqual((opt/'node-id').read_text(),'old')
+                self.assertEqual((env/'relay-node.env').read_text(),'old credential')
+                self.assertEqual((claims/'runtime-auth.json').read_text(),'old descriptor')
+                self.assertEqual((cert/'privkey.pem').read_text(),'test private key')
     def test_symlink_ancestor_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=pathlib.Path(tmp);(root/'link').symlink_to(root,target_is_directory=True)
