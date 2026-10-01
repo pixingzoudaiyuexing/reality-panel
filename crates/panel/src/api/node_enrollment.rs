@@ -970,7 +970,7 @@ fn bundle_error(status: u16, message: &'static str) -> Response {
         .into_response()
 }
 
-fn render_bundle(
+pub(crate) fn render_bundle(
     enrollment_id: &str,
     group_id: i64,
     profile: &str,

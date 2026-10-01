@@ -28,7 +28,7 @@ use relay_shared::models::{
     TunnelProfile, User,
 };
 use relay_shared::protocol::{RuleTargetRequest, TrafficEntry};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::node_claim::{
     NodeClaimNonceVerifier, NodeClaimSecret, NodeClaimSecretVerifier, NodeClaimantNonce,
@@ -587,7 +587,7 @@ pub trait GroupRepository: Send + Sync {
 
 /// Stable identity for one concrete Relay in the current data model. `node_id`
 /// alone is insufficient outside its Home Group namespace.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, sqlx::FromRow)]
 pub struct ConcreteNodeIdentity {
     pub home_group_id: i64,
     pub node_id: String,
@@ -689,8 +689,29 @@ pub struct NodePoolRetirement {
     pub needs_attention: bool,
 }
 
+/// One-time v1.3.0 replacement; the operation and identity retirement share a commit.
+#[derive(Debug)]
+pub struct LegacyUpgradeCommit {
+    pub expected_operation: Option<String>,
+    pub operation_id: String,
+    pub operation: String,
+    pub routing: Vec<(String, String, String)>,
+    pub replacement: Option<LegacyUpgradeReplacement>,
+    pub rollback: Option<ConcreteNodeIdentity>,
+}
+
+#[derive(Debug)]
+pub struct LegacyUpgradeReplacement {
+    pub old: ConcreteNodeIdentity,
+    pub new: ConcreteNodeIdentity,
+    pub new_credential_id: String,
+    pub memberships: Vec<i64>,
+}
+
 #[async_trait]
 pub trait NodePoolRepository: Send + Sync {
+    async fn commit_legacy_upgrade(&self, commit: &LegacyUpgradeCommit) -> Result<bool, DbError>;
+
     async fn list_node_pool_records(&self) -> Result<Vec<NodePoolRecord>, DbError>;
     async fn discover_node_pool_identities(&self) -> Result<Vec<ConcreteNodeIdentity>, DbError>;
     async fn register_node_pool_identity(

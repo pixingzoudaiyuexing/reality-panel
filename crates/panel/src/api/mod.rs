@@ -12,6 +12,7 @@ pub mod carrier_lines;
 pub mod diagnose;
 pub mod geoip;
 pub mod groups;
+pub mod legacy_upgrade;
 pub mod middleware;
 pub mod node;
 pub mod node_auth;
@@ -57,6 +58,30 @@ pub struct AppState {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/admin/legacy-node-upgrade-v130/current",
+            axum::routing::get(legacy_upgrade::current),
+        )
+        .route(
+            "/legacy-node-upgrade-v130/capabilities",
+            axum::routing::get(legacy_upgrade::capabilities),
+        )
+        .route(
+            "/legacy-node-upgrade-v130/script.sh",
+            axum::routing::get(legacy_upgrade::script),
+        )
+        .route(
+            "/admin/legacy-node-upgrade-v130/start",
+            axum::routing::post(legacy_upgrade::start),
+        )
+        .route(
+            "/legacy-node-upgrade-v130/{id}",
+            axum::routing::get(legacy_upgrade::status).post(legacy_upgrade::step),
+        )
+        .route(
+            "/legacy-node-upgrade-v130/{id}/bundle",
+            axum::routing::get(legacy_upgrade::bundle),
+        )
         .route(
             "/node/identity",
             axum::routing::get(node_pool::node_identity),

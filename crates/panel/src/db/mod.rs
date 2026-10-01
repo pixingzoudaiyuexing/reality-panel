@@ -13,3 +13,6 @@ pub mod sqlite_repo;
 // that exists on multiple traits (e.g. find_by_id is on both UserRepository
 // and GroupRepository), it imports the specific trait from `crate::db::repo`.
 pub use repo::Repository;
+
+#[cfg(test)]
+pub(crate) mod legacy_upgrade_contract_tests;

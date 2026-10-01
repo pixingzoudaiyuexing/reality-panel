@@ -16,6 +16,7 @@ mod dns_record_syncs;
 mod enrollments;
 mod groups;
 mod kvs;
+mod legacy_upgrade;
 mod node_claims;
 mod node_credential_deliveries;
 mod node_credentials;

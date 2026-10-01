@@ -10888,3 +10888,16 @@ async fn pg_carrier_membership_multi_selection_cleanup_is_atomic() {
     assert!(saved.carrier_policy.bindings.is_empty());
     cleanup(&db).await;
 }
+
+#[tokio::test]
+async fn pg_legacy_single_upgrade_atomic_replacement_contract() {
+    let Some(db) = repo("legacy_single_upgrade").await else {
+        return;
+    };
+    for group in [71, 72, 73] {
+        seed_group(&db, group).await;
+    }
+    sqlx::query("INSERT INTO node_credentials(credential_id,home_group_id,node_id,generation,verifier_format,verifier_version,verifier_data,activated_at) VALUES ('old-credential',71,'LEGACY_OLD',1,'rp-node-sha256',1,$1,now()::text),('staged-credential',72,'STAGED_NEW',1,'rp-node-sha256',1,$2,now()::text)").bind(vec![3_u8;32]).bind(vec![4_u8;32]).execute(&db.pool).await.unwrap();
+    crate::db::legacy_upgrade_contract_tests::replacement_contract(&db).await;
+    cleanup(&db).await;
+}

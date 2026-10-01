@@ -630,6 +630,8 @@ pub async fn report_status(
     headers: HeaderMap,
     Json(req): Json<StatusReport>,
 ) -> Json<ApiResponse<()>> {
+    // Exclude a report authenticated before the atomic retirement boundary.
+    let _migration_lease = crate::service::legacy_upgrade::MUTATIONS.read().await;
     let identity = match authenticate_node(&state, &headers).await {
         Ok(identity) => Some(identity),
         Err(NodeAuthError::Unavailable) => {

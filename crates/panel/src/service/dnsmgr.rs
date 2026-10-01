@@ -2778,6 +2778,9 @@ pub(crate) async fn refresh_all_desired(
     db: &dyn Repository,
 ) -> Result<(), crate::db::error::DbError> {
     for rule in db.list_rules(&ResourceScope::All).await? {
+        if crate::service::legacy_upgrade::group_held(db, rule.device_group_in).await? {
+            continue;
+        }
         let resolution = derive_dns_desired(db, rule.id).await?;
         persist_resolution(db, rule.id, resolution, false).await?;
     }
@@ -3488,6 +3491,7 @@ pub(crate) async fn load_client(db: &dyn Repository) -> Result<Option<DnsMgrClie
 }
 
 async fn reconciliation_tick(state: &AppState) {
+    let _migration_lease = crate::service::legacy_upgrade::MUTATIONS.read().await;
     crate::service::acme_dns01::cleanup_expired(state.db.as_ref()).await;
     // Fail unsafe switching transactions before refresh/due processing so a
     // vanished target cannot receive one more automatic DNS mutation.
@@ -3557,6 +3561,13 @@ async fn list_executable_due_syncs(
     let mut executable = Vec::with_capacity(DNS_SYNC_MAX_BATCH as usize);
 
     for sync in due {
+        if let Some(rule) =
+            RuleRepository::find_rule_by_id(db, sync.rule_id, &ResourceScope::All).await?
+        {
+            if crate::service::legacy_upgrade::group_held(db, rule.device_group_in).await? {
+                continue;
+            }
+        }
         if matches!(
             derive_dns_desired(db, sync.rule_id).await,
             Ok(DnsDesiredResolution::Frozen)

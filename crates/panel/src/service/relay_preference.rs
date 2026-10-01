@@ -3359,6 +3359,9 @@ pub(crate) async fn refresh_carrier_desired(
         else {
             continue;
         };
+        if crate::service::legacy_upgrade::group_held(state.db.as_ref(), group_id).await? {
+            continue;
+        }
         let preference: RelayPreferenceState =
             serde_json::from_str(&raw).map_err(RelayPreferenceError::InvalidPreference)?;
         if resolved_routing_mode(state.db.as_ref(), group_id, &preference).await?

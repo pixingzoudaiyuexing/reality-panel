@@ -473,7 +473,9 @@ fn preview_from_items(items: Vec<BatchUpgradeItem>) -> BatchUpgradePreview {
     }
 }
 
-async fn active_batch(state: &AppState) -> Result<Option<BatchUpgradeOperation>, String> {
+pub(crate) async fn active_batch(
+    state: &AppState,
+) -> Result<Option<BatchUpgradeOperation>, String> {
     let rows = state
         .db
         .scan_prefix(BATCH_PREFIX)

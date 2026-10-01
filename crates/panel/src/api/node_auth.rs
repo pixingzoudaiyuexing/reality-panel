@@ -129,6 +129,14 @@ pub async fn authenticate_node(
         if group.group_type != "in" {
             return Err(NodeAuthError::Forbidden);
         }
+        if let Some(id) = &node_id {
+            if crate::service::legacy_upgrade::retired(state.db.as_ref(), group.id, id)
+                .await
+                .map_err(|_| NodeAuthError::Unavailable)?
+            {
+                return Err(NodeAuthError::Unauthorized);
+            }
+        }
         return Ok(AuthenticatedNodeIdentity::LegacyHomeGroup {
             group,
             reported_node_id: node_id,
@@ -161,6 +169,16 @@ pub async fn authenticate_node(
         .await
         .map_err(|_| NodeAuthError::Unavailable)?
         .ok_or(NodeAuthError::Unauthorized)?;
+    if crate::service::legacy_upgrade::retired(
+        state.db.as_ref(),
+        record.home_group_id,
+        node_id.as_str(),
+    )
+    .await
+    .map_err(|_| NodeAuthError::Unavailable)?
+    {
+        return Err(NodeAuthError::Unauthorized);
+    }
     let stored = StoredNodeCredentialVerifier {
         credential_id: &record.credential_id,
         home_group_id: record.home_group_id,
@@ -488,5 +506,35 @@ mod tests {
         };
         println!("S3 REAL POSTGRES RUNTIME AUTH CONTRACT: EXECUTED");
         exercise_runtime_auth_contract(state, secret).await;
+    }
+    #[tokio::test]
+    async fn migrated_identity_rejects_legacy_and_permanent_authentication() {
+        let (state, secret) = sqlite_state_with_active_credential().await;
+        state
+            .db
+            .set(
+                "legacy_v130_upgrade:retired:10:Node_A",
+                "completed-operation",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            authenticate_node(&state, &credential_headers(&secret, "Node_A"))
+                .await
+                .unwrap_err(),
+            NodeAuthError::Unauthorized
+        );
+        let mut legacy = HeaderMap::new();
+        legacy.insert(AUTHORIZATION, "Bearer legacy-token".parse().unwrap());
+        legacy.insert(NODE_ID_HEADER, "Node_A".parse().unwrap());
+        assert_eq!(
+            authenticate_node(&state, &legacy).await.unwrap_err(),
+            NodeAuthError::Unauthorized
+        );
+        legacy.insert(NODE_ID_HEADER, "OTHER_NODE".parse().unwrap());
+        assert!(
+            authenticate_node(&state, &legacy).await.is_ok(),
+            "another old Node remains authorized"
+        );
     }
 }

@@ -177,6 +177,10 @@ async fn main() {
         state.node_connections.clone(),
     );
 
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        api::legacy_upgrade::guard,
+    ));
     let app = app.with_state(state);
 
     tracing::info!(

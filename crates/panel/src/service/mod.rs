@@ -23,3 +23,5 @@ pub mod settings;
 pub mod site;
 pub mod traffic;
 pub mod users;
+
+pub mod legacy_upgrade;

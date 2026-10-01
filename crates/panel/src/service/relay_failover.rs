@@ -680,6 +680,12 @@ async fn notify_failover(state: &AppState, group_id: i64, subject: &str, text: &
 }
 
 async fn process_group(state: &AppState, group_id: i64, policy: RelayFailoverPolicy) {
+    if !matches!(
+        crate::service::legacy_upgrade::group_held(state.db.as_ref(), group_id).await,
+        Ok(false)
+    ) {
+        return;
+    }
     let runtime = runtime_for(group_id);
     let Ok(_operation_guard) = runtime.operation.try_lock() else {
         return;

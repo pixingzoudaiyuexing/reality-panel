@@ -131,6 +131,11 @@ impl Default for DeploymentRegistry {
 }
 
 impl DeploymentRegistry {
+    pub(crate) async fn has_active_for_host(&self, host: &str) -> bool {
+        self.tasks.lock().await.values().any(|t| {
+            t.status.host == host && !matches!(t.status.status.as_str(), "success" | "failed")
+        })
+    }
     async fn insert(
         &self,
         group_id: i64,

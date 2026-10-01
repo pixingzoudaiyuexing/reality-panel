@@ -6,6 +6,10 @@ use relay_shared::models::DeviceGroup;
 
 #[async_trait]
 impl NodePoolRepository for PgRepository {
+    async fn commit_legacy_upgrade(&self, commit: &LegacyUpgradeCommit) -> Result<bool, DbError> {
+        self.legacy_upgrade_commit_inner(commit).await
+    }
+
     async fn list_node_pool_records(&self) -> Result<Vec<NodePoolRecord>, DbError> {
         Ok(
             sqlx::query_as("SELECT * FROM node_pool_nodes ORDER BY identity_group_id, node_id")
@@ -45,7 +49,7 @@ impl NodePoolRepository for PgRepository {
             .await?;
         sqlx::query(
             "INSERT INTO node_pool_nodes (identity_group_id, node_id)
-            SELECT id, $1 FROM device_groups WHERE id = $2 AND (
+            SELECT id, $1 FROM device_groups WHERE id = $2 AND NOT EXISTS (SELECT 1 FROM kvs WHERE key=$3) AND (
                 id != COALESCE((SELECT group_id FROM node_pool_system_anchor WHERE singleton = 1), -1)
                 OR EXISTS (SELECT 1 FROM node_credentials
                            WHERE home_group_id = id AND node_id = $1
@@ -56,6 +60,7 @@ impl NodePoolRepository for PgRepository {
         )
         .bind(node_id)
         .bind(group_id)
+        .bind(format!("legacy_v130_upgrade:retired:{group_id}:{node_id}"))
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

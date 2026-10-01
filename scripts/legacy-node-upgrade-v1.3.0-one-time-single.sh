@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# One explicit host invocation; official v1.3.0 amd64 Lite/systemd only.
+# No batching, SSH traversal, implicit next Node or unchecked network execution.
+python3 - "$@" <<'PY'
+import argparse, contextlib, fcntl, getpass, hashlib, io, json, os, pathlib, re
+import shutil, signal, ssl, subprocess, sys, tarfile, time, urllib.error, urllib.request
+
+OFFICIAL_SHA256 = '5c70aac9aab2e78b739d0468d6920b56fac427fb31f18790bc0809c616f965f9'
+BASE = '/legacy-node-upgrade-v130'
+OWNED_TREES = ['/opt/relay-node', '/etc/relay-node', '/var/lib/relay-panel/node-claims']
+SNAPSHOT_PATHS = OWNED_TREES + [
+ '/etc/systemd/system/relay-node.service', '/etc/relay-panel/camouflage-sites.json',
+ '/etc/relay-panel/lite-mode', '/etc/nginx/relay-panel-stream.d',
+ '/etc/nginx/relay-panel-stream.conf', '/etc/nginx/conf.d/relay-panel-fallback.conf',
+ '/etc/nginx/conf.d/relay-panel-acme.conf', '/etc/nginx/conf.d/relay-panel-lite-fallback.conf',
+ '/etc/nginx/relay-panel-certs', '/var/www/fallback/index.html',
+ '/etc/sysctl.d/99-reality-panel-bbr.conf', '/etc/modules-load.d/reality-panel-bbr.conf',
+]
+
+class Failure(Exception):
+    pass
+
+class ApiFailure(Failure):
+    pass
+
+def emit(stage, message):
+    print('[%s] %s' % (stage, message), flush=True)
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+def private_json(path, value):
+    temporary = path.with_name(path.name + '.new')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as out:
+        json.dump(value, out); out.flush(); os.fsync(out.fileno())
+    os.replace(temporary, path)
+
+def safe_path(path):
+    for parent in [path] + list(path.parents):
+        if parent.is_symlink():
+            raise Failure('SYMLINK_PATH_REQUIRES_MANUAL_INSPECTION')
+
+def remove_owned(path):
+    safe_path(path)
+    if path.is_dir(): shutil.rmtree(path)
+    elif path.exists(): path.unlink()
+
+class Client:
+    def __init__(self, panel, admin):
+        if not panel.startswith('https://'):
+            raise Failure('HTTPS_PANEL_REQUIRED')
+        self.url = panel.rstrip('/') + '/api/v1'; self.admin = admin
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    def request(self, method, path, body=None, token=None, headers=None, binary=False):
+        h = {'Content-Type': 'application/json'}
+        if token: h['Authorization'] = 'Bearer ' + token
+        if headers: h.update(headers)
+        req = urllib.request.Request(self.url+path, data=None if body is None else json.dumps(body).encode(), headers=h, method=method)
+        try:
+            with self.opener.open(req, timeout=60) as r:
+                data = r.read()
+                if binary: return data, r.headers.get('X-Content-SHA256', '')
+                out = json.loads(data)
+                if out.get('code', 0) != 0: raise ApiFailure('API_REJECTED')
+                return out.get('data', out)
+        except urllib.error.HTTPError as e:
+            try: category=json.loads(e.read(65536)).get('message','HTTP_'+str(e.code))
+            except (ValueError, UnicodeError): category='HTTP_'+str(e.code)
+            if not re.fullmatch('[A-Z0-9_]+',category): category='HTTP_'+str(e.code)
+            raise ApiFailure(category) from None
+        except (OSError, ValueError):
+            raise ApiFailure('PANEL_UNAVAILABLE') from None
+    def start(self, identity, probes):
+        return self.request('POST', '/admin'+BASE+'/start', {**identity, 'official_sha256':OFFICIAL_SHA256, 'probes':probes}, self.admin)
+    def status(self, op):
+        return self.request('GET', BASE+'/'+op['operation']['id'], token=op['migration_token'])
+    def action(self, op, action):
+        return self.request('POST', BASE+'/'+op['operation']['id'], {'action':action}, op['migration_token'])
+    def bundle(self, op):
+        data, sha = self.request('GET', BASE+'/'+op['operation']['id']+'/bundle', token=op['migration_token'], binary=True)
+        if not re.fullmatch('[a-f0-9]{64}',sha) or digest(data)!=sha: raise Failure('BUNDLE_CHECKSUM_FAILURE')
+        return data
+
+class Host:
+    def __init__(self, root=pathlib.Path('/')):
+        self.root=root
+    def path(self, name): return self.root/name.lstrip('/')
+    def run(self, args, check=True):
+        # Bootstrap output may include private paths. Keep it in RAM; never log credentials.
+        p=subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+        if check and p.returncode: raise Failure('HOST_COMMAND_FAILED_'+pathlib.Path(args[0]).name.upper())
+        return p
+    def precheck(self, identity):
+        if os.geteuid()!=0 or os.uname().machine!='x86_64': raise Failure('ROOT_AMD64_REQUIRED')
+        for name in SNAPSHOT_PATHS: safe_path(self.path(name))
+        node=self.path('/opt/relay-node/relay-node')
+        if not node.is_file() or digest(node.read_bytes())!=OFFICIAL_SHA256: raise Failure('OFFICIAL_V130_BINARY_REQUIRED')
+        if self.run([str(node),'--version']).stdout.decode().strip()!='relay-node 1.3.0': raise Failure('OFFICIAL_V130_VERSION_REQUIRED')
+        if self.path('/opt/relay-node/node-id').read_text().strip()!=identity['node_id']: raise Failure('OLD_NODE_ID_MISMATCH')
+        if not self.path('/etc/relay-panel/lite-mode').is_file(): raise Failure('LITE_SYSTEMD_INSTALL_REQUIRED')
+        self.run(['systemctl','is-active','--quiet','relay-node.service'])
+        fragment=self.run(['systemctl','show','-p','FragmentPath','--value','relay-node.service']).stdout.decode().strip()
+        if fragment!='/etc/systemd/system/relay-node.service': raise Failure('OFFICIAL_SYSTEMD_LAYOUT_REQUIRED')
+        release=dict(line.split('=',1) for line in self.path('/etc/os-release').read_text().splitlines() if '=' in line)
+        if release.get('ID','').strip(chr(34))!='debian' or release.get('VERSION_ID','').strip(chr(34))!='12': raise Failure('SUPPORTED_DEBIAN_12_REQUIRED')
+        if self.run(['systemctl','show','-p','DropInPaths','--value','relay-node.service']).stdout.strip(): raise Failure('CUSTOM_UNIT_DROPINS_REQUIRE_MANUAL_INSPECTION')
+        for exe in ['bash','systemctl','curl','tar','sha256sum','nginx','apt-get','sysctl']:
+            if not shutil.which(exe): raise Failure('HOST_PREREQUISITE_MISSING')
+        if shutil.disk_usage(self.root).free < 512*1024*1024: raise Failure('DISK_SPACE_REQUIRED')
+        self.run(['nginx','-t'])
+    def old_auth(self, identity):
+        descriptor=self.path('/var/lib/relay-panel/node-claims/runtime-auth.json')
+        if descriptor.exists():
+            safe_path(descriptor);d=json.loads(descriptor.read_text())
+            if str(d['identity_group_id'])!=str(identity['identity_group_id']) or d['node_id']!=identity['node_id']: raise Failure('OLD_AUTH_IDENTITY_MISMATCH')
+            secret=self.path(d['secret_file']);safe_path(secret)
+            return {'Authorization':'RelayNodeCredential '+secret.read_text().strip(), 'X-Node-Credential-ID':d['credential_id'],'X-Node-ID':identity['node_id'],'X-Config-Protocol-Version':'10'}
+        import shlex
+        lines=self.path('/etc/relay-node/relay-node.env').read_text().splitlines()
+        values={}
+        for line in lines:
+            if '=' in line and not line.lstrip().startswith('#'):
+                k,v=line.split('=',1);parts=shlex.split(v);values[k]=parts[0] if parts else ''
+        if not values.get('NODE_TOKEN'): raise Failure('OLD_AUTH_UNAVAILABLE')
+        return {'Authorization':'Bearer '+values['NODE_TOKEN'],'X-Node-ID':identity['node_id'],'X-Config-Protocol-Version':'10'}
+    def capture(self, work):
+        backup=work/'backup';backup.mkdir(mode=0o700,exist_ok=True)
+        present=[]
+        for index,name in enumerate(SNAPSHOT_PATHS):
+            path=self.path(name);safe_path(path)
+            target=backup/str(index)
+            if target.exists(): remove_owned(target)
+            if path.exists():
+                present.append(index)
+                if path.is_dir(): shutil.copytree(path,target,symlinks=True)
+                else: shutil.copy2(path,target)
+        kernel={}
+        for key in ['net.ipv4.tcp_congestion_control','net.core.default_qdisc']:
+            kernel[key]=self.run(['sysctl','-n',key]).stdout.decode().strip()
+        private_json(work/'snapshot.json',{'present':present,'kernel':kernel})
+    def stop_and_detach(self):
+        self.run(['systemctl','stop','relay-node.service'])
+        for name in OWNED_TREES: remove_owned(self.path(name))
+    def install(self, work):
+        self.run(['bash',str(work/'bundle/relay-node-bootstrap.sh'),str(work/'bundle/config.env'),str(work/'bundle/relay-node-linux-amd64'),str(work/'bootstrap-transaction')])
+    def rollback(self, work):
+        self.run(['systemctl','stop','relay-node.service'],check=False)
+        script=work/'bundle/relay-node-bootstrap.sh'
+        if (work/'bootstrap-transaction/state').exists():
+            self.run(['bash',str(script),'--rollback',str(work/'bootstrap-transaction')],check=False)
+        present=json.loads((work/'snapshot.json').read_text())['present']
+        for index,name in enumerate(SNAPSHOT_PATHS):
+            path=self.path(name);safe_path(path);remove_owned(path)
+            if index in present:
+                path.parent.mkdir(parents=True,exist_ok=True)
+                original=work/'backup'/str(index)
+                if original.is_dir(): shutil.copytree(original,path,symlinks=True)
+                else: shutil.copy2(original,path)
+        for key,value in json.loads((work/'snapshot.json').read_text()).get('kernel',{}).items():
+            self.run(['sysctl','-w',key+'='+value])
+        self.run(['systemctl','daemon-reload'])
+        self.run(['nginx','-t']);self.run(['systemctl','reload','nginx'])
+        self.run(['systemctl','start','relay-node.service'])
+        self.run(['systemctl','is-active','--quiet','relay-node.service'])
+    def complete(self, op, work):
+        private_json(self.path('/opt/relay-node/legacy-v130-upgrade-completed.json'),{'operation_id':op['operation']['id'],'old_node_id':op['operation']['old']['node_id'],'new_node_id':op['operation']['new']['node_id']})
+        remove_owned(work)
+        if not any(work.parent.iterdir()): work.parent.rmdir()
+
+class Runner:
+    def __init__(self, client, host, identity, probes, work, timeout=180):
+        self.client=client;self.host=host;self.identity=identity;self.probes=probes;self.work=work;self.timeout=timeout
+        self.op=None;self.destructive=False;self.commit_unknown=False
+    def phase(self, stage):
+        private_json(self.work/'phase.json',{'phase':stage});emit(stage,'single Node only')
+    def wait_action(self, action, transient):
+        deadline=time.monotonic()+self.timeout
+        while True:
+            try: return self.client.action(self.op,action)
+            except ApiFailure as e:
+                if str(e) not in transient or time.monotonic()>=deadline: raise
+                time.sleep(1)
+    def prepare_bundle(self, data):
+        bundle=self.work/'bundle';bundle.mkdir(mode=0o700)
+        expected={'manifest.env','relay-node-bootstrap.sh','relay-node-linux-amd64','config.env'}
+        with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+            members=archive.getmembers()
+            if set(m.name for m in members)!=expected or len(members)!=4 or any(not m.isfile() for m in members): raise Failure('INVALID_BUNDLE')
+            for member in members:
+                path=bundle/member.name
+                with path.open('wb') as out: out.write(archive.extractfile(member).read())
+                path.chmod(0o700 if member.name in ['relay-node-bootstrap.sh','relay-node-linux-amd64'] else 0o600)
+        manifest=dict(line.split('=',1) for line in (bundle/'manifest.env').read_text().splitlines() if '=' in line)
+        for filename,field in [('relay-node-bootstrap.sh','BOOTSTRAP_SCRIPT_SHA256'),('relay-node-linux-amd64','ARTIFACT_SHA256'),('config.env','BOOTSTRAP_CONFIG_SHA256')]:
+            if digest((bundle/filename).read_bytes())!=manifest.get(field): raise Failure('ARTIFACT_CHECKSUM_FAILURE')
+        if manifest.get('ARCHITECTURE')!='amd64' or manifest.get('ENROLLMENT_ID')!=self.op['operation']['new']['node_id']: raise Failure('BUNDLE_IDENTITY_MISMATCH')
+    def execute(self):
+        self.phase('1/10 PRECHECK');self.host.precheck(self.identity)
+        capabilities=self.client.request('GET',BASE+'/capabilities')
+        if capabilities.get('operation_protocol')!=1 or capabilities.get('official_amd64_sha256')!=OFFICIAL_SHA256: raise Failure('PANEL_MIGRATION_CAPABILITY_REQUIRED')
+        self.client.request('GET','/node/config',headers=self.host.old_auth(self.identity))
+        self.phase('2/10 SNAPSHOT')
+        try: self.op=self.client.start(self.identity,self.probes)
+        except ApiFailure as e:
+            if str(e)!='PANEL_UNAVAILABLE': raise
+            recovered=self.client.request('GET','/admin'+BASE+'/current',token=self.client.admin)
+            if recovered['operation']['old']!={'home_group_id':self.identity['identity_group_id'],'node_id':self.identity['node_id']} or recovered['operation']['state']!='PREPARED': raise Failure('START_RESULT_UNKNOWN_REQUIRES_ADMIN_RECOVERY')
+            self.op=recovered
+        private_json(self.work/'operation.json',self.op)
+        self.phase('3/10 VERIFIED DOWNLOAD');self.prepare_bundle(self.client.bundle(self.op))
+        if digest((self.work/'bundle/relay-node-linux-amd64').read_bytes())==OFFICIAL_SHA256: raise Failure('CURRENT_CANDIDATE_ARTIFACT_REQUIRED')
+        self.host.run([str(self.work/'bundle/relay-node-linux-amd64'),'--version'])
+        self.client.action(self.op,'preflight') # Real public forwarding before old service stop.
+        self.host.capture(self.work)
+        self.phase('4/10 STOP OLD');self.destructive=True;self.host.stop_and_detach()
+        self.phase('5/10 INSTALL CURRENT');self.host.install(self.work)
+        self.phase('6/10 RESTORE MEMBERSHIPS')
+        self.wait_action('restore',{'NODE_OFFLINE','NODE_STATUS_MISSING','NEW_CREDENTIAL_NOT_ACTIVE','PUBLIC_IPV4_NOT_REPORTED'})
+        self.phase('7/10 WAIT CONFIG + LISTENERS + REAL FORWARDING')
+        deadline=time.monotonic()+self.timeout
+        while True:
+            self.phase('8/10 FINALIZE DECISION');self.commit_unknown=True
+            try:
+                current=self.client.action(self.op,'finalize')
+                if current['state']=='SUCCESS': break
+            except ApiFailure as e:
+                try: current=self.client.status(self.op)
+                except ApiFailure: raise Failure('FINALIZE_RESULT_UNKNOWN_KEEP_NEW_RUNTIME') from None
+                if current['state'] in ['COMMITTED','SUCCESS']:
+                    if current['state']=='SUCCESS': break
+                    if time.monotonic()>=deadline: raise Failure('COMMITTED_DNS_NEEDS_ATTENTION_KEEP_NEW_RUNTIME') from None
+                    time.sleep(1);continue
+                self.commit_unknown=False
+                if str(e) not in {'NODE_OFFLINE','NODE_STATUS_MISSING','PUBLIC_IPV4_NOT_REPORTED','EFFECTIVE_CONFIG_NOT_CONVERGED','LISTENERS_NOT_READY','FORWARDING_PROBE_FAILED','FORWARDING_MARKER_MISMATCH'} or time.monotonic()>=deadline: raise
+                time.sleep(1)
+        self.phase('9/10 DNS READBACK VERIFIED');self.phase('10/10 SUCCESS')
+        self.host.complete(self.op,self.work)
+        emit('SUCCESS','Migration completed. Stop here; no next Node is started.')
+    def recover_failure(self):
+        if self.commit_unknown:
+            emit('NEEDS_ATTENTION','Finalize outcome is committed or unknown. Keep new runtime; never restore old identity. Protected recovery directory: '+str(self.work));return
+        if self.destructive:
+            self.phase('ROLLBACK');self.host.rollback(self.work)
+        if self.op:
+            self.wait_action('rollback',{'NODE_OFFLINE','NODE_STATUS_MISSING'})
+        self.phase('ROLLED_BACK' if self.destructive else 'FAILED_PRECHECK')
+        # Failed attempts retain protected backup for explicit recovery; no automatic next Node.
+
+def main():
+    parser=argparse.ArgumentParser(description='Official v1.3.0 one-time SINGLE Node upgrade, no batch support')
+    parser.add_argument('--panel-url',required=True);parser.add_argument('--identity-group-id',type=int,required=True)
+    parser.add_argument('--node-id',required=True);parser.add_argument('--probe-file');parser.add_argument('--auth-fd',type=int)
+    parser.add_argument('--recover-work',type=pathlib.Path,help='Explicit protected work directory from a failed/interrupted invocation; queries durable status first')
+    args=parser.parse_args();identity={'identity_group_id':args.identity_group_id,'node_id':args.node_id}
+    host=Host();receipt=host.path('/opt/relay-node/legacy-v130-upgrade-completed.json')
+    if receipt.exists():
+        safe_path(receipt)
+        if json.loads(receipt.read_text())['old_node_id']==args.node_id: emit('ALREADY_MIGRATED','This old identity is already retired.');return
+    if args.auth_fd is not None:
+        secret=json.load(os.fdopen(args.auth_fd));admin=secret['admin_token'];probes=secret['probes']
+    else:
+        with open('/dev/tty','r+') as tty:
+            tty.write('Panel administrator username: ');tty.flush();username=tty.readline().strip()
+        password=getpass.getpass('Panel administrator password: ')
+        client=Client(args.panel_url,None)
+        admin=client.request('POST','/auth/login',{'username':username,'password':password})['token'];password=None
+        if not args.probe_file: raise Failure('EXPLICIT_FORWARDING_PROBE_FILE_REQUIRED')
+        probes=json.loads(pathlib.Path(args.probe_file).read_text())
+    client=Client(args.panel_url,admin)
+    root=host.path('/var/lib/relay-panel/legacy-v130-upgrade');safe_path(root);root.mkdir(mode=0o700,parents=True,exist_ok=True);root.chmod(0o700)
+    lock=os.open(root/'host.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError: raise Failure('MIGRATION_IN_PROGRESS') from None
+    work=args.recover_work or root/str(os.getpid())
+    safe_path(work)
+    if work.parent.resolve()!=root.resolve(): raise Failure('RECOVERY_DIRECTORY_OUT_OF_SCOPE')
+    if not args.recover_work: work.mkdir(mode=0o700)
+    runner=Runner(client,host,identity,probes,work)
+    if args.recover_work: runner.commit_unknown=True
+    def interrupted(signum,frame): raise Failure('INTERRUPTED')
+    signal.signal(signal.SIGTERM,interrupted);signal.signal(signal.SIGINT,interrupted)
+    try:
+        if args.recover_work:
+            runner.op=json.loads((work/'operation.json').read_text())
+            if runner.op['operation']['old']!={'home_group_id':args.identity_group_id,'node_id':args.node_id}: raise Failure('RECOVERY_IDENTITY_MISMATCH')
+            current=client.status(runner.op) # Failure here keeps both host and operation untouched.
+            if current['state'] in ['COMMITTED','SUCCESS']:
+                if current['state']=='COMMITTED': client.action(runner.op,'finalize')
+                host.complete(runner.op,work);emit('SUCCESS','Explicit committed-operation recovery completed. Stop here.')
+            else:
+                runner.commit_unknown=False
+                runner.destructive=(work/'snapshot.json').exists()
+                runner.recover_failure()
+        else: runner.execute()
+    except (Failure,OSError,ValueError,subprocess.SubprocessError) as failure:
+        emit('FAILED',str(failure) if isinstance(failure,Failure) else type(failure).__name__)
+        try: runner.recover_failure()
+        except (Failure,OSError,ValueError,subprocess.SubprocessError): emit('RECOVERY_REQUIRED','Protected recovery state retained; stop here: '+str(work))
+        raise SystemExit(1)
+    finally:
+        os.close(lock)
+        # Host-wide exclusion lasts for this invocation only. Failed backups are retained.
+        with contextlib.suppress(FileNotFoundError): (root/'host.lock').unlink()
+        with contextlib.suppress(OSError): root.rmdir()
+
+if __name__=='__main__': main()
+PY

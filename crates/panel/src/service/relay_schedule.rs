@@ -783,6 +783,9 @@ async fn run_scheduler_once_with(
 ) -> Result<(), RelayScheduleError> {
     let snapshot = list_schedules(db).await?;
     for schedule in snapshot {
+        if crate::service::legacy_upgrade::group_held(db, schedule.group_id).await? {
+            continue;
+        }
         let Some(occurrence) = (match occurrence_for(&schedule, now) {
             Ok(value) => value,
             Err(error) => {
