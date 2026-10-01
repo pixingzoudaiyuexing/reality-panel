@@ -122,8 +122,16 @@ uninstall_panel() {
             warn "Account relay-panel ownership is unproven; preserved the existing account."
         fi
         if [ "$group_owned" -eq 1 ]; then
+            # Some userdel implementations already remove the private group.
+            # Recheck identity/membership before deleting any remaining group.
+            group_entry="$(getent group relay-panel || true)"
+            IFS=: read -r group_name group_password group_gid group_members <<< "$group_entry"
+            if [ -z "$group_entry" ]; then
+                :
+            elif [ "$group_gid" != "$owned_gid" ] || [ -n "$group_members" ]; then
+                warn "Group relay-panel ownership changed; preserved the current group."
             # Preserve a group still used by another account, including primary GIDs.
-            if getent passwd | awk -F: -v gid="$owned_gid" '$4 == gid { found=1 } END { exit !found }'; then
+            elif getent passwd | awk -F: -v gid="$owned_gid" '$4 == gid { found=1 } END { exit !found }'; then
                 warn "Group relay-panel is still used by another account; preserved shared group."
             else
                 groupdel relay-panel || fail "Owned group cleanup failed; retry uninstall."
