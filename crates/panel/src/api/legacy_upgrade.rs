@@ -236,6 +236,7 @@ pub async fn step(
         "preflight" if op.state == "PREPARED" => upgrade::probe(&state, &op).await.map(|()| op),
         "restore" => upgrade::restore(&state, raw, op).await,
         "finalize" => upgrade::finalize(&state, raw, op).await,
+        "rollback-begin" => upgrade::begin_rollback(&state, raw, op).await,
         "rollback" => upgrade::abort(&state, raw, op).await,
         _ => Err("INVALID_MIGRATION_ACTION".into()),
     };

@@ -37,7 +37,7 @@ impl PgRepository {
                 return Ok(false);
             }
             for group in &r.memberships {
-                let present: Option<i64> = sqlx::query_scalar("SELECT 1 FROM node_reuse_bindings WHERE reusing_group_id=$1 AND home_group_id=$2 AND node_id=$3").bind(group).bind(r.new.home_group_id).bind(&r.new.node_id).fetch_optional(&mut *tx).await?;
+                let present: Option<i32> = sqlx::query_scalar("SELECT 1 FROM node_reuse_bindings WHERE reusing_group_id=$1 AND home_group_id=$2 AND node_id=$3").bind(group).bind(r.new.home_group_id).bind(&r.new.node_id).fetch_optional(&mut *tx).await?;
                 if present.is_none() {
                     return Ok(false);
                 }

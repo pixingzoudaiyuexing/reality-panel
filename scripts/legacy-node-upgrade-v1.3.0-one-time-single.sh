@@ -244,7 +244,8 @@ class Runner:
         if self.destructive:
             self.phase('ROLLBACK');self.host.rollback(self.work)
         if self.op:
-            self.wait_action('rollback',{'NODE_OFFLINE','NODE_STATUS_MISSING'})
+            self.client.action(self.op,'rollback-begin')
+            self.wait_action('rollback',{'NODE_OFFLINE','NODE_STATUS_MISSING','OLD_RUNTIME_NOT_RECOVERED','FORWARDING_PROBE_FAILED','FORWARDING_MARKER_MISMATCH'})
         self.phase('ROLLED_BACK' if self.destructive else 'FAILED_PRECHECK')
         # Failed attempts retain protected backup for explicit recovery; no automatic next Node.
 

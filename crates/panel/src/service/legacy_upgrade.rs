@@ -47,6 +47,8 @@ pub struct Operation {
     pub created_by: i64,
     pub created_at: String,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub rollback_after: Option<String>,
 }
 impl Operation {
     pub fn active(&self) -> bool {
@@ -339,6 +341,7 @@ pub async fn start(
         created_by: admin,
         created_at: chrono::Utc::now().to_rfc3339(),
         last_error: None,
+        rollback_after: None,
     };
     store(state.db.as_ref(), previous.map(|(raw, _)| raw), &op).await?;
     drop(_preference);
@@ -726,6 +729,40 @@ pub async fn finalize(
     Ok(op)
 }
 
+pub async fn begin_rollback(
+    state: &AppState,
+    raw: String,
+    mut op: Operation,
+) -> Result<Operation, String> {
+    let _gate = MUTATIONS.write().await;
+    if op.committed() {
+        return Err("POINT_OF_NO_RETURN".into());
+    }
+    if matches!(op.state.as_str(), "ROLLED_BACK" | "ROLLBACK_PENDING") {
+        return Ok(op);
+    }
+    op.rollback_after = Some(chrono::Utc::now().to_rfc3339());
+    op.state = "ROLLBACK_PENDING".into();
+    store(state.db.as_ref(), Some(raw), &op).await?;
+    Ok(op)
+}
+
+fn recovered_report(op: &Operation, observed: &serde_json::Value) -> Result<(), String> {
+    let after = op
+        .rollback_after
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .ok_or("ROLLBACK_NOT_REQUESTED")?;
+    let seen = observed["last_seen"]
+        .as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .ok_or("OLD_RUNTIME_NOT_RECOVERED")?;
+    if seen <= after {
+        return Err("OLD_RUNTIME_NOT_RECOVERED".into());
+    }
+    Ok(())
+}
+
 pub async fn abort(state: &AppState, raw: String, mut op: Operation) -> Result<Operation, String> {
     let _gate = MUTATIONS.write().await;
     if op.committed() {
@@ -735,6 +772,16 @@ pub async fn abort(state: &AppState, raw: String, mut op: Operation) -> Result<O
         return Ok(op);
     }
     let observed = status(state.db.as_ref(), &op.old).await?;
+    recovered_report(&op, &observed)?;
+    if !state
+        .node_connections
+        .config_online_node_ids(op.old.home_group_id)
+        .await
+        .contains(&op.old.node_id)
+    {
+        return Err("OLD_RUNTIME_NOT_RECOVERED".into());
+    }
+    probe(state, &op).await?;
     if ip(&observed).as_deref() != Some(&op.public_ipv4) {
         return Err("OLD_RUNTIME_NOT_RECOVERED".into());
     }
@@ -871,9 +918,27 @@ pub(crate) mod tests {
         );
         assert_eq!(ready(&state, &op).await.unwrap_err(), "NODE_OFFLINE");
         let (raw, op) = load(state.db.as_ref()).await.unwrap().unwrap();
-        let completed = abort(&state, raw, op).await.unwrap();
-        assert_eq!(completed.state, "ROLLED_BACK");
-        assert!(!group_held(state.db.as_ref(), 10).await.unwrap());
+        assert_eq!(
+            abort(&state, raw.clone(), op.clone()).await.unwrap_err(),
+            "ROLLBACK_NOT_REQUESTED"
+        );
+        let waiting = begin_rollback(&state, raw, op).await.unwrap();
+        assert_eq!(waiting.state, "ROLLBACK_PENDING");
+        let before = state
+            .db
+            .get("node_status:10:OLD_NODE")
+            .await
+            .unwrap()
+            .unwrap();
+        let observed = serde_json::from_str(&before).unwrap();
+        assert_eq!(
+            recovered_report(&waiting, &observed).unwrap_err(),
+            "OLD_RUNTIME_NOT_RECOVERED"
+        );
+        assert!(
+            group_held(state.db.as_ref(), 10).await.unwrap(),
+            "keep singleton held until real old recovery"
+        );
         assert_eq!(
             state
                 .db
@@ -882,22 +947,8 @@ pub(crate) mod tests {
                 .unwrap(),
             vec![20]
         );
-        assert!(state
-            .db
-            .get("node_status:10:OLD_NODE")
-            .await
-            .unwrap()
-            .is_some());
-        let (raw, op) = load(state.db.as_ref()).await.unwrap().unwrap();
-        assert_eq!(abort(&state, raw, op).await.unwrap().state, "ROLLED_BACK");
-        assert_eq!(
-            start(&state, 1, completed.old, probes(), OFFICIAL_AMD64_SHA256)
-                .await
-                .unwrap()
-                .state,
-            "PREPARED",
-            "new explicit operation after rollback is allowed"
-        );
+        let fresh = serde_json::json!({"last_seen":chrono::Utc::now().to_rfc3339()});
+        assert!(recovered_report(&waiting, &fresh).is_ok());
     }
     #[tokio::test]
     async fn unknown_artifact_and_incomplete_forwarding_probes_do_not_start() {

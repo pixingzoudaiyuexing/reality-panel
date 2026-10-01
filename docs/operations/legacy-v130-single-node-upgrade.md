@@ -45,7 +45,7 @@ Carrier references remain on the old identity until this verification succeeds. 
 
 ## Failure and explicit recovery
 
-Before commit, the runner restores the exact managed host snapshot and starts the old service, then cleans/revokes the staged identity. Old memberships and Carrier references were never removed. A failed host rollback keeps the operation active and retains a root-only recovery directory. Failure backups may contain old runtime credentials and must remain protected; successful completion removes the operation token, bundle/bootstrap private material and old backup.
+Before commit, the runner restores the exact managed host snapshot and starts the old service. It requests a fresh recovery-report barrier, waits for an old-identity report after that barrier plus an actual online connection and public forwarding PASS, then cleans/revokes the staged identity. A stale pre-stop report cannot complete rollback. Old memberships and Carrier references were never removed. A failed host rollback keeps the operation active and retains a root-only recovery directory. Failure backups may contain old runtime credentials and must remain protected; successful completion removes the operation token, bundle/bootstrap private material and old backup.
 
 After an interrupted invocation, explicitly run the same command with:
 
