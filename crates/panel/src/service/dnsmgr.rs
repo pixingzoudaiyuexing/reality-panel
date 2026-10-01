@@ -2450,6 +2450,34 @@ async fn persist_resolution(
                 .map_err(|e| {
                     crate::db::error::DbError::Other(sqlx::Error::Protocol(e.to_string()))
                 })?;
+            // An absent pre-transaction default must roll back to DELETE even when the
+            // Group has no fallback IP. Periodic refresh must preserve the journal action.
+            if crate::service::relay_preference::dns_transaction_authorizes(
+                db,
+                rule_id,
+                rule.sni
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase()
+                    .as_str(),
+                DEFAULT_LINE_KEY,
+                "DELETE",
+                None,
+            )
+            .await?
+            {
+                persist_carrier_desired(db, rule_id).await?;
+                project_line_desired(db, rule_id, DEFAULT_LINE_KEY, "DELETE", None)
+                    .await
+                    .map_err(|error| {
+                        crate::db::error::DbError::Other(sqlx::Error::Protocol(format!(
+                            "journal default deletion projection failed: {error:?}"
+                        )))
+                    })?;
+                return Ok(());
+            }
             if pref.active_routing_mode
                 == Some(crate::service::relay_preference::RoutingMode::Carrier)
             {

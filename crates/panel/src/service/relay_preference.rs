@@ -4080,9 +4080,17 @@ async fn begin_rollback(
             .iter()
             .map(|record| record.rule_id)
             .collect::<Vec<_>>();
-        if let Err(schedule_error) =
-            crate::service::dnsmgr::schedule_group_eligible(db, group_id, &rule_ids).await
-        {
+        let scheduled =
+            if preference.transaction_kind == Some(RelayTransactionKind::RoutingModeTransition) {
+                schedule_transaction_records(db, &preference.dns_records, true)
+                    .await
+                    .map_err(|_| "routing journal scheduling failed".to_string())
+            } else {
+                crate::service::dnsmgr::schedule_group_eligible(db, group_id, &rule_ids)
+                    .await
+                    .map_err(|error| error.to_string())
+            };
+        if let Err(schedule_error) = scheduled {
             preference.state = RelayPreferencePhase::FailedManualIntervention;
             preference.rollback_error = Some("ROLLBACK_SCHEDULING_FAILED".into());
             store_preference(db, group_id, &preference).await?;
@@ -4423,7 +4431,12 @@ async fn recheck_carrier_commit_targets(
     group_id: i64,
     preference: &RelayPreferenceState,
 ) -> Result<Result<(), &'static str>, RelayPreferenceError> {
-    let Some(pending) = preference.pending_carrier_policy.as_ref() else {
+    let pending = preference.pending_carrier_policy.as_ref().or_else(|| {
+        (preference.transaction_kind == Some(RelayTransactionKind::RoutingModeTransition)
+            && preference.pending_routing_mode == Some(RoutingMode::Carrier))
+        .then_some(&preference.carrier_policy)
+    });
+    let Some(pending) = pending else {
         return Ok(Err("CARRIER_TRANSACTION_INCOMPLETE"));
     };
     let bindings = carrier_bindings_by_line(pending);
@@ -4568,7 +4581,14 @@ async fn finalize_routing_mode_transition(
         }
     }
 
-    if matches!(target_mode, RoutingMode::Carrier | RoutingMode::Normal) {
+    if target_mode == RoutingMode::Carrier {
+        // Carrier follows configured membership and last-known IPs, including offline Nodes.
+        if let Err(error) =
+            recheck_carrier_commit_targets(db, node_connections, group_id, &preference).await?
+        {
+            return begin_rollback(db, group_id, preference, String::new(), error).await;
+        }
+    } else if target_mode == RoutingMode::Normal {
         let Some(target_node_id) = preference.pending_node_id.clone() else {
             return begin_rollback(
                 db,

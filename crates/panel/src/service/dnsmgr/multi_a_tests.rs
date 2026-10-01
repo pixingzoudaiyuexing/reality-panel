@@ -981,4 +981,109 @@ mod multi_a_acceptance {
             preference::RelayPreferencePhase::FailedRolledBack
         );
     }
+    async fn fresh_normal_group(f: &Fixture) {
+        f.db.set(
+            "relay_preference:10",
+            &serde_json::to_string(&RelayPreferenceState {
+                active_routing_mode: Some(RoutingMode::Normal),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_carrier_activation_commits_last_known_ips_of_offline_members() {
+        let f = fixture().await;
+        fresh_normal_group(&f).await;
+        let p = policy("n2", &[("unicom", "n2"), ("unicom", "n6")]);
+        let mut body = serde_json::to_value(&p).unwrap();
+        body["mode"] = json!("carrier");
+        assert_eq!(
+            http(&f, "PUT", "/groups/10/routing-apply", body).await.0,
+            axum::http::StatusCode::OK
+        );
+        reconcile_group(&f, 10).await;
+        let saved = preference::load_preference(f.db.as_ref(), 10)
+            .await
+            .unwrap();
+        assert_eq!(saved.state, preference::RelayPreferencePhase::Idle);
+        assert_eq!(saved.active_routing_mode, Some(RoutingMode::Carrier));
+        assert_eq!(actual_values(&f, "op1", "default"), expected(&["2.2.2.2"]));
+        assert_eq!(
+            actual_values(&f, "op1", "unicom"),
+            expected(&["2.2.2.2", "6.6.6.6"])
+        );
+    }
+
+    #[tokio::test]
+    async fn carrier_activation_rollback_preserves_journal_deletes_without_group_ip() {
+        let f = fixture().await;
+        fresh_normal_group(&f).await;
+        f.mock
+            .state
+            .records
+            .lock()
+            .unwrap()
+            .push(record("other-line", "A", "8.8.8.8", "telecom"));
+        let p = policy("n2", &[("unicom", "n2"), ("unicom", "n6")]);
+        let mut body = serde_json::to_value(&p).unwrap();
+        body["mode"] = json!("carrier");
+        assert_eq!(
+            http(&f, "PUT", "/groups/10/routing-apply", body).await.0,
+            axum::http::StatusCode::OK
+        );
+        for sync in f.db.list_dns_record_syncs_for_rule(100).await.unwrap() {
+            reconcile_one(f.db.as_ref(), sync, &f.mock.client).await;
+        }
+        assert_eq!(actual_values(&f, "op1", "default"), expected(&["2.2.2.2"]));
+        assert_eq!(
+            actual_values(&f, "op1", "unicom"),
+            expected(&["2.2.2.2", "6.6.6.6"])
+        );
+        // Telemetry drifts after provider writes; commit must reject the old target.
+        f.db.set(&format!("node_status:{}:n2", f.anchor),
+            &json!({"node_id":"n2","public_ipv4":"9.9.9.9","public_ipv4_reported":true,"last_seen":"2000-01-01T00:00:00Z"}).to_string()).await.unwrap();
+        preference::finalize_switching_group_for_test(f.db.as_ref(), &f.connections, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            preference::load_preference(f.db.as_ref(), 10)
+                .await
+                .unwrap()
+                .state,
+            preference::RelayPreferencePhase::RollingBack
+        );
+        // Exercise the same refresh that runs before every real worker tick.
+        refresh_all_desired(f.db.as_ref()).await.unwrap();
+        let default =
+            f.db.find_dns_record_sync(100, DEFAULT_LINE_KEY)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(default.desired_action, "DELETE");
+        assert_eq!(default.state, "PENDING");
+        assert!(default.expected_value.is_none());
+        for _ in 0..2 {
+            refresh_all_desired(f.db.as_ref()).await.unwrap();
+            reconcile_group(&f, 10).await;
+        }
+        let saved = preference::load_preference(f.db.as_ref(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            saved.state,
+            preference::RelayPreferencePhase::FailedRolledBack
+        );
+        assert_eq!(
+            saved.last_error.as_deref(),
+            Some("CARRIER_DEFAULT_PUBLIC_IPV4_CHANGED")
+        );
+        assert_eq!(saved.active_routing_mode, Some(RoutingMode::Normal));
+        assert!(actual_values(&f, "op1", "default").is_empty());
+        assert!(actual_values(&f, "op1", "unicom").is_empty());
+        assert_eq!(actual_values(&f, "op1", "telecom"), expected(&["8.8.8.8"]));
+    }
 }
