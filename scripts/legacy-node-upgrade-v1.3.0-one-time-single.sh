@@ -169,6 +169,8 @@ class Host:
             destination=self.path('/opt/relay-node/certificates')
             destination.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
             shutil.copytree(certificates,destination,symlinks=True)
+        # Release old managed listeners before Bootstrap checks port ownership.
+        self.run(['nginx','-t']);self.run(['systemctl','reload','nginx'])
     def install(self, work):
         self.run(['bash',str(work/'bundle/relay-node-bootstrap.sh'),str(work/'bundle/config.env'),str(work/'bundle/relay-node-linux-amd64'),str(work/'bootstrap-transaction')])
     def rollback(self, work):
