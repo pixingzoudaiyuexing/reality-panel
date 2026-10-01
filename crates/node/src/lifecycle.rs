@@ -1214,8 +1214,67 @@ where
     if !completion_attempt(receipt_path, cleanup, report)? {
         return Ok(false);
     }
+    let receipt: UninstallCompletionReceipt = serde_json::from_slice(
+        &std::fs::read(receipt_path).map_err(|error| format!("read uninstall receipt: {error}"))?,
+    )
+    .map_err(|error| format!("parse uninstall receipt: {error}"))?;
+    if receipt.cleanup_success {
+        cleanup_uninstalled_credentials(root, &receipt.job)?;
+    }
     cleanup_uninstall_finalizer(root, receipt_path, systemctl)?;
     Ok(true)
+}
+
+fn cleanup_uninstalled_credentials(root: &Path, job: &UninstallJob) -> Result<(), String> {
+    let PersistedNodeAuth::PermanentCredential {
+        credential_id,
+        secret_file,
+    } = &job.auth
+    else {
+        return Ok(());
+    };
+    if job.node_id.is_empty()
+        || !job
+            .node_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Ok(());
+    }
+    let managed_dir = Path::new("/var/lib/relay-panel/node-claims").join(&job.node_id);
+    if secret_file != &managed_dir.join("node-credential.secret") {
+        return Ok(());
+    }
+    let descriptor_path = rooted(root, crate::config::RUNTIME_AUTH_DESCRIPTOR);
+    match std::fs::read(&descriptor_path) {
+        Ok(raw) => {
+            #[derive(Deserialize)]
+            struct Descriptor {
+                node_id: String,
+                credential_id: String,
+                secret_file: PathBuf,
+            }
+            let descriptor: Descriptor = serde_json::from_slice(&raw)
+                .map_err(|error| format!("parse runtime auth during uninstall: {error}"))?;
+            if descriptor.node_id == job.node_id {
+                // An old receipt may finish after a newer installation.
+                if descriptor.credential_id != *credential_id
+                    || descriptor.secret_file != *secret_file
+                {
+                    return Ok(());
+                }
+                remove_if_exists(&descriptor_path)?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("read runtime auth during uninstall: {error}")),
+    }
+    let managed_dir = rooted(root, &managed_dir.to_string_lossy());
+    match std::fs::remove_dir_all(&managed_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove uninstalled credential state: {error}")),
+    }
 }
 
 fn run_checked(program: &str, args: &[&str]) -> Result<(), String> {
@@ -1638,6 +1697,72 @@ mod tests {
         assert!(acknowledged);
         assert!(!receipt_path.exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn acknowledged_uninstall_cleans_only_its_own_credential_state() {
+        for replaced in [false, true] {
+            let root = test_dir(if replaced {
+                "uninstall-new-auth"
+            } else {
+                "uninstall-old-auth"
+            });
+            let state_dir = root.join("var/lib/relay-panel/node-claims/node-b");
+            std::fs::create_dir_all(&state_dir).unwrap();
+            std::fs::write(state_dir.join("node-credential.secret"), b"test-secret").unwrap();
+            let descriptor = root.join("var/lib/relay-panel/node-claims/runtime-auth.json");
+            std::fs::write(
+                &descriptor,
+                serde_json::json!({
+                    "node_id":"node-b", "identity_group_id":3,
+                    "credential_id":if replaced {"new-credential"} else {"old-credential"},
+                    "secret_file":"/var/lib/relay-panel/node-claims/node-b/node-credential.secret"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let receipt_path = uninstall_receipt_path(&root, "operation-credential");
+            write_private_json(
+                &receipt_path,
+                &UninstallCompletionReceipt {
+                    job: UninstallJob {
+                        operation_id: "operation-credential".into(),
+                        node_id: "node-b".into(),
+                        panel_url: "https://panel.example".into(),
+                        auth: PersistedNodeAuth::PermanentCredential {
+                            credential_id: "old-credential".into(),
+                            secret_file:
+                                "/var/lib/relay-panel/node-claims/node-b/node-credential.secret"
+                                    .into(),
+                        },
+                    },
+                    cleanup_success: true,
+                    destructive_started: true,
+                    message: "complete".into(),
+                },
+            )
+            .unwrap();
+            assert!(!finalizer_tick(
+                &root,
+                &receipt_path,
+                || panic!("cleanup must not repeat"),
+                |_, _, _, _| Err("Panel unavailable".into()),
+                |_, _| Ok(())
+            )
+            .unwrap());
+            assert!(state_dir.exists() && descriptor.exists());
+            assert!(finalizer_tick(
+                &root,
+                &receipt_path,
+                || panic!("cleanup must not repeat"),
+                |_, _, _, _| Ok(()),
+                |_, _| Ok(())
+            )
+            .unwrap());
+            assert_eq!(state_dir.exists(), replaced);
+            assert_eq!(descriptor.exists(), replaced);
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
