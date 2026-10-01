@@ -511,9 +511,18 @@ pub async fn restore(
     }
     state
         .db
-        .rename_node_pool_node(op.new.home_group_id, &op.new.node_id, &op.display_name)
+        .register_node_pool_identity(op.new.home_group_id, &op.new.node_id)
         .await
         .map_err(|_| "DATABASE_ERROR")?;
+    if state
+        .db
+        .rename_node_pool_node(op.new.home_group_id, &op.new.node_id, &op.display_name)
+        .await
+        .map_err(|_| "DATABASE_ERROR")?
+        != 1
+    {
+        return Err("NODE_POOL_RESTORE_FAILED".into());
+    }
     state
         .node_connections
         .broadcast_all(r#"{"type":"config_changed"}"#)
@@ -993,6 +1002,82 @@ pub(crate) mod tests {
                         crate::db::repo::NodeReuseBindingCreateRejection::ActiveCredentialMissing))));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn restore_registers_new_pool_record_before_restoring_display_name() {
+        use std::sync::Arc;
+        let mut state = fixture().await;
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(crate::db::schema::SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::db::schema::run_migrations(&pool).await.unwrap();
+        for group in [10_i64, 20] {
+            sqlx::query(
+                "INSERT INTO device_groups(id,name,group_type,token,uid) VALUES (?,?,'in',?,1)",
+            )
+            .bind(group)
+            .bind(format!("group-{group}"))
+            .bind(format!("token-{group}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO node_credentials(credential_id,home_group_id,node_id,generation,verifier_format,verifier_version,verifier_data,activated_at) VALUES ('new-credential',20,'NEW_NODE',1,'rp-node-sha256',1,?,datetime('now'))")
+            .bind(vec![8_u8;32]).execute(&pool).await.unwrap();
+        state.db = Arc::new(crate::db::sqlite_repo::SqliteRepository::new(pool));
+        let op = Operation {
+            id: "restore-name".into(),
+            state: "PREPARED".into(),
+            old: ConcreteNodeIdentity {
+                home_group_id: 10,
+                node_id: "OLD_NODE".into(),
+            },
+            new: ConcreteNodeIdentity {
+                home_group_id: 20,
+                node_id: "NEW_NODE".into(),
+            },
+            public_ipv4: "192.0.2.2".into(),
+            display_name: "Node B".into(),
+            memberships: vec![10],
+            listeners: serde_json::json!([]),
+            routing: vec![],
+            dns: vec![],
+            probes: vec![],
+            token_hash: "test".into(),
+            created_by: 1,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            last_error: None,
+            rollback_after: None,
+        };
+        let raw = serde_json::to_string(&op).unwrap();
+        state.db.set(SINGLETON, &raw).await.unwrap();
+        state.db.set("node_status:20:NEW_NODE",&serde_json::json!({"last_seen":chrono::Utc::now().to_rfc3339(),"public_ipv4":"192.0.2.2","public_ipv4_reported":true,"config_protocol_version":10,"verified_concrete_node":true}).to_string()).await.unwrap();
+        let (_conn, _rx) = state
+            .node_connections
+            .register(20, Some("NEW_NODE".into()))
+            .await;
+        assert!(state.db.list_node_pool_records().await.unwrap().is_empty());
+        let restored = restore(&state, raw, op).await.unwrap();
+        assert_eq!(restored.state, "RESTORED");
+        let records = state.db.list_node_pool_records().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_id, "NEW_NODE");
+        assert_eq!(records[0].display_name, "Node B");
+        assert_eq!(
+            state
+                .db
+                .list_reusing_group_ids_for_node(20, "NEW_NODE")
+                .await
+                .unwrap(),
+            vec![10]
+        );
     }
 
     #[tokio::test]
