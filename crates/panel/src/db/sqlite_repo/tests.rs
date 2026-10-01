@@ -31,7 +31,12 @@ async fn pool_retirement_revokes_and_prevents_registry_recreation() {
         .set_verified_node_status_if_active(anchor.id, &id, "pool-old", "{}")
         .await
         .unwrap());
-    assert!(db.retire_pool_native_node(anchor.id, &id).await.unwrap());
+    assert!(
+        db.retire_pool_native_node(anchor.id, &id)
+            .await
+            .unwrap()
+            .retired
+    );
     assert!(!db
         .set_verified_node_status_if_active(anchor.id, &id, "pool-old", "{}")
         .await

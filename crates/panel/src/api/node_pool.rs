@@ -927,6 +927,21 @@ mod tests {
             .await
             .unwrap();
         node_pool::list_nodes(state.db.as_ref()).await.unwrap();
+        let routing =
+            serde_json::to_string(&crate::service::relay_preference::RelayPreferenceState {
+                preferred_node_id: Some(id.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        state.db.set("relay_preference:20", &routing).await.unwrap();
+        let failover =
+            serde_json::to_string(&crate::service::relay_failover::RelayFailoverPolicy {
+                excluded_failed_node_ids: [id.to_string()].into(),
+                last_to_node_id: Some(id.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        state.db.set("relay_failover:20", &failover).await.unwrap();
         sqlx::query(
             "CREATE TRIGGER fail_pool_retire BEFORE DELETE ON node_pool_nodes
                      BEGIN SELECT RAISE(ABORT, 'injected pool deletion error'); END",
@@ -934,12 +949,26 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let parsed = ReuseEligibleNodeId::parse(id).unwrap();
-        assert!(state
-            .db
-            .retire_pool_native_node(anchor.id, &parsed)
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/admin/node-pool/nodes/{}/{id}", anchor.id))
+            .header("Authorization", format!("Bearer {}", jwt(1, true)))
+            .body(Body::empty())
+            .unwrap();
+        let response = crate::api::routes()
+            .with_state(state.clone())
+            .oneshot(request)
             .await
-            .is_err());
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            state.db.get("relay_preference:20").await.unwrap(),
+            Some(routing)
+        );
+        assert_eq!(
+            state.db.get("relay_failover:20").await.unwrap(),
+            Some(failover)
+        );
         assert!(state
             .db
             .find_active_node_credential_for_runtime("rollback-credential")
@@ -959,6 +988,101 @@ mod tests {
             .unwrap()
             .iter()
             .any(|node| node.node_id == id));
+    }
+
+    #[tokio::test]
+    async fn retirement_preserves_same_node_id_in_another_identity() {
+        let (state, pool) = fixture().await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-token")
+            .await
+            .unwrap();
+        let id = "POOL_COLLISION";
+        active_credential(&pool, anchor.id, id, "pool-collision").await;
+        active_credential(&pool, 10, id, "legacy-collision").await;
+        state.db.register_node_pool_identity(10, id).await.unwrap();
+        crate::service::node_reuse::create_binding(state.db.as_ref(), 20, anchor.id, id)
+            .await
+            .unwrap();
+        node_pool::list_nodes(state.db.as_ref()).await.unwrap();
+        let routing =
+            serde_json::to_string(&crate::service::relay_preference::RelayPreferenceState {
+                preferred_node_id: Some(id.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        for group in [10, 20] {
+            state
+                .db
+                .set(&format!("relay_preference:{group}"), &routing)
+                .await
+                .unwrap();
+        }
+        assert!(node_pool::retire_node(&state, anchor.id, id)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            state.db.get("relay_preference:10").await.unwrap(),
+            Some(routing)
+        );
+        assert_eq!(
+            crate::service::relay_preference::load_preference(state.db.as_ref(), 20)
+                .await
+                .unwrap()
+                .preferred_node_id,
+            None
+        );
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime("legacy-collision")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn retirement_preserves_ambiguous_routing_for_a_surviving_member() {
+        let (state, pool) = fixture().await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-token")
+            .await
+            .unwrap();
+        let id = "POOL_SHARED_ID";
+        active_credential(&pool, anchor.id, id, "pool-shared").await;
+        active_credential(&pool, 10, id, "legacy-shared").await;
+        sqlx::query("INSERT INTO node_reuse_bindings(reusing_group_id,home_group_id,node_id) VALUES (20,?,?),(20,10,?)")
+            .bind(anchor.id).bind(id).bind(id).execute(&pool).await.unwrap();
+        node_pool::list_nodes(state.db.as_ref()).await.unwrap();
+        let routing =
+            serde_json::to_string(&crate::service::relay_preference::RelayPreferenceState {
+                preferred_node_id: Some(id.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        state.db.set("relay_preference:20", &routing).await.unwrap();
+        assert_eq!(
+            node_pool::retire_node(&state, anchor.id, id).await.unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            state.db.get("relay_preference:20").await.unwrap(),
+            Some(routing)
+        );
+        assert!(state
+            .db
+            .find_node_reuse_binding(20, anchor.id, id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .db
+            .find_node_reuse_binding(20, 10, id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

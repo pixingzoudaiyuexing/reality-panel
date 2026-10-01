@@ -37,7 +37,7 @@ const RETRY_BACKOFF_SECONDS: [u64; 4] = [5, 10, 20, 30];
 /// automation policies. The Panel has one process, matching the existing KVS
 /// and Relay Preference locking model.
 static AUTOMATIC_POLICY_MUTATION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-static FAILOVER_MUTATION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+pub(crate) static FAILOVER_MUTATION_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static GROUP_RUNTIMES: Lazy<StdMutex<HashMap<i64, Arc<GroupRuntime>>>> =
     Lazy::new(|| StdMutex::new(HashMap::new()));
 static PROBE_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(MAX_CONCURRENT_PROBES));

@@ -17,7 +17,7 @@ pub const RELAY_SWITCH_SCHEDULES_KEY: &str = "relay_switch_schedules:v1";
 const RELAY_SCHEDULE_TICK: Duration = Duration::from_secs(30);
 const RELAY_SCHEDULE_GRACE: chrono::Duration = chrono::Duration::seconds(120);
 
-static RELAY_SCHEDULE_MUTATION_LOCK: Lazy<tokio::sync::Mutex<()>> =
+pub(crate) static RELAY_SCHEDULE_MUTATION_LOCK: Lazy<tokio::sync::Mutex<()>> =
     Lazy::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

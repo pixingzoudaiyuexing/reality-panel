@@ -78,7 +78,7 @@ impl NodePoolRepository for SqliteRepository {
         &self,
         group_id: i64,
         node_id: &crate::node_identity::ReuseEligibleNodeId,
-    ) -> Result<bool, DbError> {
+    ) -> Result<NodePoolRetirement, DbError> {
         let mut tx = self.pool.begin().await?;
         // Own the SQLite writer slot before inspecting any identity state.
         sqlx::query("UPDATE device_groups SET name = name WHERE id = ?")
@@ -95,7 +95,75 @@ impl NodePoolRepository for SqliteRepository {
         .await?;
         if exists.is_none() {
             tx.rollback().await?;
-            return Ok(false);
+            return Ok(NodePoolRetirement::default());
+        }
+        let memberships: Vec<i64> = sqlx::query_scalar(
+            "SELECT reusing_group_id FROM node_reuse_bindings WHERE home_group_id=? AND node_id=?",
+        )
+        .bind(group_id)
+        .bind(node_id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut routing_groups = Vec::new();
+        let mut needs_attention = false;
+        for business_group in memberships {
+            // Bare Node IDs in routing must continue to name any surviving
+            // identity in this Group. Never erase another identity's policy.
+            let collision: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 WHERE EXISTS (SELECT 1 FROM node_reuse_bindings
+                    WHERE reusing_group_id=? AND home_group_id<>? AND node_id=?)
+                 OR EXISTS (SELECT 1 FROM node_pool_nodes WHERE identity_group_id=? AND node_id=?)
+                 OR EXISTS (SELECT 1 FROM node_credentials WHERE home_group_id=? AND node_id=?
+                    AND activated_at IS NOT NULL AND revoked_at IS NULL)
+                 OR EXISTS (SELECT 1 FROM kvs WHERE key=?)",
+            )
+            .bind(business_group)
+            .bind(group_id)
+            .bind(node_id.as_str())
+            .bind(business_group)
+            .bind(node_id.as_str())
+            .bind(business_group)
+            .bind(node_id.as_str())
+            .bind(format!("node_status:{business_group}:{}", node_id.as_str()))
+            .fetch_optional(&mut *tx)
+            .await?;
+            if collision.is_some() {
+                needs_attention = true;
+            } else {
+                routing_groups.push(business_group);
+            }
+        }
+        let mut routing_keys = routing_groups
+            .iter()
+            .flat_map(|id| {
+                [
+                    format!("relay_preference:{id}"),
+                    format!("relay_failover:{id}"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        if !routing_groups.is_empty() {
+            routing_keys.push(crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY.into());
+        }
+        for key in routing_keys {
+            if let Some(raw) = sqlx::query_scalar::<_, String>("SELECT value FROM kvs WHERE key=?")
+                .bind(&key)
+                .fetch_optional(&mut *tx)
+                .await?
+            {
+                let (updated, attention) = crate::service::node_pool::retire_routing_value(
+                    &key,
+                    &raw,
+                    node_id.as_str(),
+                    &routing_groups,
+                )?;
+                needs_attention |= attention;
+                sqlx::query("UPDATE kvs SET value=? WHERE key=?")
+                    .bind(updated)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         sqlx::query(
@@ -156,7 +224,10 @@ impl NodePoolRepository for SqliteRepository {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(NodePoolRetirement {
+            retired: true,
+            needs_attention,
+        })
     }
 
     async fn set_verified_node_status_if_active(

@@ -305,53 +305,63 @@ pub async fn retire_node(
         return Ok(None);
     }
 
-    // Existing policy helpers remove every direct Node ID reference. Do this
-    // before the atomic identity retirement so a routing failure leaves an
-    // intact, retryable Node instead of a deleted Node with live references.
-    let mut group_ids = state
-        .db
-        .list_groups(&ResourceScope::All)
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|group| group.id)
-        .collect::<Vec<_>>();
-    group_ids.push(group_id);
-    let mut needs_attention = false;
-    for id in group_ids {
-        needs_attention |= crate::service::relay_preference::retire_node_assignment(
-            state.db.as_ref(),
-            id,
-            node_id.as_str(),
-        )
-        .await?;
-        crate::service::relay_failover::remove_excluded_node(
-            state.db.as_ref(),
-            id,
-            node_id.as_str(),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        crate::service::relay_schedule::delete_schedules_for_node(
-            state.db.as_ref(),
-            id,
-            node_id.as_str(),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    }
+    let _authority = crate::service::relay_failover::lock_automatic_policy().await;
+    let _preference = crate::service::relay_preference::RELAY_PREFERENCE_MUTATION_LOCK
+        .lock()
+        .await;
+    let _schedule = crate::service::relay_schedule::RELAY_SCHEDULE_MUTATION_LOCK
+        .lock()
+        .await;
+    let _failover = crate::service::relay_failover::FAILOVER_MUTATION_LOCK
+        .lock()
+        .await;
     let retired = state
         .db
         .retire_pool_native_node(group_id, &node_id)
         .await
         .map_err(|e| e.to_string())?;
-    if retired {
+    if retired.retired {
         state
             .node_connections
             .close_node(group_id, node_id.as_str())
             .await;
     }
-    Ok(retired.then_some(needs_attention))
+    Ok(retired.retired.then_some(retired.needs_attention))
+}
+
+/// Transform a stored routing value inside the identity retirement transaction.
+/// Group IDs have already been resolved from exact, unambiguous memberships.
+pub(crate) fn retire_routing_value(
+    key: &str,
+    raw: &str,
+    node_id: &str,
+    group_ids: &[i64],
+) -> Result<(String, bool), DbError> {
+    use crate::service::{relay_failover, relay_preference, relay_schedule};
+    let transform = || -> Result<(String, bool), serde_json::Error> {
+        if key == relay_schedule::RELAY_SWITCH_SCHEDULES_KEY {
+            let mut schedules: Vec<relay_schedule::RelaySchedule> = serde_json::from_str(raw)?;
+            schedules.retain(|schedule| {
+                !group_ids.contains(&schedule.group_id) || schedule.target_node_id != node_id
+            });
+            return Ok((serde_json::to_string(&schedules)?, false));
+        }
+        if key.starts_with(relay_preference::RELAY_PREFERENCE_KEY_PREFIX) {
+            let mut preference: relay_preference::RelayPreferenceState = serde_json::from_str(raw)?;
+            let attention = relay_preference::retire_node_assignment(&mut preference, node_id);
+            return Ok((serde_json::to_string(&preference)?, attention));
+        }
+        let mut policy: relay_failover::RelayFailoverPolicy = serde_json::from_str(raw)?;
+        policy.excluded_failed_node_ids.remove(node_id);
+        if policy.last_from_node_id.as_deref() == Some(node_id) {
+            policy.last_from_node_id = None;
+        }
+        if policy.last_to_node_id.as_deref() == Some(node_id) {
+            policy.last_to_node_id = None;
+        }
+        Ok((serde_json::to_string(&policy)?, false))
+    };
+    transform().map_err(|error| DbError::Other(sqlx::Error::Protocol(error.to_string())))
 }
 
 pub async fn list_nodes(db: &dyn Repository) -> Result<Vec<PoolNode>, DbError> {

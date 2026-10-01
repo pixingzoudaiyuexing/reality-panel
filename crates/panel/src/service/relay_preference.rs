@@ -25,7 +25,7 @@ const NODE_UNINSTALL_GATE_PREFIX: &str = "node_uninstall_gate:";
 /// The Panel is a single process. Serializing short preference mutations keeps
 /// initialization, manual switching, DNS finalization, and deletion coherent
 /// without adding database or distributed lock machinery.
-static RELAY_PREFERENCE_MUTATION_LOCK: Lazy<tokio::sync::Mutex<()>> =
+pub(crate) static RELAY_PREFERENCE_MUTATION_LOCK: Lazy<tokio::sync::Mutex<()>> =
     Lazy::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1633,24 +1633,8 @@ pub async fn remove_node_assignment(
 /// Admin retirement may target a permanently offline Node while a previous
 /// DNS switch is still unresolved. Stop that pending switch locally and leave
 /// provider state for manual inspection; never keep a deleted Node as a target.
-pub async fn retire_node_assignment(
-    db: &dyn Repository,
-    group_id: i64,
-    node_id: &str,
-) -> Result<bool, String> {
-    let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
-    if db
-        .get(&preference_key(group_id))
-        .await
-        .map_err(|e| e.to_string())?
-        .is_none()
-    {
-        return Ok(false);
-    }
-    let mut preference = load_preference(db, group_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    let needs_attention = active_transaction_references_node(&preference, node_id);
+pub(crate) fn retire_node_assignment(preference: &mut RelayPreferenceState, node_id: &str) -> bool {
+    let needs_attention = active_transaction_references_node(preference, node_id);
     if needs_attention {
         preference.state = RelayPreferencePhase::FailedManualIntervention;
         preference.last_error =
@@ -1661,11 +1645,8 @@ pub async fn retire_node_assignment(
         preference.transaction_kind = None;
         preference.switch_source = None;
     }
-    remove_node_references(&mut preference, node_id);
-    store_preference(db, group_id, &preference)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(needs_attention)
+    remove_node_references(preference, node_id);
+    needs_attention
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

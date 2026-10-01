@@ -683,6 +683,12 @@ pub struct NodePoolRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Default)]
+pub struct NodePoolRetirement {
+    pub retired: bool,
+    pub needs_attention: bool,
+}
+
 #[async_trait]
 pub trait NodePoolRepository: Send + Sync {
     async fn list_node_pool_records(&self) -> Result<Vec<NodePoolRecord>, DbError>;
@@ -704,7 +710,7 @@ pub trait NodePoolRepository: Send + Sync {
         &self,
         group_id: i64,
         node_id: &ReuseEligibleNodeId,
-    ) -> Result<bool, DbError>;
+    ) -> Result<NodePoolRetirement, DbError>;
     /// Persist a verified status only while that exact credential remains
     /// current. Serializes with retirement to reject in-flight reports.
     async fn set_verified_node_status_if_active(
