@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { Form } from 'antd';
 import { CamouflageFormFields, DnsStatusCell, ProxyProtocolFormField } from './Rules';
-import type { NodeStatus, RealityDiagnosis, RuleDnsStatus } from '../api/types';
+import type { NodeStatus, PoolNode, RealityDiagnosis, RuleDnsStatus } from '../api/types';
 import {
   camouflageCertificateMessage,
   compactRealityStatus,
@@ -233,6 +233,21 @@ describe('camouflage observed status', () => {
     expect(result.state).toBe('active');
     expect(result.activeCount).toBe(2);
     expect(result.totalCount).toBe(2);
+  });
+
+  it('uses exact Pool memberships to include active and failed business-group Relays', () => {
+    const pool: Pick<PoolNode, 'identity_group_id' | 'node_id' | 'memberships'>[] = [
+      { identity_group_id: 1, node_id: 'node-a', memberships: [{ group_id: 10, group_name: 'z1', native: false }] },
+      { identity_group_id: 1, node_id: 'node-b', memberships: [{ group_id: 10, group_name: 'z1', native: false }] },
+    ];
+    const active = node({}, { group_id: 1 });
+    const failed = node({ site_status: 'failed', certificate_status: 'failed' }, {
+      group_id: 1, node_id: 'node-b', active_listener_rule_ids: [],
+    });
+    expect(deriveCamouflageStatus(rule, [active], pool)).toMatchObject({ state: 'active', totalCount: 1 });
+    expect(deriveCamouflageStatus(rule, [active, failed], pool)).toMatchObject({ state: 'partial', totalCount: 2, activeCount: 1 });
+    expect(deriveCamouflageStatus(rule, [active, failed], [])).toMatchObject({ state: 'unknown', totalCount: 0 });
+    expect(deriveCamouflageStatus(rule, [active], [{ ...pool[0], identity_group_id: 99 }])).toMatchObject({ state: 'unknown', totalCount: 0 });
   });
 
   it('reports preparing when zero Relays are active and one is preparing', () => {

@@ -96,6 +96,7 @@ function initialResponse(url: string) {
   if (url === '/rules?owner_uid=1') return Promise.resolve(ok([rule]));
   if (url === '/groups') return Promise.resolve(ok([group]));
   if (url === '/admin/users') return Promise.resolve(ok([]));
+  if (url === '/admin/node-pool/nodes') return Promise.resolve(ok([]));
   if (url === '/nodes') return Promise.resolve(ok([]));
   if (url === '/admin/rules/dns-status') return Promise.resolve(ok([dnsPropagated]));
   return Promise.reject(new Error(`unexpected ${url}`));
@@ -180,6 +181,7 @@ describe('Rules lightweight background refresh', () => {
 
     expect(mockGet).toHaveBeenCalledWith('/rules?owner_uid=1');
     expect(mockGet).toHaveBeenCalledWith('/nodes');
+    expect(mockGet).toHaveBeenCalledWith('/admin/node-pool/nodes');
     expect(mockGet).toHaveBeenCalledWith('/admin/rules/dns-status');
     expect(mockGet).not.toHaveBeenCalledWith('/groups');
     expect(mockGet).not.toHaveBeenCalledWith('/admin/users');
@@ -247,19 +249,41 @@ describe('Rules lightweight background refresh', () => {
       if (url === '/rules?owner_uid=1') return slowRules;
       if (url === '/nodes') return slowNodes;
       if (url === '/admin/rules/dns-status') return slowDns;
+      if (url === '/admin/node-pool/nodes') return Promise.resolve(ok([]));
       return Promise.reject(new Error(`unexpected ${url}`));
     });
 
     await flush(10000);
     expect(document.querySelector('.ant-spin-spinning')).toBeNull();
-    expect(mockGet).toHaveBeenCalledTimes(3);
+    expect(mockGet).toHaveBeenCalledTimes(4);
     await flush(10000);
-    expect(mockGet).toHaveBeenCalledTimes(3);
+    expect(mockGet).toHaveBeenCalledTimes(4);
 
     resolveRules(ok([rule]));
     resolveNodes(ok([]));
     resolveDns(ok([dnsPropagated]));
     await flush();
+  });
+
+  it('shows observed Pool-native business-group status and clears it when membership reads fail', async () => {
+    const currentNode = { group_id: 1, node_id: 'pool-node', online: true, active_listener_rule_ids: [rule.id],
+      camouflage_sites: [{ site_id: 'site', sni: rule.sni, site_status: 'active', certificate_status: 'active' }] };
+    let poolFailure = false;
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/rules?owner_uid=1') return Promise.resolve(ok([{ ...rule, camouflage_enabled: true }]));
+      if (url === '/nodes') return Promise.resolve(ok([currentNode]));
+      if (url === '/admin/node-pool/nodes') return poolFailure
+        ? Promise.reject(new Error('membership unavailable'))
+        : Promise.resolve(ok([{ identity_group_id: 1, node_id: 'pool-node', memberships: [{ group_id: group.id }] }]));
+      return initialResponse(url);
+    });
+    render(<Rules />);
+    await flush();
+    const routeStatus = () => Array.from(document.querySelectorAll('.rp-rule-health-item')).find(item => item.textContent?.includes('routeDetails'));
+    expect(routeStatus()).toHaveAttribute('data-raw-state', 'OK');
+    poolFailure = true;
+    await flush(10000);
+    expect(routeStatus()).toHaveAttribute('data-raw-state', 'UNKNOWN');
   });
 
   it('preserves page, selection and an open edit modal during background refresh', async () => {

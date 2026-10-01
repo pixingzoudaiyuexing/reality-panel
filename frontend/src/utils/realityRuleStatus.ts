@@ -2,6 +2,7 @@ import type {
   CamouflageSiteStatus,
   ForwardRule,
   NodeStatus,
+  PoolNode,
   RealityDiagnosis,
   RuleDnsStatus,
 } from '../api/types';
@@ -136,13 +137,16 @@ export function dnsOwnershipDisplay(ownership: RuleDnsStatus['ownership'], t: (k
 export function deriveCamouflageStatus(
   rule: Pick<ForwardRule, 'id' | 'camouflage_enabled' | 'sni' | 'device_group_in'>,
   nodes: NodeStatus[],
+  poolNodes: Pick<PoolNode, 'identity_group_id' | 'node_id' | 'memberships'>[] = [],
 ): CamouflageAggregateStatus {
   if (!rule.camouflage_enabled) {
     return { state: 'disabled', nodes: [], activeCount: 0, totalCount: 0 };
   }
   const sni = normalizeSni(rule.sni);
   const nodeViews: CamouflageNodeStatusView[] = nodes
-    .filter(node => node.group_id === rule.device_group_in)
+    .filter(node => node.group_id === rule.device_group_in || poolNodes.some(pool =>
+      pool.identity_group_id === node.group_id && pool.node_id === node.node_id
+      && pool.memberships.some(membership => membership.group_id === rule.device_group_in)))
     .map(node => {
       const certificate = (node.camouflage_sites ?? []).find(site => site.sni === sni);
       const listenerState: CamouflageNodeStatusView['listenerState'] = node.active_listener_rule_ids == null

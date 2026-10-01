@@ -5,7 +5,7 @@ import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, SharedGroupSummary, RestartResponse, ReapplyResponse, NodeStatus, RuleDnsStatus } from '../api/types';
+import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, SharedGroupSummary, RestartResponse, ReapplyResponse, NodeStatus, PoolNode, RuleDnsStatus } from '../api/types';
 import { MIN_AUTO_RESTART_MINUTES } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { formatBytes } from '../utils/format';
@@ -246,6 +246,7 @@ export default function Rules() {
   const [sharedLoadFailed, setSharedLoadFailed] = useState(false);
   const [users, setUsers] = useState<User[]>([]);
   const [nodeStatuses, setNodeStatuses] = useState<NodeStatus[]>([]);
+  const [poolNodes, setPoolNodes] = useState<PoolNode[]>([]);
   const [dnsStatuses, setDnsStatuses] = useState<RuleDnsStatus[]>([]);
   const [dnsRetrying, setDnsRetrying] = useState<number | null>(null);
   // v1.0.7: a regular user's own traffic quota (admins read each owner's quota
@@ -317,6 +318,12 @@ export default function Rules() {
           setNodeStatuses([]);
         }
         try {
+          const pool = await api.get<unknown, ApiEnvelope<PoolNode[]>>('/admin/node-pool/nodes');
+          setPoolNodes(pool.code === 0 ? pool.data || [] : []);
+        } catch {
+          setPoolNodes([]);
+        }
+        try {
           const dns = await api.get<unknown, ApiEnvelope<RuleDnsStatus[]>>('/admin/rules/dns-status');
           setDnsStatuses(dns.data || []);
         } catch {
@@ -326,6 +333,7 @@ export default function Rules() {
       } else {
         setUsers([]);
         setNodeStatuses([]);
+        setPoolNodes([]);
         setDnsStatuses([]);
         // v1.0.7: a regular user only ever sees their own rules, so one /user/me
         // read gives the quota needed to flag all of them. Non-fatal on failure.
@@ -372,10 +380,11 @@ export default function Rules() {
     backgroundRefreshInFlight.current = true;
     try {
       if (isAdmin) {
-        const [rulesResult, nodesResult, dnsResult] = await Promise.allSettled([
+        const [rulesResult, nodesResult, dnsResult, poolResult] = await Promise.allSettled([
           api.get<unknown, ApiEnvelope<ForwardRule[]>>(scopedRulesUrl),
           api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes'),
           api.get<unknown, ApiEnvelope<RuleDnsStatus[]>>('/admin/rules/dns-status'),
+          api.get<unknown, ApiEnvelope<PoolNode[]>>('/admin/node-pool/nodes'),
         ]);
         if (rulesResult.status === 'fulfilled' && rulesResult.value.code === 0) {
           setRules(rulesResult.value.data || []);
@@ -386,6 +395,7 @@ export default function Rules() {
         if (nodesResult.status === 'fulfilled' && nodesResult.value.code === 0) {
           setNodeStatuses(nodesResult.value.data || []);
         }
+        setPoolNodes(poolResult.status === 'fulfilled' && poolResult.value.code === 0 ? poolResult.value.data || [] : []);
         if (dnsResult.status === 'fulfilled' && dnsResult.value.code === 0) {
           setDnsStatuses(dnsResult.value.data || []);
         }
@@ -942,7 +952,7 @@ export default function Rules() {
       );
     }
 
-    const view = deriveCamouflageStatus(r, nodeStatuses);
+    const view = deriveCamouflageStatus(r, nodeStatuses, poolNodes);
     const dns = dnsStatusByRule.get(r.id);
     const summary = compactRealityStatus(r, dns, view);
     const summaryDisplay = compactRealityStatusDisplay(summary, t);
