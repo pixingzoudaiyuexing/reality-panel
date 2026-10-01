@@ -5,6 +5,7 @@ import api from '../api/client';
 import type { ApiEnvelope, DeviceGroup, User, NodeDisplayRow as NodeStatus, PoolNode } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
+import { RelayPreferencePanel } from '../components/nodes/RelayPreferencePanel';
 import { GroupPoolPicker } from '../components/nodes/GroupPoolPicker';
 import { poolNodeName, poolNodeKey } from '../components/nodes/poolNodeName';
 
@@ -333,11 +334,15 @@ export default function Groups() {
 
   const expandedRowRender = (g: DeviceGroup) => {
     const groupNodes = nodesByGroup(g.id);
+    const routingPanel = isAdmin && g.group_type === 'in'
+      ? <RelayPreferencePanel key={groupNodes.map(node => poolNodeKey(node as unknown as PoolNode)).sort().join('|')} groupId={g.id} t={t} />
+      : null;
     if (groupNodes.length === 0) {
       return (
         <div style={{ padding: '8px 0', color: 'var(--rp-text-tertiary)', fontSize: 13 }}>
           {t('noNodesInGroup')}
           {isAdmin && g.group_type === 'in' && <Button size="small" type="link" icon={<ApiOutlined />} style={{ marginLeft: 12 }} onClick={() => openPool(g)}>{t('addNode')}</Button>}
+          {routingPanel}
         </div>
       );
     }
@@ -367,6 +372,7 @@ export default function Groups() {
             } }] : []),
           ]}
         />
+        {routingPanel}
       </div>
     );
   };

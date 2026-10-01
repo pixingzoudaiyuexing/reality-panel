@@ -31,6 +31,7 @@ beforeEach(() => {
   mockUseAuth.mockReturnValue({ isAdmin: true });
   mockGet.mockImplementation((url: string) => {
     if (url === '/groups') return Promise.resolve(ok([group()]));
+    if (url.endsWith('/relay-preference')) return Promise.resolve(ok(null));
     return Promise.resolve(ok([]));
   });
 });
@@ -47,6 +48,7 @@ describe('group list credential boundary', () => {
         credential_ready: true, migration_required: false, auth_reload_supported: true,
         memberships: [{ group_id: 1, group_name: 'g1', native: false }],
       }]));
+      if (url.endsWith('/relay-preference')) return Promise.resolve(ok(null));
       return Promise.resolve(ok([]));
     });
     const { container } = render(<Groups />);
@@ -241,4 +243,52 @@ describe('inbound and outbound connect host behavior', () => {
     await waitFor(() => expect(mockPut).toHaveBeenCalled());
     expect(mockPut.mock.calls[0]).toEqual(['/groups/1', { connect_host: '198.51.100.20' }]);
   });
+});
+
+
+describe('Pool-native group routing access', () => {
+  it('opens existing routing controls for the business group without Home status rows', async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/groups') return Promise.resolve(ok([group()]));
+      if (url === '/nodes') return Promise.resolve(ok([]));
+      if (url === '/admin/node-pool/nodes') return Promise.resolve(ok([{
+        identity_group_id: 10, node_id: 'POOL_NATIVE', pool_native: true,
+        display_name: 'Pool relay', public_ipv4: '203.0.113.50', online: true,
+        node_version: '1.3.0', credential_ready: true, migration_required: false,
+        memberships: [{ group_id: 1, group_name: 'g1', native: false }],
+      }]));
+      if (url === '/groups/1/relay-preference') return Promise.resolve(ok({
+        group_id: 1, active_routing_mode: 'normal', pending_routing_mode: null,
+        routing_mode_conflict: [], normal_default_node_id: 'POOL_NATIVE',
+        preferred_node_id: 'POOL_NATIVE', preferred_node_public_ipv4: '203.0.113.50',
+        pending_node_id: null, state: 'idle', started_at: null,
+        last_error: null, rollback_error: null, dns_records: [],
+        nodes: [{ node_id: 'POOL_NATIVE', public_ipv4: '203.0.113.50',
+          online: true, ready: true, ready_reasons: [], preferred: true }],
+      }));
+      return Promise.resolve(ok([]));
+    });
+    const { container } = render(<Groups />);
+    await screen.findByText('1/1');
+    fireEvent.click(container.querySelector('.ant-table-row-expand-icon')!);
+    expect(await screen.findByRole('tab', { name: 'routingFunctionCarrier' })).toBeInTheDocument();
+    expect(screen.getByText('Pool relay')).toBeInTheDocument();
+    expect(mockGet).toHaveBeenCalledWith('/groups/1/relay-preference');
+    expect(mockGet).not.toHaveBeenCalledWith('/groups/10/relay-preference');
+  });
+});
+
+
+it('does not expose administrative routing controls to a regular group owner', async () => {
+  mockUseAuth.mockReturnValue({ isAdmin: false });
+  mockGet.mockImplementation((url: string) => {
+    if (url === '/groups') return Promise.resolve(ok([group()]));
+    if (url === '/nodes/shared') return Promise.resolve(ok([{ group_id: 1, node_id: 'OWN', online: true }]));
+    return Promise.resolve(ok([]));
+  });
+  const { container } = render(<Groups />);
+  await screen.findByText('1/1');
+  fireEvent.click(container.querySelector('.ant-table-row-expand-icon')!);
+  expect(screen.queryByRole('tab', { name: 'routingFunctionCarrier' })).not.toBeInTheDocument();
+  expect(mockGet).not.toHaveBeenCalledWith('/groups/1/relay-preference');
 });
