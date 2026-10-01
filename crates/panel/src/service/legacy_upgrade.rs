@@ -235,14 +235,49 @@ pub async fn start(
         return Err("RELATED_LIFECYCLE_OPERATION_ACTIVE".into());
     }
 
-    let preview = super::node_reuse::preview_effective_config_for_node(
-        state.db.as_ref(),
-        old.home_group_id,
-        &old.node_id,
-    )
-    .await
-    .map_err(|_| "EFFECTIVE_CONFIG_UNAVAILABLE")?;
-    if preview.listeners.iter().any(|l| {
+    // Match the old runtime's authenticated delivery scope. A legacy Bearer
+    // report receives Home-only config; inactive or unused reuse authority
+    // must not turn its migration snapshot into new business memberships.
+    let (source_group_ids, listeners, has_conflicts) =
+        if observed["verified_concrete_node"].as_bool() == Some(true) {
+            let preview = super::node_reuse::preview_effective_config_for_node(
+                state.db.as_ref(),
+                old.home_group_id,
+                &old.node_id,
+            )
+            .await
+            .map_err(|_| "EFFECTIVE_CONFIG_UNAVAILABLE")?;
+            (
+                preview.source_group_ids,
+                preview.listeners,
+                !preview.conflicts.is_empty(),
+            )
+        } else {
+            let config = super::node_config::build_node_config_for_node(
+                state.db.as_ref(),
+                old.home_group_id,
+                Some(&old.node_id),
+            )
+            .await
+            .map_err(|_| "EFFECTIVE_CONFIG_UNAVAILABLE")?;
+            let listeners = config
+                .listeners
+                .into_iter()
+                .map(|l| super::node_reuse::EffectiveConfigPreviewListener {
+                    source_group_id: old.home_group_id,
+                    rule_id: l.rule_id,
+                    port: l.port,
+                    protocol: l.protocol,
+                    node_transport: l.node_transport,
+                    sni: l.sni,
+                    camouflage_required: l.camouflage_required,
+                    send_proxy_protocol: l.send_proxy_protocol,
+                    target_count: l.targets.len(),
+                })
+                .collect::<Vec<_>>();
+            (vec![old.home_group_id], listeners, false)
+        };
+    if listeners.iter().any(|l| {
         l.protocol != relay_shared::protocol::Protocol::Tcp
             || !matches!(
                 l.node_transport,
@@ -252,10 +287,10 @@ pub async fn start(
     }) {
         return Err("SUPPORTED_HTTP_PROBE_LISTENERS_REQUIRED".into());
     }
-    if !preview.conflicts.is_empty() || preview.listeners.is_empty() {
+    if has_conflicts || listeners.is_empty() {
         return Err("EXPECTED_LISTENERS_REQUIRED".into());
     }
-    let wanted: BTreeSet<i64> = preview.listeners.iter().map(|l| l.rule_id).collect();
+    let wanted: BTreeSet<i64> = listeners.iter().map(|l| l.rule_id).collect();
     let supplied: BTreeSet<i64> = probes.iter().map(|p| p.rule_id).collect();
     if wanted != supplied
         || probes.len() != supplied.len()
@@ -282,8 +317,7 @@ pub async fn start(
         .ensure_node_pool_system_group(admin, &uuid::Uuid::new_v4().to_string())
         .await
         .map_err(|_| "DATABASE_ERROR")?;
-    let memberships: Vec<i64> = preview
-        .source_group_ids
+    let memberships: Vec<i64> = source_group_ids
         .iter()
         .copied()
         .filter(|g| *g != anchor.id)
@@ -333,7 +367,7 @@ pub async fn start(
         public_ipv4: address,
         display_name: record.display_name,
         memberships,
-        listeners: listener_snapshot(&preview.listeners)?,
+        listeners: listener_snapshot(&listeners)?,
         routing,
         dns: vec![],
         probes,
@@ -881,6 +915,86 @@ pub(crate) mod tests {
             })
             .collect()
     }
+    #[tokio::test]
+    async fn legacy_bearer_snapshot_preserves_only_delivered_home_rules() {
+        // Both no credential and an unused exact credential still deliver
+        // Home-only config when the authenticated report is legacy Bearer.
+        for revoke in [true, false] {
+            let state = fixture().await;
+            let old = ConcreteNodeIdentity {
+                home_group_id: 10,
+                node_id: "OLD_NODE".into(),
+            };
+            if revoke {
+                state
+                    .db
+                    .revoke_node_credential(
+                        "legacy-credential",
+                        10,
+                        &crate::node_identity::ReuseEligibleNodeId::parse("OLD_NODE").unwrap(),
+                        1,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let raw = state
+                .db
+                .get("node_status:10:OLD_NODE")
+                .await
+                .unwrap()
+                .unwrap();
+            let mut report: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            report["verified_concrete_node"] = false.into();
+            state
+                .db
+                .set("node_status:10:OLD_NODE", &report.to_string())
+                .await
+                .unwrap();
+            let delivered = super::super::node_config::build_node_config_for_node(
+                state.db.as_ref(),
+                10,
+                Some("OLD_NODE"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(delivered.listeners.len(), 1);
+            assert_eq!(delivered.listeners[0].rule_id, 100);
+            assert_eq!(
+                state
+                    .db
+                    .list_reusing_group_ids_for_node(10, "OLD_NODE")
+                    .await
+                    .unwrap(),
+                vec![20]
+            );
+            let op = start(
+                &state,
+                1,
+                old,
+                vec![Probe {
+                    rule_id: 100,
+                    path: "/marker".into(),
+                    expected_marker: "G100".into(),
+                }],
+                OFFICIAL_AMD64_SHA256,
+            )
+            .await
+            .unwrap();
+            assert_eq!(op.state, "PREPARED");
+            assert_eq!(op.memberships, vec![10]);
+            let listeners = op.listeners.as_array().unwrap();
+            assert_eq!(listeners.len(), 1);
+            assert_eq!(listeners[0]["rule_id"], 100);
+            assert_eq!(listeners[0]["source_group_id"], 10);
+            if revoke {
+                assert!(matches!(super::super::node_reuse::preview_effective_config_for_node(
+                    state.db.as_ref(), 10, "OLD_NODE").await,
+                    Err(super::super::node_reuse::NodeReuseServiceError::AdmissionRejected(
+                        crate::db::repo::NodeReuseBindingCreateRejection::ActiveCredentialMissing))));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn snapshot_multi_group_single_active_and_rollback() {
         let state = fixture().await;
