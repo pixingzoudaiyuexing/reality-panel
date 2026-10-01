@@ -80,6 +80,8 @@ struct DurableUninstallOperation {
     saw_disconnect: bool,
     cleanup_confirmed: bool,
     #[serde(default)]
+    host_cleanup_pending: bool,
+    #[serde(default)]
     destructive_started: bool,
     panel_cleanup_complete: bool,
     result_audited: bool,
@@ -92,6 +94,7 @@ impl DurableUninstallOperation {
             actor_id: operation.actor_id,
             saw_disconnect: false,
             cleanup_confirmed: false,
+            host_cleanup_pending: false,
             destructive_started: false,
             panel_cleanup_complete: false,
             result_audited: false,
@@ -1345,6 +1348,9 @@ pub struct UninstallResultRequest {
     pub operation_id: String,
     pub node_id: String,
     pub success: bool,
+    /// Current finalizers acknowledge runtime cleanup before retiring local retry material.
+    #[serde(default)]
+    pub host_cleanup_pending: bool,
     #[serde(default)]
     pub destructive_started: bool,
     pub message: String,
@@ -1421,6 +1427,7 @@ pub async fn receive_uninstall_result(
         durable.operation.updated_at = now();
         durable.operation.message = request.message.clone();
         durable.cleanup_confirmed = request.success;
+        durable.host_cleanup_pending = request.host_cleanup_pending;
         durable.destructive_started |= request.destructive_started;
         if !currently_connected {
             durable.saw_disconnect = true;
@@ -1469,7 +1476,11 @@ pub async fn receive_uninstall_result(
         );
     }
     match finalize_durable_uninstall(&state, operation_id).await {
-        Ok(operation) if operation.status == OperationStatus::Success => success(operation),
+        Ok(operation)
+            if operation.status == OperationStatus::Success || request.host_cleanup_pending =>
+        {
+            success(operation)
+        }
         Ok(_) => response::<()>(
             StatusCode::SERVICE_UNAVAILABLE,
             503,
@@ -1556,7 +1567,7 @@ async fn finalize_durable_uninstall(
             state.node_operations.restore_uninstall(&durable);
             return Ok(durable.operation());
         }
-        if !durable.cleanup_confirmed || !durable.saw_disconnect {
+        if !durable.cleanup_confirmed || !durable.saw_disconnect || durable.host_cleanup_pending {
             state.node_operations.restore_uninstall(&durable);
             return Ok(durable.operation());
         }
@@ -2626,9 +2637,33 @@ mod tests {
             operation_id: operation.id.clone(),
             node_id: "node-a".into(),
             success: true,
+            host_cleanup_pending: false,
             destructive_started: true,
             message: "cleanup complete".into(),
         };
+        let mut pending = request();
+        pending.host_cleanup_pending = true;
+        let accepted =
+            receive_uninstall_result(State(restarted.clone()), headers.clone(), Json(pending))
+                .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let awaiting = load_durable_uninstall(&restarted, &operation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(awaiting.operation.status, OperationStatus::Verifying);
+        assert!(!awaiting.panel_cleanup_complete);
+        // Losing the Node connection must not turn a pending local-finalizer phase into Success.
+        record_uninstall_disconnect(&restarted, 1, "node-a").await;
+        assert_eq!(
+            load_durable_uninstall(&restarted, &operation.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .operation
+                .status,
+            OperationStatus::Verifying
+        );
         let response =
             receive_uninstall_result(State(restarted.clone()), headers.clone(), Json(request()))
                 .await;
@@ -2684,6 +2719,7 @@ mod tests {
             operation_id: operation.id.clone(),
             node_id: "node-a".into(),
             success: true,
+            host_cleanup_pending: false,
             destructive_started: true,
             message: "cleanup complete; OpenList ownership unknown, preserved".into(),
         };
@@ -2734,6 +2770,7 @@ mod tests {
             operation_id,
             node_id: node_id.into(),
             success: true,
+            host_cleanup_pending: false,
             destructive_started: true,
             message: "cleanup complete".into(),
         };
@@ -2854,6 +2891,7 @@ mod tests {
                 operation_id: before.id.clone(),
                 node_id: "node-a".into(),
                 success: false,
+                host_cleanup_pending: false,
                 destructive_started: false,
                 message: "finalizer installation failed".into(),
             }),
@@ -2885,6 +2923,7 @@ mod tests {
                 operation_id: after.id.clone(),
                 node_id: "node-b".into(),
                 success: false,
+                host_cleanup_pending: false,
                 destructive_started: true,
                 message: "cleanup will retry".into(),
             }),

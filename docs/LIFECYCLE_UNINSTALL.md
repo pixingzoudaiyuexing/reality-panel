@@ -28,7 +28,15 @@ The persistent finalizer/receipt and authentication material remain available
 until cleanup is confirmed and the Panel acknowledges identity retirement.
 Partial cleanup remains retryable; failure is not converted to success. A failed
 finalizer systemd reload retains its executable/receipt and restores retry units.
-After acknowledgment, the actual credential Claim directory and empty parents,
+The first callback acknowledges runtime cleanup with `host_cleanup_pending` and keeps
+the Panel operation VERIFYING and its credential valid. The finalizer caches callback
+authentication in memory, removes local credentials/units/binary/receipt, then sends
+the final callback; only this callback retires Panel identity and reports SUCCESS.
+A lost final callback is retried in process; if the host is already completely clean
+and the Panel remains unreachable, it stays VERIFYING and requires Owner inspection
+plus local Panel deletion. It never reports successful full cleanup prematurely.
+Legacy finalizers that omit the field retain their previous completion semantics.
+After the first acknowledgment, the actual credential Claim directory and empty parents,
 finalizer units/binary/receipt and persistent timer stamp are removed.
 
 BBR startup captures the original congestion/qdisc before changing them, once.

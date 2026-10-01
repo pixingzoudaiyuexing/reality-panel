@@ -1,6 +1,6 @@
 //! Restricted lifecycle actions received over the authenticated Panel WS.
 
-use crate::config::{NodeConfig, PersistedNodeAuth};
+use crate::config::{NodeConfig, NodeRuntimeAuth, PersistedNodeAuth};
 use relay_shared::protocol::{
     lifecycle_artifact_architecture, NodeLifecycleAck, NodeLifecycleAction, NodeLifecycleCommand,
     NodeLifecycleEvent, NodeLifecycleEventStatus,
@@ -1264,13 +1264,15 @@ where
     Ok(())
 }
 
-fn cleanup_uninstall_finalizer<F>(
+fn cleanup_uninstall_finalizer<F, C>(
     root: &Path,
     receipt_path: &Path,
     mut run: F,
+    retire_credentials: C,
 ) -> Result<(), String>
 where
     F: FnMut(&str, &[&str]) -> Result<(), String>,
+    C: FnOnce() -> Result<(), String>,
 {
     for path in [
         UNINSTALL_FINALIZER_SERVICE_PATH,
@@ -1313,6 +1315,7 @@ where
     );
     validate_cleanup_path(root, &timer_stamp)?;
     remove_if_exists(&timer_stamp)?;
+    retire_credentials()?;
     remove_if_exists(&rooted(root, UNINSTALL_FINALIZER_BINARY))?;
     remove_if_exists(receipt_path)?;
     for path in [
@@ -1364,11 +1367,27 @@ fn report_uninstall_once(
     destructive_started: bool,
     message: &str,
 ) -> Result<(), String> {
+    report_uninstall_phase(
+        job,
+        success,
+        destructive_started,
+        message,
+        true,
+        &job.auth.load_runtime()?,
+    )
+}
+fn report_uninstall_phase(
+    job: &UninstallJob,
+    success: bool,
+    destructive_started: bool,
+    message: &str,
+    host_cleanup_pending: bool,
+    auth: &NodeRuntimeAuth,
+) -> Result<(), String> {
     let url = format!(
         "{}/api/v1/node/uninstall_result",
         job.panel_url.trim_end_matches('/')
     );
-    let auth = job.auth.load_runtime()?;
     if !auth.transport_allowed(&job.panel_url) {
         return Err("permanent Credential uninstall callback requires HTTPS".into());
     }
@@ -1376,6 +1395,7 @@ fn report_uninstall_once(
         "operation_id": job.operation_id,
         "node_id": job.node_id,
         "success": success,
+        "host_cleanup_pending": host_cleanup_pending,
         "destructive_started": destructive_started,
         "message": message
     });
@@ -1411,7 +1431,7 @@ fn completion_attempt<C, R>(
 ) -> Result<bool, String>
 where
     C: FnMut() -> Result<UninstallCleanupReport, String>,
-    R: FnMut(&UninstallJob, bool, bool, &str) -> Result<(), String>,
+    R: FnMut(&UninstallJob, bool, bool, &str, bool) -> Result<(), String>,
 {
     let mut receipt: UninstallCompletionReceipt = serde_json::from_slice(
         &std::fs::read(receipt_path).map_err(|error| format!("read uninstall receipt: {error}"))?,
@@ -1440,6 +1460,7 @@ where
         receipt.cleanup_success,
         receipt.destructive_started,
         &receipt.message,
+        true,
     )
     .is_err()
     {
@@ -1457,26 +1478,27 @@ fn finalizer_tick<C, R, S>(
     root: &Path,
     receipt_path: &Path,
     cleanup: C,
-    report: R,
+    mut report: R,
     systemctl: S,
 ) -> Result<bool, String>
 where
     C: FnMut() -> Result<UninstallCleanupReport, String>,
-    R: FnMut(&UninstallJob, bool, bool, &str) -> Result<(), String>,
+    R: FnMut(&UninstallJob, bool, bool, &str, bool) -> Result<(), String>,
     S: FnMut(&str, &[&str]) -> Result<(), String>,
 {
-    if !completion_attempt(receipt_path, cleanup, report)? {
+    if !completion_attempt(receipt_path, cleanup, &mut report)? {
         return Ok(false);
     }
     let receipt: UninstallCompletionReceipt = serde_json::from_slice(
         &std::fs::read(receipt_path).map_err(|error| format!("read uninstall receipt: {error}"))?,
     )
     .map_err(|error| format!("parse uninstall receipt: {error}"))?;
-    if receipt.cleanup_success {
-        cleanup_uninstalled_credentials(root, &receipt.job)?;
-    }
-    cleanup_uninstall_finalizer(root, receipt_path, systemctl)?;
-    Ok(true)
+    cleanup_uninstall_finalizer(root, receipt_path, systemctl, || {
+        cleanup_uninstalled_credentials(root, &receipt.job)
+    })?;
+    // Success is acknowledged only after credentials, retry units and receipt
+    // have actually disappeared. A lost final callback leaves Panel VERIFYING.
+    Ok(report(&receipt.job, true, true, &receipt.message, false).is_ok())
 }
 
 fn cleanup_uninstalled_credentials(root: &Path, job: &UninstallJob) -> Result<(), String> {
@@ -1565,12 +1587,36 @@ pub(crate) fn run_helper_from_args(args: &[String]) -> Option<Result<(), String>
     }
     let path = PathBuf::from(&args[1]);
     if args[0] == "--lifecycle-uninstall-finalize" {
+        let auth = match std::fs::read(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<UninstallCompletionReceipt>(&bytes)
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|receipt| receipt.job.auth.load_runtime())
+        {
+            Ok(auth) => auth,
+            Err(error) => return Some(Err(error)),
+        };
         return Some(
             match finalizer_tick(
                 Path::new("/"),
                 &path,
                 || uninstall_managed(Path::new("/")),
-                report_uninstall_once,
+                |job, success, started, message, pending| {
+                    let attempts = if pending { 1 } else { 6 };
+                    for attempt in 0..attempts {
+                        if report_uninstall_phase(job, success, started, message, pending, &auth)
+                            .is_ok()
+                        {
+                            return Ok(());
+                        }
+                        if attempt + 1 < attempts {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                        }
+                    }
+                    Err("Panel uninstall callback failed".into())
+                },
                 run_checked,
             ) {
                 Ok(true) => Ok(()),
@@ -1966,7 +2012,7 @@ mod tests {
                     message: "cleanup complete".into(),
                 })
             },
-            |_, _, _, _| Err("Panel unavailable".into()),
+            |_, _, _, _, _| Err("Panel unavailable".into()),
         )
         .unwrap();
         assert!(!retry);
@@ -1977,7 +2023,8 @@ mod tests {
             &root,
             &receipt_path,
             || panic!("successful cleanup must not repeat"),
-            |job, success, destructive_started, message| {
+            |job, success, destructive_started, message, pending| {
+                assert_eq!(receipt_path.exists(), pending);
                 assert_eq!(job.operation_id, "operation-a");
                 assert!(success);
                 assert!(destructive_started);
@@ -2040,7 +2087,7 @@ mod tests {
                 &root,
                 &receipt_path,
                 || panic!("cleanup must not repeat"),
-                |_, _, _, _| Err("Panel unavailable".into()),
+                |_, _, _, _, _| Err("Panel unavailable".into()),
                 |_, _| Ok(())
             )
             .unwrap());
@@ -2049,17 +2096,19 @@ mod tests {
                 &root,
                 &receipt_path,
                 || panic!("cleanup must not repeat"),
-                |_, _, _, _| Ok(()),
+                |_, _, _, _, _| Ok(()),
                 |_, _| Err("injected systemctl failure after Panel ACK".into())
             )
             .is_err());
-            assert_eq!(state_dir.exists(), replaced);
-            assert_eq!(descriptor.exists(), replaced);
+            assert!(state_dir.exists() && descriptor.exists());
             assert!(finalizer_tick(
                 &root,
                 &receipt_path,
                 || panic!("cleanup must not repeat"),
-                |_, _, _, _| panic!("Panel ACK must survive local cleanup failure"),
+                |_, _, _, _, pending| {
+                    assert!(!pending);
+                    Ok(())
+                },
                 |_, _| Ok(())
             )
             .unwrap());
@@ -2129,7 +2178,7 @@ mod tests {
             &root,
             &receipt_path,
             || panic!("completed cleanup must not repeat"),
-            |_, _, _, _| Err("Panel unavailable".into()),
+            |_, _, _, _, _| Err("Panel unavailable".into()),
             |_, _| panic!("no ACK must not clean finalizer"),
         )
         .unwrap();
@@ -2142,7 +2191,7 @@ mod tests {
             &root,
             &receipt_path,
             || panic!("restarted finalizer must reuse completed receipt"),
-            |job, success, destructive_started, _| {
+            |job, success, destructive_started, _, _| {
                 assert_eq!(job.operation_id, "operation-b");
                 assert!(success);
                 assert!(destructive_started);
@@ -2255,13 +2304,18 @@ mod tests {
         .unwrap();
         install_uninstall_finalizer(&root, &source, &path, |_, _| Ok(())).unwrap();
         let mut failed = false;
-        assert!(cleanup_uninstall_finalizer(&root, &path, |_, args| {
-            if args == ["daemon-reload"] && !failed {
-                failed = true;
-                return Err("injected reload failure".into());
-            }
-            Ok(())
-        })
+        assert!(cleanup_uninstall_finalizer(
+            &root,
+            &path,
+            |_, args| {
+                if args == ["daemon-reload"] && !failed {
+                    failed = true;
+                    return Err("injected reload failure".into());
+                }
+                Ok(())
+            },
+            || panic!("credentials must survive reload failure")
+        )
         .is_err());
         for file in [
             UNINSTALL_FINALIZER_BINARY,
@@ -2271,7 +2325,7 @@ mod tests {
             assert!(rooted(&root, file).exists());
         }
         assert!(path.exists());
-        cleanup_uninstall_finalizer(&root, &path, |_, _| Ok(())).unwrap();
+        cleanup_uninstall_finalizer(&root, &path, |_, _| Ok(()), || Ok(())).unwrap();
         assert!(!path.exists() && !rooted(&root, UNINSTALL_FINALIZER_BINARY).exists());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2359,7 +2413,7 @@ mod tests {
             &root,
             &path,
             || Err("injected partial failure".into()),
-            |_, success, _, _| {
+            |_, success, _, _, _| {
                 assert!(!success);
                 Ok(())
             },
@@ -2373,7 +2427,7 @@ mod tests {
             || Ok(UninstallCleanupReport {
                 message: "complete".into()
             }),
-            |_, success, _, _| {
+            |_, success, _, _, _| {
                 assert!(success);
                 Ok(())
             },
