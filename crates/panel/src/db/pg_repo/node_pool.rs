@@ -98,12 +98,25 @@ impl NodePoolRepository for PgRepository {
         if exists.is_none() {
             return Ok(NodePoolRetirement::default());
         }
-        let memberships: Vec<i64> = sqlx::query_scalar(
-            "SELECT reusing_group_id FROM node_reuse_bindings WHERE home_group_id=$1 AND node_id=$2",
-        ).bind(group_id).bind(node_id.as_str()).fetch_all(&mut *tx).await?;
+        let routing_rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key,value FROM kvs WHERE key LIKE 'relay_preference:%'
+             OR key LIKE 'relay_failover:%' OR key='relay_switch_schedules:v1' ORDER BY key FOR UPDATE",
+        ).fetch_all(&mut *tx).await?;
+        let mut referenced_groups = std::collections::BTreeSet::new();
+        for (key, raw) in &routing_rows {
+            referenced_groups.extend(crate::service::node_pool::routing_reference_groups(
+                key,
+                raw,
+                node_id.as_str(),
+            )?);
+        }
         let mut routing_groups = Vec::new();
         let mut needs_attention = false;
-        for business_group in memberships {
+        for business_group in referenced_groups {
+            if business_group == group_id {
+                routing_groups.push(business_group);
+                continue;
+            }
             // Bare Node IDs in routing must continue to name any surviving
             // identity in this Group. Never erase another identity's policy.
             let collision: Option<i32> = sqlx::query_scalar(
@@ -126,24 +139,10 @@ impl NodePoolRepository for PgRepository {
                 routing_groups.push(business_group);
             }
         }
-        let mut routing_keys = routing_groups
-            .iter()
-            .flat_map(|id| {
-                [
-                    format!("relay_preference:{id}"),
-                    format!("relay_failover:{id}"),
-                ]
-            })
-            .collect::<Vec<_>>();
-        if !routing_groups.is_empty() {
-            routing_keys.push(crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY.into());
-        }
-        for key in routing_keys {
-            if let Some(raw) =
-                sqlx::query_scalar::<_, String>("SELECT value FROM kvs WHERE key=$1 FOR UPDATE")
-                    .bind(&key)
-                    .fetch_optional(&mut *tx)
-                    .await?
+        for (key, raw) in routing_rows {
+            if crate::service::node_pool::routing_reference_groups(&key, &raw, node_id.as_str())?
+                .iter()
+                .any(|id| routing_groups.contains(id))
             {
                 let (updated, attention) = crate::service::node_pool::retire_routing_value(
                     &key,

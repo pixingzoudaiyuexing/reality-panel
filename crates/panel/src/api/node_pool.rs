@@ -1019,6 +1019,9 @@ mod tests {
                 .await
                 .unwrap();
         }
+        crate::service::node_reuse::delete_binding(state.db.as_ref(), 20, anchor.id, id)
+            .await
+            .unwrap();
         assert!(node_pool::retire_node(&state, anchor.id, id)
             .await
             .unwrap()

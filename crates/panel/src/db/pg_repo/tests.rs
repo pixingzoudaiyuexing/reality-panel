@@ -35,11 +35,53 @@ async fn pg_pool_retirement_revokes_and_prevents_registry_recreation() {
         .set_verified_node_status_if_active(anchor.id, &id, "pool-old", "{}")
         .await
         .unwrap());
+    seed_group(&db, 71).await;
+    db.insert_node_reuse_binding(71, anchor.id, id.as_str())
+        .await
+        .unwrap();
+    db.set(
+        "relay_preference:71",
+        &serde_json::to_string(&crate::service::relay_preference::RelayPreferenceState {
+            preferred_node_id: Some(id.as_str().into()),
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    db.set(
+        "relay_switch_schedules:v1",
+        &serde_json::json!([{
+            "id":"pool-schedule", "group_id":71, "target_node_id":id.as_str(),
+            "schedule_type":"one_time", "enabled":false,
+            "created_at":"2026-10-01T00:00:00Z", "updated_at":"2026-10-01T00:00:00Z", "weekdays":[]
+        }])
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    db.delete_node_reuse_binding(71, anchor.id, id.as_str())
+        .await
+        .unwrap();
     assert!(
         db.retire_pool_native_node(anchor.id, &id)
             .await
             .unwrap()
             .retired
+    );
+    assert_eq!(
+        crate::service::relay_preference::load_preference(&db, 71)
+            .await
+            .unwrap()
+            .preferred_node_id,
+        None
+    );
+    assert_eq!(
+        db.get("relay_switch_schedules:v1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("[]")
     );
     assert!(!db
         .set_verified_node_status_if_active(anchor.id, &id, "pool-old", "{}")

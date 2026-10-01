@@ -67,6 +67,8 @@ struct OpenListOwnership {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UninstallCompletionReceipt {
     job: UninstallJob,
+    #[serde(default)]
+    panel_acknowledged: bool,
     cleanup_success: bool,
     #[serde(default)]
     destructive_started: bool,
@@ -1171,6 +1173,9 @@ where
         &std::fs::read(receipt_path).map_err(|error| format!("read uninstall receipt: {error}"))?,
     )
     .map_err(|error| format!("parse uninstall receipt: {error}"))?;
+    if receipt.panel_acknowledged {
+        return Ok(true);
+    }
     if !receipt.cleanup_success {
         receipt.destructive_started = true;
         write_private_json(receipt_path, &receipt)?;
@@ -1196,6 +1201,8 @@ where
     {
         return Ok(false);
     }
+    receipt.panel_acknowledged = true;
+    write_private_json(receipt_path, &receipt)?;
     Ok(true)
 }
 
@@ -1335,6 +1342,7 @@ pub(crate) fn run_helper_from_args(args: &[String]) -> Option<Result<(), String>
     if !receipt_path.exists() {
         let receipt = UninstallCompletionReceipt {
             job,
+            panel_acknowledged: false,
             cleanup_success: false,
             destructive_started: false,
             message: "uninstall cleanup pending".into(),
@@ -1659,6 +1667,7 @@ mod tests {
                     token: "secret".into(),
                 },
             },
+            panel_acknowledged: false,
             cleanup_success: false,
             destructive_started: false,
             message: "pending".into(),
@@ -1736,6 +1745,7 @@ mod tests {
                                     .into(),
                         },
                     },
+                    panel_acknowledged: false,
                     cleanup_success: true,
                     destructive_started: true,
                     message: "complete".into(),
@@ -1756,11 +1766,19 @@ mod tests {
                 &receipt_path,
                 || panic!("cleanup must not repeat"),
                 |_, _, _, _| Ok(()),
+                |_, _| Err("injected systemctl failure after Panel ACK".into())
+            )
+            .is_err());
+            assert_eq!(state_dir.exists(), replaced);
+            assert_eq!(descriptor.exists(), replaced);
+            assert!(finalizer_tick(
+                &root,
+                &receipt_path,
+                || panic!("cleanup must not repeat"),
+                |_, _, _, _| panic!("Panel ACK must survive local cleanup failure"),
                 |_, _| Ok(())
             )
             .unwrap());
-            assert_eq!(state_dir.exists(), replaced);
-            assert_eq!(descriptor.exists(), replaced);
             let _ = std::fs::remove_dir_all(root);
         }
     }
@@ -1783,6 +1801,7 @@ mod tests {
                         token: "secret".into(),
                     },
                 },
+                panel_acknowledged: false,
                 cleanup_success: true,
                 destructive_started: true,
                 message: "cleanup complete".into(),

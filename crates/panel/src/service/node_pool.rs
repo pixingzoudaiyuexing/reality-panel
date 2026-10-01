@@ -330,7 +330,7 @@ pub async fn retire_node(
 }
 
 /// Transform a stored routing value inside the identity retirement transaction.
-/// Group IDs have already been resolved from exact, unambiguous memberships.
+/// Group IDs have already been resolved from unambiguous routing references.
 pub(crate) fn retire_routing_value(
     key: &str,
     raw: &str,
@@ -362,6 +362,54 @@ pub(crate) fn retire_routing_value(
         Ok((serde_json::to_string(&policy)?, false))
     };
     transform().map_err(|error| DbError::Other(sqlx::Error::Protocol(error.to_string())))
+}
+
+pub(crate) fn routing_reference_groups(
+    key: &str,
+    raw: &str,
+    node_id: &str,
+) -> Result<Vec<i64>, DbError> {
+    use crate::service::{relay_failover, relay_preference, relay_schedule};
+    let inspect = || -> Result<Vec<i64>, String> {
+        if key == relay_schedule::RELAY_SWITCH_SCHEDULES_KEY {
+            let schedules: Vec<relay_schedule::RelaySchedule> =
+                serde_json::from_str(raw).map_err(|error| error.to_string())?;
+            return Ok(schedules
+                .into_iter()
+                .filter(|schedule| schedule.target_node_id == node_id)
+                .map(|schedule| schedule.group_id)
+                .collect());
+        }
+        let (prefix, references) = if key.starts_with(relay_preference::RELAY_PREFERENCE_KEY_PREFIX)
+        {
+            let mut preference: relay_preference::RelayPreferenceState =
+                serde_json::from_str(raw).map_err(|error| error.to_string())?;
+            let before = preference.clone();
+            relay_preference::retire_node_assignment(&mut preference, node_id);
+            (
+                relay_preference::RELAY_PREFERENCE_KEY_PREFIX,
+                preference != before,
+            )
+        } else {
+            let policy: relay_failover::RelayFailoverPolicy =
+                serde_json::from_str(raw).map_err(|error| error.to_string())?;
+            (
+                relay_failover::RELAY_FAILOVER_KEY_PREFIX,
+                policy.excluded_failed_node_ids.contains(node_id)
+                    || policy.last_from_node_id.as_deref() == Some(node_id)
+                    || policy.last_to_node_id.as_deref() == Some(node_id),
+            )
+        };
+        if !references {
+            return Ok(Vec::new());
+        }
+        let group_id = key
+            .strip_prefix(prefix)
+            .and_then(|id| id.parse::<i64>().ok())
+            .ok_or("invalid stored routing group identity")?;
+        Ok(vec![group_id])
+    };
+    inspect().map_err(|error| DbError::Other(sqlx::Error::Protocol(error)))
 }
 
 pub async fn list_nodes(db: &dyn Repository) -> Result<Vec<PoolNode>, DbError> {
