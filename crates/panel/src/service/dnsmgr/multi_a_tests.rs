@@ -1086,4 +1086,53 @@ mod multi_a_acceptance {
         assert!(actual_values(&f, "op1", "unicom").is_empty());
         assert_eq!(actual_values(&f, "op1", "telecom"), expected(&["8.8.8.8"]));
     }
+    #[tokio::test]
+    async fn carrier_default_replacement_after_delete_survives_desired_refresh() {
+        let f = fixture().await;
+        let (status, result) = http(
+            &f,
+            "DELETE",
+            &format!("/admin/node-pool/nodes/{}/n1", f.anchor),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(result["code"], 0);
+        let mut body =
+            serde_json::to_value(policy("n2", &[("unicom", "n2"), ("unicom", "n6")])).unwrap();
+        body["mode"] = json!("carrier");
+        assert_eq!(
+            http(&f, "PUT", "/groups/10/routing-apply", body).await.0,
+            axum::http::StatusCode::OK
+        );
+        // The real worker refreshes before reconciliation; the old default is now absent.
+        refresh_all_desired(f.db.as_ref()).await.unwrap();
+        let default =
+            f.db.find_dns_record_sync(100, DEFAULT_LINE_KEY)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(default.desired_action, "UPSERT");
+        assert_eq!(default.expected_value.as_deref(), Some("2.2.2.2"));
+        reconcile_group(&f, 10).await;
+        let saved = preference::load_preference(f.db.as_ref(), 10)
+            .await
+            .unwrap();
+        assert_eq!(saved.state, preference::RelayPreferencePhase::Idle);
+        assert_eq!(saved.preferred_node_id.as_deref(), Some("n2"));
+        assert_eq!(actual_values(&f, "op1", "default"), expected(&["2.2.2.2"]));
+        assert_eq!(
+            actual_values(&f, "op1", "unicom"),
+            expected(&["2.2.2.2", "6.6.6.6"])
+        );
+        refresh_all_desired(f.db.as_ref()).await.unwrap();
+        assert_eq!(
+            f.db.find_dns_record_sync(100, DEFAULT_LINE_KEY)
+                .await
+                .unwrap()
+                .unwrap()
+                .desired_action,
+            "UPSERT"
+        );
+    }
 }

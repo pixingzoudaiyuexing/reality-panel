@@ -2481,8 +2481,18 @@ async fn persist_resolution(
             if pref.active_routing_mode
                 == Some(crate::service::relay_preference::RoutingMode::Carrier)
             {
-                let default = pref
-                    .carrier_policy
+                // A Carrier policy transaction may replace a deleted default. Refresh
+                // must evaluate the pending policy while switching, not the empty old one.
+                let policy = if pref.state
+                    == crate::service::relay_preference::RelayPreferencePhase::Switching
+                {
+                    pref.pending_carrier_policy
+                        .as_ref()
+                        .unwrap_or(&pref.carrier_policy)
+                } else {
+                    &pref.carrier_policy
+                };
+                let default = policy
                     .default_node_id
                     .as_deref()
                     .or(pref.preferred_node_id.as_deref());
