@@ -307,6 +307,22 @@ pub async fn guard(State(state): State<AppState>, request: Request, next: Next) 
                 {
                     return error("MIGRATION_IN_PROGRESS")
                 }
+                Ok(Some(c))
+                    if request.method() == axum::http::Method::POST
+                        && c.home_group_id == op.new.home_group_id
+                        && c.node_id == op.new.node_id
+                        && c.claim_id == op.new.node_id
+                        && c.approval_ref == format!("node-pool-bootstrap:{}", op.new.node_id)
+                        && ["claim", "credential/prepare", "credential/activate"]
+                            .iter()
+                            .any(|action| {
+                                route == format!("/node-credential-claims/{}/{action}", c.claim_id)
+                            }) =>
+                {
+                    // This operation's own Bootstrap still passes through the existing
+                    // Claim authentication and delivery handlers. Keep other writes held.
+                    return next.run(request).await;
+                }
                 Ok(_) => {}
                 Err(_) => return error("DATABASE_ERROR"),
             }
@@ -461,6 +477,121 @@ mod tests {
                 app.clone().oneshot(request).await.unwrap().status(),
                 expected,
                 "{method} {url}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn active_operation_allows_only_its_new_bootstrap_claim_transitions() {
+        let state = upgrade::tests::fixture().await;
+        let probes = [100, 200]
+            .into_iter()
+            .map(|rule_id| Probe {
+                rule_id,
+                path: "/marker".into(),
+                expected_marker: "marker".into(),
+            })
+            .collect();
+        let op = upgrade::start(
+            &state,
+            1,
+            ConcreteNodeIdentity {
+                home_group_id: 10,
+                node_id: "OLD_NODE".into(),
+            },
+            probes,
+            upgrade::OFFICIAL_AMD64_SHA256,
+        )
+        .await
+        .unwrap();
+        super::super::provisioning::pool_credential_bootstrap_config(
+            &state,
+            &op.new.node_id,
+            op.new.home_group_id,
+            1,
+        )
+        .await
+        .unwrap();
+        let app = axum::Router::new()
+            .fallback(|| async { StatusCode::NO_CONTENT })
+            .layer(axum::middleware::from_fn_with_state(state.clone(), guard));
+        for suffix in ["claim", "credential/prepare", "credential/activate"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!(
+                            "/api/v1/node-credential-claims/{}/{suffix}",
+                            op.new.node_id
+                        ))
+                        .body(axum::body::Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{suffix}");
+        }
+        for suffix in ["claim", "credential/prepare", "credential/activate"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri(format!(
+                            "/api/v1/node-credential-claims/{}/{suffix}",
+                            op.new.node_id
+                        ))
+                        .body(axum::body::Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "non-POST {suffix}");
+        }
+        let claim_app = axum::Router::new()
+            .route(
+                "/api/v1/node-credential-claims/{claim_id}/claim",
+                axum::routing::post(super::super::node_claim::claim_node),
+            )
+            .layer(axum::middleware::from_fn_with_state(state.clone(), guard))
+            .with_state(state.clone());
+        let unauthenticated = claim_app.oneshot(axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/node-credential-claims/{}/claim", op.new.node_id))
+            .header("content-type", "application/json")
+            .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127,0,0,1],443))))
+            .body(axum::body::Body::from(serde_json::json!({"home_group_id":op.new.home_group_id,"node_id":op.new.node_id,"secret":"invalid","claimant_nonce":"invalid"}).to_string())).unwrap()).await.unwrap();
+        assert_ne!(unauthenticated.status(), StatusCode::OK);
+        // Administrative cancellation and unrelated writes to the staged Node stay blocked.
+        for (method, route) in [
+            (
+                "POST",
+                format!(
+                    "/api/v1/admin/node-credential-claims/{}/cancel",
+                    op.new.node_id
+                ),
+            ),
+            (
+                "DELETE",
+                format!(
+                    "/api/v1/admin/node-pool/nodes/{}/{}",
+                    op.new.home_group_id, op.new.node_id
+                ),
+            ),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri(route)
+                            .body(axum::body::Body::empty())
+                            .unwrap()
+                    )
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CONFLICT
             );
         }
     }
