@@ -160,7 +160,11 @@ class OperatorReleaseContract(unittest.TestCase):
             if route.endswith('/current'):
                 if self.fault=='none':raise module.ApiFailure('MIGRATION_NOT_FOUND')
                 return {'operation':{'old':{'node_id':'another-node'},'state':'RESTORED' if self.fault=='active' else 'SUCCESS'}}
-            if route=='/groups':return [{'id':7,'token':'fixture-group-token'}]
+            if route=='/groups':return [{'id':7,'name':'legacy','group_type':'in'}]
+            if route==module.BASE+'/identity':
+                assert kwargs['headers']['X-Node-ID']=='old'
+                assert kwargs['headers']['Authorization']=='Bearer fixture-group-token'
+                return {'identity_group_id':7,'node_id':'old'}
             raise AssertionError('Unexpected non-readonly surface: '+route)
     def test_readonly_check_has_no_config_revision_or_metadata_registration(self):
         client=self.ReadClient();host=Host()
@@ -192,10 +196,25 @@ class OperatorReleaseContract(unittest.TestCase):
                 # main owns this duplicated fd, as real --auth-fd does.
                 import os,sys
                 fd=os.dup(auth.fileno())
-                with patch.object(module,'Host',return_value=host),patch.object(host,'precheck'),patch.object(host,'old_auth'),patch.object(module,'Client',return_value=client),patch.object(module.os,'geteuid',return_value=0),patch.object(module.sys,'argv',['upgrader','--check','--auth-fd',str(fd)]),patch.object(module,'emit') as output:
+                with patch.object(module,'Host',return_value=host),patch.object(host,'precheck'),patch.object(module,'Client',return_value=client),patch.object(module.os,'geteuid',return_value=0),patch.object(module.sys,'argv',['upgrader','--check','--auth-fd',str(fd)]),patch.object(module,'emit') as output:
                     module.main();self.assertEqual(output.call_args.args[0],'READY')
             self.assertFalse((base/'var/lib/relay-panel/legacy-v130-upgrade').exists())
             self.assertTrue(all(m=='GET' for m,p in client.calls))
+    def test_legacy_identity_uses_authenticated_readonly_endpoint_not_group_dto(self):
+        with tempfile.TemporaryDirectory(dir=pathlib.Path(tempfile.gettempdir()).resolve()) as root:
+            host=module.Host(pathlib.Path(root));env=host.path('/etc/relay-node');env.mkdir(parents=True)
+            (env/'relay-node.env').write_text('NODE_TOKEN=fixture-group-token\n')
+            client=self.ReadClient()
+            self.assertEqual(module.operator_identity(client,host,'old'),{'identity_group_id':7,'node_id':'old'})
+            self.assertEqual(client.calls,[('GET',module.BASE+'/identity')])
+    def test_recovery_resolves_panel_from_private_snapshot_when_environment_is_absent(self):
+        with tempfile.TemporaryDirectory(dir=pathlib.Path(tempfile.gettempdir()).resolve()) as root:
+            host=module.Host(pathlib.Path(root));work=pathlib.Path(root)/'work';backup=work/'backup/1';backup.mkdir(parents=True)
+            (backup/'relay-node.env').write_text('PANEL_URL=https://panel.example.com\nNODE_TOKEN=fixture-secret\n')
+            (backup/'relay-node.env').chmod(0o600)
+            self.assertEqual(module.panel_url(host,None,work),'https://panel.example.com')
+            self.assertEqual(module.panel_url(host,'https://explicit.example.com',work),'https://explicit.example.com')
+            self.assertFalse(host.path('/etc/relay-node/relay-node.env').exists())
     def test_operator_cli_help_version_and_batch_rejection(self):
         import subprocess
         for option in ['--help','--version']:

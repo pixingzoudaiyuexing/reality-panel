@@ -56,6 +56,20 @@ pub async fn capabilities() -> Response {
         serde_json::json!({"operation_protocol":1,"target_version":env!("CARGO_PKG_VERSION"),"single_node_only":true,"supported_old_version":"1.3.0","official_amd64_sha256":upgrade::OFFICIAL_AMD64_SHA256}),
     )
 }
+/// Resolve only the authenticated current host. This is a read-only lookup;
+/// it neither delivers config/revisions nor reconciles Node Pool metadata.
+pub async fn identity(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match super::node_auth::authenticate_node(&state, &headers).await {
+        Ok(identity) => match identity.node_id() {
+            Some(node_id) => success(serde_json::json!({
+                "identity_group_id": identity.group_id(), "node_id": node_id
+            })),
+            None => (StatusCode::BAD_REQUEST, "NODE_ID_REQUIRED").into_response(),
+        },
+        Err(error) => (error.status(), "NODE_AUTHENTICATION_FAILED").into_response(),
+    }
+}
+
 pub async fn script() -> Response {
     (
         [(
@@ -396,6 +410,56 @@ mod tests {
         let mut batch = valid;
         batch["node_ids"] = serde_json::json!(["OLD_NODE"]);
         assert!(serde_json::from_value::<StartRequest>(batch).is_err());
+    }
+    #[tokio::test]
+    async fn readonly_identity_authenticates_legacy_host_without_registration_or_config_delivery() {
+        let state = upgrade::tests::fixture().await;
+        let group = GroupRepository::find_by_id(state.db.as_ref(), 10, &ResourceScope::All)
+            .await
+            .unwrap()
+            .unwrap();
+        let before_pool =
+            serde_json::to_value(state.db.list_node_pool_records().await.unwrap()).unwrap();
+        let before_status = state.db.get("node_status:10:OLD_NODE").await.unwrap();
+        let app = axum::Router::new()
+            .route("/identity", axum::routing::get(identity))
+            .with_state(state.clone());
+        for (token, node_id, status) in [
+            (group.token.as_str(), "OLD_NODE", StatusCode::OK),
+            ("invalid", "OLD_NODE", StatusCode::UNAUTHORIZED),
+            (group.token.as_str(), "", StatusCode::BAD_REQUEST),
+        ] {
+            let request = axum::http::Request::builder()
+                .uri("/identity")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-Node-ID", node_id)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), status);
+            if status == StatusCode::OK {
+                let body = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    value["data"],
+                    serde_json::json!({"identity_group_id":10,"node_id":"OLD_NODE"})
+                );
+                assert!(!String::from_utf8(body.to_vec())
+                    .unwrap()
+                    .contains(&group.token));
+            }
+        }
+        assert_eq!(
+            before_pool,
+            serde_json::to_value(state.db.list_node_pool_records().await.unwrap()).unwrap()
+        );
+        assert_eq!(
+            before_status,
+            state.db.get("node_status:10:OLD_NODE").await.unwrap()
+        );
+        assert!(upgrade::load(state.db.as_ref()).await.unwrap().is_none());
     }
     #[tokio::test]
     async fn active_operation_blocks_related_mutations_and_allows_other_groups() {

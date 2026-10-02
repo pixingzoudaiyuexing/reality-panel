@@ -67,6 +67,10 @@ pub fn routes() -> Router<AppState> {
             axum::routing::get(legacy_upgrade::capabilities),
         )
         .route(
+            "/legacy-node-upgrade-v130/identity",
+            axum::routing::get(legacy_upgrade::identity),
+        )
+        .route(
             "/legacy-node-upgrade-v130/script.sh",
             axum::routing::get(legacy_upgrade::script),
         )

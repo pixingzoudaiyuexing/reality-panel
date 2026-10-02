@@ -66,3 +66,15 @@ After one SUCCESS, inspect that Node, its rules and DNS manually. Any second Nod
 ## Verification
 
 Run `python3 scripts/test_legacy_node_upgrade.py`, migration repository tests on SQLite and a real `TEST_PG_URL`, workspace tests, fmt, clippy, repository parity and frontend gates. Formal Independent Review must pass the precise candidate HEAD before destructive TEST migration. Real acceptance additionally needs official released Panel+A+B, continuous independent public probes during Panel-only upgrade, B migration and canary checkpoint, then a separate A operation. Automated fault simulations are not physical runtime evidence.
+
+### Operator identity / interrupted recovery
+
+The operator resolves this host through the read-only authenticated `/legacy-node-upgrade-v130/identity` endpoint. Group listing DTOs contain no token; no Pool registration or config delivery is used for `--check`.
+
+After STOP, recovery can read the Panel URL from the private snapshot even if Bootstrap has not recreated `/etc/relay-node/relay-node.env`. An explicit override is also supported:
+
+```bash
+sudo ./reality-node-v1.3.0-to-v1.4.2.sh --recover-work /var/lib/relay-panel/legacy-v130-upgrade/<attempt> --panel https://panel.example.com
+```
+
+The script queries durable operation state before restoring the host. Preserve the protected attempt directory until recovery completes.

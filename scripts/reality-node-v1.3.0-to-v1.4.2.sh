@@ -287,9 +287,9 @@ def verify_target_binary(host, binary):
     if host.run([str(binary),'--version']).stdout.decode().strip() != 'relay-node '+TARGET_VERSION:
         raise Failure('FIXED_V142_ARTIFACT_VERSION_REQUIRED')
 
-def environment(host):
+def read_environment(p):
     import shlex
-    p=host.path('/etc/relay-node/relay-node.env');safe_path(p)
+    safe_path(p)
     values={}
     for line in p.read_text().splitlines():
         if '=' in line and not line.lstrip().startswith('#'):
@@ -297,17 +297,34 @@ def environment(host):
             values[key]=parts[0] if parts else ''
     return values
 
+def environment(host):
+    return read_environment(host.path('/etc/relay-node/relay-node.env'))
+
+def panel_url(host, explicit, recovery_work):
+    if explicit: return explicit
+    if recovery_work:
+        # The old managed environment may already be detached. Its protected
+        # snapshot exists before STOP and is independent of Bootstrap success.
+        saved=recovery_work/'backup'/str(SNAPSHOT_PATHS.index('/etc/relay-node'))/'relay-node.env'
+        safe_path(saved)
+        if saved.exists():
+            if saved.stat().st_uid!=os.geteuid() or saved.stat().st_mode & 0o077: raise Failure('PRIVATE_RECOVERY_FILE_REQUIRED')
+            return read_environment(saved).get('PANEL_URL')
+    current=host.path('/etc/relay-node/relay-node.env');safe_path(current)
+    return read_environment(current).get('PANEL_URL') if current.exists() else None
+
 def operator_identity(client, host, node_id):
     descriptor=host.path('/var/lib/relay-panel/node-claims/runtime-auth.json');safe_path(descriptor)
     if descriptor.exists():
         data=json.loads(descriptor.read_text())
         if data['node_id']!=node_id: raise Failure('OLD_AUTH_IDENTITY_MISMATCH')
-        return {'identity_group_id':int(data['identity_group_id']),'node_id':node_id}
-    token=environment(host).get('NODE_TOKEN')
-    groups=client.request('GET','/groups',token=client.admin)
-    candidates=[g for g in groups if g.get('token')==token and token]
-    if len(candidates)!=1: raise Failure('UNIQUE_CURRENT_NODE_IDENTITY_REQUIRED')
-    return {'identity_group_id':candidates[0]['id'],'node_id':node_id}
+        hint={'identity_group_id':int(data['identity_group_id']),'node_id':node_id}
+    else:
+        hint={'node_id':node_id}
+    identity=client.request('GET',BASE+'/identity',headers=host.old_auth(hint))
+    if identity.get('node_id')!=node_id or not isinstance(identity.get('identity_group_id'),int): raise Failure('OLD_AUTH_IDENTITY_MISMATCH')
+    if 'identity_group_id' in hint and identity['identity_group_id']!=hint['identity_group_id']: raise Failure('OLD_AUTH_IDENTITY_MISMATCH')
+    return identity
 
 def readonly_panel_check(client, host, identity):
     caps=client.request('GET',BASE+'/capabilities')
@@ -373,7 +390,7 @@ def main():
         try: host.precheck({'node_id':args.node_id})
         except Failure:
             print('This upgrader only supports the official Reality Node v1.3.0 installation.',flush=True);raise
-    args.panel_url=args.panel_url or environment(host).get('PANEL_URL')
+    args.panel_url=panel_url(host,args.panel_url,args.recover_work)
     if not args.panel_url: raise Failure('HTTPS_PANEL_REQUIRED')
     if args.recover_work:
         admin=None;probes=operation['operation']['probes']
