@@ -222,7 +222,11 @@ fn reconcile_plan(
             } else {
                 ContainerAction::Start
             },
-            pull: marker.is_some_and(|marker| marker.pull_eligible(node_version)),
+            // A Node version upgrade must not replace a healthy running
+            // Standard fallback. Fresh installs and stopped recovery retain
+            // their existing image-fetch policy.
+            pull: !container.state.running
+                && marker.is_some_and(|marker| marker.pull_eligible(node_version)),
         });
     }
     if marker.is_none() && data_exists {
@@ -289,10 +293,29 @@ struct PreparedRuntime {
 }
 
 pub async fn reconcile(node_version: &str) -> Result<XiaoyaReady, String> {
+    reconcile_with_policy(node_version, false).await
+}
+
+/// One-time Standard migration must reuse the verified existing fallback.
+/// Missing resources fail before any Docker writes; stopped containers start
+/// with their existing image rather than pulling/replacing the installation.
+pub async fn reconcile_existing(node_version: &str) -> Result<XiaoyaReady, String> {
+    reconcile_with_policy(node_version, true).await
+}
+
+async fn reconcile_with_policy(
+    node_version: &str,
+    preserve_existing: bool,
+) -> Result<XiaoyaReady, String> {
     let version = node_version.to_string();
     let prepared = tokio::task::spawn_blocking(move || {
         let mut docker = SystemDocker;
-        prepare_runtime(&mut docker, &XiaoyaPaths::production(), &version)
+        prepare_runtime(
+            &mut docker,
+            &XiaoyaPaths::production(),
+            &version,
+            preserve_existing,
+        )
     })
     .await
     .map_err(|error| format!("Xiaoya reconcile worker failed: {error}"))??;
@@ -343,9 +366,13 @@ fn prepare_runtime<D: DockerClient>(
     docker: &mut D,
     paths: &XiaoyaPaths,
     node_version: &str,
+    preserve_existing: bool,
 ) -> Result<PreparedRuntime, String> {
     let marker = read_marker(paths)?;
     let container = inspect_container(docker)?;
+    if preserve_existing && (marker.is_none() || container.is_none()) {
+        return Err("Standard migration requires the existing managed Xiaoya container".into());
+    }
     let data_exists = safe_data_path_exists(&paths.data)?;
     let needs_free_port = container.as_ref().is_none_or(|value| !value.state.running);
     let port_available = if needs_free_port {
@@ -353,13 +380,17 @@ fn prepare_runtime<D: DockerClient>(
     } else {
         true
     };
-    let plan = reconcile_plan(
+    let mut plan = reconcile_plan(
         marker.as_ref(),
         container.as_ref(),
         data_exists,
         port_available,
         node_version,
     )?;
+
+    if preserve_existing {
+        plan.pull = false;
+    }
 
     let latest_image = if plan.pull {
         docker.execute(&strings(&["pull", XIAOYA_IMAGE]))?;
@@ -905,7 +936,7 @@ mod tests {
         let plan = reconcile_plan(Some(&marker), Some(&old_image), true, true, "1.1.18")
             .expect("old image remains owned");
         assert_eq!(plan.action, ContainerAction::Keep);
-        assert!(plan.pull);
+        assert!(!plan.pull);
     }
 
     #[test]
@@ -959,7 +990,7 @@ mod tests {
             true,
         );
 
-        assert!(prepare_runtime(&mut docker, &paths, "1.1.18").is_err());
+        assert!(prepare_runtime(&mut docker, &paths, "1.1.18", false).is_err());
         assert_eq!(docker.commands.len(), 2);
         assert!(docker.commands.iter().all(|command| {
             !matches!(
@@ -976,7 +1007,7 @@ mod tests {
         let (root, paths) = test_paths("unknown-port");
         let mut docker = FakeDocker::new(vec![output(Vec::new())], false);
 
-        assert!(prepare_runtime(&mut docker, &paths, "1.1.18").is_err());
+        assert!(prepare_runtime(&mut docker, &paths, "1.1.18", false).is_err());
         assert_eq!(docker.commands.len(), 1);
         assert!(docker.commands[0].starts_with(&strings(&["container", "ls"])));
         assert_eq!(docker.port_checks.get(), 1);
@@ -988,7 +1019,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_updated_container_postcheck_restores_the_prior_managed_image() {
+    fn stopped_container_update_postcheck_restores_the_prior_managed_image() {
         let (root, paths) = test_paths("update-postcheck-rollback");
         fs::create_dir_all(&paths.data).unwrap();
         let mut marker = OwnershipMarker::new();
@@ -999,7 +1030,7 @@ mod tests {
         let mut docker = FakeDocker::new(
             vec![
                 present,
-                output(inspection_json(true, "sha256:old", true)),
+                output(inspection_json(false, "sha256:old", true)),
                 empty(),
                 output(b"sha256:new\n".to_vec()),
                 empty(),
@@ -1014,7 +1045,7 @@ mod tests {
             true,
         );
 
-        let error = prepare_runtime(&mut docker, &paths, "1.1.18").unwrap_err();
+        let error = prepare_runtime(&mut docker, &paths, "1.1.18", false).unwrap_err();
         assert!(error.contains("prior managed Xiaoya image was restored"));
         let runs = docker
             .commands
@@ -1028,7 +1059,84 @@ mod tests {
     }
 
     #[test]
-    fn successful_same_version_does_not_pull_but_new_version_does() {
+    fn node_upgrade_reuses_running_standard_fallback_without_docker_mutations() {
+        let (root, paths) = test_paths("profile-preserving-upgrade");
+        fs::create_dir_all(&paths.data).unwrap();
+        let mut marker = OwnershipMarker::new();
+        marker.last_successful_node_version = Some("1.3.0".into());
+        write_marker(&paths, &marker).unwrap();
+        let mut docker = FakeDocker::new(
+            vec![
+                output(format!("{XIAOYA_CONTAINER}\n").into_bytes()),
+                output(inspection_json(true, "sha256:original", true)),
+                output(format!("{XIAOYA_CONTAINER}\n").into_bytes()),
+                output(inspection_json(true, "sha256:original", true)),
+            ],
+            false,
+        );
+        let prepared = prepare_runtime(&mut docker, &paths, "1.4.3", false).unwrap();
+        assert!(prepared.rollback_image.is_none());
+        assert!(docker.commands.iter().all(|command| !matches!(
+            command.first().map(String::as_str),
+            Some("pull" | "start" | "rm" | "run")
+        )));
+        assert_eq!(read_marker(&paths).unwrap().unwrap(), marker);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_reuses_container_that_stopped_after_preflight_without_pull_or_replacement() {
+        let (root, paths) = test_paths("migration-stopped-after-precheck");
+        fs::create_dir_all(&paths.data).unwrap();
+        let mut marker = OwnershipMarker::new();
+        marker.last_successful_node_version = Some("1.3.0".into());
+        write_marker(&paths, &marker).unwrap();
+        let mut docker = FakeDocker::new(
+            vec![
+                output(format!("{XIAOYA_CONTAINER}\n").into_bytes()),
+                output(inspection_json(false, "sha256:original", true)),
+                output(Vec::new()),
+                output(format!("{XIAOYA_CONTAINER}\n").into_bytes()),
+                output(inspection_json(true, "sha256:original", true)),
+            ],
+            true,
+        );
+        let prepared = prepare_runtime(&mut docker, &paths, "1.4.3", true).unwrap();
+        assert!(prepared.rollback_image.is_none());
+        assert_eq!(
+            docker
+                .commands
+                .iter()
+                .filter(|c| c.first().is_some_and(|v| v == "start"))
+                .count(),
+            1
+        );
+        assert!(docker
+            .commands
+            .iter()
+            .all(|c| !matches!(c.first().map(String::as_str), Some("pull" | "rm" | "run"))));
+        assert_eq!(read_marker(&paths).unwrap().unwrap(), marker);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_never_recreates_a_fallback_removed_after_preflight() {
+        let (root, paths) = test_paths("migration-disappeared-after-precheck");
+        fs::create_dir_all(&paths.data).unwrap();
+        write_marker(&paths, &OwnershipMarker::new()).unwrap();
+        let mut docker = FakeDocker::new(vec![output(Vec::new())], true);
+        assert!(prepare_runtime(&mut docker, &paths, "1.4.3", true)
+            .unwrap_err()
+            .contains("existing managed Xiaoya container"));
+        assert!(docker
+            .commands
+            .iter()
+            .all(|c| c.starts_with(&strings(&["container", "ls"]))));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn running_fallback_is_preserved_across_versions_and_stopped_recovery_can_pull() {
         let mut marker = OwnershipMarker::new();
         marker.last_successful_node_version = Some("1.1.18".into());
         let current = inspection(true, "sha256:managed");
@@ -1038,7 +1146,13 @@ mod tests {
                 .pull
         );
         assert!(
-            reconcile_plan(Some(&marker), Some(&current), true, true, "1.1.19")
+            !reconcile_plan(Some(&marker), Some(&current), true, true, "1.1.19")
+                .unwrap()
+                .pull
+        );
+        let stopped = inspection(false, "sha256:managed");
+        assert!(
+            reconcile_plan(Some(&marker), Some(&stopped), true, true, "1.1.19")
                 .unwrap()
                 .pull
         );

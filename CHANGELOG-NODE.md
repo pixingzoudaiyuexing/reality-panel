@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.4.3] - Unpublished Candidate (2026-10-02)
+
+### 修复 / 兼容性
+
+- 正常 Pool-native binary update 保持原 Node ID、credential、Membership 和 profile。
+- Xiaoya 已归属的运行中容器跨版本复用，不再因 Node 版本变化触发 pull/替换；停止状态的恢复和首次安装仍使用原管理流程。
+- Standard / Lite fallback 与对应 uninstall ownership 规则保留，不进行隐式模式转换。
+- Config Protocol `10`、Lifecycle Protocol `1` 不变；未新增 DB schema。公开 v1.4.2 资产不变，本候选尚未发布。
+
 ## [1.4.2] - Release Candidate (2026-10-02)
 
 ### 改进 / 修复

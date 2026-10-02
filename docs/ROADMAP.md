@@ -1,8 +1,8 @@
 # Reality Panel — Roadmap
 
-## Current stage: v1.4.2 release finalization
+## Current stage: v1.4.3 profile-preserving upgrade acceptance
 
-Current functionality has completed authorized TEST acceptance. The release candidate now requires exact-source version contracts, optimized artifact build, final tests, Gemini main gate, independent review and public TEST smoke. Publication and Production deployment require separate Owner authorization. The one-time official-v1.3.0 migration stays narrowly scoped; no new architecture or features belong to finalization.
+Published v1.4.2 functionality has prior authorized TEST acceptance. The v1.4.3 profile fix has not completed runtime acceptance and now requires exact-source version contracts, optimized artifact build, final tests, Gemini main gate, independent review and public TEST smoke. Publication and Production deployment require separate Owner authorization. The one-time official-v1.3.0 migration stays narrowly scoped; no new architecture or features belong to finalization.
 
 ## Stable baseline: Node Reuse product completion
 

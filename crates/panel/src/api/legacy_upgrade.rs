@@ -19,6 +19,7 @@ pub struct StartRequest {
     pub node_id: String,
     pub official_sha256: String,
     pub probes: Vec<Probe>,
+    pub source_profile: upgrade::InstallProfile,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,7 +54,7 @@ fn success(data: serde_json::Value) -> Response {
 
 pub async fn capabilities() -> Response {
     success(
-        serde_json::json!({"operation_protocol":1,"target_version":env!("CARGO_PKG_VERSION"),"single_node_only":true,"supported_old_version":"1.3.0","official_amd64_sha256":upgrade::OFFICIAL_AMD64_SHA256}),
+        serde_json::json!({"operation_protocol":1,"target_version":env!("CARGO_PKG_VERSION"),"single_node_only":true,"profile_preserving":true,"supported_profiles":["standard","lite"],"supported_old_version":"1.3.0","official_amd64_sha256":upgrade::OFFICIAL_AMD64_SHA256}),
     )
 }
 /// Resolve only the authenticated current host. This is a read-only lookup;
@@ -76,7 +77,7 @@ pub async fn script() -> Response {
             axum::http::header::CONTENT_TYPE,
             "text/x-shellscript; charset=utf-8",
         )],
-        include_str!("../../../../scripts/reality-node-v1.3.0-to-v1.4.2.sh"),
+        include_str!("../../../../scripts/reality-node-v1.3.0-to-v1.4.3.sh"),
     )
         .into_response()
 }
@@ -94,6 +95,7 @@ pub async fn start(
         },
         req.probes,
         &req.official_sha256,
+        req.source_profile,
     )
     .await
     {
@@ -156,6 +158,19 @@ pub async fn status(
         Err(e) => e,
     }
 }
+fn operation_profile(op: &upgrade::Operation) -> Option<upgrade::InstallProfile> {
+    op.source_profile
+}
+
+fn profile_bundle(
+    profile: upgrade::InstallProfile,
+    public: &str,
+    token: &str,
+    artifact: super::provisioning::ProvisioningArtifact,
+) -> super::provisioning::ProvisioningBundle {
+    super::provisioning::ProvisioningBundle::new(public, token, artifact, profile.is_lite())
+}
+
 pub async fn bundle(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -198,8 +213,10 @@ pub async fn bundle(
         Ok(a) => a,
         Err(_) => return error("ARTIFACT_UNAVAILABLE"),
     };
-    let mut bundle =
-        super::provisioning::ProvisioningBundle::new(&public, &group.token, artifact, true);
+    let Some(profile) = operation_profile(&op) else {
+        return error("SOURCE_INSTALL_PROFILE_REQUIRED");
+    };
+    let mut bundle = profile_bundle(profile, &public, &group.token, artifact);
     let cfg = match super::provisioning::pool_credential_bootstrap_config(
         &state,
         &op.new.node_id,
@@ -215,7 +232,7 @@ pub async fn bundle(
     match super::node_enrollment::render_bundle(
         &op.new.node_id,
         op.new.home_group_id,
-        "lite",
+        profile.as_str(),
         &bundle,
     ) {
         Ok(bytes) => {
@@ -402,7 +419,7 @@ mod tests {
     use tower::ServiceExt;
     #[test]
     fn single_node_request_rejects_batches_and_unknown_keys() {
-        let valid = serde_json::json!({"identity_group_id":10,"node_id":"OLD_NODE","official_sha256":upgrade::OFFICIAL_AMD64_SHA256,"probes":[]});
+        let valid = serde_json::json!({"identity_group_id":10,"node_id":"OLD_NODE","official_sha256":upgrade::OFFICIAL_AMD64_SHA256,"probes":[],"source_profile":"lite"});
         assert!(serde_json::from_value::<StartRequest>(valid.clone()).is_ok());
         let mut array = valid.clone();
         array["node_id"] = serde_json::json!(["OLD_NODE", "OTHER_NODE"]);
@@ -411,6 +428,59 @@ mod tests {
         batch["node_ids"] = serde_json::json!(["OLD_NODE"]);
         assert!(serde_json::from_value::<StartRequest>(batch).is_err());
     }
+    #[test]
+    fn migration_requires_an_explicit_valid_source_installation_profile() {
+        let request = serde_json::json!({"identity_group_id":10,"node_id":"OLD_NODE", "official_sha256":upgrade::OFFICIAL_AMD64_SHA256,"probes":[]});
+        assert!(serde_json::from_value::<StartRequest>(request.clone()).is_err());
+        for profile in ["standard", "lite"] {
+            let mut valid = request.clone();
+            valid["source_profile"] = profile.into();
+            assert!(serde_json::from_value::<StartRequest>(valid).is_ok());
+        }
+        let mut invalid = request;
+        invalid["source_profile"] = "auto".into();
+        assert!(serde_json::from_value::<StartRequest>(invalid).is_err());
+    }
+
+    #[test]
+    fn migration_bundle_preserves_both_source_profiles() {
+        for profile in [
+            upgrade::InstallProfile::Standard,
+            upgrade::InstallProfile::Lite,
+        ] {
+            let artifact = super::super::provisioning::ProvisioningArtifact {
+                architecture: "amd64".into(),
+                bytes: vec![0x7f, b'E', b'L', b'F'],
+                sha256: "fixture".into(),
+            };
+            let bundle = profile_bundle(profile, "https://panel.test", "private-fixture", artifact);
+            assert!(bundle
+                .config
+                .contains(&format!("LITE_MODE={}\n", u8::from(profile.is_lite()))));
+            let bytes =
+                super::super::node_enrollment::render_bundle("node", 1, profile.as_str(), &bundle)
+                    .unwrap();
+            let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+            use std::io::Read;
+            let mut manifest = String::new();
+            for file in archive.entries().unwrap() {
+                let mut file = file.unwrap();
+                if file.path().unwrap().as_ref() == std::path::Path::new("manifest.env") {
+                    file.read_to_string(&mut manifest).unwrap();
+                }
+            }
+            assert!(manifest.contains(&format!("PROFILE={}\n", profile.as_str())));
+        }
+    }
+
+    #[test]
+    fn old_persisted_operation_without_profile_stays_readable_but_has_no_bundle_profile() {
+        let raw = serde_json::json!({"id":"historical","state":"ROLLED_BACK","old":{"home_group_id":10,"node_id":"old"},"new":{"home_group_id":20,"node_id":"new"},"public_ipv4":"192.0.2.1","display_name":"Old Node","memberships":[10],"listeners":[],"routing":[],"dns":[],"probes":[],"token_hash":"fixture","created_by":1,"created_at":"2026-10-02T00:00:00Z","last_error":null});
+        let op: upgrade::Operation = serde_json::from_value(raw).unwrap();
+        assert_eq!(operation_profile(&op), None);
+        assert!(!op.active());
+    }
+
     #[tokio::test]
     async fn readonly_identity_authenticates_legacy_host_without_registration_or_config_delivery() {
         let state = upgrade::tests::fixture().await;
@@ -481,6 +551,7 @@ mod tests {
             },
             probes,
             upgrade::OFFICIAL_AMD64_SHA256,
+            upgrade::InstallProfile::Lite,
         )
         .await
         .unwrap();
@@ -564,6 +635,7 @@ mod tests {
             },
             probes,
             upgrade::OFFICIAL_AMD64_SHA256,
+            upgrade::InstallProfile::Lite,
         )
         .await
         .unwrap();

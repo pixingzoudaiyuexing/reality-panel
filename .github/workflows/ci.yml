@@ -69,6 +69,13 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      - name: legacy upgrade profile contracts
+        run: |
+          python3 scripts/test_legacy_node_upgrade.py
+          python3 scripts/test_legacy_node_upgrade_v143.py
+          python3 scripts/test_legacy_node_upgrade_profiles.py
+          bash scripts/release-version-contract.test.sh
+
       - name: repo test parity
         run: bash scripts/check-repo-test-parity.sh
 

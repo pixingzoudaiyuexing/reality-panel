@@ -49,7 +49,11 @@ async fn prepare_host_runtime() -> Result<(), String> {
     if updater::lite_mode() {
         xiaoya::verify_lite_fallback().await
     } else {
-        xiaoya::reconcile(VERSION).await.map(|_| ())
+        match std::env::var("RELAY_NODE_PRESERVE_STANDARD_FALLBACK").as_deref() {
+            Ok("1") => xiaoya::reconcile_existing(VERSION).await.map(|_| ()),
+            Err(std::env::VarError::NotPresent) => xiaoya::reconcile(VERSION).await.map(|_| ()),
+            _ => Err("invalid Standard fallback preservation policy".into()),
+        }
     }
 }
 

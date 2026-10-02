@@ -1,22 +1,22 @@
-# Upgrading Reality Node v1.3.0 to v1.4.2
+# Upgrading Reality Node v1.3.0 to v1.4.3
 
-This is a one-time upgrade for the **official v1.3.0 amd64 Debian 12 Lite/systemd Node only**, using a fresh Pool-native identity. It is not a general updater or batch migration. Unknown binaries, custom drop-ins or unsupported hosts stop before the Node is stopped.
+This is a one-time upgrade for the **official v1.3.0 amd64 Debian 12 managed Standard or Lite/systemd Node only**, using a fresh Pool-native identity. It is not a general updater or batch migration. Unknown binaries, custom drop-ins or unsupported hosts stop before the Node is stopped.
 
 ## Official operator entrypoint
 
-Repository: `scripts/reality-node-v1.3.0-to-v1.4.2.sh`.
-Release asset: `reality-node-v1.3.0-to-v1.4.2.sh`, covered by Release `SHA256SUMS`.
-The script pins target version **1.4.2** and its exact Node SHA; it never resolves `latest`. Future Panel versions or a mismatched Node artifact are rejected before STOP. A Release build must match the script's pinned Node hash.
+Repository: `scripts/reality-node-v1.3.0-to-v1.4.3.sh`.
+Release asset: `reality-node-v1.3.0-to-v1.4.3.sh`, covered by Release `SHA256SUMS`.
+The script pins target version **1.4.3** and its exact Node SHA; it never resolves `latest`. Future Panel versions or a mismatched Node artifact are rejected before STOP. A Release build must match the script's pinned Node hash.
 
-After Owner-authorized publication, download the script and checksum manifest from the **v1.4.2 Release** over HTTPS; do not execute downloaded content before verifying its checksum:
+After Owner-authorized publication, download the script and checksum manifest from the **v1.4.3 Release** over HTTPS; do not execute downloaded content before verifying its checksum:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fL -O https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.4.2/reality-node-v1.3.0-to-v1.4.2.sh
-curl --proto '=https' --tlsv1.2 -fL -O https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.4.2/SHA256SUMS
+curl --proto '=https' --tlsv1.2 -fL -O https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.4.3/reality-node-v1.3.0-to-v1.4.3.sh
+curl --proto '=https' --tlsv1.2 -fL -O https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.4.3/SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
-chmod +x reality-node-v1.3.0-to-v1.4.2.sh
-sudo ./reality-node-v1.3.0-to-v1.4.2.sh --check
-sudo ./reality-node-v1.3.0-to-v1.4.2.sh
+chmod +x reality-node-v1.3.0-to-v1.4.3.sh
+sudo ./reality-node-v1.3.0-to-v1.4.3.sh --check
+sudo ./reality-node-v1.3.0-to-v1.4.3.sh
 ```
 
 The default Panel URL comes from the managed Node environment. If needed, append `--panel https://panel.example.com`. `--help` and `--version` need no mutation or credentials.
@@ -25,11 +25,11 @@ The script asks for a Panel administrator username and a **masked password**; ne
 
 For each actual Rule, the normal invocation asks for an HTTP path and a stable expected response marker. Use that Rule's real forwarding service and a marker expected after the identity replacement. This tool requires HTTP forwarding probes for every Rule; non-HTTP workloads need an operator-provided HTTP check through the same Rule before migration. It does not directly probe a loopback backend as proof of public forwarding.
 
-`--check` verifies the official binary/host, HTTPS Panel capability, Config Protocol 10, exact v1.4.2 artifact metadata and absence of an active migration. It performs only reads after normal login: no operation creation, Node stop, Membership/Carrier/DNS mutation, configuration revision delivery or Pool metadata reconciliation. It outputs `READY` for a supported old Node. A completed migration receipt outputs `ALREADY_MIGRATED`, never claims an old-host check succeeded.
+`--check` verifies the official binary/host, HTTPS Panel capability, Config Protocol 10, exact v1.4.3 artifact metadata and absence of an active migration. It performs only reads after normal login: no operation creation, Node stop, Membership/Carrier/DNS mutation, configuration revision delivery or Pool metadata reconciliation. It outputs the verified provenance and installation profile independently, then `READY` only for a supported old Node with the matching v1.4.3 Panel/artifact. Missing or contradictory profile evidence fails before STOP. It does not infer profile from disk size or marker absence. A completed migration receipt outputs `ALREADY_MIGRATED`, never claims an old-host check succeeded.
 
 ## Recommended order
 
-1. Upgrade Panel to v1.4.2 using the normal update path.
+1. Upgrade Panel to v1.4.3 using the normal update path.
 2. Confirm old Nodes still forward on LKG.
 3. Log into **one** selected Node host and run `--check`.
 4. Run the script normally, then check Online, Rules, Carrier, DNS and public forwarding.
@@ -65,7 +65,7 @@ After one SUCCESS, inspect that Node, its rules and DNS manually. Any second Nod
 
 ## Verification
 
-Run `python3 scripts/test_legacy_node_upgrade.py`, migration repository tests on SQLite and a real `TEST_PG_URL`, workspace tests, fmt, clippy, repository parity and frontend gates. Formal Independent Review must pass the precise candidate HEAD before destructive TEST migration. Real acceptance additionally needs official released Panel+A+B, continuous independent public probes during Panel-only upgrade, B migration and canary checkpoint, then a separate A operation. Automated fault simulations are not physical runtime evidence.
+Run `python3 scripts/test_legacy_node_upgrade.py`, migration repository tests on SQLite and a real `TEST_PG_URL`, workspace tests, fmt, clippy, repository parity and frontend gates. Formal Independent Review must pass the precise candidate HEAD before destructive TEST migration. v1.4.3 acceptance additionally needs fresh Standard/Lite TEST installs, ordinary v1.4.2 updates preserving both profiles and identity, and the specifically authorized real Standard legacy host. Each destructive legacy attempt requires formal PASS, TEST acceptance and read-only `--check` READY first. Real legacy Lite may be reported NOT RUN if no safe host is available. Automated fault simulations are not physical runtime evidence.
 
 ### Operator identity / interrupted recovery
 
@@ -74,7 +74,17 @@ The operator resolves this host through the read-only authenticated `/legacy-nod
 After STOP, recovery can read the Panel URL from the private snapshot even if Bootstrap has not recreated `/etc/relay-node/relay-node.env`. An explicit override is also supported:
 
 ```bash
-sudo ./reality-node-v1.3.0-to-v1.4.2.sh --recover-work /var/lib/relay-panel/legacy-v130-upgrade/<attempt> --panel https://panel.example.com
+sudo ./reality-node-v1.3.0-to-v1.4.3.sh --recover-work /var/lib/relay-panel/legacy-v130-upgrade/<attempt> --panel https://panel.example.com
 ```
 
 The script queries durable operation state before restoring the host. Preserve the protected attempt directory until recovery completes.
+
+## Profile and history compatibility
+
+Standard and Lite are equally supported installation profiles. `OFFICIAL_V130_MANAGED` reports what binary/systemd/ownership evidence proves; it does not invent a fresh-versus-upgraded history. Both official source histories use the actual managed fallback to select profile.
+
+The Panel persists `source_profile` in the existing operation JSON and supplies matching `PROFILE` and `LITE_MODE`. Older persisted operations lacking that field remain readable for recovery; they cannot receive a new bundle with an implicit Lite default. Complete/recover an active old operation with its matching old tool before changing versions.
+
+Standard checks the private Xiaoya ownership marker, data path, live Docker labels/env/mount/restart/loopback binding and health. It reuses the container and live data in place. Snapshot includes the marker and container/config identity; rollback restores the marker and managed host files and verifies that container identity/config/mounts stayed unchanged. The runner never snapshots then overwrites a live SQLite fallback data directory or removes/restarts the working container. Lite checks its explicit marker, managed Nginx files, owned loopback listener and health. Profile remains unchanged through install, rollback and uninstall.
+
+Normal Pool-native v1.4.2 → v1.4.3 updates use ordinary binary update with the same identity/credential; do not invoke this legacy replacement tool. Publication and Production Panel deployment require separate authority.

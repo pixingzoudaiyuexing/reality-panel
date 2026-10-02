@@ -7,6 +7,15 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.4.3] - Unpublished Candidate (2026-10-02)
+
+### 修复 / 兼容性
+
+- 官方 v1.3.0 单节点升级显式识别并保留 Standard / Lite 安装模式，Panel 持久保存源 profile，生成相应 provisioning bundle。Standard 与 Lite 均为正式支持模式。
+- 新升级器 `reality-node-v1.3.0-to-v1.4.3.sh` 保持单节点、固定版本/SHA、只读 `--check` 和原有 COMMITTED 恢复边界；未知/custom/矛盾 profile 在 STOP 前拒绝。
+- 复用正在运行的受管理 Standard Xiaoya fallback；不为版本升级 pull、重建或重启容器，保护其数据与配置。安装失败恢复旧 profile/身份/marker。
+- Config Protocol `10`、Lifecycle Protocol `1` 不变；未新增 DB schema。公开 v1.4.2 资产不变，本候选尚未发布。
+
 ## [1.4.2] - Release Candidate (2026-10-02)
 
 ### 新增 / 改进

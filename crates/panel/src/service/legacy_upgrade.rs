@@ -30,6 +30,25 @@ pub struct DnsSnapshot {
     pub record_id: String,
 }
 
+/// Installation profile is independent of official/legacy provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallProfile {
+    Standard,
+    Lite,
+}
+impl InstallProfile {
+    pub fn is_lite(self) -> bool {
+        matches!(self, Self::Lite)
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Lite => "lite",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operation {
     pub id: String,
@@ -49,6 +68,10 @@ pub struct Operation {
     pub last_error: Option<String>,
     #[serde(default)]
     pub rollback_after: Option<String>,
+    // Older persisted operations remain readable for recovery; absent profile
+    // must never silently select Lite when requesting a new bundle.
+    #[serde(default)]
+    pub source_profile: Option<InstallProfile>,
 }
 impl Operation {
     pub fn active(&self) -> bool {
@@ -187,6 +210,7 @@ pub async fn start(
     old: ConcreteNodeIdentity,
     probes: Vec<Probe>,
     official_hash: &str,
+    source_profile: InstallProfile,
 ) -> Result<Operation, String> {
     if !state.config.node_reuse_runtime_enabled {
         return Err("POOL_NATIVE_RUNTIME_REQUIRED".into());
@@ -376,6 +400,7 @@ pub async fn start(
         created_at: chrono::Utc::now().to_rfc3339(),
         last_error: None,
         rollback_after: None,
+        source_profile: Some(source_profile),
     };
     store(state.db.as_ref(), previous.map(|(raw, _)| raw), &op).await?;
     drop(_preference);
@@ -986,6 +1011,7 @@ pub(crate) mod tests {
                     expected_marker: "G100".into(),
                 }],
                 OFFICIAL_AMD64_SHA256,
+                InstallProfile::Lite,
             )
             .await
             .unwrap();
@@ -1055,6 +1081,7 @@ pub(crate) mod tests {
             created_at: chrono::Utc::now().to_rfc3339(),
             last_error: None,
             rollback_after: None,
+            source_profile: Some(InstallProfile::Lite),
         };
         let raw = serde_json::to_string(&op).unwrap();
         state.db.set(SINGLETON, &raw).await.unwrap();
@@ -1092,6 +1119,7 @@ pub(crate) mod tests {
             },
             probes(),
             OFFICIAL_AMD64_SHA256,
+            InstallProfile::Lite,
         )
         .await
         .unwrap();
@@ -1109,7 +1137,8 @@ pub(crate) mod tests {
                     node_id: "SECOND_NODE".into()
                 },
                 probes(),
-                OFFICIAL_AMD64_SHA256
+                OFFICIAL_AMD64_SHA256,
+                InstallProfile::Lite,
             )
             .await
             .unwrap_err(),
@@ -1157,15 +1186,29 @@ pub(crate) mod tests {
             node_id: "OLD_NODE".into(),
         };
         assert_eq!(
-            start(&state, 1, old.clone(), probes(), "unknown")
-                .await
-                .unwrap_err(),
+            start(
+                &state,
+                1,
+                old.clone(),
+                probes(),
+                "unknown",
+                InstallProfile::Standard
+            )
+            .await
+            .unwrap_err(),
             "OFFICIAL_V130_BINARY_REQUIRED"
         );
         assert_eq!(
-            start(&state, 1, old, vec![], OFFICIAL_AMD64_SHA256)
-                .await
-                .unwrap_err(),
+            start(
+                &state,
+                1,
+                old,
+                vec![],
+                OFFICIAL_AMD64_SHA256,
+                InstallProfile::Standard
+            )
+            .await
+            .unwrap_err(),
             "FORWARDING_PROBES_REQUIRED_FOR_EVERY_RULE"
         );
         assert!(load(state.db.as_ref()).await.unwrap().is_none());
