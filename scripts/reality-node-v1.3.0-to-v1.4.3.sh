@@ -266,14 +266,16 @@ class Host:
             inspected=json.loads(raw)
         except (ValueError,UnicodeError): raise Failure('STANDARD_FALLBACK_OWNERSHIP_REQUIRED') from None
         expected={'version':1,'container_name':'relay-panel-xiaoya-byoa','data_path':'/var/lib/relay-panel/xiaoya-byoa','managed_label':'io.reality-panel.managed=xiaoya-byoa'}
-        if not isinstance(evidence,dict) or any(evidence.get(key)!=value for key,value in expected.items()):
+        if not isinstance(evidence,dict) or type(evidence.get('version')) is not int or any(evidence.get(key)!=value for key,value in expected.items()) or (evidence.get('last_successful_node_version') is not None and not isinstance(evidence['last_successful_node_version'],str)):
             raise Failure('STANDARD_FALLBACK_OWNERSHIP_REQUIRED')
         if not isinstance(inspected,list) or len(inspected)!=1 or not isinstance(inspected[0],dict):
             raise Failure('STANDARD_FALLBACK_OWNERSHIP_REQUIRED')
         d=inspected[0];config=d.get('Config',{});host=d.get('HostConfig',{});mounts=d.get('Mounts',[])
+        if not isinstance(config,dict) or not isinstance(host,dict) or not isinstance(d.get('State'),dict) or not isinstance(config.get('Env'),list) or not all(isinstance(v,str) for v in config['Env']) or not isinstance(config.get('Labels'),dict) or not all(isinstance(v,str) for v in config['Labels'].values()) or not isinstance(host.get('RestartPolicy'),dict) or not isinstance(mounts,list) or any(not isinstance(m,dict) for m in mounts):
+            raise Failure('STANDARD_FALLBACK_OWNERSHIP_REQUIRED')
         binding={'5244/tcp':[{'HostIp':'127.0.0.1','HostPort':'5245'}]}
         required_env=['TZ=Asia/Shanghai','BYOA_XIAOYA_BOOTSTRAP=true','BYOA_XIAOYA_UPDATE=if-newer','BYOA_XIAOYA_STRICT=false']
-        if d.get('Name')!='/relay-panel-xiaoya-byoa' or not d.get('Id') or not d.get('Image') or d.get('State',{}).get('Running') is not True:
+        if d.get('Name')!='/relay-panel-xiaoya-byoa' or not isinstance(d.get('Id'),str) or not d['Id'] or not isinstance(d.get('Image'),str) or not d['Image'] or d.get('State',{}).get('Running') is not True:
             raise Failure('STANDARD_FALLBACK_OWNERSHIP_REQUIRED')
         if config.get('Labels',{}).get('io.reality-panel.managed')!='xiaoya-byoa' or not all(value in config.get('Env',[]) for value in required_env):
             raise Failure('STANDARD_FALLBACK_OWNERSHIP_REQUIRED')

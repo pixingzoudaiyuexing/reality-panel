@@ -361,6 +361,19 @@ class LayoutTests(unittest.TestCase):
     def test_lite_marker_content_is_exact(self):
         self.write('/etc/relay-panel/lite-mode',b'1\n')
         self.reject('INSTALL_PROFILE_EVIDENCE_CONFLICT')
+    def test_corrupt_standard_marker_types_fail_before_stop(self):
+        self.standard();marker=self.host.path('/var/lib/relay-panel/xiaoya-byoa-ownership.json');original=json.loads(marker.read_text())
+        for key,value in [('version',True),('version',1.0),('last_successful_node_version',123),('last_successful_node_version',[]),('last_successful_node_version',{})]:
+            with self.subTest(key=key,value=value):
+                candidate=dict(original);candidate[key]=value;marker.write_text(json.dumps(candidate));self.reject('STANDARD_FALLBACK_OWNERSHIP_REQUIRED')
+    def test_malformed_docker_types_are_rejected_before_stop(self):
+        self.standard();original=copy.deepcopy(self.container)
+        for key,value in [('Id',123),('Image',123),('Config',[]),('State',[]),('HostConfig',[]),('Mounts',{})]:
+            with self.subTest(key=key):
+                self.container=copy.deepcopy(original);self.container[key]=value;self.reject('STANDARD_FALLBACK_OWNERSHIP_REQUIRED')
+        for key,value in [('Env',' '.join(original['Config']['Env'])),('Labels',{'io.reality-panel.managed':'xiaoya-byoa','foreign':123})]:
+            with self.subTest(key=key):
+                self.container=copy.deepcopy(original);self.container['Config'][key]=value;self.reject('STANDARD_FALLBACK_OWNERSHIP_REQUIRED')
     def test_standard_lite_evidence_conflict(self):
         self.standard();self.write('/etc/relay-panel/lite-mode',b'lite\n')
         self.reject('INSTALL_PROFILE_EVIDENCE_CONFLICT')
