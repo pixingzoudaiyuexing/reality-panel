@@ -53,7 +53,7 @@ fn success(data: serde_json::Value) -> Response {
 
 pub async fn capabilities() -> Response {
     success(
-        serde_json::json!({"operation_protocol":1,"single_node_only":true,"supported_old_version":"1.3.0","official_amd64_sha256":upgrade::OFFICIAL_AMD64_SHA256}),
+        serde_json::json!({"operation_protocol":1,"target_version":env!("CARGO_PKG_VERSION"),"single_node_only":true,"supported_old_version":"1.3.0","official_amd64_sha256":upgrade::OFFICIAL_AMD64_SHA256}),
     )
 }
 pub async fn script() -> Response {
@@ -62,7 +62,7 @@ pub async fn script() -> Response {
             axum::http::header::CONTENT_TYPE,
             "text/x-shellscript; charset=utf-8",
         )],
-        include_str!("../../../../scripts/legacy-node-upgrade-v1.3.0-one-time-single.sh"),
+        include_str!("../../../../scripts/reality-node-v1.3.0-to-v1.4.2.sh"),
     )
         .into_response()
 }

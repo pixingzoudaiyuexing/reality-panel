@@ -95,7 +95,9 @@ jobs:
           cp target/release/relay-panel release-dist/reality-panel-linux-amd64
           cp target/release/relay-node release-dist/reality-node-linux-amd64
           tar -czf release-dist/reality-panel-web.tar.gz -C frontend/dist .
-          cp install.sh deploy.sh update.sh scripts/relay-node-install.sh release-dist/
+          cp install.sh deploy.sh update.sh scripts/relay-node-install.sh scripts/reality-node-v1.3.0-to-v1.4.2.sh release-dist/
+          PINNED_NODE_SHA="$(sed -n "s/^TARGET_SHA256 = '\(.*\)'/\1/p" scripts/reality-node-v1.3.0-to-v1.4.2.sh)"
+          test "$(sha256sum release-dist/reality-node-linux-amd64 | awk '{print $1}')" = "$PINNED_NODE_SHA"
           sed -i "s/^DEFAULT_RELEASE_TAG=.*/DEFAULT_RELEASE_TAG=\"$RELEASE_TAG\"/" release-dist/install.sh
           printf '%s\n' "$GITHUB_SHA" > release-dist/SOURCE_COMMIT
           printf '%s\n' "$VERSION" > release-dist/VERSION
@@ -106,7 +108,7 @@ jobs:
           file release-dist/reality-panel-linux-amd64 | grep -q 'ELF 64-bit.*x86-64'
           file release-dist/reality-node-linux-amd64 | grep -q 'ELF 64-bit.*x86-64'
           test -s release-dist/reality-panel-web.tar.gz
-          (cd release-dist && sha256sum reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh deploy.sh update.sh relay-node-install.sh SOURCE_COMMIT VERSION > SHA256SUMS)
+          (cd release-dist && sha256sum reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh deploy.sh update.sh relay-node-install.sh reality-node-v1.3.0-to-v1.4.2.sh SOURCE_COMMIT VERSION > SHA256SUMS)
 
       - name: Verify release assets
         run: |
@@ -143,6 +145,7 @@ jobs:
             release-dist/update.sh
             release-dist/deploy.sh
             release-dist/relay-node-install.sh
+            release-dist/reality-node-v1.3.0-to-v1.4.2.sh
             release-dist/SHA256SUMS
             release-dist/SOURCE_COMMIT
             release-dist/VERSION

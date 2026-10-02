@@ -6,6 +6,8 @@ python3 - "$@" <<'PY'
 import argparse, contextlib, fcntl, getpass, hashlib, io, json, os, pathlib, re
 import shutil, signal, ssl, subprocess, sys, tarfile, time, urllib.error, urllib.request
 
+TARGET_VERSION = '1.4.2'
+TARGET_SHA256 = 'a66de121f32f572e5c6e04d99225a1baf152f9698df27a103122ca771bcb2390'
 OFFICIAL_SHA256 = '5c70aac9aab2e78b739d0468d6920b56fac427fb31f18790bc0809c616f965f9'
 BASE = '/legacy-node-upgrade-v130'
 OWNED_TREES = ['/opt/relay-node', '/etc/relay-node', '/var/lib/relay-panel/node-claims']
@@ -239,7 +241,7 @@ class Runner:
         private_json(self.work/'operation.json',self.op)
         self.phase('3/10 VERIFIED DOWNLOAD');self.prepare_bundle(self.client.bundle(self.op))
         if digest((self.work/'bundle/relay-node-linux-amd64').read_bytes())==OFFICIAL_SHA256: raise Failure('CURRENT_CANDIDATE_ARTIFACT_REQUIRED')
-        self.host.run([str(self.work/'bundle/relay-node-linux-amd64'),'--version'])
+        verify_target_binary(self.host, self.work/'bundle/relay-node-linux-amd64')
         self.client.action(self.op,'preflight') # Real public forwarding before old service stop.
         self.host.capture(self.work)
         self.phase('4/10 STOP OLD');self.destructive=True;self.host.stop_and_detach(self.work)
@@ -265,39 +267,134 @@ class Runner:
                 time.sleep(1)
         self.phase('9/10 DNS READBACK VERIFIED');self.phase('10/10 SUCCESS')
         self.host.complete(self.op,self.work)
-        emit('SUCCESS','Migration completed. Stop here; no next Node is started.')
+        emit('SUCCESS','Reality Node upgrade completed successfully.')
+        print('Old Node: '+self.identity['node_id']+'\nNew Node: '+self.op['operation']['new']['node_id']+'\nMembership: MATCH\nRules: MATCH\nCarrier: MATCH\nDNS: MATCH\nListeners: MATCH\nForwarding: PASS',flush=True)
     def recover_failure(self):
         if self.commit_unknown:
-            emit('NEEDS_ATTENTION','Finalize outcome is committed or unknown. Keep new runtime; never restore old identity. Protected recovery directory: '+str(self.work));return
+            emit('NEEDS_ATTENTION','Upgrade requires manual attention. Do not upgrade another Node. Old Node restored: NO; New Node active: UNKNOWN; Carrier finalized: COMMITTED OR UNKNOWN. Finalize outcome is committed or unknown. Keep new runtime; never restore old identity. Protected recovery directory: '+str(self.work));return
         if self.destructive:
             self.phase('ROLLBACK');self.host.rollback(self.work)
         if self.op:
             self.client.action(self.op,'rollback-begin')
             self.wait_action('rollback',{'NODE_OFFLINE','NODE_STATUS_MISSING','OLD_RUNTIME_NOT_RECOVERED','FORWARDING_PROBE_FAILED','FORWARDING_MARKER_MISMATCH'})
         self.phase('ROLLED_BACK' if self.destructive else 'FAILED_PRECHECK')
+        if self.destructive: emit('ROLLED_BACK','Upgrade failed, but the original v1.3.0 Node was restored successfully. No other Node was modified. Old Node restored: YES; New Node active: NO; Carrier finalized: NO.')
         # Failed attempts retain protected backup for explicit recovery; no automatic next Node.
 
+def verify_target_binary(host, binary):
+    if digest(binary.read_bytes()) != TARGET_SHA256:
+        raise Failure('FIXED_V142_ARTIFACT_SHA256_REQUIRED')
+    if host.run([str(binary),'--version']).stdout.decode().strip() != 'relay-node '+TARGET_VERSION:
+        raise Failure('FIXED_V142_ARTIFACT_VERSION_REQUIRED')
+
+def environment(host):
+    import shlex
+    p=host.path('/etc/relay-node/relay-node.env');safe_path(p)
+    values={}
+    for line in p.read_text().splitlines():
+        if '=' in line and not line.lstrip().startswith('#'):
+            key,value=line.split('=',1);parts=shlex.split(value)
+            values[key]=parts[0] if parts else ''
+    return values
+
+def operator_identity(client, host, node_id):
+    descriptor=host.path('/var/lib/relay-panel/node-claims/runtime-auth.json');safe_path(descriptor)
+    if descriptor.exists():
+        data=json.loads(descriptor.read_text())
+        if data['node_id']!=node_id: raise Failure('OLD_AUTH_IDENTITY_MISMATCH')
+        return {'identity_group_id':int(data['identity_group_id']),'node_id':node_id}
+    token=environment(host).get('NODE_TOKEN')
+    groups=client.request('GET','/groups',token=client.admin)
+    candidates=[g for g in groups if g.get('token')==token and token]
+    if len(candidates)!=1: raise Failure('UNIQUE_CURRENT_NODE_IDENTITY_REQUIRED')
+    return {'identity_group_id':candidates[0]['id'],'node_id':node_id}
+
+def readonly_panel_check(client, host, identity):
+    caps=client.request('GET',BASE+'/capabilities')
+    if caps.get('operation_protocol')!=1 or caps.get('official_amd64_sha256')!=OFFICIAL_SHA256 or caps.get('target_version')!=TARGET_VERSION:
+        raise Failure('PANEL_V142_MIGRATION_CAPABILITY_REQUIRED')
+    catalog=client.request('GET','/admin/node-artifacts',token=client.admin)
+    if catalog.get('config_protocol_version')!=10: raise Failure('CONFIG_PROTOCOL_10_REQUIRED')
+    artifacts=[a for a in catalog['artifacts'] if a['architecture']=='amd64' and a['available']]
+    if len(artifacts)!=1 or artifacts[0].get('version')!=TARGET_VERSION or artifacts[0].get('sha256')!=TARGET_SHA256:
+        raise Failure('FIXED_V142_ARTIFACT_METADATA_REQUIRED')
+    try: current=client.request('GET','/admin'+BASE+'/current',token=client.admin)
+    except ApiFailure as error:
+        if str(error)!='MIGRATION_NOT_FOUND': raise
+    else:
+        if current['operation']['state'] not in ['SUCCESS','ROLLED_BACK','FAILED_PRECHECK']:
+            raise Failure('MIGRATION_IN_PROGRESS')
+    host.old_auth(identity) # Read private local auth only; no config delivery/revision write.
+
+def tty_prompt(message):
+    with open('/dev/tty','r+') as tty:
+        tty.write(message);tty.flush();return tty.readline().strip()
+
+def operator_probes(config):
+    # The existing migration preflight validates every submitted Rule publicly.
+    listeners={l['rule_id']:l for l in config['listeners']}
+    probes=[]
+    for rule_id,listener in sorted(listeners.items()):
+        print('Rule %s, public port %s: enter a stable HTTP forwarding check.'%(rule_id,listener['port']),flush=True)
+        path=tty_prompt('HTTP path [/]: ') or '/'
+        marker=tty_prompt('Expected response marker (required): ')
+        if not path.startswith('/') or not marker: raise Failure('FORWARDING_PROBE_REQUIRED')
+        probes.append({'rule_id':rule_id,'path':path,'expected_marker':marker})
+    return probes
+
 def main():
-    parser=argparse.ArgumentParser(description='Official v1.3.0 one-time SINGLE Node upgrade, no batch support')
-    parser.add_argument('--panel-url',required=True);parser.add_argument('--identity-group-id',type=int,required=True)
-    parser.add_argument('--node-id',required=True);parser.add_argument('--probe-file');parser.add_argument('--auth-fd',type=int)
-    parser.add_argument('--recover-work',type=pathlib.Path,help='Explicit protected work directory from a failed/interrupted invocation; queries durable status first')
-    args=parser.parse_args();identity={'identity_group_id':args.identity_group_id,'node_id':args.node_id}
-    host=Host();receipt=host.path('/opt/relay-node/legacy-v130-upgrade-completed.json')
-    if receipt.exists():
-        safe_path(receipt)
-        if json.loads(receipt.read_text())['old_node_id']==args.node_id: emit('ALREADY_MIGRATED','This old identity is already retired.');return
-    if args.auth_fd is not None:
+    parser=argparse.ArgumentParser(description='Official Reality Node v1.3.0 -> fixed v1.4.2, this host only; never multiple Nodes at once')
+    parser.add_argument('--version',action='version',version='Reality Node one-time upgrader 1.3.0 -> '+TARGET_VERSION)
+    parser.add_argument('--panel','--panel-url',dest='panel_url',help='HTTPS Panel v1.4.2 URL; default: managed Node environment')
+    parser.add_argument('--check',action='store_true',help='Read-only host and Panel check; no operation, stop, Membership or DNS mutation')
+    parser.add_argument('--identity-group-id',type=int,help=argparse.SUPPRESS)
+    parser.add_argument('--node-id',help=argparse.SUPPRESS)
+    parser.add_argument('--probe-file',help=argparse.SUPPRESS)
+    parser.add_argument('--auth-fd',type=int,help=argparse.SUPPRESS)
+    parser.add_argument('--recover-work',type=pathlib.Path,help='Explicit protected recovery directory; queries durable state first')
+    args=parser.parse_args();host=Host()
+    if args.recover_work and args.check: raise Failure('CHECK_AND_RECOVERY_ARE_DISTINCT')
+    if os.geteuid()!=0: raise Failure('ROOT_REQUIRED')
+    if not args.recover_work:
+        receipt=host.path('/opt/relay-node/legacy-v130-upgrade-completed.json');safe_path(receipt)
+        if receipt.exists():
+            emit('ALREADY_MIGRATED','This host has already completed the one-time migration. No other Node was modified.');return
+    if args.recover_work:
+        root=host.path('/var/lib/relay-panel/legacy-v130-upgrade');safe_path(args.recover_work)
+        if args.recover_work.parent.resolve()!=root.resolve(): raise Failure('RECOVERY_DIRECTORY_OUT_OF_SCOPE')
+        operation_path=args.recover_work/'operation.json';safe_path(operation_path)
+        if operation_path.stat().st_uid!=0 or operation_path.stat().st_mode & 0o077: raise Failure('PRIVATE_RECOVERY_FILE_REQUIRED')
+        operation=json.loads(operation_path.read_text());old=operation['operation']['old']
+        args.identity_group_id=old['home_group_id'];args.node_id=old['node_id']
+    else:
+        node_id=host.path('/opt/relay-node/node-id');safe_path(node_id)
+        args.node_id=args.node_id or node_id.read_text().strip()
+        emit('1/10','Verifying official Reality Node v1.3.0')
+        try: host.precheck({'node_id':args.node_id})
+        except Failure:
+            print('This upgrader only supports the official Reality Node v1.3.0 installation.',flush=True);raise
+    args.panel_url=args.panel_url or environment(host).get('PANEL_URL')
+    if not args.panel_url: raise Failure('HTTPS_PANEL_REQUIRED')
+    if args.recover_work:
+        admin=None;probes=operation['operation']['probes']
+    elif args.auth_fd is not None:
         secret=json.load(os.fdopen(args.auth_fd));admin=secret['admin_token'];probes=secret['probes']
     else:
-        with open('/dev/tty','r+') as tty:
-            tty.write('Panel administrator username: ');tty.flush();username=tty.readline().strip()
-        password=getpass.getpass('Panel administrator password: ')
+        username=tty_prompt('Panel administrator username: ')
+        password=getpass.getpass('Panel administrator password (not stored): ')
         client=Client(args.panel_url,None)
         admin=client.request('POST','/auth/login',{'username':username,'password':password})['token'];password=None
-        if not args.probe_file: raise Failure('EXPLICIT_FORWARDING_PROBE_FILE_REQUIRED')
-        probes=json.loads(pathlib.Path(args.probe_file).read_text())
+        probes=None
     client=Client(args.panel_url,admin)
+    if not args.recover_work:
+        identity=operator_identity(client,host,args.node_id)
+        if args.identity_group_id is not None and args.identity_group_id!=identity['identity_group_id']: raise Failure('OLD_AUTH_IDENTITY_MISMATCH')
+        args.identity_group_id=identity['identity_group_id']
+        readonly_panel_check(client,host,identity)
+        if args.check: emit('READY','Official v1.3.0 host and fixed v1.4.2 artifact checks passed. No migration was started.');return
+        config=client.request('GET','/node/config',headers=host.old_auth(identity))
+        if probes is None: probes=json.loads(pathlib.Path(args.probe_file).read_text()) if args.probe_file else operator_probes(config)
+    else: identity={'identity_group_id':args.identity_group_id,'node_id':args.node_id}
     root=host.path('/var/lib/relay-panel/legacy-v130-upgrade');safe_path(root);root.mkdir(mode=0o700,parents=True,exist_ok=True);root.chmod(0o700)
     lock=os.open(root/'host.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
     try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -325,8 +422,9 @@ def main():
         else: runner.execute()
     except (Failure,OSError,ValueError,subprocess.SubprocessError) as failure:
         emit('FAILED',str(failure) if isinstance(failure,Failure) else type(failure).__name__)
+        if runner.op: emit('OPERATION',runner.op['operation']['id']+'; phase='+json.loads((work/'phase.json').read_text()).get('phase','unknown')+'; committed/unknown='+str(runner.commit_unknown))
         try: runner.recover_failure()
-        except (Failure,OSError,ValueError,subprocess.SubprocessError): emit('RECOVERY_REQUIRED','Protected recovery state retained; stop here: '+str(work))
+        except (Failure,OSError,ValueError,subprocess.SubprocessError): emit('RECOVERY_REQUIRED','Upgrade requires manual attention. Do not upgrade another Node. Protected recovery directory: '+str(work))
         raise SystemExit(1)
     finally:
         os.close(lock)
@@ -334,5 +432,9 @@ def main():
         with contextlib.suppress(FileNotFoundError): (root/'host.lock').unlink()
         with contextlib.suppress(OSError): root.rmdir()
 
-if __name__=='__main__': main()
+if __name__=='__main__':
+    try: main()
+    except (Failure,OSError,ValueError,subprocess.SubprocessError) as failure:
+        emit('FAILED',str(failure) if isinstance(failure,Failure) else type(failure).__name__)
+        raise SystemExit(1)
 PY

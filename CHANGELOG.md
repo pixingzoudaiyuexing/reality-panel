@@ -16,7 +16,7 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 - 完成 Panel full purge 和 Node full cleanup 的资源归属检查；保护外部文件、服务、账户和路径。
 - Carrier 线路支持多个成员 Node；DNS 以去重 IPv4 集合收敛，支持 Huawei RRset / DNSMgr Multi-A。Unknown A 和 CNAME 覆盖需要确认；Provider 读取失败不会伪装为无记录。
 - Rule 创建页提供只读域名预检查。安装器增加 Debian 13 与 Ubuntu capability 支持；Debian 12 amd64 实体验收通过。
-- 提供仅针对官方 v1.3.0 amd64 Debian 12 Lite/systemd Node 的一次性单节点升级脚本，目标为当前 v1.4.2 制品。新身份上线后恢复名称、Membership、Rules 和 Carrier 引用；同 IP 迁移保持 DNS 值和 Record ID。
+- Release 独立提供 `reality-node-v1.3.0-to-v1.4.2.sh`（含只读 `--check`、交互认证、固定目标 SHA）；提供仅针对官方 v1.3.0 amd64 Debian 12 Lite/systemd Node 的一次性单节点升级脚本，目标为当前 v1.4.2 制品。新身份上线后恢复名称、Membership、Rules 和 Carrier 引用；同 IP 迁移保持 DNS 值和 Record ID。
 
 ### 安全 / 兼容性
 

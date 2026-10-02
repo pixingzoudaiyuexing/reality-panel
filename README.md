@@ -532,3 +532,7 @@ Control channel  HTTP(S) + WebSocket
 Reality Panel 使用 [GNU Affero General Public License v3.0](LICENSE) 发布。
 
 使用、修改、部署本项目时，请同时遵守所在地法律法规以及相关网络、DNS、证书和云服务提供商的使用条款。
+
+## Official v1.3.0 Node upgrade to v1.4.2
+
+The Release supplies `reality-node-v1.3.0-to-v1.4.2.sh`. Upgrade Panel first, run `--check` on one official v1.3.0 Node, execute once and verify it before selecting another Node. See [operator instructions](docs/operations/legacy-v130-single-node-upgrade.md). No batch upgrade or latest-target fallback is provided.

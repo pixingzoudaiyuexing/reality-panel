@@ -1,7 +1,7 @@
 """Failure-boundary tests for the shipped host runner; no remote mutation."""
 import hashlib, io, json, pathlib, tarfile, tempfile, types, unittest
 from unittest.mock import patch
-SCRIPT = pathlib.Path(__file__).with_name('legacy-node-upgrade-v1.3.0-one-time-single.sh')
+SCRIPT = pathlib.Path(__file__).with_name('reality-node-v1.3.0-to-v1.4.2.sh')
 module = types.ModuleType('legacy_upgrade_runner')
 exec(compile(SCRIPT.read_text().split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0], str(SCRIPT), 'exec'), module.__dict__)
 
@@ -10,7 +10,7 @@ class Host:
     def precheck(self, identity):
         self.events.append('precheck')
         if self.fault=='old-checksum': raise module.Failure('OFFICIAL_V130_BINARY_REQUIRED')
-    def run(self,args): return None
+    def run(self,args): return types.SimpleNamespace(stdout=b'relay-node 1.4.2\n')
     def old_auth(self, identity): return {'Authorization':'in-memory-test'}
     def capture(self, work): self.events.append('snapshot')
     def stop_and_detach(self, work):
@@ -69,7 +69,7 @@ class Boundaries(unittest.TestCase):
         host=Host(fault);client=Client(fault)
         with tempfile.TemporaryDirectory() as root:
             runner=module.Runner(client,host,{'node_id':'old'},[],pathlib.Path(root),timeout=1 if fault=="lost-finalize-ack" else 0)
-            with patch.object(module,'emit'),patch.object(module.time,'sleep'):
+            with patch.object(module,'emit'),patch.object(module.time,'sleep'),patch.object(module,'TARGET_SHA256',hashlib.sha256(b'candidate').hexdigest()):
                 try: runner.execute()
                 except module.Failure: runner.recover_failure()
         return host,client
@@ -146,5 +146,61 @@ class Boundaries(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             p=pathlib.Path(tmp)/'private.json';module.private_json(p,{'phase':'TEST'})
             self.assertEqual(p.stat().st_mode&0o777,0o600);self.assertEqual(json.loads(p.read_text()),{'phase':'TEST'})
+
+class OperatorReleaseContract(unittest.TestCase):
+    class ReadClient:
+        admin='fixture-admin'
+        def __init__(self, fault=None): self.calls=[];self.fault=fault
+        def request(self, method, route, **kwargs):
+            self.calls.append((method,route));assert method=='GET'
+            if route.endswith('/capabilities'):
+                return {'operation_protocol':1,'official_amd64_sha256':module.OFFICIAL_SHA256,'target_version':'1.4.3' if self.fault=='future-panel' else '1.4.2'}
+            if route=='/admin/node-artifacts':
+                return {'config_protocol_version':10,'artifacts':[{'architecture':'amd64','available':True,'version':'1.4.3' if self.fault=='future-node' else '1.4.2','sha256':'f'*64 if self.fault=='wrong-sha' else module.TARGET_SHA256}]}
+            if route.endswith('/current'):
+                if self.fault=='none':raise module.ApiFailure('MIGRATION_NOT_FOUND')
+                return {'operation':{'old':{'node_id':'another-node'},'state':'RESTORED' if self.fault=='active' else 'SUCCESS'}}
+            if route=='/groups':return [{'id':7,'token':'fixture-group-token'}]
+            raise AssertionError('Unexpected non-readonly surface: '+route)
+    def test_readonly_check_has_no_config_revision_or_metadata_registration(self):
+        client=self.ReadClient();host=Host()
+        module.readonly_panel_check(client,host,{'identity_group_id':7,'node_id':'old'})
+        self.assertEqual(client.calls,[('GET',module.BASE+'/capabilities'),('GET','/admin/node-artifacts'),('GET','/admin'+module.BASE+'/current')])
+        self.assertEqual(host.events,[])
+    def test_check_rejects_future_target_wrong_hash_or_active_operation(self):
+        for fault in ['future-panel','future-node','wrong-sha','active']:
+            with self.subTest(fault=fault),self.assertRaises(module.Failure):
+                module.readonly_panel_check(self.ReadClient(fault),Host(),{'node_id':'old','identity_group_id':7})
+    def test_other_nodes_terminal_operation_and_no_operation_do_not_block_check(self):
+        for fault in [None,'none']:
+            module.readonly_panel_check(self.ReadClient(fault),Host(),{'node_id':'old','identity_group_id':7})
+    def test_fixed_binary_guard_rejects_wrong_version_with_correct_hash(self):
+        with tempfile.TemporaryDirectory() as root:
+            binary=pathlib.Path(root)/'node';binary.write_bytes(b'fixture-v142')
+            with patch.object(module,'TARGET_SHA256',hashlib.sha256(b'fixture-v142').hexdigest()):
+                module.verify_target_binary(Host(),binary)
+                host=Host();host.run=lambda args:types.SimpleNamespace(stdout=b'relay-node 1.4.3\n')
+                with self.assertRaisesRegex(module.Failure,'FIXED_V142_ARTIFACT_VERSION_REQUIRED'):module.verify_target_binary(host,binary)
+            with self.assertRaisesRegex(module.Failure,'FIXED_V142_ARTIFACT_SHA256_REQUIRED'):module.verify_target_binary(Host(),binary)
+    def test_check_main_stops_before_creating_work_or_starting_operation(self):
+        with tempfile.TemporaryDirectory(dir=pathlib.Path(tempfile.gettempdir()).resolve()) as root:
+            base=pathlib.Path(root);opt=base/'opt/relay-node';opt.mkdir(parents=True);(opt/'node-id').write_text('old')
+            env=base/'etc/relay-node';env.mkdir(parents=True);(env/'relay-node.env').write_text('PANEL_URL=https://panel.example.com\nNODE_TOKEN=fixture-group-token\n')
+            host=module.Host(base);client=self.ReadClient()
+            with tempfile.TemporaryFile(mode='w+') as auth:
+                auth.write(json.dumps({'admin_token':'fixture-admin','probes':[]}));auth.seek(0)
+                # main owns this duplicated fd, as real --auth-fd does.
+                import os,sys
+                fd=os.dup(auth.fileno())
+                with patch.object(module,'Host',return_value=host),patch.object(host,'precheck'),patch.object(host,'old_auth'),patch.object(module,'Client',return_value=client),patch.object(module.os,'geteuid',return_value=0),patch.object(module.sys,'argv',['upgrader','--check','--auth-fd',str(fd)]),patch.object(module,'emit') as output:
+                    module.main();self.assertEqual(output.call_args.args[0],'READY')
+            self.assertFalse((base/'var/lib/relay-panel/legacy-v130-upgrade').exists())
+            self.assertTrue(all(m=='GET' for m,p in client.calls))
+    def test_operator_cli_help_version_and_batch_rejection(self):
+        import subprocess
+        for option in ['--help','--version']:
+            r=subprocess.run(['bash',str(SCRIPT),option],capture_output=True,text=True);self.assertEqual(r.returncode,0);self.assertIn('1.4.2',r.stdout)
+        r=subprocess.run(['bash',str(SCRIPT),'--batch'],capture_output=True,text=True);self.assertNotEqual(r.returncode,0)
+        self.assertNotIn('Traceback',r.stderr)
 
 if __name__=='__main__':unittest.main()

@@ -14,6 +14,7 @@ install.sh
 update.sh
 deploy.sh
 relay-node-install.sh
+reality-node-v1.3.0-to-v1.4.2.sh
 SOURCE_COMMIT
 VERSION
 SHA256SUMS

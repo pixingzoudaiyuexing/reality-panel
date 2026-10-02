@@ -1,35 +1,41 @@
-# One-time official v1.3.0 single-node replacement
+# Upgrading Reality Node v1.3.0 to v1.4.2
 
-This tool replaces one official released v1.3.0 amd64 Lite/systemd Node on Debian 12 with the Panel's configured current candidate artifact. It is an explicit maintenance operation, not the ordinary updater and not a compatibility framework. Panel and Node version numbers are not changed by this feature.
+This is a one-time upgrade for the **official v1.3.0 amd64 Debian 12 Lite/systemd Node only**, using a fresh Pool-native identity. It is not a general updater or batch migration. Unknown binaries, custom drop-ins or unsupported hosts stop before the Node is stopped.
 
-## Preconditions
+## Official operator entrypoint
 
-Upgrade Panel first. Keep the released old Nodes running and verify their public forwarding. Enable the existing `NODE_REUSE_RUNTIME_ENABLED` setting and configure the normal HTTPS public Panel URL and current amd64 Node assets. The administrator supplies one identity group ID and one Node ID, plus an HTTP forwarding probe for every effective Rule. Automatic routing must be disabled; current normal/Carrier policy must be idle. DNS records associated with the Node must be Panel-owned and readable. Unknown binary hashes, another active migration, conflicting lifecycle work, unsupported listener/probe types, and unresolved configuration conflicts stop before the old service is stopped.
+Repository: `scripts/reality-node-v1.3.0-to-v1.4.2.sh`.
+Release asset: `reality-node-v1.3.0-to-v1.4.2.sh`, covered by Release `SHA256SUMS`.
+The script pins target version **1.4.2** and its exact Node SHA; it never resolves `latest`. Future Panel versions or a mismatched Node artifact are rejected before STOP. A Release build must match the script's pinned Node hash.
 
-The script checks the exact released binary SHA256, not only the version string:
-
-`5c70aac9aab2e78b739d0468d6920b56fac427fb31f18790bc0809c616f965f9`
-
-Other versions, unknown locally compiled v1.3.0 artifacts, customized systemd drop-ins and symlinked managed root paths require manual inspection. The small script intentionally supports only this known installation layout. Its preflight does not promise that a later network/package operation cannot fail; such failures enter rollback.
-
-## Run one Node
-
-Obtain `/api/v1/legacy-node-upgrade-v130/script.sh` over the Panel's normal HTTPS endpoint and inspect the downloaded script. Prepare a local JSON probe file, for example:
-
-```json
-[{"rule_id":1,"path":"/marker","expected_marker":"NODE-B-G1"}]
-```
-
-Include every effective Rule, including all reused Groups. Invoke on the chosen Node host:
+After Owner-authorized publication, download the script and checksum manifest from the **v1.4.2 Release** over HTTPS; do not execute downloaded content before verifying its checksum:
 
 ```bash
-bash legacy-node-upgrade-v130.sh \
-  --panel-url https://YOUR-TEST-PANEL \
-  --identity-group-id 1 --node-id ONE-NODE-ID \
-  --probe-file /root/forwarding-probes.json
+curl --proto '=https' --tlsv1.2 -fL -O https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.4.2/reality-node-v1.3.0-to-v1.4.2.sh
+curl --proto '=https' --tlsv1.2 -fL -O https://github.com/pixingzoudaiyuexing/reality-panel/releases/download/v1.4.2/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+chmod +x reality-node-v1.3.0-to-v1.4.2.sh
+sudo ./reality-node-v1.3.0-to-v1.4.2.sh --check
+sudo ./reality-node-v1.3.0-to-v1.4.2.sh
 ```
 
-The script prompts for administrator credentials through the terminal. Automated authorized operation may provide an already authenticated admin token and probes through `--auth-fd`; tokens are never command-line arguments. It never SSHs to another Node or starts a next operation.
+The default Panel URL comes from the managed Node environment. If needed, append `--panel https://panel.example.com`. `--help` and `--version` need no mutation or credentials.
+
+The script asks for a Panel administrator username and a **masked password**; neither password nor permanent Node credential appears in the command line or output. Authentication stays in process memory. The normal Panel start creates the existing short-lived Node-scoped migration authorization. The script reads this host's managed identity and determines its Home Group itself. No manual API calls or Membership/Carrier JSON are required.
+
+For each actual Rule, the normal invocation asks for an HTTP path and a stable expected response marker. Use that Rule's real forwarding service and a marker expected after the identity replacement. This tool requires HTTP forwarding probes for every Rule; non-HTTP workloads need an operator-provided HTTP check through the same Rule before migration. It does not directly probe a loopback backend as proof of public forwarding.
+
+`--check` verifies the official binary/host, HTTPS Panel capability, Config Protocol 10, exact v1.4.2 artifact metadata and absence of an active migration. It performs only reads after normal login: no operation creation, Node stop, Membership/Carrier/DNS mutation, configuration revision delivery or Pool metadata reconciliation. It outputs `READY` for a supported old Node. A completed migration receipt outputs `ALREADY_MIGRATED`, never claims an old-host check succeeded.
+
+## Recommended order
+
+1. Upgrade Panel to v1.4.2 using the normal update path.
+2. Confirm old Nodes still forward on LKG.
+3. Log into **one** selected Node host and run `--check`.
+4. Run the script normally, then check Online, Rules, Carrier, DNS and public forwarding.
+5. After manual confirmation, log into another host and explicitly repeat.
+
+**Never upgrade multiple Nodes at once.** There is no `--all`, `--batch` or implicit next Node.
 
 ## State and commit boundary
 
