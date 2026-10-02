@@ -2,7 +2,7 @@
 
 > 面向 Reality SNI 中转场景的自托管控制面板：集中管理 Relay 节点、SNI 转发、DNS、证书、伪装站与节点生命周期，同时尽量让数据面不依赖 Panel 持续在线。
 
-**当前稳定版：`v1.1.26`** · **候选源码：`v1.3.0`（未发布）** · **Config Protocol：`10`** · **生产部署：Debian 12 / amd64 / systemd** · **License：AGPL-3.0**
+**已发布基线：`v1.3.0`** · **候选源码：`v1.4.2`（未发布）** · **Config Protocol：`10`** · **生产部署：Debian 12 / amd64 / systemd** · **License：AGPL-3.0**
 
 ---
 
@@ -275,7 +275,7 @@ Reality Panel 更适合下面这类结构：
 | 安装权限 | root |
 | Panel 默认端口 | `18888` |
 | 当前稳定版 | `v1.1.26` |
-| 候选源码 | `v1.3.0`（尚未发布或部署） |
+| 候选源码 | `v1.4.2`（尚未正式发布；已验收授权 TEST） |
 | Config Protocol | `10` |
 
 Docker 文件仍可能保留在仓库中作为开发 / 兼容资产，但 **Docker 已不再属于正式自动发布流程**。生产安装以 GitHub Release 的 systemd 二进制资产为准。

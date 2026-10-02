@@ -1,15 +1,10 @@
 # Release Contract
 
-Reality Panel uses one release tag and one compatibility version for the Panel
-and Node. The current stable release is `v1.1.26`; a historical 1.2.x source
-line exists, so the new candidate is `v1.3.0`. It has not been released or
-deployed. The Owner reports `v1.1.26` is deployed to production; this remains
-Owner-reported and was not independently verified here. Config Protocol
-remains `10` and Lifecycle Protocol remains `1`.
+Reality Panel uses one application release version for Panel and Node. The published baseline is `v1.3.0`; the current candidate is `v1.4.2`. Candidate TEST acceptance and official publication are separate. Production was not accessed or verified during this task. Config Protocol remains `10`, Lifecycle Protocol remains `1`.
 
 ## Release assets
 
-Each `vX.Y.Z` GitHub Release is built from its tagged checkout and contains:
+The tagged source produces these systemd Release assets:
 
 ```text
 reality-panel-linux-amd64
@@ -19,31 +14,28 @@ install.sh
 update.sh
 deploy.sh
 relay-node-install.sh
+SOURCE_COMMIT
+VERSION
 SHA256SUMS
 ```
 
-The release workflow checks that Cargo package versions equal the tag, builds
-both binaries and the frontend from that checkout, and creates the checksum
-manifest. The systemd updater only trusts GitHub Release assets. Existing Docker
-images remain available for compatibility deployments, but Docker is no longer
-part of the automatic release workflow.
+Panel embeds its Bootstrap, credential, lifecycle and one-time migration scripts from the same checkout; Node download metadata is served from the verified Panel-managed Node artifact. SOURCE_COMMIT names the exact source HEAD. VERSION contains the bare application version. SHA256SUMS covers every listed asset except itself. A local verified release-shaped archive for TEST is not a GitHub Release.
 
-## Version locations
+## Version sources
 
-- `crates/panel/Cargo.toml` and `crates/node/Cargo.toml` carry the matching
-  candidate application version `1.3.0`.
-- `Cargo.lock` records both package versions.
-- `crates/panel/src/config.rs` reads the Panel package version by default.
-- `scripts/relay-node-install.sh` is a legacy compatibility script only.
-- `.github/workflows/binary-release.yml` publishes systemd release assets.
-
-Validate the candidate source before a later, separately authorized release:
+- `crates/panel/Cargo.toml`, `crates/node/Cargo.toml` and their Cargo.lock entries: `1.4.2`.
+- Panel configuration and both `--version` commands derive from their package version.
+- Legacy compatibility `scripts/relay-node-install.sh` SCRIPT_VERSION: `1.4.2`.
+- Workspace has no application version. Shared crate `0.1.0` and private frontend package `0.0.0` are independently versioned and are not public release versions.
+- GitHub release tag is validated against Panel/Node package versions. The release workflow generates VERSION, SOURCE_COMMIT and the release installer default tag.
+- Installer and updater resolve an explicit tag or the latest published stable Release; there is no unpublished latest fallback.
+- Official legacy detector remains `1.3.0`, exact amd64 SHA and official source. The one-time upgrade target is current Panel version and current verified Node artifact, `1.4.2` for this candidate.
+- Docker files do not carry an application version; images remain compatibility material, not the automatic formal release path.
 
 ```bash
-bash scripts/release-check.sh 1.3.0
+bash scripts/release-check.sh 1.4.2
+bash scripts/release-version-contract.test.sh v1.4.2
+cargo build --workspace --release --locked
 ```
 
-The default updater resolves the latest non-prerelease `v*` Release. An
-explicit version may select `v1.0.0-rc.6`, `v1.0.0`, or a later stable tag.
-This permits an in-place RC-to-stable upgrade without changing database or
-runtime paths.
+The checked-in optimized release profile uses stripping, fat LTO and one codegen unit. Resource limits may serialize compilation without changing this profile. Multi-A state and pending DNS transactions prohibit a bare downgrade to an older binary that does not understand the state; no downgrade converter is provided.

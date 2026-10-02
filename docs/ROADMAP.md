@@ -1,8 +1,8 @@
 # Reality Panel — Roadmap
 
-## Current stage: Node Pool V1 v1.3.0 release candidate pending Primary review
+## Current stage: v1.4.2 release finalization
 
-Node Pool V1 projects existing Nodes and memberships without automatic runtime changes, adds Pool-managed names and Group-centric assignment, and provisions new Nodes under a hidden identity anchor. Implementation and RT-001 have passed independent review; isolated Debian 12 amd64 runtime acceptance also passed, including post-migration restart, invalid descriptor and Pool-native SSH Bootstrap flows. Candidate version is `v1.3.0`; it is not released or deployed. The Owner reports stable `v1.1.26` production deployment; that state has not been independently verified in this task. See [ADR 0002](adr/0002-node-pool-v1.md).
+Current functionality has completed authorized TEST acceptance. The release candidate now requires exact-source version contracts, optimized artifact build, final tests, Gemini main gate, independent review and public TEST smoke. Publication and Production deployment require separate Owner authorization. The one-time official-v1.3.0 migration stays narrowly scoped; no new architecture or features belong to finalization.
 
 ## Stable baseline: Node Reuse product completion
 

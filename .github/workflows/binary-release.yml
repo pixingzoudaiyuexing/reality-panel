@@ -98,6 +98,7 @@ jobs:
           cp install.sh deploy.sh update.sh scripts/relay-node-install.sh release-dist/
           sed -i "s/^DEFAULT_RELEASE_TAG=.*/DEFAULT_RELEASE_TAG=\"$RELEASE_TAG\"/" release-dist/install.sh
           printf '%s\n' "$GITHUB_SHA" > release-dist/SOURCE_COMMIT
+          printf '%s\n' "$VERSION" > release-dist/VERSION
           chmod +x release-dist/reality-panel-linux-amd64 release-dist/reality-node-linux-amd64
           chmod +x release-dist/install.sh release-dist/deploy.sh release-dist/update.sh release-dist/relay-node-install.sh
           test "$(release-dist/reality-panel-linux-amd64 --version | awk '{print $NF}')" = "$VERSION"
@@ -105,7 +106,7 @@ jobs:
           file release-dist/reality-panel-linux-amd64 | grep -q 'ELF 64-bit.*x86-64'
           file release-dist/reality-node-linux-amd64 | grep -q 'ELF 64-bit.*x86-64'
           test -s release-dist/reality-panel-web.tar.gz
-          (cd release-dist && sha256sum reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh deploy.sh update.sh relay-node-install.sh SOURCE_COMMIT > SHA256SUMS)
+          (cd release-dist && sha256sum reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh deploy.sh update.sh relay-node-install.sh SOURCE_COMMIT VERSION > SHA256SUMS)
 
       - name: Verify release assets
         run: |
@@ -115,6 +116,7 @@ jobs:
           grep -Eq '^([0-9a-f]{64})  reality-panel-linux-amd64$' SHA256SUMS
           grep -Eq '^([0-9a-f]{64})  reality-node-linux-amd64$' SHA256SUMS
           test "$(cat SOURCE_COMMIT)" = "$GITHUB_SHA"
+          test "$(cat VERSION)" = "$VERSION"
 
       - name: Upload verified release artifacts
         uses: actions/upload-artifact@v4
@@ -143,3 +145,4 @@ jobs:
             release-dist/relay-node-install.sh
             release-dist/SHA256SUMS
             release-dist/SOURCE_COMMIT
+            release-dist/VERSION

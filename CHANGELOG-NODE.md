@@ -7,6 +7,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.4.2] - Release Candidate (2026-10-02)
+
+### 改进 / 修复
+
+- 与 Panel v1.4.2 统一发布；Pool-native 多 Group Rules 保持现有配置修订、指纹与 LKG 保护。
+- 完整受管理 Uninstall 清理，并在移除自身私有状态后持久确认终态；保护非本产品的资源。
+- 官方 v1.3.0 单节点替换保留同主机有效 TLS 资产，停机前验证生成配置归属；只清理指定的产品 Nginx 配置并 reload 后 Bootstrap，失败恢复旧运行状态。
+- 支持 Debian 12/13 与 Ubuntu 安装能力检查；真实主机证据限 Debian 12 amd64。Docker/OpenList/Xiaoya 未宣称完整实体 Runtime Accepted。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`。Legacy v1.3.0 检测器和 SHA 不随本版版本号修改。
+
 ## [1.3.0] - Release Candidate (2026-09-28)
 
 ### 新增 / 改进

@@ -32,7 +32,7 @@ The repository currently contains support for:
 - Lite-node related behavior;
 - GitHub Release based publishing;
 - exact-concrete-node Node Reuse with admin Preflight and guarded runtime delivery (released in `v1.1.26`; Owner reports production deployment);
-- Node Pool V1, integrated and independently reviewed on `main`, with RT-001 runtime acceptance passed; RC `v1.3.0` source is prepared but not released or deployed.
+- Node Pool V1, integrated and independently reviewed on `main`, with RT-001 runtime acceptance passed; RC `v1.4.2` source is being finalized; publication is separately authorized.
 
 ## Non-goals / boundaries
 
@@ -49,7 +49,7 @@ The repository currently contains support for:
 - Config Protocol is currently 10.
 - Lifecycle Protocol is currently 1.
 - Current stable release is `v1.1.26`; the Owner reports it has been deployed to production (not independently verified in this task).
-- Current release candidate source is `v1.3.0`; it is not released or deployed.
+- Current release candidate source is `v1.4.2`; it is not officially published.
 - Production release artifacts are built and published from the tagged checkout.
 - Existing SQLite deployment remains supported; PostgreSQL support is also present.
 - Project-level decisions proposed by Codex require Primary acceptance before becoming canonical project knowledge.

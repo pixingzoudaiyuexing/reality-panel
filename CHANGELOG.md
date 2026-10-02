@@ -7,6 +7,31 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.4.2] - Release Candidate (2026-10-02)
+
+### 新增 / 改进
+
+- Pool-native Node 可加入多个业务 Group；EffectiveConfig 合并各 Group Rules，Carrier 选择不筛选节点运行的 Rules。
+- 完成节点生命周期：Offline 保留身份和 Membership；移出 Group 保留 Node；Delete 退休具体身份、撤销认证并清理实时引用；Uninstall 清理受管理的主机资源。历史流量、指标与审计保留。
+- 完成 Panel full purge 和 Node full cleanup 的资源归属检查；保护外部文件、服务、账户和路径。
+- Carrier 线路支持多个成员 Node；DNS 以去重 IPv4 集合收敛，支持 Huawei RRset / DNSMgr Multi-A。Unknown A 和 CNAME 覆盖需要确认；Provider 读取失败不会伪装为无记录。
+- Rule 创建页提供只读域名预检查。安装器增加 Debian 13 与 Ubuntu capability 支持；Debian 12 amd64 实体验收通过。
+- 提供仅针对官方 v1.3.0 amd64 Debian 12 Lite/systemd Node 的一次性单节点升级脚本，目标为当前 v1.4.2 制品。新身份上线后恢复名称、Membership、Rules 和 Carrier 引用；同 IP 迁移保持 DNS 值和 Record ID。
+
+### 安全 / 兼容性
+
+- 只升级 Panel 时旧 v1.3.0 Node 继续保持 LKG forwarding；迁移一次仅一台，成功后结束，下一台须管理员显式再调用。
+- 提交前失败必须恢复旧主机，并通过 fresh report、WS 和真实 forwarding 屏障才完成回滚；COMMITTED/SUCCESS 后禁止旧身份回滚。旧身份退休后无法继续认证。
+- Config Protocol 保持 `10`，Lifecycle Protocol 保持 `1`；没有新增数据库 schema migration。
+- Carrier/DNS 经授权 Huawei/DNSMgr 真实 API 回读及两台 Relay 实体验收；本条为候选发布说明，不表示已经创建正式 Release。
+
+### 已知限制
+
+- Legacy upgrade 仅支持上述明确官方 v1.3.0 布局，不是通用迁移器，不提供批量升级。
+- Debian 13 / Ubuntu 只有 capability/fixture 证据；Docker、OpenList、Xiaoya 不宣称完整实体 Runtime Accepted。
+- 写入 Multi-A 数据后不能裸降级到不了解该状态的旧 binary，pending DNS transaction 期间尤其禁止降级。
+- Group Delete 维持现有语义。本版未重做；普通 Membership 移除后重新加入不会自动恢复历史 Carrier selection，Legacy migration 的业务恢复是专项逻辑。
+
 ## [1.3.0] - Release Candidate (2026-09-28)
 
 ### 新增
