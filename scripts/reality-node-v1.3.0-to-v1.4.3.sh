@@ -8,7 +8,7 @@ import argparse, contextlib, fcntl, getpass, hashlib, io, json, os, pathlib, re
 import shutil, signal, ssl, subprocess, sys, tarfile, time, urllib.error, urllib.request
 
 TARGET_VERSION = '1.4.3'
-TARGET_SHA256 = 'a66de121f32f572e5c6e04d99225a1baf152f9698df27a103122ca771bcb2390'
+TARGET_SHA256 = '5342c286d088b2df129dfeee6c9f13ac8c80ce525a047cf0e19d620c4e4e93a8'
 OFFICIAL_SHA256 = '5c70aac9aab2e78b739d0468d6920b56fac427fb31f18790bc0809c616f965f9'
 BASE = '/legacy-node-upgrade-v130'
 OWNED_TREES = ['/opt/relay-node', '/etc/relay-node', '/var/lib/relay-panel/node-claims']
