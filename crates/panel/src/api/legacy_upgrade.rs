@@ -77,7 +77,7 @@ pub async fn script() -> Response {
             axum::http::header::CONTENT_TYPE,
             "text/x-shellscript; charset=utf-8",
         )],
-        include_str!("../../../../scripts/reality-node-v1.3.0-to-v1.4.3.sh"),
+        include_str!("../../../../scripts/reality-node-v1.3.0-to-v1.4.4.sh"),
     )
         .into_response()
 }

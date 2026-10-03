@@ -256,6 +256,14 @@ capture_transaction() {
     acquire_transaction_lock || fail "TRANSACTION_BUSY: another bootstrap transaction is active"
   fi
 
+  if [ -n "${POOL_NODE_ID:-}" ]; then
+    command -v python3 >/dev/null || fail "python3 is required for Pool credential bootstrap"
+    snapshot_file pool_node_id /opt/relay-node/node-id
+    snapshot_file pool_runtime_auth /var/lib/relay-panel/node-claims/runtime-auth.json
+    snapshot_directory_state pool_claim "/var/lib/relay-panel/node-claims/$POOL_NODE_ID"
+    cp -- "$CONFIG_FILE" "$TRANSACTION_DIR/pool-bootstrap.conf"
+    chmod 0600 "$TRANSACTION_DIR/pool-bootstrap.conf"
+  fi
   snapshot_file binary /opt/relay-node/relay-node
   snapshot_file env /etc/relay-node/relay-node.env
   snapshot_file unit /etc/systemd/system/relay-node.service
@@ -313,6 +321,85 @@ restore_enablement() {
   fi
 }
 
+# Cancel the exact Fresh claim before removing any candidate identity. This is
+# also available to a reconnecting SSH rollback through the private transaction.
+cleanup_pool_bootstrap() (
+  [ -f "$TRANSACTION_DIR/pool-bootstrap.conf" ] || return 0
+  # Captured from the same mode-0600 deployment configuration, never a public DTO.
+  source "$TRANSACTION_DIR/pool-bootstrap.conf"
+  POOL_NODE_ID="$POOL_NODE_ID" POOL_GROUP_ID="$POOL_GROUP_ID" \
+  POOL_CLAIM_SECRET="$POOL_CLAIM_SECRET" NODE_TOKEN="$NODE_TOKEN" PANEL_URL="$PANEL_URL" \
+  python3 - "$TRANSACTION_DIR" "$TRANSACTION_ROOT" <<'POOL_CLEANUP_PY'
+import json, os, pathlib, re, shutil, sys, urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        raise RuntimeError("redirect refused")
+try:
+    transaction = pathlib.Path(sys.argv[1])
+    root = pathlib.Path(sys.argv[2] or "/")
+    node = os.environ["POOL_NODE_ID"]
+    group = int(os.environ["POOL_GROUP_ID"])
+    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f-]{27}", node):
+        raise RuntimeError("invalid exact deployment identity")
+    claims = root / "var/lib/relay-panel/node-claims"
+    state_dir = claims / node
+    body = {"home_group_id":group, "node_id":node, "secret":os.environ["POOL_CLAIM_SECRET"]}
+    nonce_path = state_dir / "pool-claimant-nonce"
+    if nonce_path.exists():
+        if nonce_path.is_symlink(): raise RuntimeError("unsafe nonce file")
+        body["claimant_nonce"] = nonce_path.read_text()
+    import urllib.parse
+    origin = os.environ["PANEL_URL"].rstrip("/")
+    url = urllib.parse.urlsplit(origin)
+    if url.scheme != "https" or not url.hostname or url.username or url.password or url.query or url.fragment or url.path:
+        raise RuntimeError("canonical HTTPS Panel URL required")
+    request = urllib.request.Request(origin +
+        "/api/v1/node-credential-claims/" + node + "/bootstrap/cancel",
+        data=json.dumps(body).encode(), headers={"Authorization":"Bearer " + os.environ["NODE_TOKEN"],
+        "Content-Type":"application/json"})
+    opener = urllib.request.build_opener(NoRedirect())
+    with opener.open(request, timeout=15) as response:
+        result = json.loads(response.read(65536))
+    data = result.get("data", {})
+    if result.get("code") != 0 or (data.get("claim_id"), data.get("home_group_id"), data.get("node_id")) != (node, group, node):
+        raise RuntimeError("cleanup identity confirmation failed")
+    if data.get("outcome") == "ACTIVE_PRESERVED":
+        print("BOOTSTRAP_CREDENTIAL=ACTIVE_PRESERVED", file=sys.stderr)
+        sys.exit(20)
+    if data.get("outcome") != "CANCELLED" or data.get("state") not in ("CANCELLED", "EXPIRED"):
+        raise RuntimeError("cleanup requires terminal inactive claim")
+    identity = root / "opt/relay-node/node-id"
+    descriptor = claims / "runtime-auth.json"
+    # Check all candidate ownership before performing a local removal.
+    for path in [identity, descriptor, state_dir]:
+        for component in [path] + list(path.parents):
+            if component == root.parent: break
+            if component.is_symlink(): raise RuntimeError("unsafe candidate path")
+    if identity.exists() and identity.read_text().strip() != node:
+        raise RuntimeError("candidate identity changed")
+    if (transaction / "pool_runtime_auth.state").read_text().strip() == "absent" and descriptor.exists():
+        auth = json.loads(descriptor.read_text())
+        if (auth.get("identity_group_id"), auth.get("node_id")) != (group, node) or \
+            pathlib.Path(auth.get("secret_file", "")).parent != pathlib.Path("/var/lib/relay-panel/node-claims") / node:
+            raise RuntimeError("candidate descriptor changed")
+    if (transaction / "pool_claim.dir-state").read_text().strip() == "absent" and state_dir.exists():
+        if not state_dir.is_dir(): raise RuntimeError("unsafe candidate directory")
+        allowed = {"credential-pending.json", "node-credential.secret", "pool-claimant-nonce"}
+        if any((p.name not in allowed and not re.fullmatch(r"\.(?:credential-pending\.json|node-credential\.secret|pool-claimant-nonce)\.[0-9]+\.[0-9a-f]{16}", p.name)) or p.is_symlink() or not p.is_file() for p in state_dir.iterdir()):
+            raise RuntimeError("unexpected candidate material")
+        shutil.rmtree(state_dir)
+    if (transaction / "pool_runtime_auth.state").read_text().strip() == "absent":
+        descriptor.unlink(missing_ok=True)
+    if (transaction / "pool_node_id.state").read_text().strip() == "absent":
+        identity.unlink(missing_ok=True)
+    print("BOOTSTRAP_CREDENTIAL=CANCELLED_CANDIDATE_CLEANED", file=sys.stderr)
+except Exception as exc:
+    # Never emit HTTP bodies, exception URLs or authentication material.
+    print("BOOTSTRAP_CREDENTIAL_CLEANUP=RECOVERY_REQUIRED category=" + type(exc).__name__, file=sys.stderr)
+    sys.exit(1)
+POOL_CLEANUP_PY
+)
+
 rollback_transaction() {
   local failed=0 relay_was_active relay_was_enabled nginx_was_active nginx_was_enabled
   local relay_files_changed=0 nginx_files_changed=0 unit_changed=0
@@ -322,6 +409,8 @@ rollback_transaction() {
     rolled_back) return 0 ;;
     committed) return 1 ;;
   esac
+
+  cleanup_pool_bootstrap || return 1
 
   relay_was_active="$(cat "$TRANSACTION_DIR/relay-node.active")"
   relay_was_enabled="$(cat "$TRANSACTION_DIR/relay-node.enabled")"
@@ -464,6 +553,7 @@ rollback_transaction() {
   remove_file_staging "$LITE_FALLBACK_INDEX"
   remove_file_staging "$LITE_FALLBACK_CONF"
   rm -rf -- "$TRANSACTION_DIR/candidate"
+  rm -f -- "$TRANSACTION_DIR/pool-bootstrap.conf"
 
   if [ "$failed" = 0 ]; then
     printf 'rolled_back\n' > "$TRANSACTION_DIR/state"
@@ -494,6 +584,7 @@ commit_transaction() {
        -o -name '*.active' -o -name '*.enabled' \
        -o -name '*.path' \) \
     -delete
+  rm -f -- "$TRANSACTION_DIR/pool-bootstrap.conf"
   TRANSACTION_FINALIZED=1
 }
 

@@ -68,8 +68,8 @@ for script in install.sh deploy.sh update.sh scripts/relay-node-install.sh \
     scripts/release-version-contract.sh scripts/release-version-contract.test.sh; do
     bash -n "$ROOT/$script" || fail "shell syntax failed: $script"
 done
-grep -Fq 'reality-node-v1.3.0-to-v1.4.3.sh' "$ROOT/.github/workflows/binary-release.yml" || fail "one-time upgrader release asset missing"
-grep -Fq "TARGET_VERSION = '1.4.3'" "$ROOT/scripts/reality-node-v1.3.0-to-v1.4.3.sh" || fail "one-time upgrader target version changed"
-grep -Eq "^TARGET_SHA256 = '[a-f0-9]{64}'$" "$ROOT/scripts/reality-node-v1.3.0-to-v1.4.3.sh" || fail "one-time upgrader target hash missing"
-bash -n "$ROOT/scripts/reality-node-v1.3.0-to-v1.4.3.sh"
+grep -Fq 'reality-node-v1.3.0-to-v1.4.4.sh' "$ROOT/.github/workflows/binary-release.yml" || fail "one-time upgrader release asset missing"
+grep -Fq "TARGET_VERSION = '1.4.4'" "$ROOT/scripts/reality-node-v1.3.0-to-v1.4.4.sh" || fail "one-time upgrader target version changed"
+grep -Eq "^TARGET_SHA256 = '[a-f0-9]{64}'$" "$ROOT/scripts/reality-node-v1.3.0-to-v1.4.4.sh" || fail "one-time upgrader target hash missing"
+bash -n "$ROOT/scripts/reality-node-v1.3.0-to-v1.4.4.sh"
 ok "Reality Panel $VERSION release contract is ready"

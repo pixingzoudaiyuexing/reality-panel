@@ -226,6 +226,14 @@ pub fn routes() -> Router<AppState> {
                 )),
         )
         .route(
+            "/node-credential-claims/{claim_id}/bootstrap/cancel",
+            axum::routing::post(node_claim::cancel_bootstrap)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(
+                    node_claim::claim_response_headers,
+                )),
+        )
+        .route(
             "/node-credential-claims/{claim_id}/credential/prepare",
             axum::routing::post(node_credential_delivery::prepare_credential)
                 .layer(axum::extract::DefaultBodyLimit::max(4096))

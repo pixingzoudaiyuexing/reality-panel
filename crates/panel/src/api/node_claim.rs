@@ -5,21 +5,12 @@
 //! allocates, returns, activates, rotates, or authenticates a permanent
 //! Node Credential and it grants no runtime Node Reuse authority.
 //!
-//! Claim creation and claim submission are sensitive operations. Reality Panel's
-//! primary listener is plain HTTP and may sit behind a TLS-terminating reverse
-//! proxy, so a configured `https://` public URL alone is not evidence that the
-//! current request arrived over HTTPS. These handlers therefore require all of:
-//! - an effective public Panel URL using `https://`;
-//! - the socket peer to be one of NODE_CLAIM_TRUSTED_PROXY_IPS;
-//! - exactly one `X-Forwarded-Proto: https` value from that trusted peer.
-//!
-//! NODE_CLAIM_TRUSTED_PROXY_IPS is an explicit deployment trust boundary, not a
-//! convenience switch. The trusted ingress must strip/overwrite client-supplied
-//! forwarding headers and the Panel listener must not be publicly bypassable.
+//! Authorization is bound to the approved exact identity, claim secret and
+//! claimant nonce. TLS terminates at the canonical HTTPS edge; the final origin
+//! hop and forwarding headers are not credential authorization conditions.
 
 use crate::api::middleware::AdminOnly;
 use crate::api::node::extract_node_token;
-use crate::api::provisioning::effective_public_panel_url;
 use crate::api::AppState;
 use crate::db::repo::{
     GroupRepository, NewNodeCredentialClaim, NodeCredentialClaimAttempt,
@@ -37,11 +28,12 @@ use once_cell::sync::Lazy;
 use relay_shared::protocol::ApiResponse;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const CLAIM_TTL_SECS: i64 = 10 * 60;
+#[cfg(test)]
 const CLAIM_TRUSTED_PROXY_IPS_ENV: &str = "NODE_CLAIM_TRUSTED_PROXY_IPS";
 const CLAIM_ATTEMPT_LIMIT: u32 = 10;
 const CLAIM_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
@@ -226,71 +218,6 @@ fn sensitive_error(status: StatusCode, code: i32, message: &str) -> Response {
     )
 }
 
-fn trusted_proxy_ips_from_env() -> Option<Vec<IpAddr>> {
-    let raw = std::env::var(CLAIM_TRUSTED_PROXY_IPS_ENV).ok()?;
-    let mut ips = Vec::new();
-    for part in raw.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            return None;
-        }
-        ips.push(part.parse().ok()?);
-    }
-    (!ips.is_empty()).then_some(ips)
-}
-
-fn exactly_https_forwarded_proto(headers: &HeaderMap) -> bool {
-    let mut values = headers.get_all("x-forwarded-proto").iter();
-    let Some(first) = values.next() else {
-        return false;
-    };
-    if values.next().is_some() {
-        return false;
-    }
-    first
-        .to_str()
-        .ok()
-        .is_some_and(|value| value.eq_ignore_ascii_case("https"))
-}
-
-fn configured_public_url_is_https(public_url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(public_url) else {
-        return false;
-    };
-    url.scheme() == "https"
-        && url.host_str().is_some()
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.query().is_none()
-        && url.fragment().is_none()
-        && (url.path().is_empty() || url.path() == "/")
-}
-
-fn claim_transport_allowed(
-    public_url: &str,
-    peer: SocketAddr,
-    headers: &HeaderMap,
-    trusted_proxy_ips: &[IpAddr],
-) -> bool {
-    configured_public_url_is_https(public_url)
-        && trusted_proxy_ips.contains(&peer.ip())
-        && exactly_https_forwarded_proto(headers)
-}
-
-pub(crate) async fn production_claim_transport_allowed(
-    state: &AppState,
-    peer: SocketAddr,
-    headers: &HeaderMap,
-) -> bool {
-    let Some(trusted_proxy_ips) = trusted_proxy_ips_from_env() else {
-        return false;
-    };
-    let Some(public_url) = effective_public_panel_url(state).await else {
-        return false;
-    };
-    claim_transport_allowed(&public_url, peer, headers, &trusted_proxy_ips)
-}
-
 fn valid_claim_id(claim_id: &str) -> bool {
     uuid::Uuid::parse_str(claim_id)
         .map(|parsed| parsed.to_string() == claim_id)
@@ -315,34 +242,20 @@ fn claim_attempt_rate_limited(key: &str) -> bool {
 pub async fn create_claim(
     admin: AdminOnly,
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    _headers: HeaderMap,
     Json(req): Json<CreateNodeClaimRequest>,
 ) -> Response {
-    if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Concrete Node Claim requires the configured trusted HTTPS ingress",
-        );
-    }
     create_claim_after_transport(admin, state, req, "admin-api").await
 }
 
 pub(crate) async fn create_pool_migration_claim(
     admin: AdminOnly,
     state: AppState,
-    peer: SocketAddr,
-    headers: HeaderMap,
+    _peer: SocketAddr,
+    _headers: HeaderMap,
     request: CreateNodeClaimRequest,
 ) -> Response {
-    if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Concrete Node Claim requires the configured trusted HTTPS ingress",
-        );
-    }
     create_claim_after_transport(admin, state, request, "node-pool-migration").await
 }
 
@@ -457,16 +370,9 @@ pub async fn claim_status(
     admin: AdminOnly,
     State(state): State<AppState>,
     Path(claim_id): Path<String>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    _headers: HeaderMap,
 ) -> Response {
-    if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Concrete Node Claim requires the configured trusted HTTPS ingress",
-        );
-    }
     claim_status_after_transport(admin, state, claim_id).await
 }
 
@@ -531,16 +437,9 @@ pub async fn cancel_claim(
     admin: AdminOnly,
     State(state): State<AppState>,
     Path(claim_id): Path<String>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    _headers: HeaderMap,
 ) -> Response {
-    if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Concrete Node Claim requires the configured trusted HTTPS ingress",
-        );
-    }
     cancel_claim_after_transport(admin, state, claim_id).await
 }
 
@@ -633,20 +532,145 @@ async fn cancel_claim_after_transport(
     }
 }
 
+/// Fresh deployment failure cleanup is authorized by the same exact approved
+/// claim. It can cancel pending material, never revoke an active credential.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelBootstrapRequest {
+    pub home_group_id: i64,
+    pub node_id: String,
+    pub secret: String,
+    pub claimant_nonce: Option<String>,
+}
+
+pub async fn cancel_bootstrap(
+    State(state): State<AppState>,
+    Path(claim_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<CancelBootstrapRequest>,
+) -> Response {
+    let denied = || {
+        sensitive_error(
+            StatusCode::UNAUTHORIZED,
+            401,
+            "bootstrap cleanup authentication failed",
+        )
+    };
+    let Some(token) = extract_node_token(&headers) else {
+        return denied();
+    };
+    let group = match GroupRepository::find_by_token(state.db.as_ref(), &token).await {
+        Ok(Some(group)) if group.group_type == "in" && group.id == req.home_group_id => group,
+        _ => return denied(),
+    };
+    let Ok(node) = ReuseEligibleNodeId::parse(&req.node_id) else {
+        return denied();
+    };
+    let Ok(secret) = NodeClaimSecret::parse(&req.secret) else {
+        return denied();
+    };
+    if !valid_claim_id(&claim_id) || claim_id != req.node_id {
+        return denied();
+    }
+    let record = match state.db.find_node_credential_claim(&claim_id).await {
+        Ok(Some(record)) => record,
+        _ => return denied(),
+    };
+    if record.home_group_id != group.id
+        || record.approval_ref != format!("node-pool-bootstrap:{claim_id}")
+        || !record.secret_matches(&node, &secret)
+    {
+        return denied();
+    }
+    if record.claimant_nonce_verifier_data.is_some()
+        && !matches!(record.state.as_str(), "CANCELLED" | "EXPIRED")
+        && !req
+            .claimant_nonce
+            .as_deref()
+            .and_then(|v| NodeClaimantNonce::parse(v).ok())
+            .is_some_and(|nonce| record.claimant_nonce_matches(&node, &nonce))
+    {
+        return denied();
+    }
+    let cancelled = match state
+        .db
+        .cancel_node_credential_claim(&claim_id, group.id, &node, chrono::Utc::now())
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            return sensitive_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                500,
+                "bootstrap cleanup database error",
+            )
+        }
+    };
+    if matches!(cancelled, NodeCredentialClaimMutationResult::Applied) {
+        crate::service::audit::record(
+            &state,
+            None,
+            "node_bootstrap_claim_cancel",
+            "node_credential_claim",
+            &claim_id,
+            &format!(
+                "home_group_id={} node_id={} pending material cancelled",
+                group.id,
+                node.as_str()
+            ),
+        )
+        .await;
+    }
+    let latest = match state.db.find_node_credential_claim(&claim_id).await {
+        Ok(Some(record)) => record,
+        _ => {
+            return sensitive_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                500,
+                "bootstrap cleanup state unavailable",
+            )
+        }
+    };
+    let active = match state
+        .db
+        .find_current_active_node_credential_for_identity(group.id, &node)
+        .await
+    {
+        Ok(value) => value.is_some(),
+        Err(_) => {
+            return sensitive_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                500,
+                "bootstrap cleanup state unavailable",
+            )
+        }
+    };
+    let outcome = if active || latest.state == "COMPLETED" {
+        "ACTIVE_PRESERVED"
+    } else if matches!(latest.state.as_str(), "CANCELLED" | "EXPIRED") {
+        "CANCELLED"
+    } else {
+        return sensitive_error(
+            StatusCode::CONFLICT,
+            409,
+            "bootstrap cleanup requires recovery",
+        );
+    };
+    sensitive_json(
+        StatusCode::OK,
+        ApiResponse::success(
+            serde_json::json!({"outcome":outcome,"claim_id":claim_id,"home_group_id":group.id,"node_id":node.as_str(),"state":latest.state}),
+        ),
+    )
+}
+
 pub async fn claim_node(
     State(state): State<AppState>,
     Path(claim_id): Path<String>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<ClaimNodeRequest>,
 ) -> Response {
-    if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Concrete Node Claim requires the configured trusted HTTPS ingress",
-        );
-    }
     claim_node_after_transport(state, claim_id, headers, req).await
 }
 
@@ -982,59 +1006,233 @@ mod tests {
         }
     }
 
-    #[test]
-    fn trusted_https_gate_requires_https_url_trusted_peer_and_single_proxy_header() {
-        let trusted_peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
-        let untrusted_peer: SocketAddr = "203.0.113.9:40000".parse().unwrap();
-        let trusted = vec!["127.0.0.1".parse().unwrap()];
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+    #[tokio::test]
+    async fn fresh_cancel_is_exact_scoped_and_cancels_pending_but_preserves_active() {
+        use crate::api::node_credential_delivery::{
+            activate_credential, prepare_credential, ActivateCredentialDeliveryRequest,
+            PrepareCredentialDeliveryRequest,
+        };
+        use crate::node_credential::{
+            NodeCredentialDeliveryNonce, NodeCredentialSecret, NodeCredentialVerifier,
+        };
+        use base64::Engine;
+        for activate in [false, true] {
+            let (state, _pool) = test_state().await;
+            let id = uuid::Uuid::new_v4().to_string();
+            let config =
+                crate::api::provisioning::pool_credential_bootstrap_config(&state, &id, 7, 1)
+                    .await
+                    .unwrap();
+            let claim_secret = config
+                .lines()
+                .find_map(|line| line.strip_prefix("POOL_CLAIM_SECRET='"))
+                .unwrap()
+                .trim_end_matches('\'')
+                .to_string();
+            let headers = node_headers("group-token-secret-7");
+            // Wrong authorization and exact identity cannot cancel an APPROVED claim.
+            for (token, node, secret) in [
+                ("wrong", id.as_str(), claim_secret.as_str()),
+                ("group-token-secret-7", "wrong-node", claim_secret.as_str()),
+                (
+                    "group-token-secret-7",
+                    id.as_str(),
+                    "rpc1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                ),
+            ] {
+                let response = cancel_bootstrap(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    node_headers(token),
+                    Json(CancelBootstrapRequest {
+                        home_group_id: 7,
+                        node_id: node.into(),
+                        secret: secret.into(),
+                        claimant_nonce: None,
+                    }),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                assert_eq!(
+                    state
+                        .db
+                        .find_node_credential_claim(&id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "APPROVED"
+                );
+            }
+            let claimant_nonce = nonce();
+            assert_eq!(
+                claim_node(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    ConnectInfo("203.0.113.9:1".parse().unwrap()),
+                    headers.clone(),
+                    Json(claim_request(7, &id, &claim_secret, &claimant_nonce))
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+            let credential_id = uuid::Uuid::new_v4().to_string();
+            let secret = NodeCredentialSecret::generate().unwrap();
+            let node = ReuseEligibleNodeId::parse(&id).unwrap();
+            let verifier = NodeCredentialVerifier::derive(&credential_id, 7, &node, &secret);
+            let delivery_nonce = NodeCredentialDeliveryNonce::generate()
+                .unwrap()
+                .to_wire_value();
+            assert_eq!(
+                prepare_credential(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    ConnectInfo("203.0.113.9:1".parse().unwrap()),
+                    headers.clone(),
+                    Json(PrepareCredentialDeliveryRequest {
+                        home_group_id: 7,
+                        node_id: id.clone(),
+                        claim_secret: claim_secret.clone(),
+                        claimant_nonce: claimant_nonce.clone(),
+                        delivery_nonce: delivery_nonce.clone(),
+                        credential_id: credential_id.clone(),
+                        verifier_format: verifier.format().into(),
+                        verifier_version: verifier.version(),
+                        verifier_data: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .encode(verifier.data()),
+                    })
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+            let wrong_nonce = cancel_bootstrap(
+                State(state.clone()),
+                Path(id.clone()),
+                headers.clone(),
+                Json(CancelBootstrapRequest {
+                    home_group_id: 7,
+                    node_id: id.clone(),
+                    secret: claim_secret.clone(),
+                    claimant_nonce: Some(nonce()),
+                }),
+            )
+            .await;
+            assert_eq!(wrong_nonce.status(), StatusCode::UNAUTHORIZED);
+            if activate {
+                assert_eq!(
+                    activate_credential(
+                        State(state.clone()),
+                        Path(id.clone()),
+                        ConnectInfo("203.0.113.9:1".parse().unwrap()),
+                        headers.clone(),
+                        Json(ActivateCredentialDeliveryRequest {
+                            home_group_id: 7,
+                            node_id: id.clone(),
+                            credential_id: credential_id.clone(),
+                            delivery_nonce: delivery_nonce.clone(),
+                            credential_secret: secret.to_wire_value(),
+                        })
+                    )
+                    .await
+                    .status(),
+                    StatusCode::OK
+                );
+            }
+            for _ in 0..2 {
+                let response = cancel_bootstrap(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    headers.clone(),
+                    Json(CancelBootstrapRequest {
+                        home_group_id: 7,
+                        node_id: id.clone(),
+                        secret: claim_secret.clone(),
+                        claimant_nonce: Some(claimant_nonce.clone()),
+                    }),
+                )
+                .await;
+                let (status, response_headers, body) = response_json(response).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(response_headers[header::CACHE_CONTROL], "no-store");
+                assert_eq!(
+                    body["data"]["outcome"],
+                    if activate {
+                        "ACTIVE_PRESERVED"
+                    } else {
+                        "CANCELLED"
+                    }
+                );
+            }
+            // Interrupted local cleanup may already have removed its nonce.
+            let terminal_retry = cancel_bootstrap(
+                State(state.clone()),
+                Path(id.clone()),
+                headers.clone(),
+                Json(CancelBootstrapRequest {
+                    home_group_id: 7,
+                    node_id: id.clone(),
+                    secret: claim_secret.clone(),
+                    claimant_nonce: None,
+                }),
+            )
+            .await;
+            assert_eq!(
+                terminal_retry.status(),
+                if activate {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::OK
+                }
+            );
+            assert_eq!(
+                state
+                    .db
+                    .find_node_credential_claim(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                if activate { "COMPLETED" } else { "CANCELLED" }
+            );
+            assert_eq!(
+                state
+                    .db
+                    .find_node_credential_delivery(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                if activate { "COMPLETED" } else { "CANCELLED" }
+            );
+            assert_eq!(
+                state
+                    .db
+                    .find_current_active_node_credential_for_identity(7, &node)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                activate
+            );
+        }
+    }
 
-        assert!(claim_transport_allowed(
-            "https://panel.example",
-            trusted_peer,
-            &headers,
-            &trusted
-        ));
-        assert!(!claim_transport_allowed(
-            "http://panel.example",
-            trusted_peer,
-            &headers,
-            &trusted
-        ));
-        assert!(!claim_transport_allowed(
-            "https://panel.example",
-            untrusted_peer,
-            &headers,
-            &trusted
-        ));
-
-        let mut spoofed = HeaderMap::new();
-        spoofed.insert("x-forwarded-proto", "https".parse().unwrap());
-        assert!(!claim_transport_allowed(
-            "https://panel.example",
-            untrusted_peer,
-            &spoofed,
-            &trusted
-        ));
-
-        let mut duplicated = HeaderMap::new();
-        duplicated.append("x-forwarded-proto", "https".parse().unwrap());
-        duplicated.append("x-forwarded-proto", "https".parse().unwrap());
-        assert!(!claim_transport_allowed(
-            "https://panel.example",
-            trusted_peer,
-            &duplicated,
-            &trusted
-        ));
-
-        headers.insert("x-forwarded-proto", "http".parse().unwrap());
-        assert!(!claim_transport_allowed(
-            "https://panel.example",
-            trusted_peer,
-            &headers,
-            &trusted
-        ));
+    #[tokio::test]
+    async fn credential_claim_accepts_http_origin_without_forwarded_proto() {
+        let (state, _pool) = test_state().await;
+        let response = create_claim(
+            AdminOnly { user_id: 1 },
+            State(state),
+            ConnectInfo("203.0.113.9:41000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(CreateNodeClaimRequest {
+                home_group_id: 7,
+                node_id: "HTTP_ORIGIN_NODE".into(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
@@ -1206,7 +1404,7 @@ mod tests {
                 format!("Bearer {}", auth_token(&state, 1, true)),
             )
             .header("x-forwarded-proto", "https")
-            .body(Body::from(body.clone()))
+            .body(Body::from(body.replace("Node_Route", "Node_Origin")))
             .unwrap();
         untrusted_proxy.extensions_mut().insert(ConnectInfo(
             "203.0.113.9:41000".parse::<SocketAddr>().unwrap(),
@@ -1218,8 +1416,8 @@ mod tests {
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "a client cannot spoof HTTPS merely by supplying X-Forwarded-Proto"
+            StatusCode::OK,
+            "authorized admin issuance is independent of proxy headers"
         );
 
         let mut plain_from_trusted_proxy = Request::builder()
@@ -1231,7 +1429,7 @@ mod tests {
                 format!("Bearer {}", auth_token(&state, 1, true)),
             )
             .header("x-forwarded-proto", "http")
-            .body(Body::from(body.clone()))
+            .body(Body::from(body.replace("Node_Route", "Node_HttpOrigin")))
             .unwrap();
         plain_from_trusted_proxy
             .extensions_mut()
@@ -1243,7 +1441,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::OK
         );
 
         let mut admin = Request::builder()

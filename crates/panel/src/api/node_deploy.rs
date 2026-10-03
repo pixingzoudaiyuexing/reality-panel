@@ -886,8 +886,23 @@ async fn run_task(
 
     if let Some(err) = failure {
         let mut message = public_error(&err, &secrets);
+        let preserve_activated = match cancel_failed_pool_bootstrap(&state, &id, group_id).await {
+            Ok(active) => {
+                if active {
+                    message.push_str(
+                        "; ACTIVE_CREDENTIAL_PRESERVED: resume this exact deployment identity",
+                    );
+                }
+                active
+            }
+            Err(()) => {
+                message.push_str("; CREDENTIAL_CLEANUP_REQUIRES_RECOVERY: identity retained");
+                true // An unavailable activation result never authorizes destructive rollback.
+            }
+        };
         if mutation_started.load(AtomicOrdering::SeqCst)
             && !transaction_committed.load(AtomicOrdering::SeqCst)
+            && !preserve_activated
         {
             state
                 .deployments
@@ -937,6 +952,56 @@ async fn run_task(
             &format!("host={host} group_id={group_id} category={}", err.category),
         )
         .await;
+    }
+}
+
+/// Cancel only the claim allocated for this exact Fresh deployment. The existing
+/// repository transaction arbitrates cancellation against activation.
+async fn cancel_failed_pool_bootstrap(
+    state: &AppState,
+    id: &str,
+    group_id: i64,
+) -> Result<bool, ()> {
+    let Some(claim) = state
+        .db
+        .find_node_credential_claim(id)
+        .await
+        .map_err(|_| ())?
+    else {
+        return Ok(false);
+    };
+    if claim.home_group_id != group_id
+        || claim.node_id != id
+        || claim.approval_ref != format!("node-pool-bootstrap:{id}")
+    {
+        return Err(());
+    }
+    let node = crate::node_identity::ReuseEligibleNodeId::parse(id).map_err(|_| ())?;
+    state
+        .db
+        .cancel_node_credential_claim(id, group_id, &node, chrono::Utc::now())
+        .await
+        .map_err(|_| ())?;
+    let latest = state
+        .db
+        .find_node_credential_claim(id)
+        .await
+        .map_err(|_| ())?
+        .ok_or(())?;
+    if latest.state == "COMPLETED"
+        || state
+            .db
+            .find_current_active_node_credential_for_identity(group_id, &node)
+            .await
+            .map_err(|_| ())?
+            .is_some()
+    {
+        return Ok(true);
+    }
+    if matches!(latest.state.as_str(), "CANCELLED" | "EXPIRED") {
+        Ok(false)
+    } else {
+        Err(())
     }
 }
 

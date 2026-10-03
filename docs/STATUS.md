@@ -1,10 +1,9 @@
 # Current Status
 
-## v1.4.3 unpublished candidate
+## v1.4.4 RC preparation
 
-Published baseline: v1.4.2, source `6601e0936fbc07250effceebec71f7b11c8d044f`.
-Current work preserves Standard → Standard and Lite → Lite for official v1.3.0 migration and ordinary Pool-native updates. Source provenance and installation profile are separate. Profile is explicit in the existing operation JSON and provisioning bundle; no new schema, Config Protocol 10 and Lifecycle Protocol 1 remain.
+Published baseline: v1.4.3, source `81cab1cab54f490171817208b07bb51c62c1cb04`.
+This work targets Fresh credential origin transport compatibility, exact unactivated deployment cleanup/retry, safe bootstrap diagnostics and deterministic official-v1.3.0 Standard/Lite replacement.
+Legacy PRECHECK snapshots Membership, Rules baseline and local Carrier references without live Provider DNS I/O. Normal Carrier sync owns final DNS state.
 
-Formal Independent Review, exact HEAD Gemini review, optimized release artifact verification and authorized TEST/real legacy acceptance are required. This document does not claim those gates passed. No main integration, tag, GitHub Release or Production Panel deployment is authorized. Public v1.4.2 assets stay unchanged.
-
-See [installation profile contract](operations/node-installation-profiles.md) and [single-node operator instructions](operations/legacy-v130-single-node-upgrade.md).
+Config Protocol 10 and Lifecycle Protocol 1 remain. Formal Independent Review and physical TEST acceptance are required; neither publication nor Production upgrades are authorized. RC acceptance evidence is recorded separately after execution. Published v1.4.3 assets and tag remain immutable.

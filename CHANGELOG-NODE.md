@@ -7,6 +7,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.4.4] - 2026-10-03 (RC preparation)
+
+### Fixed (RC preparation)
+- Fresh bootstrap rollback handles exact unactivated local identity state and reports bootstrap-specific safe diagnostics.
+- Adds deterministic official-v1.3.0 → v1.4.4 operator script, preserving Standard/Lite and durable start-response recovery.
+- Panel and Node version advance together; Node runtime, Config Protocol 10 and Lifecycle Protocol 1 are unchanged.
+
+This RC has not been published; existing v1.4.3 binaries and assets remain immutable.
+
 ## [1.4.3] - Unpublished Candidate (2026-10-02)
 
 ### 修复 / 兼容性

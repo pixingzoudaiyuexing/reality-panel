@@ -1,7 +1,7 @@
 //! Narrow, one-time official v1.3.0 replacement. Ordinary deletion is unchanged.
 use crate::api::AppState;
 use crate::db::repo::{
-    ConcreteNodeIdentity, LegacyUpgradeCommit, LegacyUpgradeReplacement, Repository, ResourceScope,
+    ConcreteNodeIdentity, LegacyUpgradeCommit, LegacyUpgradeReplacement, Repository,
 };
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -403,82 +403,12 @@ pub async fn start(
         source_profile: Some(source_profile),
     };
     store(state.db.as_ref(), previous.map(|(raw, _)| raw), &op).await?;
-    drop(_preference);
-    drop(_authority);
-    drop(_gate);
+    // Membership, Rules and local routing references are the upgrade snapshot.
+    // Provider availability must never gate STOP OLD. DNS uses normal Carrier sync.
     let raw = serde_json::to_string(&op).map_err(|_| "SNAPSHOT_INVALID")?;
-    match snapshot_dns(state.db.as_ref(), &op).await {
-        Ok(dns) => {
-            op.dns = dns;
-            op.state = "PREPARED".into();
-            store(state.db.as_ref(), Some(raw), &op).await?;
-            Ok(op)
-        }
-        Err(error) => {
-            op.state = "FAILED_PRECHECK".into();
-            op.last_error = Some(error.clone());
-            store(state.db.as_ref(), Some(raw), &op).await?;
-            Err(error)
-        }
-    }
-}
-
-pub async fn snapshot_dns(db: &dyn Repository, op: &Operation) -> Result<Vec<DnsSnapshot>, String> {
-    use super::dnsmgr::{self, LineRecordSnapshot};
-    let ids: BTreeSet<i64> = op
-        .listeners
-        .as_array()
-        .ok_or("SNAPSHOT_INVALID")?
-        .iter()
-        .filter_map(|l| l["rule_id"].as_i64())
-        .collect();
-    let eligible: Vec<_> = db
-        .list_rules(&ResourceScope::All)
-        .await
-        .map_err(|_| "DATABASE_ERROR")?
-        .into_iter()
-        .filter(|r| ids.contains(&r.id) && dnsmgr::rule_is_dns_eligible(r))
-        .collect();
-    if eligible.is_empty() {
-        return Ok(vec![]);
-    }
-    let client = dnsmgr::load_client(db)
-        .await
-        .map_err(|_| "PROVIDER_READ_FAILURE")?
-        .ok_or("DNS_PROVIDER_REQUIRED")?;
-    let mut snapshots = vec![];
-    for rule in eligible {
-        let mut lines = BTreeSet::from(["__default__".to_string()]);
-        if let Some((_, raw)) = op
-            .routing
-            .iter()
-            .find(|(k, _)| k == &format!("relay_preference:{}", rule.device_group_in))
-        {
-            let p: super::relay_preference::RelayPreferenceState =
-                serde_json::from_str(raw).map_err(|_| "SNAPSHOT_INVALID")?;
-            lines.extend(p.carrier_policy.bindings.iter().map(|b| b.line_id.clone()));
-        }
-        for line in lines {
-            let observed = if line == "__default__" {
-                dnsmgr::inspect_default_line_record_for_transaction(db, &client, rule.id).await
-            } else {
-                dnsmgr::inspect_line_record(db, &client, rule.id, &line).await
-            }
-            .map_err(|_| "PROVIDER_READ_FAILURE_OR_UNOWNED_RECORD")?;
-            match observed {
-                LineRecordSnapshot::PanelOwned { value, record_id } => {
-                    snapshots.push(DnsSnapshot {
-                        rule_id: rule.id,
-                        line,
-                        value,
-                        record_id,
-                    })
-                }
-                _ => return Err("PANEL_OWNED_DNS_REQUIRED".into()),
-            }
-        }
-    }
-    Ok(snapshots)
+    op.state = "PREPARED".into();
+    store(state.db.as_ref(), Some(raw), &op).await?;
+    Ok(op)
 }
 
 pub async fn restore(
@@ -786,12 +716,6 @@ pub async fn finalize(
     if current.id != op.id {
         return Err("MIGRATION_STATE_CHANGED".into());
     }
-    let after = snapshot_dns(state.db.as_ref(), &op).await?;
-    if serde_json::to_value(after).map_err(|_| "SNAPSHOT_INVALID")?
-        != serde_json::to_value(&op.dns).map_err(|_| "SNAPSHOT_INVALID")?
-    {
-        return Err("DNS_RECORDS_CHANGED_NEEDS_ATTENTION".into());
-    }
     op.state = "SUCCESS".into();
     store(state.db.as_ref(), Some(raw), &op).await?;
     Ok(op)
@@ -880,8 +804,11 @@ pub async fn abort(state: &AppState, raw: String, mut op: Operation) -> Result<O
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::db::repo::{KvsRepository, NodePoolRepository, NodeReuseRepository};
+    use crate::db::repo::{KvsRepository, NodePoolRepository, NodeReuseRepository, ResourceScope};
     pub(crate) async fn fixture() -> AppState {
+        fixture_with_dns(false).await
+    }
+    async fn fixture_with_dns(dns: bool) -> AppState {
         use std::sync::Arc;
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -907,6 +834,10 @@ pub(crate) mod tests {
         sqlx::query("INSERT INTO node_credentials(credential_id,home_group_id,node_id,generation,verifier_format,verifier_version,verifier_data,activated_at) VALUES ('legacy-credential',10,'OLD_NODE',1,'rp-node-sha256',1,?,datetime('now'))").bind(vec![9_u8;32]).execute(&pool).await.unwrap();
         for (id, g, port) in [(100_i64, 10_i64, 45100_i64), (200, 20, 45200)] {
             sqlx::query("INSERT INTO forward_rules(id,name,uid,listen_port,device_group_in,target_addr,target_port) VALUES (?, ?, 1, ?, ?, '127.0.0.1', 8080)").bind(id).bind(format!("rule-{id}")).bind(port).bind(g).execute(&pool).await.unwrap();
+        }
+        if dns {
+            sqlx::query("UPDATE forward_rules SET node_transport='nginx_sni', sni='migration-test.example.com', camouflage_enabled=1 WHERE id=100")
+                .execute(&pool).await.unwrap();
         }
         let db = Arc::new(crate::db::sqlite_repo::SqliteRepository::new(pool));
         db.insert_node_reuse_binding(20, 10, "OLD_NODE")
@@ -949,6 +880,101 @@ pub(crate) mod tests {
             })
             .collect()
     }
+    #[tokio::test]
+    async fn precheck_does_not_require_live_dns_provider_for_dns_eligible_rules() {
+        let state = fixture_with_dns(true).await;
+        let rule = state
+            .db
+            .list_rules(&ResourceScope::All)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == 100)
+            .unwrap();
+        assert!(super::super::dnsmgr::rule_is_dns_eligible(&rule));
+        let op = start(
+            &state,
+            1,
+            ConcreteNodeIdentity {
+                home_group_id: 10,
+                node_id: "OLD_NODE".into(),
+            },
+            probes(),
+            OFFICIAL_AMD64_SHA256,
+            InstallProfile::Standard,
+        )
+        .await
+        .unwrap();
+        assert_eq!(op.state, "PREPARED");
+        assert!(op.dns.is_empty());
+        assert_eq!(op.memberships, vec![10, 20]);
+    }
+
+    #[tokio::test]
+    async fn provider_timeout_5xx_and_unavailable_do_not_gate_prepared() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::io::AsyncWriteExt;
+        for failure in ["timeout", "5xx", "unavailable"] {
+            let state = fixture_with_dns(true).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let count = requests.clone();
+            let provider = tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if failure == "5xx" {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+                            )
+                            .await;
+                    } else if failure == "timeout" {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            });
+            if failure == "unavailable" {
+                provider.abort();
+            }
+            state.db.set(super::super::dnsmgr::DNSMGR_CONFIG_KEY,
+                &serde_json::json!({"enabled":true,"base_url":format!("http://{address}"),"uid":1,"api_key":"test-only-provider-key"}).to_string()).await.unwrap();
+            let routing = serde_json::json!({"active_routing_mode":"normal","normal_default_node_id":"OLD_NODE","preferred_node_id":"OLD_NODE","state":"idle"}).to_string();
+            state.db.set("relay_preference:10", &routing).await.unwrap();
+            let op = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                start(
+                    &state,
+                    1,
+                    ConcreteNodeIdentity {
+                        home_group_id: 10,
+                        node_id: "OLD_NODE".into(),
+                    },
+                    probes(),
+                    OFFICIAL_AMD64_SHA256,
+                    InstallProfile::Standard,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(op.state, "PREPARED", "{failure}");
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                0,
+                "PRECHECK contacted Provider during {failure}"
+            );
+            assert!(op
+                .routing
+                .contains(&("relay_preference:10".into(), routing)));
+            assert!(op.dns.is_empty());
+            provider.abort();
+        }
+    }
+
     #[tokio::test]
     async fn legacy_bearer_snapshot_preserves_only_delivered_home_rules() {
         // Both no credential and an unused exact credential still deliver

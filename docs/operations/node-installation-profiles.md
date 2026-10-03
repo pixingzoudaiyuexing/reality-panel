@@ -14,4 +14,4 @@ Standard and Lite are both official profiles. Upgrade preserves Standard → Sta
 
 Official source provenance and installation profile are independent. A missing Lite marker alone is not Standard evidence; disk size is not evidence. Unknown/custom/conflicting layouts fail before STOP. No new schema or protocol was added.
 
-v1.4.3 is an unpublished candidate. The v1.4.2 release, tag, original upgrade script and SHA256SUMS remain immutable. Do not deploy this candidate to Production as part of TEST acceptance.
+v1.4.4 RC is being prepared. Published v1.4.3 release binaries, tag, original/R2 upgrade assets and checksums remain immutable. Do not deploy this candidate to Production as part of TEST acceptance.

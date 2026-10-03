@@ -7,6 +7,15 @@ Node-only changes are in **CHANGELOG-NODE.md**.
 
 ---
 
+## [1.4.4] - 2026-10-03 (RC preparation)
+
+### Fixed (RC preparation)
+- Fresh exact Credential bootstrap accepts HTTPS edge / HTTP origin without an X-Forwarded-Proto authorization gate; existing identity/claim/replay/revocation checks remain.
+- Failed unactivated Fresh deployments cancel exact pending claim/delivery and clean only owned candidate identity state, enabling new-UUID retry. Active/unknown activation results remain protected.
+- Official v1.3.0 Standard/Lite single-node upgrade snapshots local Membership/Rules/Carrier without live Provider DNS during PRECHECK or finalize; adds a fixed v1.4.4 upgrader with lost-response recovery.
+
+This RC has not been published or deployed to Production. Formal review and physical TEST acceptance are separate gates.
+
 ## [1.4.3] - Unpublished Candidate (2026-10-02)
 
 ### 修复 / 兼容性

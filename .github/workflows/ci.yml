@@ -73,6 +73,8 @@ jobs:
         run: |
           python3 scripts/test_legacy_node_upgrade.py
           python3 scripts/test_legacy_node_upgrade_v143.py
+          python3 scripts/test_legacy_node_upgrade_v144.py
+          python3 scripts/relay-node-bootstrap-cleanup.test.py
           python3 scripts/test_legacy_node_upgrade_profiles.py
           bash scripts/release-version-contract.test.sh
 

@@ -4,7 +4,6 @@
 //! authenticate normal HTTP/WS runtime traffic and grant no Node Reuse authority.
 
 use crate::api::node::extract_node_token;
-use crate::api::node_claim::production_claim_transport_allowed;
 use crate::api::AppState;
 use crate::db::repo::{
     ActivateInitialNodeCredentialFromDelivery, GroupRepository,
@@ -288,17 +287,10 @@ async fn authenticated_group(
 pub async fn prepare_credential(
     State(state): State<AppState>,
     Path(claim_id): Path<String>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<PrepareCredentialDeliveryRequest>,
 ) -> Response {
-    if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Node Credential delivery requires the configured trusted HTTPS ingress",
-        );
-    }
     prepare_credential_after_transport(state, claim_id, headers, req).await
 }
 
@@ -498,17 +490,10 @@ fn prepare_failure(
 pub async fn activate_credential(
     State(state): State<AppState>,
     Path(claim_id): Path<String>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<ActivateCredentialDeliveryRequest>,
 ) -> Response {
-    if !production_claim_transport_allowed(&state, peer, &headers).await {
-        return sensitive_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            503,
-            "Node Credential delivery requires the configured trusted HTTPS ingress",
-        );
-    }
     activate_credential_after_transport(state, claim_id, headers, req).await
 }
 
@@ -1654,7 +1639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn credential_delivery_routes_fail_closed_on_transport_shape_and_body_limit() {
+    async fn credential_delivery_routes_preserve_auth_and_body_limit_on_http_origin() {
         let _lock = DELIVERY_ENV_LOCK.lock().await;
         let _guard = TrustedProxyEnvGuard::install("127.0.0.1");
         let state = sqlite_state().await;
@@ -1688,7 +1673,7 @@ mod tests {
             "https",
         )
         .await;
-        assert_eq!(untrusted.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(untrusted.status(), StatusCode::OK);
 
         let plain = post_json(
             router.clone(),
@@ -1699,7 +1684,7 @@ mod tests {
             "http",
         )
         .await;
-        assert_eq!(plain.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(plain.status(), StatusCode::OK);
 
         std::env::remove_var("NODE_CLAIM_TRUSTED_PROXY_IPS");
         let missing_proxy_config = post_json(
@@ -1711,10 +1696,7 @@ mod tests {
             "https",
         )
         .await;
-        assert_eq!(
-            missing_proxy_config.status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
+        assert_eq!(missing_proxy_config.status(), StatusCode::OK);
         std::env::set_var("NODE_CLAIM_TRUSTED_PROXY_IPS", "127.0.0.1");
 
         let mut unknown = valid.clone();

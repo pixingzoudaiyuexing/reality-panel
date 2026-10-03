@@ -102,9 +102,6 @@ pub async fn start_migration(
     peer: axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    if !crate::api::node_claim::production_claim_transport_allowed(&state, peer.0, &headers).await {
-        return unavailable();
-    }
     start_migration_after_transport(admin, state, identity_group_id, node_id, peer, headers).await
 }
 

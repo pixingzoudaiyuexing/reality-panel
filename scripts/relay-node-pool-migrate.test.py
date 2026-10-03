@@ -22,6 +22,30 @@ class MigrationRecoveryTests(unittest.TestCase):
         self.identity = {"home_group_id": 7, "node_id": "NODE_A"}
         self.state = {"credential_id": "credential-a", "delivery_nonce": "nonce-a"}
 
+    def test_bootstrap_exception_reports_fresh_stage_without_migration_or_secret(self):
+        import subprocess
+        result = subprocess.run(["python3", str(path), "--bootstrap", "--claim-id", "invalid",
+            "--identity-group-id", "7", "--node-id", "NODE_A"], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Node credential bootstrap failed", result.stderr)
+        self.assertIn("stage=", result.stderr)
+        self.assertNotIn("安全迁移", result.stderr)
+
+    def test_bootstrap_http_error_has_safe_business_details_and_no_secrets(self):
+        import io
+        import urllib.error
+        migrate.ERROR_CONTEXT.update(stage="prepare", endpoint="/api/v1/node-credential-claims/claim-a/credential/prepare")
+        migrate.ERROR_SECRETS[:] = ["group-token-fixture", "claim-secret-fixture", "nonce-fixture"]
+        exc = urllib.error.HTTPError("https://unused", 409, "group-token-fixture", {},
+            io.BytesIO(json.dumps({"code":409,"message":"claim-secret-fixture nonce-fixture prepare rejected"}).encode()))
+        message = migrate.bootstrap_error(exc)
+        self.assertIn("stage=prepare", message)
+        self.assertIn("HTTP=409", message)
+        self.assertIn("code=409", message)
+        self.assertIn("prepare rejected", message)
+        for secret in migrate.ERROR_SECRETS:
+            self.assertNotIn(secret, message)
+
     def test_successful_activation(self):
         calls = []
         def request(*args):

@@ -11,7 +11,7 @@ class Host:
         self.events.append('precheck')
         if self.fault=='old-checksum': raise module.Failure('OFFICIAL_V130_BINARY_REQUIRED')
         return self.profile
-    def run(self,args): return types.SimpleNamespace(stdout=b'relay-node 1.4.3\n')
+    def run(self,args): return types.SimpleNamespace(stdout=('relay-node '+module.TARGET_VERSION+'\n').encode())
     def old_auth(self, identity): return {'Authorization':'in-memory-test'}
     def capture(self, work): self.events.append('snapshot')
     def stop_and_detach(self, work):
