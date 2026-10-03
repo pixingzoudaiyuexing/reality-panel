@@ -81,6 +81,7 @@ function arrange(over: Partial<CarrierAffinityView> = {}, displayedNodes = nodes
 
 describe('CarrierAffinityPanel node-oriented editor', () => {
   beforeEach(() => {
+    sessionStorage.clear();
     vi.clearAllMocks();
     mockApply.mockResolvedValue(applied());
   });
@@ -248,4 +249,58 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     arrange({}, nodes, 'normal', { ...catalog, issues: [{ kind: 'no_eligible_rules' }] });
     expect(await screen.findByText('当前没有可用于运营商分流的生效规则')).toBeInTheDocument();
   });
+});
+
+
+describe('Carrier authoritative progress and refresh', () => {
+  beforeEach(() => { sessionStorage.clear(); vi.clearAllMocks(); mockApply.mockResolvedValue(applied()); });
+  it('restores a running transaction on mount and disables mutation', async () => {
+    arrange({ pending_policy: view.active_policy, transaction: { ...view.transaction, kind: 'carrier_policy_apply', state: 'switching' } }, nodes, 'carrier');
+    expect(await screen.findByTestId('carrier-operation')).toHaveTextContent('carrierOperationSyncing');
+    expect(screen.getByText('保存修改').closest('button')).toBeDisabled();
+    expect(mockApply).not.toHaveBeenCalled();
+  });
+  it('keeps rollback error visible after page refresh', async () => {
+    arrange({ transaction: { ...view.transaction, state: 'failed_manual_intervention', last_error: 'DNSMGR_TIMEOUT', rollback_error: 'POST_WRITE_NOT_VERIFIED' } }, nodes, 'carrier');
+    expect(await screen.findByTestId('carrier-operation')).toHaveTextContent('POST_WRITE_NOT_VERIFIED');
+    expect(screen.getByTestId('carrier-operation')).toHaveTextContent('carrierOperationRollbackFailed');
+  });
+  it('does not display completion merely because apply returns HTTP-success', async () => {
+    arrange({ pending_policy: view.active_policy, transaction: { ...view.transaction, state: 'switching' } }, nodes, 'carrier');
+    expect(await screen.findByTestId('carrier-operation')).not.toHaveTextContent('carrierOperationReady');
+  });
+  it('restores an uncertain submission without resubmitting', async () => {
+    sessionStorage.setItem('reality-carrier-operation:7', JSON.stringify({ desired: { default_node_id: 'node-b', bindings: [] }, unknown: true, error: null }));
+    arrange({}, nodes, 'carrier');
+    expect(await screen.findByTestId('carrier-operation')).toHaveTextContent('carrierOperationUnknown');
+    expect(screen.getByText('保存修改').closest('button')).toBeDisabled();
+    expect(mockApply).not.toHaveBeenCalled();
+  });
+  it('keeps authoritative failure visible when Provider catalog reads fail', async () => {
+    mockGet.mockImplementation((url: string) => url.endsWith('/carrier-lines') ? Promise.reject(new Error('Provider down')) : Promise.resolve(ok({ ...view, transaction: { ...view.transaction, state: 'failed_rolled_back', last_error: 'DNSMGR_TIMEOUT' } })));
+    render(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} activeMode="carrier" onApply={mockApply} />);
+    expect(await screen.findByTestId('carrier-operation')).toHaveTextContent('DNSMGR_TIMEOUT');
+    expect(screen.getByTestId('carrier-operation')).toHaveTextContent('carrierOperationRolledBack');
+  });
+
+  it('recovers a lost response through reads without a second apply', async () => {
+    mockApply.mockRejectedValueOnce(new Error('response lost'));
+    arrange({}, nodes, 'carrier');
+    fireEvent.click(await screen.findByRole('button', { name: '设为全网默认' }));
+    fireEvent.click(screen.getByRole('button', { name: /保存修改/ }));
+    await waitFor(() => expect(mockApply).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId('carrier-operation')).toHaveTextContent('carrierOperationUnknown');
+    mockGet.mockImplementation((url: string) => Promise.resolve(ok(url.endsWith('/carrier-lines') ? catalog : { ...view, active_policy: { default_node_id: 'node-b', bindings: [{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }] } })));
+    fireEvent.click(screen.getByRole('button', { name: 'carrierOperationRefresh' }));
+    await waitFor(() => expect(screen.getByTestId('carrier-operation')).toHaveTextContent('carrierOperationReady'));
+    expect(mockApply).toHaveBeenCalledTimes(1);
+  });
+  it('does not use the old same-policy success to resolve an interrupted request', async () => {
+    const policy = { default_node_id: 'node-a', bindings: [{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }] };
+    sessionStorage.setItem('reality-carrier-operation:7', JSON.stringify({ desired: policy, pending: true, baseline: JSON.stringify(policy), observed: false }));
+    arrange({}, nodes, 'carrier');
+    expect(await screen.findByTestId('carrier-operation')).toHaveTextContent('carrierOperationUnknown');
+    expect(mockApply).not.toHaveBeenCalled();
+  });
+
 });

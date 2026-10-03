@@ -257,6 +257,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
         const result = payload?.data;
         if (payload?.message?.startsWith('DNS_PROVIDER_READ_FAILED')) {
           message.error(t('dnsProviderReadFailed'));
+          if (mode === 'carrier') return { config_saved: false, activation_requested: false, activation_succeeded: false, active_mode: activeModeBeforeRequest, target_mode: mode, transition_state: 'idle', business_error_code: 'DNS_PROVIDER_READ_FAILED', message: 'DNS_PROVIDER_READ_FAILED', client_outcome: 'failed', client_error: payload.message.match(/^DNS_PROVIDER_READ_FAILED: ([A-Z_]+)$/)?.[1] ?? 'DNS_PROVIDER_READ_FAILED' };
           return null;
         }
         if (result) {
@@ -271,13 +272,17 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
           return result;
         }
         message.warning(t('routingApplyOutcomeUnknown'));
+        if (mode === 'carrier') {
+          await refreshPreferenceView().catch(() => null);
+          return { config_saved: false, activation_requested: false, activation_succeeded: false, active_mode: activeModeBeforeRequest, target_mode: mode, transition_state: 'idle', business_error_code: null, message: 'outcome unknown', client_outcome: 'unknown' };
+        }
         await recoverUnknownOutcome(mode, activeModeBeforeRequest);
         return null;
       }
 
       if (response.data.config_saved) setModeDirty(mode, false);
       if (response.data.dns_complete === false) message.warning(`${t('dnsTargetsIncomplete')} ${(response.data.warnings ?? []).join('; ')}`);
-      message.success(t(response.data.transition_state === 'switching'
+      if (mode !== 'carrier') message.success(t(response.data.transition_state === 'switching'
         ? response.data.activation_requested ? 'routingActivationStarted' : 'routingConfigurationApplying'
         : response.data.activation_requested
           ? 'routingActivationSucceeded'
@@ -545,7 +550,7 @@ export function RelayPreferencePanel({ groupId, t, onDiagnoseNode, onViewChange 
             label: t('routingFunctionCarrier'),
             children: (
               <CarrierAffinityPanel
-                key={`carrier-${discardRevisions.carrier ?? 0}`}
+                key={`${groupId}-carrier-${discardRevisions.carrier ?? 0}`}
                 groupId={groupId}
                 nodes={view?.nodes ?? []}
                 t={t}

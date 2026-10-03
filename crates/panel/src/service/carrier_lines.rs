@@ -27,6 +27,7 @@ pub struct CarrierLine {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CarrierLineCatalog {
+    pub providers: Vec<String>,
     pub lines: Vec<CarrierLine>,
     pub stale: bool,
     pub issues: Vec<CarrierCatalogIssue>,
@@ -156,6 +157,7 @@ pub async fn group_catalog(
     eligible_snis.dedup();
     if eligible_snis.is_empty() {
         return Ok(CarrierLineCatalog {
+            providers: Vec::new(),
             lines: vec![default_line()],
             stale: false,
             issues: vec![CarrierCatalogIssue::NoEligibleRules],
@@ -351,6 +353,17 @@ fn build_catalog(
     };
 
     CarrierLineCatalog {
+        providers: used_zone_ids
+            .iter()
+            .filter_map(|id| {
+                provider
+                    .zones
+                    .get(id)
+                    .and_then(|zone| zone.provider_type.clone())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         lines,
         stale,
         issues,

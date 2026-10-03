@@ -1,6 +1,6 @@
 import { Alert, Button, Empty, Select, Space, Spin, Tag, Typography } from 'antd';
-import { SaveOutlined } from '@ant-design/icons';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { LoadingOutlined, SaveOutlined } from '@ant-design/icons';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import api from '../../api/client';
 import type { ApiEnvelope, CarrierAffinityView, CarrierCatalogIssue, CarrierLineBinding, CarrierLineCatalog, RelayDnsRecordView, RelayReadyNode, RoutingApplyRequest, RoutingApplyResult, RoutingMode } from '../../api/types';
 import type { Tfn } from './types';
@@ -11,6 +11,9 @@ import {
   isCarrierMutableLineId,
   mutableCarrierBindings,
 } from './carrierCatalog';
+
+import { carrierOperation, carrierPolicyKey } from './carrierOperation';
+import type { CarrierPolicy } from '../../api/types';
 
 const { Text } = Typography;
 
@@ -94,47 +97,75 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [saving, setSaving] = useState(false);
+  const requestInFlight = useRef(false);
+  const readInFlight = useRef(false);
+  const operationKey = `reality-carrier-operation:${groupId}`;
+  const [intent, setIntent] = useState<{ desired: CarrierPolicy | null; unknown: boolean; error: string | null; baseline?: string; observed?: boolean; pending?: boolean }>(() => {
+    try { const stored = JSON.parse(sessionStorage.getItem(operationKey) ?? 'null'); return stored ? { ...stored, unknown: stored.unknown || stored.pending === true } : { desired: null, unknown: false, error: null }; }
+    catch { return { desired: null, unknown: false, error: null }; }
+  });
+  useEffect(() => { sessionStorage.setItem(operationKey, JSON.stringify(intent)); }, [intent, operationKey]);
+  const backendPhase = carrierOperation(view, intent.desired, saving, intent.unknown);
+  const unchangedUnknown = intent.unknown && !intent.observed && intent.desired && intent.baseline === carrierPolicyKey(intent.desired);
+  const phase = intent.error && !saving && !['rolling_back', 'rolled_back', 'rollback_failed'].includes(backendPhase)
+    ? 'failed' : unchangedUnknown && backendPhase === 'ready' ? 'unknown' : activeMode !== 'carrier' && !intent.desired && backendPhase === 'pending' ? 'idle' : backendPhase;
+  useEffect(() => {
+    if (intent.desired && !intent.observed && (view?.pending_policy || ['switching', 'rolling_back'].includes(view?.transaction.state ?? ''))) {
+      setIntent((current) => ({ ...current, observed: true }));
+    }
+  }, [intent.desired, intent.observed, view?.pending_policy, view?.transaction.state]);
+  const polling = saving || ['syncing', 'rolling_back', 'pending', 'unknown'].includes(phase);
+  const operationText = { submitting: 'carrierOperationSubmitting', unknown: 'carrierOperationUnknown', syncing: 'carrierOperationSyncing', pending: 'carrierOperationPending', ready: 'carrierOperationReady', failed: 'carrierOperationFailed', rolled_back: 'carrierOperationRolledBack', rollback_failed: 'carrierOperationRollbackFailed', rolling_back: 'carrierOperationRollingBack' } as const;
+
 
   const load = useCallback(async () => {
+    if (readInFlight.current) return;
+    readInFlight.current = true;
     setLoading(true);
     try {
-      const [affinity, lines] = await Promise.all([
+      const [affinityResult, linesResult] = await Promise.allSettled([
         api.get<unknown, ApiEnvelope<CarrierAffinityView>>(`/groups/${groupId}/carrier-affinity`),
         api.get<unknown, ApiEnvelope<CarrierLineCatalog>>(`/groups/${groupId}/carrier-lines`),
       ]);
-      if (affinity.code !== 0 || !affinity.data || lines.code !== 0 || !lines.data) throw new Error(affinity.message || lines.message);
+      const affinity = affinityResult.status === 'fulfilled' ? affinityResult.value : null;
+      const lines = linesResult.status === 'fulfilled' ? linesResult.value : null;
+      if (!affinity || affinity.code !== 0 || !affinity.data) throw new Error('Carrier state unavailable');
       setView(affinity.data);
-      setCatalog(lines.data);
       setDraft(mutableCarrierBindings(affinity.data.pending_policy?.bindings ?? affinity.data.active_policy.bindings));
-      setDraftDefaultNodeId(
-        affinity.data.pending_policy?.default_node_id
-          ?? affinity.data.active_policy.default_node_id
-          ?? affinity.data.default_node_id,
-      );
-      setLoadError(false);
+      setDraftDefaultNodeId(affinity.data.pending_policy?.default_node_id ?? affinity.data.active_policy.default_node_id ?? affinity.data.default_node_id);
       onViewChange?.(affinity.data);
-      onCatalogChange?.(lines.data);
-      onAvailabilityChange?.('ready');
+      if (lines?.code === 0 && lines.data) {
+        setCatalog(lines.data);
+        setLoadError(false);
+        onCatalogChange?.(lines.data);
+        onAvailabilityChange?.('ready');
+      } else {
+        // Provider catalog failure must never hide the local transaction error.
+        setCatalog((current) => current ? { ...current, stale: true } : null);
+        setLoadError(true);
+        onAvailabilityChange?.('error');
+      }
     } catch {
       setLoadError(true);
       onAvailabilityChange?.('error');
     } finally {
+      readInFlight.current = false;
       setLoading(false);
     }
   }, [groupId, onAvailabilityChange, onCatalogChange, onViewChange]);
 
   useEffect(() => { void load(); }, [load]);
   useEffect(() => {
-    if (view?.transaction.state !== 'switching' && view?.transaction.state !== 'rolling_back') return;
+    if (!polling) return;
     const timer = window.setInterval(() => void load(), 5000);
     return () => window.clearInterval(timer);
-  }, [load, view?.transaction.state]);
+  }, [load, polling]);
 
   const savedPolicy = view?.pending_policy ?? view?.active_policy;
   const dirty = normalize(draftDefaultNodeId, draft)
     !== normalize(savedPolicy?.default_node_id ?? view?.default_node_id, savedPolicy?.bindings ?? []);
   const transactionBusy = view?.transaction.state === 'switching' || view?.transaction.state === 'rolling_back';
-  const mutationLocked = transactionBusy || view?.transaction.state === 'failed_manual_intervention';
+  const mutationLocked = polling || transactionBusy || view?.transaction.state === 'failed_manual_intervention';
   const catalogUnavailable = !catalog || catalog.stale;
   const status = view ? transactionLabel(view, t) : null;
   const effectiveDefaultNodeId = nodes.find((node) => node.preferred)?.node_id ?? view?.default_node_id;
@@ -171,7 +202,11 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   };
 
   const save = async () => {
-    if ((activeMode === 'carrier' && !dirty) || mutationLocked || catalogUnavailable || disabled) return;
+    if (requestInFlight.current || (activeMode === 'carrier' && !dirty) || mutationLocked || catalogUnavailable || disabled) return;
+    requestInFlight.current = true;
+    const submitted = { desired: { default_node_id: draftDefaultNodeId, bindings: mutableCarrierBindings(draft) }, unknown: false, error: null, baseline: view ? carrierPolicyKey(view.active_policy) : undefined, observed: false, pending: true };
+    sessionStorage.setItem(operationKey, JSON.stringify(submitted));
+    setIntent(submitted);
     setSaving(true);
     try {
       const result = await onApply({
@@ -179,8 +214,17 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
         default_node_id: draftDefaultNodeId,
         bindings: mutableCarrierBindings(draft),
       });
-      if (result?.config_saved) await load();
+      if (result === null) setIntent({ desired: null, unknown: false, error: null });
+      else if (result?.client_outcome === 'failed') setIntent((current) => ({ ...current, unknown: false, error: result.client_error ?? result.business_error_code ?? 'DNS_PROVIDER_READ_FAILED' }));
+      else if (result?.client_outcome === 'unknown') setIntent((current) => ({ ...current, unknown: true }));
+      else if (result && !result.config_saved && result.business_error_code) setIntent((current) => ({ ...current, unknown: false, error: result.business_error_code }));
+      setIntent((current) => ({ ...current, pending: false }));
+      await load();
+    } catch {
+      setIntent((current) => ({ ...current, unknown: true }));
+      await load();
     } finally {
+      requestInFlight.current = false;
       setSaving(false);
     }
   };
@@ -199,6 +243,22 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
         <Button size="small" type="primary" icon={<SaveOutlined />} loading={saving} disabled={(activeMode === 'carrier' && !dirty) || mutationLocked || catalogUnavailable || disabled} onClick={() => void save()}>{t(activeMode === 'carrier' ? 'routingSaveChanges' : 'routingSaveAndActivate')}</Button>
       </div>
       <Text type="secondary">{t('carrierMultiNodeHint')}</Text>
+      {phase !== 'idle' ? <Alert data-testid="carrier-operation" type={['failed', 'rolled_back', 'rollback_failed'].includes(phase) ? 'error' : phase === 'ready' ? 'success' : 'info'} showIcon
+        icon={polling ? <LoadingOutlined /> : undefined}
+        title={t(operationText[phase as keyof typeof operationText])}
+        style={{ margin: '10px 0' }}
+        description={<Space orientation="vertical" size={4} style={{ width: '100%' }} aria-live="polite">
+          {loadError ? <Text type="warning">{t('carrierOperationReadFailed')}</Text> : null}
+          {intent.error ? <Text type="danger" style={{ overflowWrap: 'anywhere' }}>{intent.error}</Text> : null}
+          {view?.transaction.last_error ? <Text type="danger">{t('carrierOperationError')}: {view.transaction.last_error}</Text> : null}
+          {view?.transaction.rollback_error ? <Text type="danger">{t('carrierOperationRollbackError')}: {view.transaction.rollback_error}</Text> : null}
+          <Text type="secondary">{t('carrierOperationState')}: {view?.transaction.state ?? '-'} · {view?.transaction.kind ?? '-'}</Text>
+          {(view?.dns_records ?? []).map((record) => <div key={`${record.rule_id}:${record.line_id}`} style={{ overflowWrap: 'anywhere' }}>
+            <Text>{record.provider} · {record.line_id} · {record.fqdn} · {record.state}</Text>
+            {record.last_error ? <Text type="danger"> · {record.last_error}</Text> : null}
+          </div>)}
+          {['failed', 'rolled_back', 'rollback_failed', 'unknown'].includes(phase) ? <Button size="small" onClick={() => void load()}>{t('carrierOperationRefresh')}</Button> : null}
+        </Space>} /> : null}
       {transactionBusy ? <Alert type="info" showIcon title={t('carrierBusy')} style={{ margin: '10px 0' }} /> : null}
       {catalog?.stale ? <Alert type="warning" showIcon title={t('carrierCatalogStale')} style={{ margin: '10px 0' }} /> : null}
       {(catalog?.issues ?? []).map((issue, index) => <CarrierCatalogIssueAlert key={`${issue.kind}-${index}`} issue={issue} t={t} />)}

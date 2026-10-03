@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.5] - 2026-10-03 (RC, unpublished)
+
+- Fresh SSH deployment detects an existing installation before issuing credentials, requests explicit scoped overwrite confirmation, retires the old Pool identity and reuses product-owned uninstall cleanup before a new UUID install.
+- Carrier saving shows authoritative transaction/DNS progress, recovers lost responses without duplicate writes, resumes on refresh and exposes sanitized failure/rollback categories.
+- No database schema, Rule/Carrier model or legacy migration change; Production is outside RC validation scope.
+
+
 All notable changes to Reality Panel are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 

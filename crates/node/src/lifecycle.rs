@@ -1615,7 +1615,227 @@ fn run_checked(program: &str, args: &[&str]) -> Result<(), String> {
         .ok_or_else(|| format!("{program} {} exited unsuccessfully", args.join(" ")))
 }
 
+/// Root-only SSH replacement reuses uninstall ownership rules. Panel must first
+/// retire the exact identity; this helper grants no Panel authentication authority.
+fn existing_install_cleanup(root: &Path, expected: &str, check_only: bool) -> Result<(), String> {
+    if !valid_id(expected) {
+        return Err("invalid existing identity".into());
+    }
+    if root == Path::new("/") && unsafe { libc::geteuid() } != 0 {
+        return Err("root is required".into());
+    }
+    let identity = rooted(root, "/opt/relay-node/node-id");
+    validate_cleanup_path(root, &identity)?;
+    if std::fs::read_to_string(&identity)
+        .map_err(|_| "existing identity missing")?
+        .trim()
+        != expected
+    {
+        return Err("existing identity changed; all resources preserved".into());
+    }
+    for unit in [
+        "/etc/systemd/system/relay-node-uninstall-finalizer.timer",
+        "/etc/systemd/system/relay-node-uninstall-finalizer.service",
+    ] {
+        if rooted(root, unit).symlink_metadata().is_ok() {
+            return Err("uninstall finalizer is pending; preserve installation".into());
+        }
+    }
+    // Check before Panel retirement as well as cleanup: an active credential
+    // bootstrap/migration must not be disrupted by replacement.
+    let lock_path = rooted(root, "/var/lib/relay-panel/node-claims/migration.lock");
+    validate_cleanup_path(root, &lock_path)?;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+    {
+        Ok(file) => {
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            if !metadata.is_file()
+                || metadata.len() != 0
+                || metadata.mode() & 0o777 != 0o600
+                || metadata.uid() != unsafe { libc::geteuid() }
+            {
+                return Err("unexpected migration lock ownership".into());
+            }
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err("credential migration is active; preserve installation".into());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("read migration lock: {error}")),
+    }
+    for managed in UNINSTALL_REMOVE_FILES
+        .iter()
+        .chain(UNINSTALL_REMOVE_DIRS)
+        .chain(
+            [
+                "/etc/nginx/nginx.conf",
+                "/etc/nginx/relay-panel-stream.conf",
+                "/etc/nginx/relay-panel-stream.d/relay-panel-sni.conf",
+                "/etc/nginx/stream.d/relay-panel-sni.conf",
+                "/etc/nginx/conf.d/relay-panel-fallback.conf",
+                "/etc/nginx/conf.d/relay-panel-acme.conf",
+                "/etc/nginx/conf.d/relay-panel-lite-fallback.conf",
+                "/var/lib/relay-panel/node-claims",
+                "/var/lib/relay-panel/openlist-ownership.json",
+                "/var/lib/relay-panel/openlist",
+                "/var/lib/relay-panel/xiaoya-byoa",
+                "/var/lib/relay-panel/xiaoya-byoa-ownership.json",
+                "/var/lib/relay-panel/uninstall-completions",
+                "/var/lib/relay-panel/uninstall-finalizer",
+                "/etc/sysctl.d/99-reality-panel-bbr.conf",
+                "/etc/modules-load.d/reality-panel-bbr.conf",
+            ]
+            .iter(),
+        )
+    {
+        validate_cleanup_path(root, &rooted(root, managed))?;
+    }
+    inspect_docker_nginx(root)?;
+    if root == Path::new("/") {
+        crate::xiaoya::validate_uninstall_owned()?;
+    }
+    let descriptor = rooted(root, crate::config::RUNTIME_AUTH_DESCRIPTOR);
+    let auth = if descriptor.exists() {
+        #[derive(Deserialize)]
+        struct Descriptor {
+            node_id: String,
+            credential_id: String,
+            secret_file: PathBuf,
+        }
+        let value: Descriptor = serde_json::from_slice(
+            &std::fs::read(&descriptor).map_err(|_| "read runtime descriptor failed")?,
+        )
+        .map_err(|_| "invalid runtime descriptor")?;
+        if value.node_id != expected || !valid_id(&value.credential_id) {
+            return Err("runtime identity conflict".into());
+        }
+        let relative = value
+            .secret_file
+            .strip_prefix("/var/lib/relay-panel/node-claims")
+            .map_err(|_| "unmanaged credential path")?;
+        if relative.components().count() != 2
+            || relative.file_name().and_then(|s| s.to_str()) != Some("node-credential.secret")
+            || !valid_id(relative.parent().and_then(|s| s.to_str()).unwrap_or(""))
+        {
+            return Err("unmanaged credential path".into());
+        }
+        validate_cleanup_path(root, &rooted(root, &value.secret_file.to_string_lossy()))?;
+        Some(PersistedNodeAuth::PermanentCredential {
+            credential_id: value.credential_id,
+            secret_file: value.secret_file,
+        })
+    } else {
+        None
+    };
+    // Discover only state files naming this exact previous identity. An inactive
+    // Fresh failure can leave a claim directory without runtime-auth.json.
+    let claims = rooted(root, "/var/lib/relay-panel/node-claims");
+    let mut orphan_credentials = Vec::new();
+    let mut empty_residue_dirs = Vec::new();
+    if claims.exists() {
+        for entry in std::fs::read_dir(&claims).map_err(|_| "read credential residue failed")? {
+            let entry = entry.map_err(|_| "read credential residue failed")?;
+            if !entry
+                .file_type()
+                .map_err(|_| "read credential residue type failed")?
+                .is_dir()
+            {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !valid_id(name) {
+                continue;
+            }
+            let state = entry.path().join("credential-pending.json");
+            validate_cleanup_path(root, &state)?;
+            let raw = match std::fs::read(&state) {
+                Ok(raw) => raw,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if name == expected
+                        && std::fs::read_dir(entry.path())
+                            .map_err(|_| "read empty residue failed")?
+                            .next()
+                            .is_none()
+                    {
+                        empty_residue_dirs.push(entry.path());
+                    }
+                    continue;
+                }
+                Err(_) => return Err("read credential residue state failed".into()),
+            };
+            let state: serde_json::Value =
+                serde_json::from_slice(&raw).map_err(|_| "invalid credential residue state")?;
+            if state["node_id"].as_str() != Some(expected) {
+                continue;
+            }
+            let credential_id = state["credential_id"]
+                .as_str()
+                .filter(|id| valid_id(id))
+                .ok_or("invalid residue credential identity")?;
+            let secret_file = PathBuf::from(format!(
+                "/var/lib/relay-panel/node-claims/{name}/node-credential.secret"
+            ));
+            validate_cleanup_path(root, &rooted(root, &secret_file.to_string_lossy()))?;
+            orphan_credentials.push(PersistedNodeAuth::PermanentCredential {
+                credential_id: credential_id.into(),
+                secret_file,
+            });
+        }
+    }
+    if check_only {
+        return Ok(());
+    }
+    // Credentials are removed before service/files only after exact identity and
+    // path validation. No historical Panel data or unrelated claim is removed.
+    if let Some(auth) = auth {
+        cleanup_uninstalled_credentials(
+            root,
+            &UninstallJob {
+                operation_id: expected.into(),
+                node_id: expected.into(),
+                panel_url: String::new(),
+                auth,
+            },
+        )?;
+    }
+    for auth in orphan_credentials {
+        cleanup_uninstalled_credentials(
+            root,
+            &UninstallJob {
+                operation_id: expected.into(),
+                node_id: expected.into(),
+                panel_url: String::new(),
+                auth,
+            },
+        )?;
+    }
+    for path in empty_residue_dirs {
+        std::fs::remove_dir(path).map_err(|_| "empty identity residue changed; retry detection")?;
+    }
+    uninstall_managed(root)?;
+    Ok(())
+}
+
 pub(crate) fn run_helper_from_args(args: &[String]) -> Option<Result<(), String>> {
+    if args.len() == 2
+        && matches!(
+            args[0].as_str(),
+            "--check-existing-install-cleanup" | "--cleanup-retired-install"
+        )
+    {
+        return Some(existing_install_cleanup(
+            Path::new("/"),
+            &args[1],
+            args[0] == "--check-existing-install-cleanup",
+        ));
+    }
     if args.len() != 2
         || !matches!(
             args[0].as_str(),
@@ -2663,5 +2883,89 @@ mod tests {
             assert!(!UNINSTALL_REMOVE_DIRS.contains(&protected));
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn existing_cleanup_check_preserves_identity_and_rejects_mismatch() {
+        let root = test_dir("existing-cleanup-check");
+        let id = "11111111-1111-4111-8111-111111111111";
+        std::fs::create_dir_all(root.join("opt/relay-node")).unwrap();
+        std::fs::write(root.join("opt/relay-node/node-id"), id).unwrap();
+        std::fs::write(root.join("opt/relay-node/relay-node"), b"test-binary").unwrap();
+        std::fs::write(root.join("user-data"), b"preserve").unwrap();
+        existing_install_cleanup(&root, id, true).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("opt/relay-node/relay-node")).unwrap(),
+            b"test-binary"
+        );
+        assert!(
+            existing_install_cleanup(&root, "22222222-2222-4222-8222-222222222222", false).is_err()
+        );
+        assert_eq!(std::fs::read(root.join("user-data")).unwrap(), b"preserve");
+        existing_install_cleanup(&root, id, false).unwrap();
+        assert!(!root.join("opt/relay-node/node-id").exists());
+        assert_eq!(std::fs::read(root.join("user-data")).unwrap(), b"preserve");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_cleanup_refuses_symlink_before_any_mutation() {
+        let root = test_dir("existing-cleanup-symlink");
+        let id = "11111111-1111-4111-8111-111111111111";
+        std::fs::create_dir_all(root.join("opt/relay-node")).unwrap();
+        std::fs::create_dir_all(root.join("etc/nginx/conf.d")).unwrap();
+        std::fs::write(root.join("opt/relay-node/node-id"), id).unwrap();
+        std::fs::write(root.join("user-config"), b"preserve").unwrap();
+        std::os::unix::fs::symlink(
+            root.join("user-config"),
+            root.join("etc/nginx/conf.d/relay-panel-fallback.conf"),
+        )
+        .unwrap();
+        assert!(existing_install_cleanup(&root, id, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("opt/relay-node/node-id")).unwrap(),
+            id
+        );
+        assert_eq!(
+            std::fs::read(root.join("user-config")).unwrap(),
+            b"preserve"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn replacement_dry_check_blocks_active_migration_and_finalizer() {
+        let root = test_dir("replacement-lock");
+        let id = "11111111-1111-4111-8111-111111111111";
+        std::fs::create_dir_all(root.join("opt/relay-node")).unwrap();
+        std::fs::write(root.join("opt/relay-node/node-id"), id).unwrap();
+        let claims = root.join("var/lib/relay-panel/node-claims");
+        std::fs::create_dir_all(&claims).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(claims.join("migration.lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(existing_install_cleanup(&root, id, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("opt/relay-node/node-id")).unwrap(),
+            id
+        );
+        drop(lock);
+        existing_install_cleanup(&root, id, true).unwrap();
+        std::fs::create_dir_all(root.join("etc/systemd/system")).unwrap();
+        std::fs::write(
+            root.join("etc/systemd/system/relay-node-uninstall-finalizer.timer"),
+            b"pending",
+        )
+        .unwrap();
+        assert!(existing_install_cleanup(&root, id, false).is_err());
+        assert!(root.join("opt/relay-node/node-id").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

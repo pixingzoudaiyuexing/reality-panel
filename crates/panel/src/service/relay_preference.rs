@@ -602,7 +602,18 @@ pub struct CarrierAffinityBindingView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CarrierDnsProgressView {
+    pub rule_id: i64,
+    pub fqdn: String,
+    pub line_id: String,
+    pub provider: String,
+    pub state: String,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CarrierAffinityView {
+    pub dns_records: Vec<CarrierDnsProgressView>,
     pub group_id: i64,
     pub default_node_id: Option<String>,
     pub active_policy: CarrierPolicy,
@@ -5071,6 +5082,38 @@ fn relay_health_for_node(evaluated: &[EvaluatedNode], node_id: Option<&str>) -> 
     )
 }
 
+pub(crate) fn public_dns_error(error: Option<&str>) -> Option<String> {
+    error.map(|raw| {
+        let category = raw.split(':').next().unwrap_or("");
+        match category {
+            "DNSMGR_TRANSPORT"
+            | "DNSMGR_TIMEOUT"
+            | "DNSMGR_TEMPORARY"
+            | "DNSMGR_UPSTREAM"
+            | "DNSMGR_DISABLED"
+            | "DNSMGR_AUTHENTICATION"
+            | "DNSMGR_PERMISSION"
+            | "DNS_PROVIDER_READ_FAILED"
+            | "DNS_RECORD_CONFLICT"
+            | "DNS_OWNERSHIP_UNVERIFIED"
+            | "POST_WRITE_NOT_VERIFIED"
+            | "MUTATION_UNKNOWN"
+            | "DNS_PROVIDER_FAILED"
+            | "DATABASE"
+            | "STALE"
+            | "RULE_NOT_ELIGIBLE"
+            | "PROVIDER_LINE_UNAVAILABLE"
+            | "TTL_OUT_OF_RANGE"
+            | "ROLLBACK_SCHEDULING_FAILED"
+            | "ROLLBACK_RULE_NOT_ELIGIBLE"
+            | "DNS_ROLLBACK_FAILED"
+            | "DNS_TARGET_CHANGED"
+            | "TARGET_IPV4_UNAVAILABLE" => category.to_owned(),
+            _ => "DNS_OPERATION_FAILED".to_owned(),
+        }
+    })
+}
+
 pub async fn get_carrier_affinity(
     db: &dyn Repository,
     node_connections: &NodeConnections,
@@ -5082,7 +5125,7 @@ pub async fn get_carrier_affinity(
     }
     let preference = load_preference(db, group_id).await?;
     let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
-    let (catalog_ids, catalog_stale) =
+    let (catalog_ids, catalog_stale, providers) =
         match crate::service::carrier_lines::group_catalog(db, group_id).await {
             Ok(catalog) => (
                 catalog
@@ -5091,8 +5134,9 @@ pub async fn get_carrier_affinity(
                     .map(|line| line.id)
                     .collect::<HashSet<_>>(),
                 catalog.stale,
+                catalog.providers,
             ),
-            Err(_) => (HashSet::new(), true),
+            Err(_) => (HashSet::new(), true, Vec::new()),
         };
     let displayed_policy = preference
         .pending_carrier_policy
@@ -5100,6 +5144,24 @@ pub async fn get_carrier_affinity(
         .filter(|_| preference.transaction_kind == Some(RelayTransactionKind::CarrierPolicyApply))
         .unwrap_or(&preference.carrier_policy);
     let eligible = crate::service::dnsmgr::eligible_rule_ids_for_group(db, group_id).await?;
+    let mut dns_records = Vec::new();
+    let provider = if providers.is_empty() {
+        "DNSMgr".into()
+    } else {
+        providers.join(", ")
+    };
+    for rule_id in &eligible {
+        for sync in db.list_dns_record_syncs_for_rule(*rule_id).await? {
+            dns_records.push(CarrierDnsProgressView {
+                rule_id: *rule_id,
+                fqdn: sync.fqdn,
+                line_id: sync.line,
+                provider: provider.clone(),
+                state: sync.state,
+                last_error: public_dns_error(sync.last_error_category.as_deref()),
+            });
+        }
+    }
     let mut bindings = Vec::with_capacity(displayed_policy.bindings.len());
     for binding in &displayed_policy.bindings {
         let effective_node_id = match binding.mode {
@@ -5143,6 +5205,7 @@ pub async fn get_carrier_affinity(
         });
     }
     Ok(CarrierAffinityView {
+        dns_records,
         group_id,
         default_node_id: preference.preferred_node_id.clone(),
         active_policy: preference.carrier_policy,
@@ -5151,8 +5214,8 @@ pub async fn get_carrier_affinity(
             kind: preference.transaction_kind,
             state: preference.state,
             started_at: preference.started_at,
-            last_error: preference.last_error,
-            rollback_error: preference.rollback_error,
+            last_error: public_dns_error(preference.last_error.as_deref()),
+            rollback_error: public_dns_error(preference.rollback_error.as_deref()),
         },
         bindings,
         catalog_stale,
@@ -9030,5 +9093,21 @@ mod tests {
         let committed = load_preference(&repo, 7).await.unwrap();
         assert_eq!(committed.state, RelayPreferencePhase::Idle);
         assert_eq!(committed.preferred_node_id.as_deref(), Some("node-b"));
+    }
+    #[test]
+    fn carrier_public_errors_never_forward_provider_or_auth_payloads() {
+        assert_eq!(
+            public_dns_error(Some("DNSMGR_TIMEOUT: Authorization=secret")).as_deref(),
+            Some("DNSMGR_TIMEOUT")
+        );
+        assert_eq!(
+            public_dns_error(Some("provider replied access-key SECRET")).as_deref(),
+            Some("DNS_OPERATION_FAILED")
+        );
+        assert_eq!(
+            public_dns_error(Some("POST_WRITE_NOT_VERIFIED")).as_deref(),
+            Some("POST_WRITE_NOT_VERIFIED")
+        );
+        assert_eq!(public_dns_error(None), None);
     }
 }

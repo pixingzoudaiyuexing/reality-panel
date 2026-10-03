@@ -478,6 +478,22 @@ fn replace_container<D: DockerClient>(
 }
 
 /// Retire only resources whose durable marker and live Docker identity match.
+pub(crate) fn validate_uninstall_owned() -> Result<(), String> {
+    let paths = XiaoyaPaths::production();
+    if let Some(marker) = read_marker(&paths)? {
+        marker.validate()?;
+        for path in [&paths.marker, &paths.data] {
+            if path.is_symlink() {
+                return Err("refusing symlinked Xiaoya cleanup path".into());
+            }
+        }
+        if let Some(container) = inspect_container(&mut SystemDocker)? {
+            container.validate_owned_identity()?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn uninstall_owned() -> Result<(), String> {
     uninstall_with(&mut SystemDocker, &XiaoyaPaths::production())
 }

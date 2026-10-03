@@ -469,6 +469,8 @@ export type RoutingApplyRequest =
   | { mode: 'failover'; health_check_port: number; failure_after_seconds: number };
 
 export interface RoutingApplyResult {
+  client_outcome?: 'unknown' | 'failed';
+  client_error?: string;
   confirmation_required?: boolean;
   dns_confirmation?: string;
   conflicts?: Array<{
@@ -531,6 +533,7 @@ export interface CarrierAffinityBindingView extends CarrierLineBinding {
 }
 
 export interface CarrierAffinityView {
+  dns_records?: Array<{ rule_id: number; fqdn: string; line_id: string; provider: string; state: string; last_error: string | null }>;
   group_id: number;
   default_node_id: string | null;
   active_policy: CarrierPolicy;

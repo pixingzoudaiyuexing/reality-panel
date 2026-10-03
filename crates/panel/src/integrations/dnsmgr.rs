@@ -356,6 +356,23 @@ pub(crate) enum DnsMgrError {
 }
 
 impl DnsMgrError {
+    pub(crate) fn public_category(&self) -> &'static str {
+        match self {
+            Self::Timeout => "DNSMGR_TIMEOUT",
+            Self::Transport(_) => "DNSMGR_TRANSPORT",
+            Self::Authentication => "DNSMGR_AUTHENTICATION",
+            Self::Permission => "DNSMGR_PERMISSION",
+            Self::RateLimitedOrTemporarilyUnavailable => "DNSMGR_TEMPORARY",
+            Self::ProviderFailure(_) => "DNSMGR_UPSTREAM",
+            Self::MalformedResponse(_) | Self::ProtocolContractViolation(_) => {
+                "DNSMGR_READ_CONTRACT_FAILED"
+            }
+            Self::InvalidBaseUrl | Self::InvalidRequest(_) => "DNSMGR_INVALID_CONFIG",
+            Self::DomainNotFoundOrUnavailable => "DNSMGR_ZONE_UNAVAILABLE",
+            Self::UnknownUpstream(_) => "DNSMGR_UPSTREAM",
+        }
+    }
+
     fn is_retryable(&self) -> bool {
         matches!(
             self,

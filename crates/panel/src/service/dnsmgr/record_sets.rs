@@ -77,13 +77,13 @@ pub(crate) async fn prepare_carrier_dns(
     use crate::service::relay_preference::{self, CarrierLineMode, RelayDnsTarget};
     let rules = eligible_rule_ids_for_group(db, group_id)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| "DATABASE".to_string())?;
     let mut lines: std::collections::BTreeMap<String, BTreeSet<String>> =
         std::collections::BTreeMap::new();
     let mut warnings = Vec::new();
     let old = relay_preference::load_preference(db, group_id)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| "DATABASE".to_string())?;
     let default = policy
         .default_node_id
         .as_ref()
@@ -146,13 +146,13 @@ pub(crate) async fn prepare_carrier_dns(
         let zone = match resolve_zone(&client, &fqdn).await {
             ZoneResolution::ZoneResolved(zone) => zone,
             ZoneResolution::NoMatchingZone => return Err("no matching DNS zone".into()),
-            ZoneResolution::UpstreamFailure(error) => return Err(error.to_string()),
+            ZoneResolution::UpstreamFailure(error) => return Err(error.public_category().into()),
         };
         // Read failures and unsupported lines are technical errors, not confirmations.
         let detail = client
             .get_domain(zone.domain_id)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.public_category().to_string())?;
         for (raw_line, desired) in &lines {
             if desired.is_empty() && configured.contains(raw_line) {
                 continue;
@@ -161,11 +161,11 @@ pub(crate) async fn prepare_carrier_dns(
                 .ok_or("DNS carrier line unavailable")?;
             let current = read_set(&client, &zone, &line)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.public_category().to_string())?;
             let binding = db
                 .find_dns_record_binding_for_rule(rule_id, fqdn.as_str(), "A", &line.key)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|_| "DATABASE".to_string())?;
             if current.is_empty() || owns_set(binding.as_ref(), &fqdn, &zone, &line, &current) {
                 continue;
             }
@@ -199,7 +199,7 @@ pub(crate) async fn prepare_carrier_dns(
             &serde_json::to_string(&approval).map_err(|e| e.to_string())?,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| "DATABASE".to_string())?;
     }
     Ok((Vec::new(), warnings))
 }

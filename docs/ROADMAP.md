@@ -1,8 +1,8 @@
 # Reality Panel — Roadmap
 
-## Current stage: v1.4.4 Fresh and legacy upgrade RC
+## Current stage: v1.4.5 Fresh overwrite and Carrier progress RC
 
-Close the four Owner-authorized v1.4.3 lifecycle defects without architectural expansion. Required gates are exact-source independent Gemini review, fixed optimized artifact, Fresh Standard/Lite failure/retry and authentication tests, physical official-v1.3.0 migrations, ordinary v1.4.3 updates and real forwarding. Publication and Production deployment require separate authorization.
+Prepare only the two Owner-authorized improvements: explicit Fresh replacement of a safely verified existing installation and accurate Carrier/DNS progress, failure and lost-response recovery. Reuse existing lifecycle and transaction mechanisms without schema or model changes. Exact-source Formal Independent Review and physical TEST UI/runtime acceptance are required; publication and Production access are excluded.
 
 ## Stable baseline: Node Reuse product completion
 

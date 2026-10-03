@@ -124,3 +124,36 @@ describe('Node Bootstrap deployment modes', () => {
     expect(screen.queryByDisplayValue('one-time-enrollment-secret')).toBeNull();
   });
 });
+
+
+const managed = { classification: 'MANAGED_EXISTING_NODE', old_node_id: 'old-node', version: '1.4.4', profile: 'standard', service_active: true, panel_present: true, online: true, credential_active: true, group_count: 2, carrier_reference_count: 3, confirmation: 'snapshot-proof', reason: null };
+async function inspectExisting(existing = managed) {
+  const user = userEvent.setup();
+  mockPost.mockImplementation((url: string) => Promise.resolve(ok(url.endsWith('/fingerprint') ? { fingerprint: 'SHA256:node-a', os: 'Debian', architecture: 'amd64', existing } : { id: 'task', status: 'PENDING', stage: 'PENDING', host: 'node-a' })));
+  renderPage();
+  await user.type(screen.getByLabelText('nodeBootstrapHost 1'), 'node-a');
+  await user.type(screen.getByLabelText('nodeBootstrapPassword 1'), 'test-only-password');
+  await user.click(screen.getByText('nodeBootstrapTestConnection'));
+  await screen.findByText('overwriteExistingTitle');
+  return user;
+}
+describe('Existing installation confirmation', () => {
+  it('keeps managed identity intact until explicit overwrite confirmation', async () => {
+    const user = await inspectExisting();
+    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeDisabled();
+    expect(screen.getByText(/2 overwriteGroups/)).toBeInTheDocument();
+    await user.click(screen.getByText('overwriteConfirm'));
+    await user.click(screen.getByText('cancel'));
+    expect(mockPost.mock.calls.filter(([url]) => url === '/admin/node-deployments')).toHaveLength(0);
+    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeDisabled();
+  });
+  it('binds confirmed installation to the detected exact identity and snapshot', async () => {
+    const user = await inspectExisting();
+    await user.click(screen.getByText('overwriteConfirm'));
+    const buttons = await screen.findAllByText('overwriteConfirm');
+    await user.click(buttons[buttons.length - 1]);
+    await waitFor(() => expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeEnabled());
+    await user.click(screen.getByText('nodeBootstrapDeploy'));
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ overwrite_node_id: 'old-node', existing_confirmation: 'snapshot-proof' })));
+  });
+});

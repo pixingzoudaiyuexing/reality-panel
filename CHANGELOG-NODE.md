@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.4.5] - 2026-10-03 (RC, unpublished)
+
+- Adds trusted-root exact identity cleanup helpers for confirmed Fresh replacement; reuses existing uninstall ownership rules and preserves unrelated host data.
+- Standard/Lite profile confirmation and Panel/Node version advance together. Forwarding runtime and Config/Lifecycle protocols are unchanged.
+- Published v1.4.4 legacy upgrader remains pinned; no legacy migration expansion.
+
 ## [1.4.4] - 2026-10-03 (RC preparation)
 
 ### Fixed (RC preparation)
