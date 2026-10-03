@@ -189,9 +189,9 @@ export default function NodeBootstrap() {
             { key: 'id', label: t('overwriteOldNode'), children: <Text code style={{ overflowWrap: 'anywhere' }}>{old.old_node_id}</Text> },
             { key: 'version', label: t('overwriteVersion'), children: old.version ?? '-' },
             { key: 'profile', label: t('overwriteProfile'), children: `${old.profile ?? '-'} → ${liteMode ? 'Lite' : 'Standard'}` },
-            { key: 'status', label: t('status'), children: `${t(old.online ? 'online' : 'offline')} · ${t(old.service_active ? 'overwriteServiceActive' : 'overwriteServiceInactive')}` },
-            { key: 'panel', label: t('overwritePanelIdentity'), children: `${t(old.panel_present ? 'overwritePresent' : 'overwriteAbsent')} · ${t(old.credential_active ? 'overwriteCredentialActive' : 'overwriteCredentialInactive')}` },
-            { key: 'refs', label: t('overwriteRelations'), children: `${old.group_count} ${t('overwriteGroups')} · ${old.carrier_reference_count} ${t('overwriteCarrierRefs')}` },
+            { key: 'status', label: t('status'), children: `${ambiguous ? t('overwriteUnverified') : t(old.online ? 'online' : 'offline')} · ${t(old.service_active ? 'overwriteServiceActive' : 'overwriteServiceInactive')}` },
+            { key: 'panel', label: t('overwritePanelIdentity'), children: ambiguous ? t('overwriteUnverified') : `${t(old.panel_present ? 'overwritePresent' : 'overwriteAbsent')} · ${t(old.credential_active ? 'overwriteCredentialActive' : 'overwriteCredentialInactive')}` },
+            { key: 'refs', label: t('overwriteRelations'), children: ambiguous ? t('overwriteUnverified') : `${old.group_count} ${t('overwriteGroups')} · ${old.carrier_reference_count} ${t('overwriteCarrierRefs')}` },
           ]} />
           {old.reason ? <Text type="danger">{old.reason}</Text> : <Text>{t('overwriteRetirementWarning')}</Text>}
           {!ambiguous ? <Button danger disabled={rowsLocked || row.overwriteConfirmed} onClick={() => confirmOverwrite(row)}>{t(row.overwriteConfirmed ? 'overwriteConfirmed' : old.classification === 'STALE_INACTIVE_RESIDUE' ? 'overwriteCleanInstall' : 'overwriteConfirm')}</Button> : null}

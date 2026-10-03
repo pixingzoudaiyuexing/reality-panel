@@ -134,7 +134,7 @@ async function inspectExisting(existing = managed) {
   await user.type(screen.getByLabelText('nodeBootstrapHost 1'), 'node-a');
   await user.type(screen.getByLabelText('nodeBootstrapPassword 1'), 'test-only-password');
   await user.click(screen.getByText('nodeBootstrapTestConnection'));
-  await screen.findByText('overwriteExistingTitle');
+  await screen.findByText(existing.classification === 'AMBIGUOUS_STATE' ? 'overwriteAmbiguousTitle' : 'overwriteExistingTitle');
   return user;
 }
 describe('Existing installation confirmation', () => {
@@ -168,6 +168,16 @@ describe('Existing installation confirmation', () => {
     await screen.findByText(`overwriteNewNode: ${newId}`);
     expect(screen.queryByText('overwriteCredentialActive')).not.toBeInTheDocument();
     expect(screen.queryByText('overwriteExistingTitle')).not.toBeInTheDocument();
+  });
+
+  it('labels ambiguous authority and relations as unverified without offering cleanup', async () => {
+    await inspectExisting({ ...managed, classification: 'AMBIGUOUS_STATE', panel_present: false, online: false, credential_active: false, group_count: 0, carrier_reference_count: 0 });
+    expect(screen.getAllByText('overwriteUnverified')).toHaveLength(2);
+    expect(screen.getByText(/overwriteUnverified · overwriteServiceActive/)).toBeInTheDocument();
+    expect(screen.queryByText('overwriteCredentialInactive')).not.toBeInTheDocument();
+    expect(screen.queryByText(/0 overwriteGroups/)).not.toBeInTheDocument();
+    expect(screen.queryByText('overwriteConfirm')).not.toBeInTheDocument();
+    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeDisabled();
   });
 
 });

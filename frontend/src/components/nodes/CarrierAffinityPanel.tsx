@@ -100,13 +100,13 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const requestInFlight = useRef(false);
   const readInFlight = useRef(false);
   const operationKey = `reality-carrier-operation:${groupId}`;
-  const [intent, setIntent] = useState<{ desired: CarrierPolicy | null; unknown: boolean; error: string | null; baseline?: string; observed?: boolean; pending?: boolean }>(() => {
+  const [intent, setIntent] = useState<{ desired: CarrierPolicy | null; unknown: boolean; error: string | null; baseline?: string; observed?: boolean; pending?: boolean; baselineMode?: RoutingMode }>(() => {
     try { const stored = JSON.parse(sessionStorage.getItem(operationKey) ?? 'null'); return stored ? { ...stored, unknown: stored.unknown || stored.pending === true } : { desired: null, unknown: false, error: null }; }
     catch { return { desired: null, unknown: false, error: null }; }
   });
   useEffect(() => { sessionStorage.setItem(operationKey, JSON.stringify(intent)); }, [intent, operationKey]);
   const backendPhase = carrierOperation(view, intent.desired, saving, intent.unknown);
-  const unchangedUnknown = intent.unknown && !intent.observed && intent.desired && intent.baseline === carrierPolicyKey(intent.desired);
+  const unchangedUnknown = intent.unknown && !intent.observed && intent.desired && intent.baseline === carrierPolicyKey(intent.desired) && (!intent.baselineMode || intent.baselineMode === activeMode);
   const phase = intent.error && !saving && !['rolling_back', 'rolled_back', 'rollback_failed'].includes(backendPhase)
     ? 'failed' : unchangedUnknown && backendPhase === 'ready' ? 'unknown' : activeMode !== 'carrier' && !intent.desired && backendPhase === 'pending' ? 'idle' : backendPhase;
   useEffect(() => {
@@ -204,7 +204,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const save = async () => {
     if (requestInFlight.current || (activeMode === 'carrier' && !dirty) || mutationLocked || catalogUnavailable || disabled) return;
     requestInFlight.current = true;
-    const submitted = { desired: { default_node_id: draftDefaultNodeId, bindings: mutableCarrierBindings(draft) }, unknown: false, error: null, baseline: view ? carrierPolicyKey(view.active_policy) : undefined, observed: false, pending: true };
+    const submitted = { desired: { default_node_id: draftDefaultNodeId, bindings: mutableCarrierBindings(draft) }, unknown: false, error: null, baseline: view ? carrierPolicyKey(view.active_policy) : undefined, observed: false, pending: true, baselineMode: activeMode };
     sessionStorage.setItem(operationKey, JSON.stringify(submitted));
     setIntent(submitted);
     setSaving(true);

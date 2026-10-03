@@ -303,4 +303,12 @@ describe('Carrier authoritative progress and refresh', () => {
     expect(mockApply).not.toHaveBeenCalled();
   });
 
+  it('resolves a lost same-policy activation when the server confirms Carrier became active', async () => {
+    const policy = { default_node_id: 'node-a', bindings: [{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }] };
+    sessionStorage.setItem('reality-carrier-operation:7', JSON.stringify({ desired: policy, unknown: true, baseline: JSON.stringify(policy), baselineMode: 'normal', observed: false }));
+    arrange({}, nodes, 'carrier');
+    expect(await screen.findByTestId('carrier-operation')).toHaveTextContent('carrierOperationReady');
+    expect(mockApply).not.toHaveBeenCalled();
+  });
+
 });
