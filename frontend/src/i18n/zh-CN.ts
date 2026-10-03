@@ -1726,6 +1726,7 @@ export const zhCN = {
   overwriteStaleTitle: '检测到旧的无效 Reality Node 安装残留',
   overwriteAmbiguousTitle: '检测到无法安全确认的旧 Node 状态',
   overwriteVersion: '版本',
+  overwriteNewNode: '新节点身份',
   overwriteOldNode: '旧节点身份',
   overwriteProfile: '安装模式',
   overwritePanelIdentity: '面板记录与认证',

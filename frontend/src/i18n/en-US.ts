@@ -1731,6 +1731,7 @@ export const enUS: Dict = {
   overwriteStaleTitle: 'Inactive Reality Node installation residue detected',
   overwriteAmbiguousTitle: 'Existing Node state cannot be safely verified',
   overwriteVersion: 'Version',
+  overwriteNewNode: 'New node identity',
   overwriteOldNode: 'Previous Node identity',
   overwriteProfile: 'Install profile',
   overwritePanelIdentity: 'Panel record and authentication',

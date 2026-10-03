@@ -12,7 +12,7 @@ type Values = { group_id?: number; host: string; port: number; username: string;
 type ExistingInstallation = { classification: 'CLEAN_HOST' | 'STALE_INACTIVE_RESIDUE' | 'MANAGED_EXISTING_NODE' | 'AMBIGUOUS_STATE'; old_node_id: string | null; version: string | null; profile: string | null; service_active: boolean; panel_present: boolean; online: boolean; credential_active: boolean; group_count: number; carrier_reference_count: number; reason: string | null; confirmation: string };
 type SshProbe = { existing?: ExistingInstallation; fingerprint: string; os: string; architecture: string };
 type DeployLog = { stage: string; message: string; at: string };
-type Deployment = { id: string; group_id: number; host: string; stage: string; status: string; message: string; node_id?: string | null; profile: 'reality_camouflage'; lite_mode: boolean; capabilities?: ProvisioningCapabilities | null };
+type Deployment = { id: string; group_id: number; host: string; stage: string; status: string; message: string; node_id?: string | null; candidate_node_id?: string | null; profile: 'reality_camouflage'; lite_mode: boolean; capabilities?: ProvisioningCapabilities | null };
 type RowState = 'WAITING' | 'TESTING' | 'PASSED' | 'FAILED' | 'DEPLOYING' | 'SUCCESS';
 type SshRow = { overwriteConfirmed?: boolean; id: number; values: Values; state: RowState; probe: SshProbe | null; deployment: Deployment | null; logs: DeployLog[]; error: string | null };
 type EnrollmentState = 'PENDING' | 'CLAIMED' | 'VERIFYING' | 'LOCAL_COMMITTED' | 'SUCCESS' | 'FAILED' | 'EXPIRED';
@@ -175,12 +175,12 @@ export default function NodeBootstrap() {
         <Input disabled={rowsLocked} aria-label={`${t('nodeBootstrapUser')} ${index + 1}`} value={row.values.username} onChange={(event) => updateRow(row.id, { username: event.target.value })} />
         <Input.Password disabled={rowsLocked} aria-label={`${t('nodeBootstrapPassword')} ${index + 1}`} value={row.values.password} autoComplete="new-password" onChange={(event) => updateRow(row.id, { password: event.target.value })} />
         <Space size={4}><Tag color={rowColor[row.state]}>{t(`nodeBootstrapRow${row.state}` as keyof Dict)}</Tag>{rows.length > 1 ? <Button disabled={rowsLocked} type="text" danger icon={<DeleteOutlined />} aria-label={`${t('delete')} ${index + 1}`} onClick={() => setRows((current) => current.filter((item) => item.id !== row.id))} /> : null}</Space>
-        {row.error ? <Text type="danger" className="rp-ssh-row-message">{row.error}</Text> : row.deployment ? <Text className="rp-ssh-row-message">{row.deployment.message}</Text> : row.probe ? <Text type="secondary" className="rp-ssh-row-message">{row.probe.os} · {row.probe.architecture} · {row.probe.fingerprint}</Text> : null}
+        {row.error ? <Text type="danger" className="rp-ssh-row-message">{row.error}</Text> : row.deployment ? <Space orientation="vertical" size={2}><Text className="rp-ssh-row-message">{row.deployment.message}</Text>{row.deployment.node_id || row.deployment.candidate_node_id ? <Text code style={{ overflowWrap: 'anywhere' }}>{t('overwriteNewNode')}: {row.deployment.node_id ?? row.deployment.candidate_node_id}</Text> : null}</Space> : row.probe ? <Text type="secondary" className="rp-ssh-row-message">{row.probe.os} · {row.probe.architecture} · {row.probe.fingerprint}</Text> : null}
       </div>)}
     </div>
     {rows.map((row) => {
       const old = row.probe?.existing;
-      if (!old || old.classification === 'CLEAN_HOST') return null;
+      if (!old || old.classification === 'CLEAN_HOST' || row.deployment) return null;
       const ambiguous = old.classification === 'AMBIGUOUS_STATE';
       return <Alert key={row.id} style={{ marginTop: 12 }} type={ambiguous ? 'error' : 'warning'} showIcon
         title={t(ambiguous ? 'overwriteAmbiguousTitle' : old.classification === 'STALE_INACTIVE_RESIDUE' ? 'overwriteStaleTitle' : 'overwriteExistingTitle')}

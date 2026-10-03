@@ -156,4 +156,17 @@ describe('Existing installation confirmation', () => {
     await user.click(screen.getByText('nodeBootstrapDeploy'));
     await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ overwrite_node_id: 'old-node', existing_confirmation: 'snapshot-proof' })));
   });
+  it('shows the new identity and hides the obsolete active-credential snapshot after replacement starts', async () => {
+    const user = await inspectExisting();
+    await user.click(screen.getByText('overwriteConfirm'));
+    const buttons = await screen.findAllByText('overwriteConfirm');
+    await user.click(buttons[buttons.length - 1]);
+    const newId = '22222222-2222-4222-8222-222222222222';
+    mockPost.mockResolvedValueOnce(ok({ id: 'task', status: 'SUCCESS', stage: 'SUCCESS', host: 'node-a', node_id: newId, candidate_node_id: newId, message: 'completed' }));
+    await user.click(screen.getByText('nodeBootstrapDeploy'));
+    await screen.findByText(`overwriteNewNode: ${newId}`);
+    expect(screen.queryByText('overwriteCredentialActive')).not.toBeInTheDocument();
+    expect(screen.queryByText('overwriteExistingTitle')).not.toBeInTheDocument();
+  });
+
 });
