@@ -327,6 +327,13 @@ pub async fn start(
     {
         return Err("FORWARDING_PROBES_REQUIRED_FOR_EVERY_RULE".into());
     }
+    // Pool metadata is a projection, not a prerequisite for a validated legacy
+    // Node. A managed host may never have been listed in the admin Pool UI.
+    state
+        .db
+        .register_node_pool_identity(old.home_group_id, &old.node_id)
+        .await
+        .map_err(|_| "DATABASE_ERROR")?;
     let records = state
         .db
         .list_node_pool_records()
@@ -809,6 +816,9 @@ pub(crate) mod tests {
         fixture_with_dns(false).await
     }
     async fn fixture_with_dns(dns: bool) -> AppState {
+        fixture_with_metadata(dns, true).await
+    }
+    async fn fixture_with_metadata(dns: bool, registered: bool) -> AppState {
         use std::sync::Arc;
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -843,9 +853,11 @@ pub(crate) mod tests {
         db.insert_node_reuse_binding(20, 10, "OLD_NODE")
             .await
             .unwrap();
-        db.register_node_pool_identity(10, "OLD_NODE")
-            .await
-            .unwrap();
+        if registered {
+            db.register_node_pool_identity(10, "OLD_NODE")
+                .await
+                .unwrap();
+        }
         db.set("node_status:10:OLD_NODE",&serde_json::json!({"last_seen":chrono::Utc::now().to_rfc3339(),"public_ipv4":"192.0.2.1","node_version":"1.3.0","architecture":"x86_64","verified_concrete_node":true}).to_string()).await.unwrap();
         AppState {
             db,
@@ -880,6 +892,67 @@ pub(crate) mod tests {
             })
             .collect()
     }
+    #[tokio::test]
+    async fn precheck_registers_only_the_validated_legacy_identity_without_pool_listing() {
+        let state = fixture_with_metadata(false, false).await;
+        state
+            .db
+            .revoke_node_credential(
+                "legacy-credential",
+                10,
+                &crate::node_identity::ReuseEligibleNodeId::parse("OLD_NODE").unwrap(),
+                1,
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .delete_node_reuse_binding(20, 10, "OLD_NODE")
+            .await
+            .unwrap();
+        let report = serde_json::json!({"last_seen":chrono::Utc::now().to_rfc3339(),
+            "public_ipv4":"192.0.2.1", "node_version":"1.3.0", "architecture":"x86_64",
+            "verified_concrete_node":false})
+        .to_string();
+        state
+            .db
+            .set("node_status:10:OLD_NODE", &report)
+            .await
+            .unwrap();
+        state
+            .db
+            .set("node_status:20:OTHER_NODE", &report)
+            .await
+            .unwrap();
+        assert!(state.db.list_node_pool_records().await.unwrap().is_empty());
+        let op = start(
+            &state,
+            1,
+            ConcreteNodeIdentity {
+                home_group_id: 10,
+                node_id: "OLD_NODE".into(),
+            },
+            vec![Probe {
+                rule_id: 100,
+                path: "/marker".into(),
+                expected_marker: "G100".into(),
+            }],
+            OFFICIAL_AMD64_SHA256,
+            InstallProfile::Lite,
+        )
+        .await
+        .unwrap();
+        assert_eq!(op.state, "PREPARED");
+        assert_eq!(op.memberships, vec![10]);
+        assert!(op.dns.is_empty());
+        let records = state.db.list_node_pool_records().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            (records[0].identity_group_id, records[0].node_id.as_str()),
+            (10, "OLD_NODE")
+        );
+    }
+
     #[tokio::test]
     async fn precheck_does_not_require_live_dns_provider_for_dns_eligible_rules() {
         let state = fixture_with_dns(true).await;
