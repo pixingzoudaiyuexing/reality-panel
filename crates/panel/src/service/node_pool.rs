@@ -294,6 +294,12 @@ pub async fn retire_node(
     {
         return Ok(None);
     }
+    // A freshly activated identity may not have been visited by the Pool UI yet.
+    // Reconcile existing credential/binding authority before the metadata lookup;
+    // a derived record must never decide whether a live credential is retired.
+    reconcile_metadata(state.db.as_ref())
+        .await
+        .map_err(|e| e.to_string())?;
     if !state
         .db
         .list_node_pool_records()

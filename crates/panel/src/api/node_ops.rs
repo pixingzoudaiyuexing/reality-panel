@@ -3238,6 +3238,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_uninstall_retires_active_identity_before_first_pool_list() {
+        let (state, pool) = test_state().await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-token")
+            .await
+            .unwrap();
+        let id = "FRESH_NOT_LISTED";
+        for (credential, node) in [("fresh-active", id), ("unrelated-active", "OTHER_FRESH")] {
+            sqlx::query("INSERT INTO node_credentials(credential_id,home_group_id,node_id,generation,verifier_format,verifier_version,verifier_data,activated_at) VALUES (?, ?, ?,1,'rp-node-sha256',1,?,datetime('now'))")
+                .bind(credential).bind(anchor.id).bind(node).bind(vec![7_u8; 32]).execute(&pool).await.unwrap();
+        }
+        assert!(state.db.list_node_pool_records().await.unwrap().is_empty());
+        let operation = state
+            .node_operations
+            .start(
+                anchor.id,
+                id.into(),
+                NodeLifecycleAction::Uninstall,
+                Some("1.4.4".into()),
+                None,
+                None,
+                None,
+                Some(1),
+            )
+            .unwrap();
+        seed_durable_uninstall(&state, &operation, true, true).await;
+        let mut durable = load_durable_uninstall(&state, &operation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        durable.destructive_started = true;
+        store_durable_uninstall(&state, &durable).await.unwrap();
+        assert_eq!(
+            finalize_durable_uninstall(&state, &operation.id)
+                .await
+                .unwrap()
+                .status,
+            OperationStatus::Success
+        );
+        assert!(
+            state
+                .db
+                .find_active_node_credential_for_runtime("fresh-active")
+                .await
+                .unwrap()
+                .is_none(),
+            "successful Fresh uninstall must revoke authority without requiring a prior Pool GET"
+        );
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime("unrelated-active")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(crate::service::node_pool::list_nodes(state.db.as_ref())
+            .await
+            .unwrap()
+            .iter()
+            .all(|entry| entry.node_id != id));
+    }
+
+    #[tokio::test]
     async fn pool_uninstall_retires_only_after_verified_cleanup_and_disconnect() {
         let (state, pool) = test_state().await;
         let anchor = state
