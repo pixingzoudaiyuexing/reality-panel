@@ -161,6 +161,7 @@ describe('Existing installation confirmation', () => {
     await user.click(screen.getByText('overwriteConfirm'));
     const buttons = await screen.findAllByText('overwriteConfirm');
     await user.click(buttons[buttons.length - 1]);
+    await waitFor(() => expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeEnabled());
     const newId = '22222222-2222-4222-8222-222222222222';
     mockPost.mockResolvedValueOnce(ok({ id: 'task', status: 'SUCCESS', stage: 'SUCCESS', host: 'node-a', node_id: newId, candidate_node_id: newId, message: 'completed' }));
     await user.click(screen.getByText('nodeBootstrapDeploy'));
