@@ -732,6 +732,13 @@ pub trait NodePoolRepository: Send + Sync {
         group_id: i64,
         node_id: &ReuseEligibleNodeId,
     ) -> Result<NodePoolRetirement, DbError>;
+    /// SSH destructive reinstall retires a host-known identity in its actual
+    /// Home Group. Uses the same live-state transaction and historical retention.
+    async fn retire_installation_node(
+        &self,
+        group_id: i64,
+        node_id: &ReuseEligibleNodeId,
+    ) -> Result<NodePoolRetirement, DbError>;
     /// Persist a verified status only while that exact credential remains
     /// current. Serializes with retirement to reject in-flight reports.
     async fn set_verified_node_status_if_active(

@@ -298,6 +298,72 @@ pub(super) async fn host_candidates(
     nodes.into_iter().collect()
 }
 
+pub(super) async fn resolve_host_identities(
+    state: &AppState,
+    ids: Vec<String>,
+    fallback_group: i64,
+) -> Result<Vec<(i64, String)>, DeployError> {
+    let mut known = state
+        .db
+        .discover_node_pool_identities()
+        .await
+        .map_err(db_error)?;
+    known.extend(
+        state
+            .db
+            .list_node_pool_records()
+            .await
+            .map_err(db_error)?
+            .into_iter()
+            .map(|r| crate::db::repo::ConcreteNodeIdentity {
+                home_group_id: r.identity_group_id,
+                node_id: r.node_id,
+            }),
+    );
+    for (key, _) in state
+        .db
+        .scan_prefix("node_status:")
+        .await
+        .map_err(db_error)?
+    {
+        if let Some((home_group_id, Some(node_id))) = crate::api::stats::parse_status_key(&key) {
+            known.push(crate::db::repo::ConcreteNodeIdentity {
+                home_group_id,
+                node_id: node_id.into(),
+            });
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    for id in ids {
+        if let Some(claim) = state
+            .db
+            .find_node_credential_claim(&id)
+            .await
+            .map_err(db_error)?
+        {
+            if claim.node_id == id {
+                known.push(crate::db::repo::ConcreteNodeIdentity {
+                    home_group_id: claim.home_group_id,
+                    node_id: id.clone(),
+                });
+            }
+        }
+        let groups: Vec<_> = known
+            .iter()
+            .filter(|n| n.node_id == id)
+            .map(|n| n.home_group_id)
+            .collect();
+        if groups.is_empty() {
+            out.insert((fallback_group, id));
+        } else {
+            for group in groups {
+                out.insert((group, id.clone()));
+            }
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
 pub(super) async fn retire_host_identity(
     state: &AppState,
     group: i64,
@@ -306,7 +372,7 @@ pub(super) async fn retire_host_identity(
 ) -> Result<(), DeployError> {
     let node = ReuseEligibleNodeId::parse(id).map_err(|_| retirement_error())?;
     // Existing atomic Pool delete preserves independent history and schedules DNS.
-    node_pool::retire_node(state, group, id)
+    node_pool::retire_installation_identity(state, group, id)
         .await
         .map_err(|_| retirement_error())?;
     for claim in state
@@ -325,7 +391,7 @@ pub(super) async fn retire_host_identity(
     }
     // Cancellation serializes with activation. An activation that won the race
     // is retired through the same authority transaction before local cleanup.
-    node_pool::retire_node(state, group, id)
+    node_pool::retire_installation_identity(state, group, id)
         .await
         .map_err(|_| retirement_error())?;
     if state

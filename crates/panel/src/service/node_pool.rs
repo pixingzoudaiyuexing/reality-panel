@@ -311,6 +311,26 @@ pub async fn retire_node(
         return Ok(None);
     }
 
+    retire_identity(state, group_id, node_id.as_str(), false).await
+}
+
+/// A verified SSH destructive reset supplies host-local identity evidence.
+/// This does not grant a public Delete API permission for non-Pool identities.
+pub(crate) async fn retire_installation_identity(
+    state: &crate::api::AppState,
+    group_id: i64,
+    node_id: &str,
+) -> Result<Option<bool>, String> {
+    retire_identity(state, group_id, node_id, true).await
+}
+
+async fn retire_identity(
+    state: &crate::api::AppState,
+    group_id: i64,
+    node_id: &str,
+    fresh_reset: bool,
+) -> Result<Option<bool>, String> {
+    let node_id = ReuseEligibleNodeId::parse(node_id).map_err(|_| "invalid node identity")?;
     let _authority = crate::service::relay_failover::lock_automatic_policy().await;
     let _preference = crate::service::relay_preference::RELAY_PREFERENCE_MUTATION_LOCK
         .lock()
@@ -332,11 +352,12 @@ pub async fn retire_node(
     let _failover = crate::service::relay_failover::FAILOVER_MUTATION_LOCK
         .lock()
         .await;
-    let retired = state
-        .db
-        .retire_pool_native_node(group_id, &node_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    let retired = if fresh_reset {
+        state.db.retire_installation_node(group_id, &node_id).await
+    } else {
+        state.db.retire_pool_native_node(group_id, &node_id).await
+    }
+    .map_err(|e| e.to_string())?;
     if retired.retired {
         state
             .node_connections

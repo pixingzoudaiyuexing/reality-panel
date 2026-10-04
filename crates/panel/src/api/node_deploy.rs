@@ -886,7 +886,12 @@ async fn run_task(
         if destructive_fresh {
             *reset_artifact.lock().await = Some(artifact.clone());
             let facts = state.deployments.runner.inspect(&ssh, &fingerprint).await?;
-            let old_ids = existing::host_candidates(&state, &facts, &host, &fingerprint).await;
+            let old_ids = existing::resolve_host_identities(
+                &state,
+                existing::host_candidates(&state, &facts, &host, &fingerprint).await,
+                group_id,
+            )
+            .await?;
             state
                 .deployments
                 .runner
@@ -918,8 +923,8 @@ async fn run_task(
                     &secrets,
                 )
                 .await;
-            for old_id in old_ids {
-                existing::retire_host_identity(&state, group_id, &old_id, actor_id).await?;
+            for (old_group, old_id) in old_ids {
+                existing::retire_host_identity(&state, old_group, &old_id, actor_id).await?;
             }
             state
                 .deployments
@@ -3616,5 +3621,100 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             state.deployments.status(&task.id).await.unwrap().status,
             "FAILED"
         );
+    }
+    #[tokio::test]
+    async fn fresh_retirement_resolves_old_home_group_and_preserves_unrelated_node() {
+        use crate::node_identity::ReuseEligibleNodeId;
+        use axum::http::HeaderMap;
+        let (state, facts) = existing_fixture().await;
+        state
+            .db
+            .insert_group(
+                "old installation",
+                "in",
+                "old-group-token",
+                1,
+                "",
+                "10000-20000",
+                1.0,
+                false,
+            )
+            .await
+            .unwrap();
+        let old_group = state
+            .db
+            .find_by_token("old-group-token")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let old = "44444444-4444-4444-8444-444444444444";
+        let node = ReuseEligibleNodeId::parse(old).unwrap();
+        state
+            .db
+            .set(&format!("node_status:{old_group}:{old}"), "{}")
+            .await
+            .unwrap();
+        state
+            .db
+            .set(
+                &format!("node_config_revision:{old_group}:{old}"),
+                "old revision",
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .set(&format!("traffic-history:{old_group}:{old}"), "preserve")
+            .await
+            .unwrap();
+        let identities = existing::resolve_host_identities(
+            &state,
+            vec![old.into()],
+            facts.identity_group_id.unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(identities, vec![(old_group, old.into())]);
+        existing::retire_host_identity(&state, old_group, node.as_str(), 1)
+            .await
+            .unwrap();
+        assert!(state
+            .db
+            .get(&format!("node_status:{old_group}:{old}"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .db
+            .get(&format!("node_config_revision:{old_group}:{old}"))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            state
+                .db
+                .get(&format!("traffic-history:{old_group}:{old}"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("preserve")
+        );
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime(facts.credential_id.as_ref().unwrap())
+            .await
+            .unwrap()
+            .is_some());
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer old-group-token".parse().unwrap());
+        headers.insert("X-Node-ID", old.parse().unwrap());
+        assert!(crate::api::node_auth::authenticate_node(&state, &headers)
+            .await
+            .is_err());
+        headers.insert("X-Node-ID", "unrelated-node".parse().unwrap());
+        assert!(crate::api::node_auth::authenticate_node(&state, &headers)
+            .await
+            .is_ok());
     }
 }

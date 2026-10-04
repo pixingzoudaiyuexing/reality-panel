@@ -84,20 +84,116 @@ impl NodePoolRepository for SqliteRepository {
         group_id: i64,
         node_id: &crate::node_identity::ReuseEligibleNodeId,
     ) -> Result<NodePoolRetirement, DbError> {
+        self.retire_installation_inner(group_id, node_id, false)
+            .await
+    }
+    async fn retire_installation_node(
+        &self,
+        group_id: i64,
+        node_id: &crate::node_identity::ReuseEligibleNodeId,
+    ) -> Result<NodePoolRetirement, DbError> {
+        self.retire_installation_inner(group_id, node_id, true)
+            .await
+    }
+
+    async fn set_verified_node_status_if_active(
+        &self,
+        group_id: i64,
+        node_id: &crate::node_identity::ReuseEligibleNodeId,
+        credential_id: &str,
+        status: &str,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE device_groups SET name=name WHERE id=?")
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+        let written = sqlx::query(
+            "INSERT INTO kvs (key,value)
+             SELECT ?,? WHERE EXISTS (
+                 SELECT 1 FROM node_credentials AS current
+                 WHERE current.home_group_id=? AND current.node_id=? AND current.credential_id=?
+                   AND current.activated_at IS NOT NULL AND current.revoked_at IS NULL
+                   AND current.generation=(SELECT MAX(history.generation) FROM node_credentials AS history
+                       WHERE history.home_group_id=current.home_group_id AND history.node_id=current.node_id
+                       AND history.activated_at IS NOT NULL))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        )
+        .bind(format!("node_status:{group_id}:{}", node_id.as_str()))
+        .bind(status).bind(group_id).bind(node_id.as_str()).bind(credential_id)
+        .execute(&mut *tx).await?.rows_affected() == 1;
+        tx.commit().await?;
+        Ok(written)
+    }
+
+    async fn node_pool_system_group_id(&self) -> Result<Option<i64>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT group_id FROM node_pool_system_anchor WHERE singleton = 1")
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn ensure_node_pool_system_group(
+        &self,
+        admin_id: i64,
+        token: &str,
+    ) -> Result<DeviceGroup, DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE node_pool_system_anchor SET singleton = singleton WHERE 0")
+            .execute(&mut *tx)
+            .await?;
+        if let Some(group) = sqlx::query_as::<_, DeviceGroup>(
+            "SELECT g.* FROM device_groups g JOIN node_pool_system_anchor p ON p.group_id = g.id WHERE p.singleton = 1")
+            .fetch_optional(&mut *tx).await? {
+            tx.commit().await?;
+            return Ok(group);
+        }
+        let group_id: i64 = sqlx::query_scalar(
+            "INSERT INTO device_groups (name, group_type, token, uid, hidden)
+             SELECT '__node_pool__', 'in', ?, id, 1 FROM users WHERE id = ? AND admin = 1
+             RETURNING id",
+        )
+        .bind(token)
+        .bind(admin_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO node_pool_system_anchor (singleton, group_id) VALUES (1, ?)")
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+        let group = sqlx::query_as("SELECT * FROM device_groups WHERE id = ?")
+            .bind(group_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(group)
+    }
+}
+
+impl SqliteRepository {
+    async fn retire_installation_inner(
+        &self,
+        group_id: i64,
+        node_id: &crate::node_identity::ReuseEligibleNodeId,
+        fresh_reset: bool,
+    ) -> Result<NodePoolRetirement, DbError> {
         let mut tx = self.pool.begin().await?;
         // Own the SQLite writer slot before inspecting any identity state.
         sqlx::query("UPDATE device_groups SET name = name WHERE id = ?")
             .bind(group_id)
             .execute(&mut *tx)
             .await?;
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM node_pool_nodes WHERE identity_group_id = ? AND node_id = ?
-             AND identity_group_id = (SELECT group_id FROM node_pool_system_anchor WHERE singleton = 1)",
-        )
-        .bind(group_id)
-        .bind(node_id.as_str())
-        .fetch_optional(&mut *tx)
-        .await?;
+        let exists: Option<i64> = if fresh_reset {
+            sqlx::query_scalar("SELECT 1 FROM device_groups WHERE id=?")
+                .bind(group_id)
+                .fetch_optional(&mut *tx)
+                .await?
+        } else {
+            sqlx::query_scalar("SELECT 1 FROM node_pool_nodes WHERE identity_group_id=? AND node_id=?
+                AND identity_group_id=(SELECT group_id FROM node_pool_system_anchor WHERE singleton=1)")
+                .bind(group_id).bind(node_id.as_str()).fetch_optional(&mut *tx).await?
+        };
         if exists.is_none() {
             tx.rollback().await?;
             return Ok(NodePoolRetirement::default());
@@ -226,84 +322,17 @@ impl NodePoolRepository for SqliteRepository {
             .bind(node_id.as_str())
             .execute(&mut *tx)
             .await?;
+        if fresh_reset {
+            // Reuse the existing exact-identity retirement guard; no migration
+            // operation is created and no Group token is changed.
+            sqlx::query("INSERT INTO kvs(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                .bind(format!("legacy_v130_upgrade:retired:{group_id}:{}", node_id.as_str()))
+                .bind("SSH_FRESH_RETIRED").execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(NodePoolRetirement {
             retired: true,
             needs_attention,
         })
-    }
-
-    async fn set_verified_node_status_if_active(
-        &self,
-        group_id: i64,
-        node_id: &crate::node_identity::ReuseEligibleNodeId,
-        credential_id: &str,
-        status: &str,
-    ) -> Result<bool, DbError> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE device_groups SET name=name WHERE id=?")
-            .bind(group_id)
-            .execute(&mut *tx)
-            .await?;
-        let written = sqlx::query(
-            "INSERT INTO kvs (key,value)
-             SELECT ?,? WHERE EXISTS (
-                 SELECT 1 FROM node_credentials AS current
-                 WHERE current.home_group_id=? AND current.node_id=? AND current.credential_id=?
-                   AND current.activated_at IS NOT NULL AND current.revoked_at IS NULL
-                   AND current.generation=(SELECT MAX(history.generation) FROM node_credentials AS history
-                       WHERE history.home_group_id=current.home_group_id AND history.node_id=current.node_id
-                       AND history.activated_at IS NOT NULL))
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        )
-        .bind(format!("node_status:{group_id}:{}", node_id.as_str()))
-        .bind(status).bind(group_id).bind(node_id.as_str()).bind(credential_id)
-        .execute(&mut *tx).await?.rows_affected() == 1;
-        tx.commit().await?;
-        Ok(written)
-    }
-
-    async fn node_pool_system_group_id(&self) -> Result<Option<i64>, DbError> {
-        Ok(
-            sqlx::query_scalar("SELECT group_id FROM node_pool_system_anchor WHERE singleton = 1")
-                .fetch_optional(&self.pool)
-                .await?,
-        )
-    }
-
-    async fn ensure_node_pool_system_group(
-        &self,
-        admin_id: i64,
-        token: &str,
-    ) -> Result<DeviceGroup, DbError> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE node_pool_system_anchor SET singleton = singleton WHERE 0")
-            .execute(&mut *tx)
-            .await?;
-        if let Some(group) = sqlx::query_as::<_, DeviceGroup>(
-            "SELECT g.* FROM device_groups g JOIN node_pool_system_anchor p ON p.group_id = g.id WHERE p.singleton = 1")
-            .fetch_optional(&mut *tx).await? {
-            tx.commit().await?;
-            return Ok(group);
-        }
-        let group_id: i64 = sqlx::query_scalar(
-            "INSERT INTO device_groups (name, group_type, token, uid, hidden)
-             SELECT '__node_pool__', 'in', ?, id, 1 FROM users WHERE id = ? AND admin = 1
-             RETURNING id",
-        )
-        .bind(token)
-        .bind(admin_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query("INSERT INTO node_pool_system_anchor (singleton, group_id) VALUES (1, ?)")
-            .bind(group_id)
-            .execute(&mut *tx)
-            .await?;
-        let group = sqlx::query_as("SELECT * FROM device_groups WHERE id = ?")
-            .bind(group_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(group)
     }
 }
