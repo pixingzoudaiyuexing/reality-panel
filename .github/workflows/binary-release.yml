@@ -1,13 +1,13 @@
-name: Reality Panel Release
+name: Reality Panel v1.4.5 Frozen Publication Build
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - 'codex/v145-publication-build-only'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: reality-panel-release-${{ github.ref }}
@@ -15,11 +15,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   build-and-release:
     name: Build and publish verified amd64 release
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     container: rust:1.96-bookworm
     defaults:
       run:
@@ -28,13 +30,14 @@ jobs:
       - name: Check out the triggering source revision
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: 216f43d10879cd541b9c9ffed5b58e06a7f787fe
 
       - name: Install Rust toolchain
         run: |
           rustup show
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates file openssl sqlite3
+          apt-get install -y --no-install-recommends ca-certificates file openssl sqlite3 python3
+          rustup component add rustfmt clippy
           rm -rf /var/lib/apt/lists/*
 
       - name: Install Node.js
@@ -47,7 +50,9 @@ jobs:
       - name: Validate source and package versions
         id: release-meta
         run: |
-          test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "216f43d10879cd541b9c9ffed5b58e06a7f787fe"
+          test -z "$(git -c safe.directory="$GITHUB_WORKSPACE" status --porcelain)"
+          printf 'SOURCE_SHA=216f43d10879cd541b9c9ffed5b58e06a7f787fe\n' >> "$GITHUB_ENV"
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             RELEASE_TAG="$GITHUB_REF_NAME"
           else
@@ -65,15 +70,24 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace --locked
 
-      - name: Run locked workspace tests
+      - name: Static release contracts and shell syntax
         run: |
-          # These four pre-existing SQLite tests are the documented historical
-          # baseline. All other workspace tests remain release-blocking.
-          cargo test --workspace --locked -- \
-            --skip db::schema::tests::migration_skips_index_when_duplicates_exist \
-            --skip db::sqlite_repo::tests::rule_insert_quota_guarded_port_scoped_by_group \
-            --skip db::sqlite_repo::tests::rule_insert_quota_guarded_surfaces_port_unique_violation \
-            --skip db::sqlite_repo::tests::rule_insert_quota_guarded_tcp_udp_share_port
+          bash scripts/check-repo-test-parity.sh
+          bash scripts/release-version-contract.sh v1.4.5
+          bash scripts/release-version-contract.test.sh
+          while IFS= read -r -d '' script; do bash -n "$script"; done < <(find . -name '*.sh' -not -path './target/*' -not -path './frontend/node_modules/*' -print0)
+
+      - name: Clippy warnings gate
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run locked complete workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Targeted overwrite and lifecycle regressions
+        run: |
+          cargo test --locked -p relay-panel api::node_deploy
+          cargo test --locked -p relay-node lifecycle
+          python3 scripts/relay-node-existing-install.test.py
 
       - name: Build Linux amd64 binaries from this checkout
         run: cargo build --release --locked -p relay-panel -p relay-node
@@ -82,7 +96,9 @@ jobs:
         working-directory: frontend
         run: |
           npm ci --no-audit --no-fund
+          npm run lint
           npm test
+          npx vitest run src/pages/NodeBootstrap.test.tsx src/components/nodes/CarrierAffinityPanel.test.tsx src/components/nodes/carrierOperation.test.ts
           npm run typecheck
           npm run build
 
@@ -95,11 +111,9 @@ jobs:
           cp target/release/relay-panel release-dist/reality-panel-linux-amd64
           cp target/release/relay-node release-dist/reality-node-linux-amd64
           tar -czf release-dist/reality-panel-web.tar.gz -C frontend/dist .
-          cp install.sh deploy.sh update.sh scripts/relay-node-install.sh scripts/reality-node-v1.3.0-to-v1.4.4.sh release-dist/
-          PINNED_NODE_SHA="$(sed -n "s/^TARGET_SHA256 = '\(.*\)'/\1/p" scripts/reality-node-v1.3.0-to-v1.4.4.sh)"
-          test "$(sha256sum release-dist/reality-node-linux-amd64 | awk '{print $1}')" = "$PINNED_NODE_SHA"
+          cp install.sh deploy.sh update.sh scripts/relay-node-install.sh release-dist/
           sed -i "s/^DEFAULT_RELEASE_TAG=.*/DEFAULT_RELEASE_TAG=\"$RELEASE_TAG\"/" release-dist/install.sh
-          printf '%s\n' "$GITHUB_SHA" > release-dist/SOURCE_COMMIT
+          printf '%s\n' "$SOURCE_SHA" > release-dist/SOURCE_COMMIT
           printf '%s\n' "$VERSION" > release-dist/VERSION
           chmod +x release-dist/reality-panel-linux-amd64 release-dist/reality-node-linux-amd64
           chmod +x release-dist/install.sh release-dist/deploy.sh release-dist/update.sh release-dist/relay-node-install.sh
@@ -108,7 +122,7 @@ jobs:
           file release-dist/reality-panel-linux-amd64 | grep -q 'ELF 64-bit.*x86-64'
           file release-dist/reality-node-linux-amd64 | grep -q 'ELF 64-bit.*x86-64'
           test -s release-dist/reality-panel-web.tar.gz
-          (cd release-dist && sha256sum reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh deploy.sh update.sh relay-node-install.sh reality-node-v1.3.0-to-v1.4.4.sh SOURCE_COMMIT VERSION > SHA256SUMS)
+          (cd release-dist && sha256sum reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh deploy.sh update.sh relay-node-install.sh SOURCE_COMMIT VERSION > SHA256SUMS)
 
       - name: Verify release assets
         run: |
@@ -117,35 +131,23 @@ jobs:
           test "$(tar -tzf reality-panel-web.tar.gz | grep -c '^./index.html$')" -eq 1
           grep -Eq '^([0-9a-f]{64})  reality-panel-linux-amd64$' SHA256SUMS
           grep -Eq '^([0-9a-f]{64})  reality-node-linux-amd64$' SHA256SUMS
-          test "$(cat SOURCE_COMMIT)" = "$GITHUB_SHA"
+          test "$(cat SOURCE_COMMIT)" = "$SOURCE_SHA"
           test "$(cat VERSION)" = "$VERSION"
+          mkdir web-extracted
+          tar -xzf reality-panel-web.tar.gz -C web-extracted 2> web-extract.stderr
+          test ! -s web-extract.stderr
+          diff -qr ../frontend/dist web-extracted
+          test -s web-extracted/index.html
+          test -d web-extracted/assets
+          if tar -tzf reality-panel-web.tar.gz | grep -E '(^|/)\._|__MACOSX'; then exit 1; fi
+          python3 -c "import tarfile; t=tarfile.open('reality-panel-web.tar.gz'); assert all(not m.pax_headers and '._' not in m.name.split('/') and '__MACOSX' not in m.name for m in t)"
+          rm -r web-extracted web-extract.stderr
 
       - name: Upload verified release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: reality-panel-${{ steps.release-meta.outputs.version }}-linux-amd64-${{ github.sha }}
+          name: reality-panel-1.4.5-formal-linux-amd64-216f43d10879
           path: release-dist/
           if-no-files-found: error
           retention-days: 14
 
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: Reality Panel ${{ github.ref_name }}
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          make_latest: ${{ !contains(github.ref_name, '-') }}
-          generate_release_notes: true
-          files: |
-            release-dist/reality-panel-linux-amd64
-            release-dist/reality-node-linux-amd64
-            release-dist/reality-panel-web.tar.gz
-            release-dist/install.sh
-            release-dist/update.sh
-            release-dist/deploy.sh
-            release-dist/relay-node-install.sh
-            release-dist/reality-node-v1.3.0-to-v1.4.4.sh
-            release-dist/SHA256SUMS
-            release-dist/SOURCE_COMMIT
-            release-dist/VERSION
