@@ -30,7 +30,7 @@ jobs:
       - name: Check out the triggering source revision
         uses: actions/checkout@v4
         with:
-          ref: 216f43d10879cd541b9c9ffed5b58e06a7f787fe
+          ref: a9a498c8c64f178d496a3f982d2e206adfc6b203
 
       - name: Install Rust toolchain
         run: |
@@ -50,9 +50,9 @@ jobs:
       - name: Validate source and package versions
         id: release-meta
         run: |
-          test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "216f43d10879cd541b9c9ffed5b58e06a7f787fe"
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "a9a498c8c64f178d496a3f982d2e206adfc6b203"
           test -z "$(git -c safe.directory="$GITHUB_WORKSPACE" status --porcelain)"
-          printf 'SOURCE_SHA=216f43d10879cd541b9c9ffed5b58e06a7f787fe\n' >> "$GITHUB_ENV"
+          printf 'SOURCE_SHA=a9a498c8c64f178d496a3f982d2e206adfc6b203\n' >> "$GITHUB_ENV"
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             RELEASE_TAG="$GITHUB_REF_NAME"
           else
@@ -99,6 +99,10 @@ jobs:
           npm run lint
           npm test
           npx vitest run src/pages/NodeBootstrap.test.tsx src/components/nodes/CarrierAffinityPanel.test.tsx src/components/nodes/carrierOperation.test.ts
+          for iteration in $(seq 1 10); do
+            printf 'STABILITY_RUN=%s\n' "$iteration"
+            npx vitest run src/pages/NodeBootstrap.test.tsx
+          done
           npm run typecheck
           npm run build
 
@@ -146,7 +150,7 @@ jobs:
       - name: Upload verified release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: reality-panel-1.4.5-formal-linux-amd64-216f43d10879
+          name: reality-panel-1.4.5-formal-linux-amd64-a9a498c8c64f
           path: release-dist/
           if-no-files-found: error
           retention-days: 14
