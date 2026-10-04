@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "relay-node"
-version = "1.4.5"
+version = "1.4.6"
 dependencies = [
  "chrono",
  "dashmap",
@@ -1903,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "relay-panel"
-version = "1.4.5"
+version = "1.4.6"
 dependencies = [
  "async-trait",
  "axum",

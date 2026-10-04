@@ -38,11 +38,42 @@ def regular(name, private=False):
     return p.read_text()
 
 
+def local_candidates():
+    """Host-local residue hints, independent of descriptor consistency checks.
+
+    Never trust a credential ID or a foreign descriptor's node ID alone.
+    Claim directory names and node-id remain usable through malformed metadata.
+    """
+    candidates = set()
+    try:
+        node = (regular('/opt/relay-node/node-id') or '').strip()
+        if node:
+            candidates.add(node)
+    except (OSError, ValueError, UnicodeError):
+        pass
+    claims = path('/var/lib/relay-panel/node-claims')
+    if not claims.is_symlink() and claims.is_dir():
+        for child in claims.iterdir():
+            if not child.is_symlink() and child.is_dir():
+                candidates.add(child.name)
+    tmp = path('/tmp')
+    if tmp.is_dir():
+        for config in tmp.glob('relay-panel-bootstrap-*/config.env'):
+            try:
+                raw = regular('/' + str(config.relative_to(ROOT)), True) or ''
+                for line in raw.splitlines():
+                    if line.startswith('POOL_NODE_ID='):
+                        candidates.add(line.partition('=')[2].strip().strip('"\''))
+            except (OSError, ValueError, UnicodeError):
+                pass
+    return sorted(candidates)
+
+
 def inspect():
     facts = dict(node_id=None, version=None, profile=None, service_active=False,
                  panel_url=None, identity_group_id=None, credential_id=None,
                  credential_verifier=None, runtime_valid=False, state_phase=None,
-                 residue_owned=False, ambiguity=None)
+                 residue_owned=False, ambiguity=None, candidate_node_ids=local_candidates())
     try:
         facts['node_id'] = (regular('/opt/relay-node/node-id') or '').strip() or None
         env = regular('/etc/relay-node/relay-node.env', True) or regular('/etc/relay-panel/node.env', True) or ''

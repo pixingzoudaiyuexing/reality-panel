@@ -1,8 +1,8 @@
 # Reality Panel — Roadmap
 
-## Current stage: v1.4.5 Fresh overwrite and Carrier progress RC
+## Current stage: v1.4.6 unconditional destructive Fresh reinstall RC
 
-Prepare only the two Owner-authorized improvements: explicit Fresh replacement of a safely verified existing installation and accurate Carrier/DNS progress, failure and lost-response recovery. Reuse existing lifecycle and transaction mechanisms without schema or model changes. Exact-source Formal Independent Review and physical TEST UI/runtime acceptance are required; publication and Production access are excluded.
+Owner-authorized SSH install resets the target server's Reality Node installation and installs one new UUID with the selected Standard/Lite profile. Old identity, credential and Panel URL mismatches are diagnostics. Reuse existing owned cleanup, Pool retirement and Carrier pruning; preserve history and unrelated workloads. Physical TEST, Carrier regression and exact-HEAD Formal Independent Review are required before returning the RC to PM. Publication and Production are excluded.
 
 ## Stable baseline: Node Reuse product completion
 

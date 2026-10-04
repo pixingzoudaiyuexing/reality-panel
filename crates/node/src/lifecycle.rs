@@ -1823,7 +1823,208 @@ fn existing_install_cleanup(root: &Path, expected: &str, check_only: bool) -> Re
     Ok(())
 }
 
+// SSH Fresh reset deliberately has no old identity/authentication gate. The
+// original exact-identity uninstall/upgrade helpers retain their own contract.
+const FRESH_REMOVE_FILES: &[&str] = &[
+    "/etc/relay-panel/lite-mode",
+    UNINSTALL_FINALIZER_SERVICE_PATH,
+    UNINSTALL_FINALIZER_TIMER_PATH,
+];
+const FRESH_REMOVE_DIRS: &[&str] = &[
+    "/var/lib/relay-panel/node-claims",
+    UNINSTALL_RECEIPT_DIR,
+    UNINSTALL_FINALIZER_DIR,
+];
+
+fn fresh_reset(root: &Path, phase: &str) -> Result<(), String> {
+    if root == Path::new("/") && unsafe { libc::geteuid() } != 0 {
+        return Err("root is required".into());
+    }
+    for path in UNINSTALL_REMOVE_FILES
+        .iter()
+        .chain(UNINSTALL_REMOVE_DIRS)
+        .chain(FRESH_REMOVE_FILES)
+        .chain(FRESH_REMOVE_DIRS)
+        .chain(
+            [
+                "/etc/nginx/nginx.conf",
+                "/etc/nginx/relay-panel-stream.conf",
+                "/etc/nginx/relay-panel-stream.d/relay-panel-sni.conf",
+                "/etc/nginx/stream.d/relay-panel-sni.conf",
+                "/etc/nginx/conf.d/relay-panel-fallback.conf",
+                "/etc/nginx/conf.d/relay-panel-acme.conf",
+                "/etc/nginx/conf.d/relay-panel-lite-fallback.conf",
+                "/var/lib/relay-panel/openlist-ownership.json",
+                "/var/lib/relay-panel/openlist",
+                "/var/lib/relay-panel/xiaoya-byoa",
+                "/var/lib/relay-panel/xiaoya-byoa-ownership.json",
+                "/etc/sysctl.d/99-reality-panel-bbr.conf",
+                "/etc/modules-load.d/reality-panel-bbr.conf",
+            ]
+            .iter(),
+        )
+    {
+        validate_cleanup_path(root, &rooted(root, path))?;
+    }
+    inspect_docker_nginx(root)?;
+    if root == Path::new("/") {
+        crate::xiaoya::validate_uninstall_owned()?;
+    }
+    if phase == "check" {
+        return Ok(());
+    }
+    if root == Path::new("/") {
+        for unit in [
+            "relay-node-uninstall-finalizer.timer",
+            "relay-node-uninstall-finalizer.service",
+            "relay-node.service",
+        ] {
+            // Missing units are a normal clean-host case. A loaded unit must
+            // stop successfully, including timers left by interrupted uninstall.
+            let loaded = Command::new("systemctl")
+                .args(["show", "--property=LoadState", "--value", unit])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if String::from_utf8_lossy(&loaded.stdout).trim() != "not-found" {
+                run_checked("systemctl", &["disable", "--now", unit])?;
+            }
+        }
+        stop_fresh_processes()?;
+    }
+    if phase == "stop" {
+        return Ok(());
+    }
+    uninstall_managed(root)?;
+    for path in FRESH_REMOVE_FILES {
+        remove_if_exists(&rooted(root, path))?;
+    }
+    for path in FRESH_REMOVE_DIRS {
+        let path = rooted(root, path);
+        if path.exists() {
+            std::fs::remove_dir_all(&path).map_err(|e| format!("remove Fresh residue: {e}"))?;
+        }
+    }
+    // Only installer-owned UUID directories, never arbitrary /tmp contents.
+    let tmp = rooted(root, "/tmp");
+    if tmp.is_dir() {
+        for entry in std::fs::read_dir(tmp).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let suffix = name
+                .strip_prefix("relay-panel-bootstrap-")
+                .or_else(|| name.strip_prefix("relay-panel-replacement-"));
+            if suffix.is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()) {
+                validate_cleanup_path(root, &entry.path())?;
+                if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+                    std::fs::remove_dir_all(entry.path()).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+    if root == Path::new("/") {
+        run_checked("systemctl", &["daemon-reload"])?;
+    }
+    Ok(())
+}
+
+fn stop_fresh_processes() -> Result<(), String> {
+    let mut targets = Vec::new();
+    for entry in std::fs::read_dir("/proc").map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid == std::process::id() as i32 {
+            continue;
+        }
+        let exe = std::fs::read_link(entry.path().join("exe")).unwrap_or_default();
+        let exe = exe.to_string_lossy();
+        let runtime = exe.trim_end_matches(" (deleted)") == "/opt/relay-node/relay-node"
+            || exe.trim_end_matches(" (deleted)") == UNINSTALL_FINALIZER_BINARY;
+        let cmd = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let installer = cmd.split(|b| *b == 0).any(|arg| {
+            std::str::from_utf8(arg)
+                .ok()
+                .and_then(|s| s.strip_prefix("/tmp/relay-panel-bootstrap-"))
+                .and_then(|s| s.strip_suffix("/bootstrap.sh"))
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        });
+        if runtime || installer {
+            // SSH installer starts in its own setsid group; systemd services
+            // are stopped above. Never signal the helper/SSH session group.
+            let pgid = unsafe { libc::getpgid(pid) };
+            let target = if installer && pgid == pid { -pgid } else { pid };
+            targets.push(target);
+            unsafe {
+                libc::kill(target, libc::SIGTERM);
+            }
+        }
+    }
+    for _ in 0..50 {
+        targets.retain(|pid| {
+            if unsafe { libc::kill(*pid, 0) } != 0 {
+                return false;
+            }
+            if *pid > 0 {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                if stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, state)| state.starts_with('Z'))
+                {
+                    return false;
+                }
+            }
+            true
+        });
+        if targets.is_empty() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    for pid in &targets {
+        unsafe {
+            libc::kill(*pid, libc::SIGKILL);
+        }
+    }
+    for _ in 0..50 {
+        targets.retain(|pid| {
+            if unsafe { libc::kill(*pid, 0) } != 0 {
+                return false;
+            }
+            if *pid > 0 {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                if stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, state)| state.starts_with('Z'))
+                {
+                    return false;
+                }
+            }
+            true
+        });
+        if targets.is_empty() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err("old Reality Node processes could not be stopped".into())
+}
+
 pub(crate) fn run_helper_from_args(args: &[String]) -> Option<Result<(), String>> {
+    if args.len() == 1 {
+        let phase = match args[0].as_str() {
+            "--fresh-reset-check" => "check",
+            "--fresh-reset-stop" => "stop",
+            "--fresh-reset-clean" => "clean",
+            _ => return None,
+        };
+        return Some(fresh_reset(Path::new("/"), phase));
+    }
     if args.len() == 2
         && matches!(
             args[0].as_str(),
@@ -2884,6 +3085,68 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(root);
     }
+    #[test]
+    fn fresh_reinstall_ignores_old_identity_and_clears_all_claim_residue() {
+        let root = test_dir("fresh-reinstall-mismatch");
+        std::fs::create_dir_all(root.join("opt/relay-node")).unwrap();
+        std::fs::write(root.join("opt/relay-node/node-id"), "mismatched-old-id").unwrap();
+        for id in [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        ] {
+            let dir = root.join("var/lib/relay-panel/node-claims").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("credential-pending.json"),
+                b"invalid stale metadata",
+            )
+            .unwrap();
+            std::fs::write(dir.join("node-credential.secret"), b"old credential").unwrap();
+        }
+        std::fs::write(
+            root.join("var/lib/relay-panel/node-claims/runtime-auth.json"),
+            b"foreign panel / identity / credential",
+        )
+        .unwrap();
+        std::fs::write(root.join("protected-data"), b"preserve").unwrap();
+        fresh_reset(&root, "check").unwrap();
+        assert!(root.join("opt/relay-node/node-id").exists());
+        fresh_reset(&root, "clean").unwrap();
+        assert!(!root.join("opt/relay-node").exists());
+        assert!(!root.join("var/lib/relay-panel/node-claims").exists());
+        assert_eq!(
+            std::fs::read(root.join("protected-data")).unwrap(),
+            b"preserve"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_reset_checks_owned_paths_before_mutation_and_supports_clean_retry() {
+        use std::os::unix::fs::symlink;
+        let root = test_dir("fresh-reset-precheck");
+        let dir = root.join("opt/relay-node");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("node-id"), "old-id").unwrap();
+        let claims = root.join("var/lib/relay-panel/node-claims");
+        std::fs::create_dir_all(claims.parent().unwrap()).unwrap();
+        symlink(&dir, &claims).unwrap();
+        assert!(fresh_reset(&root, "check").is_err());
+        assert!(fresh_reset(&root, "clean").is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("node-id")).unwrap(),
+            "old-id"
+        );
+        std::fs::remove_file(&claims).unwrap();
+        std::fs::create_dir_all(root.join("etc/relay-panel")).unwrap();
+        std::fs::write(root.join("etc/relay-panel/lite-mode"), "old invalid marker").unwrap();
+        fresh_reset(&root, "clean").unwrap();
+        assert!(!root.join("etc/relay-panel/lite-mode").exists());
+        fresh_reset(&root, "check").unwrap();
+        fresh_reset(&root, "clean").unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn existing_cleanup_check_preserves_identity_and_rejects_mismatch() {
         let root = test_dir("existing-cleanup-check");

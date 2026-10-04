@@ -143,54 +143,41 @@ async function inspectExisting(existing = managed) {
   await user.type(screen.getByLabelText('nodeBootstrapHost 1'), 'node-a');
   await user.type(screen.getByLabelText('nodeBootstrapPassword 1'), 'test-only-password');
   await user.click(screen.getByText('nodeBootstrapTestConnection'));
-  await screen.findByText(existing.classification === 'AMBIGUOUS_STATE' ? 'overwriteAmbiguousTitle' : 'overwriteExistingTitle');
+  await screen.findByText('overwriteExistingTitle');
   return user;
 }
-describe('Existing installation confirmation', () => {
-  it('keeps managed identity intact until explicit overwrite confirmation', async () => {
+describe('Destructive fresh reinstall', () => {
+  it('enables deploy after SSH success and cancellation leaves the old installation untouched', async () => {
     const user = await inspectExisting();
-    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeDisabled();
-    expect(screen.getByText(/2 overwriteGroups/)).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'overwriteConfirm' }));
+    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeEnabled();
+    await user.click(screen.getByText('nodeBootstrapDeploy'));
     const dialog = await screen.findByRole('dialog');
+    expect(screen.getAllByText('freshResetConfirm').length).toBeGreaterThan(0);
     await user.click(within(dialog).getByRole('button', { name: 'cancel' }));
     await waitFor(() => expect(dialog).not.toBeInTheDocument());
     expect(mockPost.mock.calls.filter(([url]) => url === '/admin/node-deployments')).toHaveLength(0);
-    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeDisabled();
+    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeEnabled();
   });
-  it('binds confirmed installation to the detected exact identity and snapshot', async () => {
-    const user = await inspectExisting();
-    await user.click(screen.getByRole('button', { name: 'overwriteConfirm' }));
-    const dialog = await screen.findByRole('dialog');
-    await user.click(within(dialog).getByRole('button', { name: 'overwriteConfirm' }));
-    await waitFor(() => expect(dialog).not.toBeInTheDocument());
-    await waitFor(() => expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeEnabled());
+  it.each(['MANAGED_EXISTING_NODE', 'STALE_INACTIVE_RESIDUE', 'AMBIGUOUS_STATE'])('installs %s with only the confirmed SSH fingerprint', async (classification) => {
+    const user = await inspectExisting({ ...managed, classification, reason: 'old identity / credential / Panel mismatch' });
+    expect(screen.getByText('freshResetInconsistent')).toBeInTheDocument();
+    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeEnabled();
     await user.click(screen.getByText('nodeBootstrapDeploy'));
-    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ overwrite_node_id: 'old-node', existing_confirmation: 'snapshot-proof' })));
-  });
-  it('shows the new identity and hides the obsolete active-credential snapshot after replacement starts', async () => {
-    const user = await inspectExisting();
-    await user.click(screen.getByRole('button', { name: 'overwriteConfirm' }));
     const dialog = await screen.findByRole('dialog');
     await user.click(within(dialog).getByRole('button', { name: 'overwriteConfirm' }));
-    await waitFor(() => expect(dialog).not.toBeInTheDocument());
-    await waitFor(() => expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeEnabled());
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ confirmed_fingerprint: 'SHA256:node-a' })));
+    const payload = mockPost.mock.calls.find(([url]) => url === '/admin/node-deployments')![1];
+    expect(payload).not.toHaveProperty('overwrite_node_id');
+    expect(payload).not.toHaveProperty('existing_confirmation');
+  });
+  it('shows the new candidate and hides obsolete diagnostic state once deployment starts', async () => {
+    const user = await inspectExisting();
+    await user.click(screen.getByText('nodeBootstrapDeploy'));
+    const dialog = await screen.findByRole('dialog');
     const newId = '22222222-2222-4222-8222-222222222222';
     mockPost.mockResolvedValueOnce(ok({ id: 'task', status: 'SUCCESS', stage: 'SUCCESS', host: 'node-a', node_id: newId, candidate_node_id: newId, message: 'completed' }));
-    await user.click(screen.getByText('nodeBootstrapDeploy'));
+    await user.click(within(dialog).getByRole('button', { name: 'overwriteConfirm' }));
     await screen.findByText(`overwriteNewNode: ${newId}`);
-    expect(screen.queryByText('overwriteCredentialActive')).not.toBeInTheDocument();
     expect(screen.queryByText('overwriteExistingTitle')).not.toBeInTheDocument();
   });
-
-  it('labels ambiguous authority and relations as unverified without offering cleanup', async () => {
-    await inspectExisting({ ...managed, classification: 'AMBIGUOUS_STATE', panel_present: false, online: false, credential_active: false, group_count: 0, carrier_reference_count: 0 });
-    expect(screen.getAllByText('overwriteUnverified')).toHaveLength(2);
-    expect(screen.getByText(/overwriteUnverified · overwriteServiceActive/)).toBeInTheDocument();
-    expect(screen.queryByText('overwriteCredentialInactive')).not.toBeInTheDocument();
-    expect(screen.queryByText(/0 overwriteGroups/)).not.toBeInTheDocument();
-    expect(screen.queryByText('overwriteConfirm')).not.toBeInTheDocument();
-    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeDisabled();
-  });
-
 });

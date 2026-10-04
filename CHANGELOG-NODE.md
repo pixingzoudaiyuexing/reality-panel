@@ -1,5 +1,11 @@
 # Changelog — relay-node
 
+## [1.4.6] - 2026-10-04 (RC, unpublished)
+
+- Add a root-only Fresh reset helper independent of the existing exact-identity uninstall/legacy upgrade helpers. Validate product-owned paths before stopping runtime, clear all old claim/runtime/profile residue, and terminate owned installer sessions before failed-candidate cleanup.
+- Physical TEST and exact-HEAD independent review are separate gates. No Production or publication in this task.
+
+
 All notable changes to the **relay-node** binary are documented here. This
 binary is released together with the Panel under one `vX.Y.Z` tag.
 

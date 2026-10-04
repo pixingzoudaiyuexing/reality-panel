@@ -56,10 +56,6 @@ pub struct TestSshRequest {
 #[derive(Deserialize)]
 pub struct StartDeploymentRequest {
     #[serde(default)]
-    pub existing_confirmation: Option<String>,
-    #[serde(default)]
-    pub overwrite_node_id: Option<String>,
-    #[serde(default)]
     pub group_id: i64,
     pub host: String,
     #[serde(default = "default_port")]
@@ -119,6 +115,7 @@ pub struct DeploymentStatus {
 }
 
 struct Task {
+    ssh_fingerprint: Option<String>,
     status: DeploymentStatus,
     logs: Vec<DeploymentLog>,
 }
@@ -148,6 +145,12 @@ impl DeploymentRegistry {
     pub(crate) async fn has_active_for_host(&self, host: &str) -> bool {
         self.tasks.lock().await.values().any(|t| {
             t.status.host == host && !matches!(t.status.status.as_str(), "SUCCESS" | "FAILED")
+        })
+    }
+    async fn has_active_for_target(&self, host: &str, fingerprint: &str) -> bool {
+        self.tasks.lock().await.values().any(|t| {
+            (t.status.host == host || t.ssh_fingerprint.as_deref() == Some(fingerprint))
+                && !matches!(t.status.status.as_str(), "SUCCESS" | "FAILED")
         })
     }
     async fn insert(
@@ -181,6 +184,7 @@ impl DeploymentRegistry {
         self.tasks.lock().await.insert(
             id,
             Task {
+                ssh_fingerprint: None,
                 status: status.clone(),
                 logs: vec![log],
             },
@@ -275,13 +279,12 @@ struct Preflight {
 #[async_trait]
 trait DeploymentRunner: Send + Sync {
     async fn inspect(&self, ssh: &SshInput, fingerprint: &str) -> Result<HostFacts, DeployError>;
-    async fn replacement_cleanup(
+    async fn fresh_reset(
         &self,
         ssh: &SshInput,
         fingerprint: &str,
         artifact: &ProvisioningArtifact,
-        old_id: &str,
-        check_only: bool,
+        phase: &str,
     ) -> Result<(), DeployError>;
     async fn probe(&self, ssh: &SshInput) -> Result<SshProbe, DeployError>;
     async fn preflight(&self, ssh: &SshInput, fingerprint: &str) -> Result<Preflight, DeployError>;
@@ -356,31 +359,31 @@ impl DeploymentRunner for SystemSshRunner {
         .await
         .map_err(|_| DeployError::new("EXISTING_STATE_UNAVAILABLE", "安装检测未完成"))?
     }
-    async fn replacement_cleanup(
+    async fn fresh_reset(
         &self,
         ssh: &SshInput,
         fingerprint: &str,
         artifact: &ProvisioningArtifact,
-        old_id: &str,
-        check_only: bool,
+        phase: &str,
     ) -> Result<(), DeployError> {
         let input = ssh.clone_without_secret_debug();
         let fingerprint = fingerprint.to_string();
         let bytes = artifact.bytes.clone();
-        let old_id = old_id.to_string();
+        let phase = phase.to_string();
         tokio::task::spawn_blocking(move || {
             let mut session = connect(&input, Some(&fingerprint))?;
             authenticate(&mut session, &input)?;
-            let dir = format!("/tmp/relay-panel-replacement-{old_id}");
+            let dir = format!("/tmp/relay-panel-reset-{}", uuid::Uuid::new_v4());
             exec(&mut session, &format!("umask 077; mkdir -m 700 -- {dir}"))?;
             let result = (|| {
                 upload(&mut session, &format!("{dir}/cleanup"), &bytes, 0o700)?;
-                let flag = if check_only {
-                    "--check-existing-install-cleanup"
-                } else {
-                    "--cleanup-retired-install"
+                let flag = match phase.as_str() {
+                    "check" => "--fresh-reset-check",
+                    "stop" => "--fresh-reset-stop",
+                    "clean" => "--fresh-reset-clean",
+                    _ => return Err(DeployError::new("RESET_FAILED", "invalid reset phase")),
                 };
-                exec(&mut session, &format!("{dir}/cleanup {flag} {old_id}"))?;
+                exec(&mut session, &format!("{dir}/cleanup {flag}"))?;
                 Ok(())
             })();
             let _ = exec(
@@ -472,7 +475,7 @@ impl DeploymentRunner for SystemSshRunner {
                 exec(
                     &mut session,
                     &format!(
-                        "bash {} {} {} {}",
+                        "setsid bash {} {} {} {}",
                         shell_quote(&script_path),
                         shell_quote(&config_path),
                         shell_quote(&artifact_path),
@@ -724,24 +727,11 @@ pub async fn start_deployment(
         },
         Err(_) => return error(409, "无法安全检测现有节点；未修改旧节点"),
     };
-    if existing.classification == "AMBIGUOUS_STATE" {
-        return error(
-            409,
-            existing
-                .reason
-                .unwrap_or_else(|| "检测到无法安全确认的旧 Node 状态".into()),
-        );
-    }
-    if existing.classification != "CLEAN_HOST"
-        && (req.existing_confirmation.as_deref() != Some(existing.confirmation.as_str())
-            || req.overwrite_node_id != existing.old_node_id)
+    if state
+        .deployments
+        .has_active_for_target(&ssh.host, &fingerprint)
+        .await
     {
-        return error(
-            409,
-            "EXISTING_NODE_CONFIRMATION_REQUIRED: 请重新检测并明确确认覆盖安装",
-        );
-    }
-    if state.deployments.has_active_for_host(&ssh.host).await {
         return error(409, "此主机已有部署正在执行");
     }
     let Some(panel_url) = effective_public_panel_url(&state).await else {
@@ -768,6 +758,9 @@ pub async fn start_deployment(
         .deployments
         .insert(group.id, ssh.host.clone(), req.profile, req.lite_mode)
         .await;
+    if let Some(task) = state.deployments.tasks.lock().await.get_mut(&status.id) {
+        task.ssh_fingerprint = Some(fingerprint.clone());
+    }
     crate::service::audit::record(
         &state,
         Some(admin.user_id),
@@ -849,7 +842,10 @@ async fn run_task(
         .await
         .is_some_and(|task| task.lite_mode);
     let bootstrap_identity = Arc::new(Mutex::new(id.clone()));
-    let old_retired = Arc::new(AtomicBool::new(false));
+    let destructive_fresh = existing.is_some();
+    let reset_started = Arc::new(AtomicBool::new(false));
+    let reset_completed = Arc::new(AtomicBool::new(false));
+    let reset_artifact = Arc::new(Mutex::new(None::<ProvisioningArtifact>));
     let mutation_started = Arc::new(AtomicBool::new(false));
     let transaction_committed = Arc::new(AtomicBool::new(false));
     let work_mutation_started = mutation_started.clone();
@@ -887,123 +883,62 @@ async fn run_task(
             .runner
             .artifact(&preflight.architecture)
             .await?;
-        if let Some(expected) = &existing {
+        if destructive_fresh {
+            *reset_artifact.lock().await = Some(artifact.clone());
             let facts = state.deployments.runner.inspect(&ssh, &fingerprint).await?;
-            let current = existing::detect(&state, &facts, &fingerprint, lite_mode).await?;
-            if current.classification != expected.classification
-                || current.confirmation != expected.confirmation
-                || current.old_node_id != expected.old_node_id
-            {
-                return Err(DeployError::new(
-                    "EXISTING_STATE_CHANGED",
-                    "现有节点状态已变化；请重新检测，旧节点未被修改",
-                ));
-            }
-            if let Some(old_id) = &current.old_node_id {
-                state
-                    .deployments
-                    .runner
-                    .replacement_cleanup(&ssh, &fingerprint, &artifact, old_id, true)
-                    .await?;
-                let group = current.identity_group_id.ok_or_else(|| {
-                    DeployError::new("EXISTING_STATE_AMBIGUOUS", "旧身份归属不可确认")
-                })?;
-                let result = crate::service::node_pool::retire_node(&state, group, old_id)
-                    .await
-                    .map_err(|_| {
-                        DeployError::new(
-                            "OLD_IDENTITY_RETIREMENT_FAILED",
-                            "旧身份退休失败；保留主机",
-                        )
-                    })?;
-                if current.classification == "MANAGED_EXISTING_NODE" && result.is_none() {
-                    return Err(DeployError::new(
-                        "OLD_IDENTITY_RETIREMENT_FAILED",
-                        "旧身份未完成退休；保留主机",
-                    ));
-                }
-                if result.is_some() {
-                    old_retired.store(true, AtomicOrdering::SeqCst);
-                }
-                // Terminal stale claims still use the existing exact cancellation API.
-                let parsed = crate::node_identity::ReuseEligibleNodeId::parse(old_id)
-                    .map_err(|_| DeployError::new("EXISTING_STATE_AMBIGUOUS", "旧身份格式错误"))?;
-                for claim in state
-                    .db
-                    .list_node_credential_claims_for_identity(group, &parsed)
-                    .await
-                    .map_err(|_| {
-                        DeployError::new("EXISTING_STATE_UNAVAILABLE", "无法确认旧授权清理")
-                    })?
-                {
-                    if !matches!(claim.state.as_str(), "COMPLETED" | "CANCELLED" | "EXPIRED") {
-                        let outcome = state
-                            .db
-                            .cancel_node_credential_claim(
-                                &claim.claim_id,
-                                group,
-                                &parsed,
-                                chrono::Utc::now(),
-                            )
-                            .await
-                            .map_err(|_| {
-                                DeployError::new("OLD_CLAIM_CANCEL_FAILED", "旧授权清理未完成")
-                            })?;
-                        if outcome == crate::db::repo::NodeCredentialClaimMutationResult::Rejected {
-                            return Err(DeployError::new(
-                                "OLD_CLAIM_STATE_CHANGED",
-                                "旧授权状态已变化；保留主机，请重新检测",
-                            ));
-                        }
-                    }
-                }
-                if state
-                    .db
-                    .find_current_active_node_credential_for_identity(group, &parsed)
-                    .await
-                    .map_err(|_| {
-                        DeployError::new("EXISTING_STATE_UNAVAILABLE", "旧认证清理状态不可确认")
-                    })?
-                    .is_some()
-                {
-                    return Err(DeployError::new(
-                        "EXISTING_STATE_CHANGED",
-                        "旧身份又出现 ACTIVE credential；保留主机",
-                    ));
-                }
-                old_retired.store(true, AtomicOrdering::SeqCst);
-                crate::api::node_ops::supersede_uninstall_after_admin_delete(&state, group, old_id)
-                    .await;
-                crate::service::audit::record(
-                    &state,
-                    Some(actor_id),
-                    "node_deploy_old_identity_retired",
-                    "node",
-                    old_id,
-                    &format!("replacement_task={id} identity_group_id={group}"),
+            let old_ids = existing::host_candidates(&state, &facts, &host, &fingerprint).await;
+            state
+                .deployments
+                .runner
+                .fresh_reset(&ssh, &fingerprint, &artifact, "check")
+                .await?;
+            state
+                .deployments
+                .update(
+                    &id,
+                    DeploymentStage::Preflight,
+                    "RUNNING",
+                    "STOP OLD: 正在停止旧 Reality Node 安装",
+                    &secrets,
                 )
                 .await;
-                state
-                    .deployments
-                    .update(
-                        &id,
-                        DeploymentStage::Preflight,
-                        "RUNNING",
-                        "旧 Node 已退休；正在清理产品所属的安装资源",
-                        &secrets,
-                    )
-                    .await;
-                state
-                    .deployments
-                    .runner
-                    .replacement_cleanup(&ssh, &fingerprint, &artifact, old_id, false)
-                    .await?;
+            reset_started.store(true, AtomicOrdering::SeqCst);
+            state
+                .deployments
+                .runner
+                .fresh_reset(&ssh, &fingerprint, &artifact, "stop")
+                .await?;
+            state
+                .deployments
+                .update(
+                    &id,
+                    DeploymentStage::Preflight,
+                    "RUNNING",
+                    "RETIRE OLD: 正在退休当前 Panel 的旧身份及业务引用",
+                    &secrets,
+                )
+                .await;
+            for old_id in old_ids {
+                existing::retire_host_identity(&state, group_id, &old_id, actor_id).await?;
             }
+            state
+                .deployments
+                .update(
+                    &id,
+                    DeploymentStage::Preflight,
+                    "RUNNING",
+                    "CLEAN LOCAL: 正在清理旧产品状态；新 Node 不继承业务分组或运营商配置",
+                    &secrets,
+                )
+                .await;
+            state
+                .deployments
+                .runner
+                .fresh_reset(&ssh, &fingerprint, &artifact, "clean")
+                .await?;
+            reset_completed.store(true, AtomicOrdering::SeqCst);
         }
-        let fresh_id = if existing
-            .as_ref()
-            .is_some_and(|old| old.old_node_id.is_some())
-        {
+        let fresh_id = if destructive_fresh {
             uuid::Uuid::new_v4().to_string()
         } else {
             id.clone()
@@ -1160,66 +1095,99 @@ async fn run_task(
 
     if let Some(err) = failure {
         let mut message = public_error(&err, &secrets);
-        if old_retired.load(AtomicOrdering::SeqCst) {
-            message = format!("旧 Node 已退休，新 Node 安装失败；{message}");
-        }
-        let preserve_activated = match cancel_failed_pool_bootstrap(
-            &state,
-            &bootstrap_identity.lock().await.clone(),
-            group_id,
-        )
-        .await
-        {
-            Ok(active) => {
-                if active {
-                    message.push_str(
-                        "; ACTIVE_CREDENTIAL_PRESERVED: resume this exact deployment identity",
-                    );
-                }
-                active
+        if destructive_fresh {
+            if reset_completed.load(AtomicOrdering::SeqCst) {
+                message = format!("旧安装已清理，新安装失败；{message}");
+            } else if reset_started.load(AtomicOrdering::SeqCst) {
+                message = format!("旧安装重置已开始但未完成；{message}");
             }
-            Err(()) => {
-                message.push_str("; CREDENTIAL_CLEANUP_REQUIRES_RECOVERY: identity retained");
-                true // An unavailable activation result never authorizes destructive rollback.
-            }
-        };
-        if mutation_started.load(AtomicOrdering::SeqCst)
-            && !transaction_committed.load(AtomicOrdering::SeqCst)
-            && !preserve_activated
-        {
-            state
+            // Stop the owned installer session before arbitrating activation.
+            // A failed new candidate is retired, never restored as a live Node.
+            let candidate = state
                 .deployments
-                .update(
-                    &id,
-                    DeploymentStage::Configuring,
-                    "RUNNING",
-                    "deployment failed; restoring previous managed runtime",
-                    &secrets,
-                )
-                .await;
-            match tokio::time::timeout(
-                ROLLBACK_TIMEOUT,
-                state.deployments.runner.rollback(&id, &ssh, &fingerprint),
+                .status(&id)
+                .await
+                .and_then(|s| s.candidate_node_id);
+            if let (Some(candidate), Some(artifact)) =
+                (candidate, reset_artifact.lock().await.clone())
+            {
+                let cleanup = async {
+                    state
+                        .deployments
+                        .runner
+                        .fresh_reset(&ssh, &fingerprint, &artifact, "stop")
+                        .await?;
+                    existing::retire_host_identity(&state, group_id, &candidate, actor_id).await?;
+                    state
+                        .deployments
+                        .runner
+                        .fresh_reset(&ssh, &fingerprint, &artifact, "clean")
+                        .await
+                };
+                match tokio::time::timeout(ROLLBACK_TIMEOUT, cleanup).await {
+                    Ok(Ok(())) => message.push_str("；失败候选已清理，可直接重新部署"),
+                    _ => message.push_str("；失败候选清理尚未完成，重新部署将继续清理"),
+                }
+            }
+        } else {
+            let preserve_activated = match cancel_failed_pool_bootstrap(
+                &state,
+                &bootstrap_identity.lock().await.clone(),
+                group_id,
             )
             .await
             {
-                Ok(Ok(())) => {
-                    state
-                        .deployments
-                        .update(
-                            &id,
-                            DeploymentStage::Configuring,
-                            "RUNNING",
-                            "previous managed runtime restored and verified",
-                            &secrets,
-                        )
-                        .await;
+                Ok(active) => {
+                    if active {
+                        message.push_str(
+                            "; ACTIVE_CREDENTIAL_PRESERVED: resume this exact deployment identity",
+                        );
+                    }
+                    active
                 }
-                Ok(Err(rollback_error)) => {
-                    message.push_str("; ROLLBACK_FAILED: ");
-                    message.push_str(&redact(&rollback_error.message, &secrets));
+                Err(()) => {
+                    message.push_str("; CREDENTIAL_CLEANUP_REQUIRES_RECOVERY: identity retained");
+                    true // An unavailable activation result never authorizes destructive rollback.
                 }
-                Err(_) => message.push_str("; ROLLBACK_FAILED: rollback timed out"),
+            };
+            if mutation_started.load(AtomicOrdering::SeqCst)
+                && !transaction_committed.load(AtomicOrdering::SeqCst)
+                && !preserve_activated
+            {
+                state
+                    .deployments
+                    .update(
+                        &id,
+                        DeploymentStage::Configuring,
+                        "RUNNING",
+                        "deployment failed; restoring previous managed runtime",
+                        &secrets,
+                    )
+                    .await;
+                match tokio::time::timeout(
+                    ROLLBACK_TIMEOUT,
+                    state.deployments.runner.rollback(&id, &ssh, &fingerprint),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        state
+                            .deployments
+                            .update(
+                                &id,
+                                DeploymentStage::Configuring,
+                                "RUNNING",
+                                "previous managed runtime restored and verified",
+                                &secrets,
+                            )
+                            .await;
+                    }
+                    Ok(Err(rollback_error)) => {
+                        message.push_str("; ROLLBACK_FAILED: ");
+                        message.push_str(&redact(&rollback_error.message, &secrets));
+                    }
+                    Err(_) => message.push_str("; ROLLBACK_FAILED: rollback timed out"),
+                }
             }
         }
         state
@@ -1674,6 +1642,8 @@ mod tests {
     }
 
     struct FakeRunner {
+        host_facts: HostFacts,
+        reset_calls: Arc<Mutex<Vec<String>>>,
         behavior: FakeBehavior,
         install_calls: Arc<AtomicUsize>,
         pool_config_seen: Arc<Mutex<Option<String>>>,
@@ -1684,6 +1654,8 @@ mod tests {
     impl FakeRunner {
         fn new(behavior: FakeBehavior) -> Self {
             Self {
+                host_facts: HostFacts::default(),
+                reset_calls: Arc::new(Mutex::new(Vec::new())),
                 behavior,
                 install_calls: Arc::new(AtomicUsize::new(0)),
                 pool_config_seen: Arc::new(Mutex::new(None)),
@@ -1700,16 +1672,16 @@ mod tests {
             _ssh: &SshInput,
             _fingerprint: &str,
         ) -> Result<HostFacts, DeployError> {
-            Ok(HostFacts::default())
+            Ok(self.host_facts.clone())
         }
-        async fn replacement_cleanup(
+        async fn fresh_reset(
             &self,
             _ssh: &SshInput,
             _fingerprint: &str,
             _artifact: &ProvisioningArtifact,
-            _old_id: &str,
-            _check_only: bool,
+            phase: &str,
         ) -> Result<(), DeployError> {
+            self.reset_calls.lock().await.push(phase.into());
             Ok(())
         }
         async fn probe(&self, _ssh: &SshInput) -> Result<SshProbe, DeployError> {
@@ -3386,6 +3358,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             .await
             .unwrap();
         let facts = HostFacts {
+            candidate_node_ids: Vec::new(),
             node_id: Some(node.as_str().into()),
             version: Some("relay-node 1.4.4".into()),
             profile: Some("standard".into()),
@@ -3403,7 +3376,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
     }
 
     #[tokio::test]
-    async fn existing_detection_is_exact_and_never_revokes_without_confirmation() {
+    async fn existing_diagnostics_preserve_credentials_and_hide_private_evidence() {
         let (state, facts) = existing_fixture().await;
         let view = existing::detect(&state, &facts, "SHA256:test-host", false)
             .await
@@ -3430,7 +3403,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
     }
 
     #[tokio::test]
-    async fn offline_active_node_is_managed_and_auth_conflicts_block() {
+    async fn offline_active_node_is_managed_and_auth_conflicts_are_diagnostic() {
         let (state, mut facts) = existing_fixture().await;
         facts.service_active = false;
         assert_eq!(
@@ -3482,7 +3455,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
     }
 
     #[tokio::test]
-    async fn foreign_panel_and_missing_runtime_proof_never_authorize_overwrite() {
+    async fn foreign_panel_and_missing_runtime_proof_are_unverified_diagnostics() {
         let (state, mut facts) = existing_fixture().await;
         facts.panel_url = Some("https://another-panel.test".into());
         assert_eq!(
@@ -3500,6 +3473,148 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
                 .unwrap()
                 .classification,
             "AMBIGUOUS_STATE"
+        );
+    }
+    #[tokio::test]
+    async fn fresh_reinstall_retires_mismatched_host_and_cleans_failed_candidate_without_rollback()
+    {
+        let (mut state, mut facts) = existing_fixture().await;
+        let old = facts.node_id.clone().unwrap();
+        let group = facts.identity_group_id.unwrap();
+        facts.candidate_node_ids.push(old.clone());
+        facts.node_id = Some("33333333-3333-4333-8333-333333333333".into());
+        facts.panel_url = Some("https://another-panel.test".into());
+        facts.credential_verifier = Some("mismatch".into());
+        let view = existing::detect(&state, &facts, "host", true)
+            .await
+            .unwrap();
+        assert_eq!(view.classification, "AMBIGUOUS_STATE");
+        let mut runner = FakeRunner::new(FakeBehavior::InstallFailure("INSTALL_FAILED"));
+        runner.host_facts = facts.clone();
+        let runner = Arc::new(runner);
+        state.deployments = test_registry(
+            runner.clone(),
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+        );
+        let task = state
+            .deployments
+            .insert(
+                group,
+                "node.example".into(),
+                ProvisioningProfile::RealityCamouflage,
+                true,
+            )
+            .await;
+        run_task(
+            state.clone(),
+            task.id.clone(),
+            ssh_input(),
+            "host".into(),
+            "test-token".into(),
+            "https://panel.test".into(),
+            (1, Some(view)),
+        )
+        .await;
+        let status = state.deployments.status(&task.id).await.unwrap();
+        assert_eq!(status.status, "FAILED");
+        assert!(status.message.contains("旧安装已清理，新安装失败"));
+        assert_eq!(
+            *runner.reset_calls.lock().await,
+            ["check", "stop", "clean", "stop", "clean"]
+        );
+        assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 0);
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime(facts.credential_id.as_ref().unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        let candidate = status.candidate_node_id.unwrap();
+        assert_ne!(candidate, old);
+        assert_eq!(
+            state
+                .db
+                .find_node_credential_claim(&candidate)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "CANCELLED"
+        );
+        assert!(!crate::service::node_pool::list_nodes(state.db.as_ref())
+            .await
+            .unwrap()
+            .iter()
+            .any(|n| n.node_id == old || n.node_id == candidate));
+    }
+
+    #[tokio::test]
+    async fn fresh_preflight_failure_preserves_old_identity_and_never_resets() {
+        let (mut state, facts) = existing_fixture().await;
+        let view = existing::detect(&state, &facts, "host", false)
+            .await
+            .unwrap();
+        let runner = Arc::new(FakeRunner::new(FakeBehavior::RejectPassword));
+        state.deployments = test_registry(
+            runner.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let task = state
+            .deployments
+            .insert(
+                facts.identity_group_id.unwrap(),
+                "node.example".into(),
+                ProvisioningProfile::RealityCamouflage,
+                false,
+            )
+            .await;
+        run_task(
+            state.clone(),
+            task.id,
+            ssh_input(),
+            "host".into(),
+            "test-token".into(),
+            "https://panel.test".into(),
+            (1, Some(view)),
+        )
+        .await;
+        assert!(runner.reset_calls.lock().await.is_empty());
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime(facts.credential_id.as_ref().unwrap())
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn fresh_start_accepts_ambiguous_diagnostics_without_old_identity_confirmation() {
+        let (mut state, mut facts) = existing_fixture().await;
+        facts.panel_url = Some("https://another-panel.test".into());
+        let mut runner = FakeRunner::new(FakeBehavior::SlowPreflight);
+        runner.host_facts = facts;
+        state.deployments = test_registry(
+            Arc::new(runner),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        );
+        let req: StartDeploymentRequest = serde_json::from_value(serde_json::json!({"host":"node.example", "password":"test", "confirmed_fingerprint":"SHA256:fake"})).unwrap();
+        let Json(reply) =
+            start_deployment(AdminOnly { user_id: 1 }, State(state.clone()), Json(req)).await;
+        assert_eq!(reply.code, 0);
+        let task = reply.data.unwrap();
+        assert!(
+            state
+                .deployments
+                .has_active_for_target("another-alias", "SHA256:fake")
+                .await
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            state.deployments.status(&task.id).await.unwrap().status,
+            "FAILED"
         );
     }
 }

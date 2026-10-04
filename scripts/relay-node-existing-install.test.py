@@ -55,18 +55,18 @@ class Inspection(unittest.TestCase):
         expected = hashlib.sha256(b'relay-panel/node-credential/v1\0' + len(c).to_bytes(8, 'big') + c + (2).to_bytes(8, 'big', signed=True) + len(c).to_bytes(8, 'big') + c + bytes(range(32))).hexdigest()
         self.assertEqual(facts['credential_verifier'], expected)
 
-    def test_auth_identity_conflict_blocks_and_changes_nothing(self):
+    def test_auth_identity_conflict_is_diagnostic_and_changes_nothing(self):
         self.installed(); self.auth(OTHER)
         before = {str(p): p.read_bytes() for p in module.ROOT.rglob('*') if p.is_file()}
         self.assertIsNotNone(module.inspect()['ambiguity'])
         self.assertEqual(before, {str(p): p.read_bytes() for p in module.ROOT.rglob('*') if p.is_file()})
 
-    def test_symlinked_identity_blocks(self):
+    def test_symlinked_identity_is_diagnostic(self):
         self.installed()
         p = module.path('/opt/relay-node/node-id'); p.unlink(); p.symlink_to('/etc/passwd')
         self.assertIsNotNone(module.inspect()['ambiguity'])
 
-    def test_public_secret_file_blocks(self):
+    def test_public_secret_file_is_diagnostic(self):
         self.installed(); self.auth()
         module.path(f'/var/lib/relay-panel/node-claims/{NODE}/node-credential.secret').chmod(0o644)
         self.assertIsNotNone(module.inspect()['ambiguity'])
@@ -75,14 +75,28 @@ class Inspection(unittest.TestCase):
         self.installed(); self.auth(phase='PREPARED')
         self.assertFalse(module.inspect()['runtime_valid'])
 
-    def test_service_without_identity_blocks(self):
+    def test_service_without_identity_is_diagnostic(self):
         self.installed(); module.path('/opt/relay-node/node-id').unlink()
         self.assertIsNotNone(module.inspect()['ambiguity'])
 
-    def test_other_active_claim_blocks(self):
+    def test_other_active_claim_is_diagnostic(self):
         self.installed(); self.auth()
         self.file(f'/var/lib/relay-panel/node-claims/{OTHER}/credential-pending.json', json.dumps(dict(node_id=OTHER, phase='ACTIVE_CONFIRMED')))
         self.assertIsNotNone(module.inspect()['ambiguity'])
+
+    def test_candidates_survive_malformed_auth_and_multiple_failed_claims(self):
+        self.installed()
+        self.file('/var/lib/relay-panel/node-claims/runtime-auth.json', 'invalid')
+        self.file(f'/var/lib/relay-panel/node-claims/{OTHER}/credential-pending.json', 'invalid')
+        self.file(f'/tmp/relay-panel-bootstrap-{NODE}/config.env', f'POOL_NODE_ID={OTHER}\nPOOL_CLAIM_SECRET=must-never-leak\n')
+        facts = module.inspect()
+        self.assertEqual(facts['candidate_node_ids'], [NODE, OTHER])
+        self.assertIsNotNone(facts['ambiguity'])
+        self.assertNotIn('must-never-leak', json.dumps(facts))
+
+    def test_foreign_descriptor_alone_does_not_retire_another_node(self):
+        self.installed(); self.auth(OTHER)
+        self.assertEqual(module.inspect()['candidate_node_ids'], [NODE])
 
 
 if __name__ == '__main__':

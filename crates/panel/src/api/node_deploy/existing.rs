@@ -5,6 +5,8 @@ use crate::service::node_pool;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub(super) struct HostFacts {
+    #[serde(default)]
+    pub candidate_node_ids: Vec<String>,
     pub node_id: Option<String>,
     pub version: Option<String>,
     pub profile: Option<String>,
@@ -272,5 +274,85 @@ fn db_error(_: crate::db::error::DbError) -> DeployError {
     DeployError::new(
         "EXISTING_STATE_UNAVAILABLE",
         "无法读取旧身份状态；旧节点未被修改",
+    )
+}
+
+/// Only host-local product identities and prior deployments to this exact SSH
+/// target are retired. Public IP alone is not evidence of installation ownership.
+pub(super) async fn host_candidates(
+    state: &AppState,
+    facts: &HostFacts,
+    host: &str,
+    fingerprint: &str,
+) -> Vec<String> {
+    let mut nodes: std::collections::BTreeSet<String> =
+        facts.candidate_node_ids.iter().cloned().collect();
+    nodes.extend(facts.node_id.iter().cloned());
+    for task in state.deployments.tasks.lock().await.values() {
+        if task.status.host == host || task.ssh_fingerprint.as_deref() == Some(fingerprint) {
+            nodes.extend(task.status.candidate_node_id.iter().cloned());
+            nodes.extend(task.status.node_id.iter().cloned());
+        }
+    }
+    nodes.retain(|id| ReuseEligibleNodeId::parse(id).is_ok());
+    nodes.into_iter().collect()
+}
+
+pub(super) async fn retire_host_identity(
+    state: &AppState,
+    group: i64,
+    id: &str,
+    actor: i64,
+) -> Result<(), DeployError> {
+    let node = ReuseEligibleNodeId::parse(id).map_err(|_| retirement_error())?;
+    // Existing atomic Pool delete preserves independent history and schedules DNS.
+    node_pool::retire_node(state, group, id)
+        .await
+        .map_err(|_| retirement_error())?;
+    for claim in state
+        .db
+        .list_node_credential_claims_for_identity(group, &node)
+        .await
+        .map_err(db_error)?
+    {
+        if !matches!(claim.state.as_str(), "COMPLETED" | "CANCELLED" | "EXPIRED") {
+            state
+                .db
+                .cancel_node_credential_claim(&claim.claim_id, group, &node, chrono::Utc::now())
+                .await
+                .map_err(db_error)?;
+        }
+    }
+    // Cancellation serializes with activation. An activation that won the race
+    // is retired through the same authority transaction before local cleanup.
+    node_pool::retire_node(state, group, id)
+        .await
+        .map_err(|_| retirement_error())?;
+    if state
+        .db
+        .find_current_active_node_credential_for_identity(group, &node)
+        .await
+        .map_err(db_error)?
+        .is_some()
+    {
+        return Err(retirement_error());
+    }
+    crate::api::node_ops::supersede_uninstall_after_admin_delete(state, group, id).await;
+    crate::service::audit::record(
+        state,
+        Some(actor),
+        "node_deploy_old_identity_retired",
+        "node",
+        id,
+        "SSH destructive fresh reset",
+    )
+    .await;
+    Ok(())
+}
+
+fn retirement_error() -> DeployError {
+    DeployError::new(
+        "IDENTITY_RETIREMENT_FAILED",
+        "旧身份退休未完成；重新部署将继续清理",
     )
 }

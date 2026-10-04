@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.6] - 2026-10-04 (RC, unpublished)
+
+- SSH Fresh install is a destructive reset and reinstall: old identity, credential and Panel URL mismatch diagnostics never disable deployment. Old known Pool identities are retired using existing Membership/Carrier/DNS cleanup; failed new candidates are cleared for direct retry. Selected Standard/Lite profile controls the result.
+- Physical TEST and exact-HEAD independent review are separate gates. No Production or publication in this task.
+
+
 ## [1.4.5] - 2026-10-03 (RC, unpublished)
 
 - Fresh SSH deployment detects an existing installation before issuing credentials, requests explicit scoped overwrite confirmation, retires the old Pool identity and reuses product-owned uninstall cleanup before a new UUID install.
