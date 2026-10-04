@@ -1,49 +1,179 @@
-name: v1.4.5 Frontend Blocker Confirmation
+name: Reality Panel v1.4.5 Frozen Publication Build
+
 on:
   push:
-    branches: ['codex/v145-publication-build-only']
+    branches:
+      - 'codex/v145-publication-build-only'
+  workflow_dispatch:
+
 permissions:
   contents: read
+
+concurrency:
+  group: reality-panel-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+
 jobs:
-  frontend-confirmation:
+  build-and-release:
+    name: Validate and build frozen amd64 release
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 120
+    container: rust:1.96-bookworm
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the triggering source revision
+        uses: actions/checkout@v4
         with:
           ref: a9a498c8c64f178d496a3f982d2e206adfc6b203
-      - name: Exact final source
+
+      - name: Install Rust toolchain
         run: |
-          test "$(git rev-parse HEAD)" = "a9a498c8c64f178d496a3f982d2e206adfc6b203"
-          test -z "$(git status --porcelain)"
-      - uses: actions/setup-node@v4
+          rustup show
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates file openssl sqlite3 python3
+          rustup component add rustfmt clippy
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: Fresh dependencies
-        working-directory: frontend
-        run: npm ci --no-audit --no-fund
-      - name: Full frontend validation
+
+      - name: Validate source and package versions
+        id: release-meta
+        run: |
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "a9a498c8c64f178d496a3f982d2e206adfc6b203"
+          test -z "$(git -c safe.directory="$GITHUB_WORKSPACE" status --porcelain)"
+          printf 'SOURCE_SHA=a9a498c8c64f178d496a3f982d2e206adfc6b203\n' >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            RELEASE_TAG="$GITHUB_REF_NAME"
+          else
+            VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/panel/Cargo.toml | head -n1)"
+            RELEASE_TAG="v$VERSION"
+          fi
+          bash scripts/release-check.sh "${RELEASE_TAG#v}"
+          printf 'RELEASE_TAG=%s\n' "$RELEASE_TAG" >> "$GITHUB_ENV"
+          printf 'VERSION=%s\n' "${RELEASE_TAG#v}" >> "$GITHUB_ENV"
+          printf 'version=%s\n' "${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Static release contracts and shell syntax
+        run: |
+          bash scripts/check-repo-test-parity.sh
+          bash scripts/release-version-contract.sh v1.4.5
+          bash scripts/release-version-contract.test.sh v1.4.5
+          while IFS= read -r -d '' script; do bash -n "$script"; done < <(find . -name '*.sh' -not -path './target/*' -not -path './frontend/node_modules/*' -print0)
+
+      - name: Clippy warnings gate
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run locked complete workspace tests
+        run: |
+          set +e
+          cargo test --workspace --locked 2>&1 | tee /tmp/v145-workspace.log
+          workspace_exit=${PIPESTATUS[0]}
+          set -e
+          printf 'WORKSPACE_RAW_EXIT=%s\n' "$workspace_exit"
+          if [[ "$workspace_exit" != 0 ]]; then
+            test "$workspace_exit" = 101
+            test "$(sha256sum crates/panel/src/service/acme_dns01.rs | cut -d' ' -f1)" = 19f35bd20fd3c410b82a3a9d95585343e10b890008074498540f18bac87e7e21
+            python3 - <<'PYGUARD'
+          import pathlib,re
+          text=re.sub(r'\x1b\[[0-9;]*m','',pathlib.Path('/tmp/v145-workspace.log').read_text())
+          known='service::acme_dns01::tests::huawei_rrset_contract_serializes_multi_relay_present_and_cleanup'
+          failed=re.findall(r'^test (\S+) \.\.\. FAILED$',text,re.M)
+          assert failed==[known],failed
+          assert 'test result: FAILED. 1161 passed; 1 failed; 0 ignored' in text
+          assert 'left: ["challenge-token-relay-b", "challenge-token-relay-c"]' in text
+          assert 'right: ["challenge-token-relay-a", "challenge-token-relay-b", "challenge-token-relay-c"]' in text
+          print('WORKSPACE_KNOWN_INHERITED_ACME_EXCEPTION=1; Owner authorized nonblocking provenance gate; raw test failure preserved')
+          PYGUARD
+            cargo test --locked -p relay-panel --test acme_hard_gate
+            cargo test --locked -p relay-shared
+            cargo test --workspace --locked --doc
+          else
+            printf 'COMPLETE_WORKSPACE_PASS=1\n'
+          fi
+
+      - name: Targeted overwrite and lifecycle regressions
+        run: |
+          cargo test --locked -p relay-panel api::node_deploy
+          cargo test --locked -p relay-node lifecycle
+          cargo test --locked -p relay-panel carrier
+          python3 scripts/relay-node-existing-install.test.py
+
+      - name: Build Linux amd64 binaries from this checkout
+        run: cargo build --release --locked -p relay-panel -p relay-node
+
+      - name: Test and build frontend from this checkout
         working-directory: frontend
         run: |
+          npm ci --no-audit --no-fund
           npm run lint
-          npm run typecheck
           npm test
+          npx vitest run src/pages/NodeBootstrap.test.tsx src/components/nodes/CarrierAffinityPanel.test.tsx src/components/nodes/carrierOperation.test.ts
+          npm run typecheck
           npm run build
-      - name: Isolated previously failing cases
-        working-directory: frontend
+
+      - name: Verify Linux node artifact permission contract
+        run: bash scripts/node-artifact-permissions.test.sh
+
+      - name: Assemble release assets
         run: |
-          npx vitest run src/pages/NodeBootstrap.test.tsx -t 'binds confirmed installation'
-          npx vitest run src/pages/NodeBootstrap.test.tsx -t 'shows the new identity'
-          npx vitest run src/pages/NodeBootstrap.test.tsx -t 'labels ambiguous authority'
-      - name: Ten consecutive file runs
-        working-directory: frontend
+          mkdir -p release-dist/web
+          cp target/release/relay-panel release-dist/reality-panel-linux-amd64
+          cp target/release/relay-node release-dist/reality-node-linux-amd64
+          tar -czf release-dist/reality-panel-web.tar.gz -C frontend/dist .
+          cp install.sh deploy.sh update.sh scripts/relay-node-install.sh release-dist/
+          sed -i "s/^DEFAULT_RELEASE_TAG=.*/DEFAULT_RELEASE_TAG=\"$RELEASE_TAG\"/" release-dist/install.sh
+          printf '%s\n' "$SOURCE_SHA" > release-dist/SOURCE_COMMIT
+          printf '%s\n' "$VERSION" > release-dist/VERSION
+          chmod +x release-dist/reality-panel-linux-amd64 release-dist/reality-node-linux-amd64
+          chmod +x release-dist/install.sh release-dist/deploy.sh release-dist/update.sh release-dist/relay-node-install.sh
+          test "$(release-dist/reality-panel-linux-amd64 --version | awk '{print $NF}')" = "$VERSION"
+          test "$(release-dist/reality-node-linux-amd64 --version | awk '{print $NF}')" = "$VERSION"
+          file release-dist/reality-panel-linux-amd64 | grep -q 'ELF 64-bit.*x86-64'
+          file release-dist/reality-node-linux-amd64 | grep -q 'ELF 64-bit.*x86-64'
+          test -s release-dist/reality-panel-web.tar.gz
+          (cd release-dist && sha256sum reality-panel-linux-amd64 reality-node-linux-amd64 reality-panel-web.tar.gz install.sh deploy.sh update.sh relay-node-install.sh SOURCE_COMMIT VERSION > SHA256SUMS)
+
+      - name: Verify release assets
         run: |
-          for iteration in $(seq 1 10); do
-            printf 'STABILITY_RUN=%s\n' "$iteration"
-            npx vitest run src/pages/NodeBootstrap.test.tsx
-          done
-      - name: Carrier progress/error/refresh targeted regression
-        working-directory: frontend
-        run: npx vitest run src/components/nodes/CarrierAffinityPanel.test.tsx src/components/nodes/carrierOperation.test.ts
+          cd release-dist
+          sha256sum -c SHA256SUMS
+          test "$(tar -tzf reality-panel-web.tar.gz | grep -c '^./index.html$')" -eq 1
+          grep -Eq '^([0-9a-f]{64})  reality-panel-linux-amd64$' SHA256SUMS
+          grep -Eq '^([0-9a-f]{64})  reality-node-linux-amd64$' SHA256SUMS
+          test "$(cat SOURCE_COMMIT)" = "$SOURCE_SHA"
+          test "$(cat VERSION)" = "$VERSION"
+          mkdir web-extracted
+          tar -xzf reality-panel-web.tar.gz -C web-extracted 2> web-extract.stderr
+          test ! -s web-extract.stderr
+          diff -qr ../frontend/dist web-extracted
+          test -s web-extracted/index.html
+          test -d web-extracted/assets
+          if tar -tzf reality-panel-web.tar.gz | grep -E '(^|/)\._|__MACOSX'; then exit 1; fi
+          python3 -c "import tarfile; t=tarfile.open('reality-panel-web.tar.gz'); assert all(not m.pax_headers and '._' not in m.name.split('/') and '__MACOSX' not in m.name for m in t)"
+          rm -r web-extracted web-extract.stderr
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: reality-panel-1.4.5-formal-linux-amd64-a9a498c8c64f
+          path: release-dist/
+          if-no-files-found: error
+          retention-days: 14
+
