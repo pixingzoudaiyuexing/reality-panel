@@ -1,7 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
+import { Modal } from 'antd';
 
 const { mockGet, mockPost } = vi.hoisted(() => ({ mockGet: vi.fn(), mockPost: vi.fn() }));
 vi.mock('../api/client', () => ({ default: { get: mockGet, post: mockPost } }));
@@ -21,12 +22,20 @@ function renderPage(path = '/node-bootstrap?group_id=7') {
 }
 
 beforeEach(() => {
+  expect(screen.queryAllByRole('dialog', { hidden: true })).toHaveLength(0);
   mockGet.mockReset();
   mockPost.mockReset();
   mockGet.mockImplementation((url: string) => {
     if (url === '/groups') return Promise.resolve(ok([group]));
     return Promise.resolve(ok(null));
   });
+});
+
+afterEach(async () => {
+  // Static confirmations own a separate React root, outside render()/cleanup().
+  await act(async () => { Modal.destroyAll(); });
+  cleanup();
+  await waitFor(() => expect(screen.queryAllByRole('dialog', { hidden: true })).toHaveLength(0));
 });
 
 describe('Node Bootstrap deployment modes', () => {
@@ -142,25 +151,29 @@ describe('Existing installation confirmation', () => {
     const user = await inspectExisting();
     expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeDisabled();
     expect(screen.getByText(/2 overwriteGroups/)).toBeInTheDocument();
-    await user.click(screen.getByText('overwriteConfirm'));
-    await user.click(screen.getByText('cancel'));
+    await user.click(screen.getByRole('button', { name: 'overwriteConfirm' }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'cancel' }));
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
     expect(mockPost.mock.calls.filter(([url]) => url === '/admin/node-deployments')).toHaveLength(0);
     expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeDisabled();
   });
   it('binds confirmed installation to the detected exact identity and snapshot', async () => {
     const user = await inspectExisting();
-    await user.click(screen.getByText('overwriteConfirm'));
-    const buttons = await screen.findAllByText('overwriteConfirm');
-    await user.click(buttons[buttons.length - 1]);
+    await user.click(screen.getByRole('button', { name: 'overwriteConfirm' }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'overwriteConfirm' }));
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
     await waitFor(() => expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeEnabled());
     await user.click(screen.getByText('nodeBootstrapDeploy'));
     await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ overwrite_node_id: 'old-node', existing_confirmation: 'snapshot-proof' })));
   });
   it('shows the new identity and hides the obsolete active-credential snapshot after replacement starts', async () => {
     const user = await inspectExisting();
-    await user.click(screen.getByText('overwriteConfirm'));
-    const buttons = await screen.findAllByText('overwriteConfirm');
-    await user.click(buttons[buttons.length - 1]);
+    await user.click(screen.getByRole('button', { name: 'overwriteConfirm' }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'overwriteConfirm' }));
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
     await waitFor(() => expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeEnabled());
     const newId = '22222222-2222-4222-8222-222222222222';
     mockPost.mockResolvedValueOnce(ok({ id: 'task', status: 'SUCCESS', stage: 'SUCCESS', host: 'node-a', node_id: newId, candidate_node_id: newId, message: 'completed' }));
