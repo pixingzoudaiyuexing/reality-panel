@@ -890,6 +890,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let after = node_pool::list_nodes(state.db.as_ref()).await.unwrap();
         assert!(!after.iter().any(|n| n.node_id == "LEGACY"));
+        assert!(state
+            .db
+            .get("node_config_revision:legacy:10:LEGACY")
+            .await
+            .unwrap()
+            .is_none());
         assert!(after.iter().any(|n| n.node_id == "OTHER"));
         assert!(
             crate::service::legacy_upgrade::retired(state.db.as_ref(), 10, "LEGACY")

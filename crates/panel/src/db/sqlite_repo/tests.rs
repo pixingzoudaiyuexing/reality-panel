@@ -10851,6 +10851,12 @@ async fn historical_pool_delete_is_exact_and_keeps_other_nodes() {
     db.set("node_status:72:OLD_NO_CREDENTIAL", "unrelated")
         .await
         .unwrap();
+    db.set(
+        "node_config_revision:legacy:71:OLD_NO_CREDENTIAL",
+        "historical-current",
+    )
+    .await
+    .unwrap();
     let id = crate::node_identity::ReuseEligibleNodeId::parse("OLD_NO_CREDENTIAL").unwrap();
     assert!(db.retire_pool_native_node(71, &id).await.unwrap().retired);
     assert!(db
@@ -10880,6 +10886,11 @@ async fn historical_pool_delete_is_exact_and_keeps_other_nodes() {
             .as_deref(),
         Some("unrelated")
     );
+    assert!(db
+        .get("node_config_revision:legacy:71:OLD_NO_CREDENTIAL")
+        .await
+        .unwrap()
+        .is_none());
     // Even a lingering status source cannot recreate a retired legacy identity.
     db.register_node_pool_identity(71, id.as_str())
         .await

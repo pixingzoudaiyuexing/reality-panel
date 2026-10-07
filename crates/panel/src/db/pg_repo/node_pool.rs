@@ -310,6 +310,10 @@ impl PgRepository {
         for key in [
             format!("node_status:{group_id}:{}", node_id.as_str()),
             format!("node_config_revision:{group_id}:{}", node_id.as_str()),
+            format!(
+                "node_config_revision:legacy:{group_id}:{}",
+                node_id.as_str()
+            ),
             crate::service::node_pool::pending_display_name_key(group_id, node_id.as_str()),
         ] {
             sqlx::query("DELETE FROM kvs WHERE key=$1")
