@@ -48,6 +48,7 @@ pub(crate) fn config_protocol_compatible(headers: &HeaderMap) -> bool {
 }
 
 pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let _publication = crate::service::legacy_upgrade::MUTATIONS.read().await;
     // v0.4.0: protocol-version gate. A node reporting a different
     // config_protocol_version (or none at all — pre-v0.4.0 node) must NOT
     // receive config it can't deserialize (e.g. the renamed node_transport
@@ -658,6 +659,26 @@ pub async fn report_status(
             }
         }
         let g = identity.group();
+        if identity.verified().is_none() {
+            if let Some(node_id) = req
+                .node_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                match crate::service::legacy_upgrade::retired(state.db.as_ref(), g.id, node_id)
+                    .await
+                {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return Json(ApiResponse::<()>::error(401, "Node identity retired"))
+                    }
+                    Err(_) => {
+                        return Json(ApiResponse::<()>::error(503, "Node status unavailable"))
+                    }
+                }
+            }
+        }
         // v0.3.0: key node status by (group_id, node_id) so multiple nodes
         // sharing one group token no longer overwrite each other. The node_id
         // is a stable per-node identity generated on first start (see

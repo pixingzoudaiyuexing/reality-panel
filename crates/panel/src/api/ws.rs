@@ -479,14 +479,16 @@ async fn handle_node_ws(
             lifecycle_capable,
         )
         .await;
-    if let Some(verified) = verified_credential.as_ref() {
-        if !matches!(
-            verified_credential_still_active(&state, verified).await,
-            Ok(true)
-        ) {
-            node_connections.unregister(group_id, conn_id).await;
-            return;
-        }
+    if !registered_runtime_authority_still_active(
+        &state,
+        group_id,
+        node_id.as_deref(),
+        verified_credential.as_ref(),
+    )
+    .await
+    {
+        node_connections.unregister(group_id, conn_id).await;
+        return;
     }
     if let Some(node_id) = lifecycle_node_id.as_deref() {
         for operation in node_operations.connected(
@@ -635,6 +637,32 @@ async fn handle_node_ws(
     }
 }
 
+pub(crate) async fn registered_runtime_authority_still_active(
+    state: &AppState,
+    group_id: i64,
+    node_id: Option<&str>,
+    verified: Option<&VerifiedConcreteNode>,
+) -> bool {
+    let _publication = crate::service::legacy_upgrade::MUTATIONS.read().await;
+    if let Some(verified) = verified {
+        matches!(
+            verified_credential_still_active(state, verified).await,
+            Ok(true)
+        )
+    } else {
+        matches!(
+            crate::service::node_pool::legacy_config_authority_retired(
+                state.db.as_ref(),
+                group_id,
+                node_id,
+                false,
+            )
+            .await,
+            Ok(false)
+        )
+    }
+}
+
 pub(crate) async fn build_config_snapshot_for_node(
     db: &dyn crate::db::Repository,
     certificate_state_dir: &std::path::Path,
@@ -643,6 +671,7 @@ pub(crate) async fn build_config_snapshot_for_node(
     verified_concrete_node: bool,
     runtime_enabled: bool,
 ) -> Option<NodeConfigSnapshot> {
+    let _publication = crate::service::legacy_upgrade::MUTATIONS.read().await;
     match crate::service::node_pool::legacy_config_authority_retired(
         db,
         group_id,

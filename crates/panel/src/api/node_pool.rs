@@ -923,6 +923,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_retirement_fences_inflight_status_and_late_ws_registration() {
+        let (state, _) = fixture().await;
+        node_pool::list_nodes(state.db.as_ref()).await.unwrap();
+        // This lease represents a legacy report/config authenticated before Delete.
+        let publication = crate::service::legacy_upgrade::MUTATIONS.read().await;
+        let deleting = state.clone();
+        let mut task =
+            tokio::spawn(async move { node_pool::retire_node(&deleting, 10, "LEGACY").await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut task)
+                .await
+                .is_err()
+        );
+        state
+            .db
+            .set(
+                "node_status:10:LEGACY",
+                r#"{"last_seen":"2026-10-07T00:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+        drop(publication);
+        assert!(task.await.unwrap().unwrap().is_some());
+        assert!(state
+            .db
+            .get("node_status:10:LEGACY")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .db
+            .get("node_config_revision:legacy:10:LEGACY")
+            .await
+            .unwrap()
+            .is_none());
+        // Legacy report body identifies the concrete Node even without an ID header.
+        let app = crate::api::routes().with_state(state.clone());
+        for (id, expected) in [("LEGACY", 401), ("OTHER", 0)] {
+            let response = app.clone().oneshot(Request::builder().method("POST").uri("/node/report_status")
+                .header("Authorization", "Bearer test-group-token").header("Content-Type", "application/json")
+                .body(Body::from(serde_json::json!({"node_id":id,"cpu_usage":0,"mem_usage":0,"active_connections":0,"uptime_secs":1}).to_string())).unwrap()).await.unwrap();
+            let body = to_bytes(response.into_body(), 65536).await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
+                expected
+            );
+        }
+        assert!(state
+            .db
+            .get("node_status:10:LEGACY")
+            .await
+            .unwrap()
+            .is_none());
+        // A WS authenticated earlier but registered after close must recheck authority.
+        let (late, _) = state
+            .node_connections
+            .register(10, Some("LEGACY".into()))
+            .await;
+        assert!(
+            !crate::api::ws::registered_runtime_authority_still_active(
+                &state,
+                10,
+                Some("LEGACY"),
+                None
+            )
+            .await
+        );
+        state.node_connections.unregister(10, late).await;
+        assert!(
+            crate::api::ws::registered_runtime_authority_still_active(
+                &state,
+                10,
+                Some("OTHER"),
+                None
+            )
+            .await
+        );
+        let certs = std::path::PathBuf::from(state.config.certificate_state_dir());
+        assert!(crate::api::ws::build_config_snapshot_for_node(
+            state.db.as_ref(),
+            &certs,
+            10,
+            Some("LEGACY"),
+            false,
+            true
+        )
+        .await
+        .is_none());
+        assert!(state
+            .db
+            .get("node_config_revision:legacy:10:LEGACY")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn online_pool_node_can_be_deleted_without_remote_ack() {
         let (state, pool) = fixture().await;
         let anchor = state

@@ -63,6 +63,9 @@ pub async fn legacy_config_authority_retired(
     let Some(node_id) = node_id.and_then(|id| ReuseEligibleNodeId::parse(id).ok()) else {
         return Ok(false);
     };
+    if crate::service::legacy_upgrade::retired(db, group_id, node_id.as_str()).await? {
+        return Ok(true);
+    }
     Ok(db
         .get(&completion_key(group_id, node_id.as_str()))
         .await?
@@ -322,6 +325,9 @@ async fn retire_identity(
     fresh_reset: bool,
 ) -> Result<Option<bool>, String> {
     let node_id = ReuseEligibleNodeId::parse(node_id).map_err(|_| "invalid node identity")?;
+    // Reports/config publication already use this fence. Retire locally before
+    // releasing it so a previously authenticated legacy write cannot resurrect.
+    let _publication = crate::service::legacy_upgrade::MUTATIONS.write().await;
     let _authority = crate::service::relay_failover::lock_automatic_policy().await;
     let _preference = crate::service::relay_preference::RELAY_PREFERENCE_MUTATION_LOCK
         .lock()
@@ -359,6 +365,7 @@ async fn retire_identity(
     drop(_schedule);
     drop(_preference);
     drop(_authority);
+    drop(_publication);
     let mut needs_attention = retired.needs_attention;
     if retired.retired {
         for group in affected_groups {
