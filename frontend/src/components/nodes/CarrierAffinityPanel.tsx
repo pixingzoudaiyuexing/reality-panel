@@ -100,6 +100,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const requestInFlight = useRef(false);
   const readInFlight = useRef(false);
   const mutationGeneration = useRef(0);
+  const [mutationVersion, setMutationVersion] = useState(0);
   const [viewGeneration, setViewGeneration] = useState(-1);
   const operationKey = `reality-carrier-operation:${groupId}`;
   const [intent, setIntent] = useState<{ desired: CarrierPolicy | null; unknown: boolean; error: string | null; baseline?: string; observed?: boolean; pending?: boolean; baselineMode?: RoutingMode }>(() => {
@@ -116,7 +117,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
       setIntent((current) => ({ ...current, observed: true }));
     }
   }, [intent.desired, intent.observed, loadError, viewGeneration, view?.pending_policy, view?.transaction.state]);
-  const polling = saving || (!!intent.desired && viewGeneration !== mutationGeneration.current) || ['syncing', 'rolling_back', 'pending', 'unknown'].includes(phase);
+  const polling = saving || (!!intent.desired && viewGeneration !== mutationVersion) || ['syncing', 'rolling_back', 'pending', 'unknown'].includes(phase);
   const operationText = { submitting: 'carrierOperationSubmitting', unknown: 'carrierOperationUnknown', syncing: 'carrierOperationSyncing', pending: 'carrierOperationPending', ready: 'carrierOperationReady', failed: 'carrierOperationFailed', rolled_back: 'carrierOperationRolledBack', rollback_failed: 'carrierOperationRollbackFailed', rolling_back: 'carrierOperationRollingBack' } as const;
 
 
@@ -226,6 +227,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
     if (requestInFlight.current || (activeMode === 'carrier' && !dirty) || mutationLocked || catalogUnavailable || disabled) return;
     requestInFlight.current = true;
     mutationGeneration.current += 1;
+    setMutationVersion(mutationGeneration.current);
     const submitted = { desired: { default_node_id: draftDefaultNodeId, bindings: mutableCarrierBindings(draft) }, unknown: false, error: null, baseline: view ? carrierPolicyKey(view.active_policy) : undefined, observed: false, pending: true, baselineMode: activeMode };
     sessionStorage.setItem(operationKey, JSON.stringify(submitted));
     setIntent(submitted);
@@ -245,6 +247,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
     } finally {
       // Reads begun while the POST was pending cannot acknowledge its outcome.
       mutationGeneration.current += 1;
+      setMutationVersion(mutationGeneration.current);
       setIntent((current) => ({ ...current, pending: false }));
       requestInFlight.current = false;
       setSaving(false);
