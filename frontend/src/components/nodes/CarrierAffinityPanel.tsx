@@ -103,7 +103,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const [viewGeneration, setViewGeneration] = useState(-1);
   const operationKey = `reality-carrier-operation:${groupId}`;
   const [intent, setIntent] = useState<{ desired: CarrierPolicy | null; unknown: boolean; error: string | null; baseline?: string; observed?: boolean; pending?: boolean; baselineMode?: RoutingMode }>(() => {
-    try { const stored = JSON.parse(sessionStorage.getItem(operationKey) ?? 'null'); return stored ? { ...stored, unknown: stored.unknown || stored.pending === true } : { desired: null, unknown: false, error: null }; }
+    try { const stored = JSON.parse(sessionStorage.getItem(operationKey) ?? 'null'); return stored ? { ...stored, unknown: stored.unknown || stored.pending === true, pending: false } : { desired: null, unknown: false, error: null }; }
     catch { return { desired: null, unknown: false, error: null }; }
   });
   useEffect(() => { sessionStorage.setItem(operationKey, JSON.stringify(intent)); }, [intent, operationKey]);
@@ -116,7 +116,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
       setIntent((current) => ({ ...current, observed: true }));
     }
   }, [intent.desired, intent.observed, loadError, viewGeneration, view?.pending_policy, view?.transaction.state]);
-  const polling = saving || ['syncing', 'rolling_back', 'pending', 'unknown'].includes(phase);
+  const polling = saving || (!!intent.desired && viewGeneration !== mutationGeneration.current) || ['syncing', 'rolling_back', 'pending', 'unknown'].includes(phase);
   const operationText = { submitting: 'carrierOperationSubmitting', unknown: 'carrierOperationUnknown', syncing: 'carrierOperationSyncing', pending: 'carrierOperationPending', ready: 'carrierOperationReady', failed: 'carrierOperationFailed', rolled_back: 'carrierOperationRolledBack', rollback_failed: 'carrierOperationRollbackFailed', rolling_back: 'carrierOperationRollingBack' } as const;
 
 
@@ -240,15 +240,15 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
       else if (result?.client_outcome === 'failed') setIntent((current) => ({ ...current, unknown: false, error: result.client_error ?? result.business_error_code ?? 'DNS_PROVIDER_READ_FAILED' }));
       else if (result?.client_outcome === 'unknown') setIntent((current) => ({ ...current, unknown: true }));
       else if (result && !result.config_saved && result.business_error_code) setIntent((current) => ({ ...current, unknown: false, error: result.business_error_code }));
-      setIntent((current) => ({ ...current, pending: false }));
-      await load();
     } catch {
       setIntent((current) => ({ ...current, unknown: true }));
-      await load();
     } finally {
+      // Reads begun while the POST was pending cannot acknowledge its outcome.
+      mutationGeneration.current += 1;
       setIntent((current) => ({ ...current, pending: false }));
       requestInFlight.current = false;
       setSaving(false);
+      await load();
     }
   };
 

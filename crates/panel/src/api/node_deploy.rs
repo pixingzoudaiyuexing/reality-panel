@@ -1117,6 +1117,18 @@ async fn run_task(
     };
 
     if let Some(err) = failure {
+        // Display metadata has no authority. Clear it even if remote rollback
+        // cannot run; retain the existing activation/remote-stop safety gates.
+        let candidate = bootstrap_identity.lock().await.clone();
+        if let Err(error) = state
+            .db
+            .delete(&crate::service::node_pool::pending_display_name_key(
+                group_id, &candidate,
+            ))
+            .await
+        {
+            tracing::warn!(group_id, node_id = %candidate, "failed deployment name cleanup unavailable: {error}");
+        }
         let mut message = public_error(&err, &secrets);
         if destructive_fresh {
             if reset_completed.load(AtomicOrdering::SeqCst) {
@@ -2401,6 +2413,66 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
         assert_eq!(claim.node_id, task.id);
         assert_eq!(claim.home_group_id, anchor.id);
         assert_eq!(runner.commit_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_ssh_bootstrap_clears_pending_name_without_creating_a_pool_row() {
+        let runner = Arc::new(FakeRunner::new(FakeBehavior::InstallFailure(
+            "INSTALL_FAILED",
+        )));
+        let state = test_state(test_registry(
+            runner,
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        ))
+        .await;
+        let anchor = state
+            .db
+            .ensure_node_pool_system_group(1, "pool-token")
+            .await
+            .unwrap();
+        let task = state
+            .deployments
+            .insert(
+                anchor.id,
+                "node.example".into(),
+                ProvisioningProfile::RealityCamouflage,
+                false,
+            )
+            .await;
+        run_task(
+            state.clone(),
+            task.id.clone(),
+            ssh_input(),
+            "SHA256:confirmed".into(),
+            anchor.token,
+            "https://panel.test".into(),
+            (1, None, "Never live name".into()),
+        )
+        .await;
+        assert_eq!(
+            state.deployments.status(&task.id).await.unwrap().status,
+            "FAILED"
+        );
+        assert!(state
+            .db
+            .get(&crate::service::node_pool::pending_display_name_key(
+                anchor.id, &task.id
+            ))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state.db.list_node_pool_records().await.unwrap().is_empty());
+        assert_eq!(
+            state
+                .db
+                .find_node_credential_claim(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "CANCELLED"
+        );
     }
 
     async fn seed_node_capabilities(state: &AppState, capabilities: ProvisioningCapabilities) {

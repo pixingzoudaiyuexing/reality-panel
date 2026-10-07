@@ -413,3 +413,40 @@ describe('Carrier new mutation read ordering', () => {
     expect(screen.getByRole('combobox', { name: 'node-a carrierLine' })).toBeDisabled();
   });
 });
+
+
+it('ends a restored pending marker after observed takeover and a terminal GET', async () => {
+  sessionStorage.clear(); vi.clearAllMocks();
+  sessionStorage.setItem('reality-carrier-operation:7', JSON.stringify({ desired: { default_node_id: 'node-b', bindings: [] }, unknown: false, pending: true, observed: true, error: null }));
+  arrange({}, nodes, 'carrier');
+  await waitFor(() => expect(JSON.parse(sessionStorage.getItem('reality-carrier-operation:7')!).desired).toBeNull());
+  expect(screen.getByRole('combobox', { name: 'node-a carrierLine' })).not.toBeDisabled();
+});
+
+it('requires a GET begun after the POST settled before releasing a new mutation', async () => {
+  sessionStorage.clear(); vi.clearAllMocks();
+  let releasePost: (value: RoutingApplyResult) => void = () => {};
+  mockApply.mockImplementationOnce(() => new Promise((resolve) => { releasePost = resolve; }));
+  let reads = 0;
+  let releaseDuring: (value: ReturnType<typeof ok<CarrierAffinityView>>) => void = () => {};
+  let releaseAfter: (value: ReturnType<typeof ok<CarrierAffinityView>>) => void = () => {};
+  mockGet.mockImplementation((url: string) => {
+    if (url.endsWith('/carrier-lines')) return Promise.resolve(ok(catalog));
+    reads += 1;
+    if (reads === 1) return Promise.resolve(ok(view));
+    return new Promise((resolve) => { if (reads === 2) releaseDuring = resolve; else releaseAfter = resolve; });
+  });
+  const page = render(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} activeMode="carrier" onApply={mockApply} />);
+  await screen.findByText('✓ 全网默认');
+  fireEvent.click(screen.getByRole('button', { name: '设为全网默认' }));
+  fireEvent.click(screen.getByText('保存修改'));
+  page.rerender(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} activeMode="carrier" onApply={mockApply} onViewChange={() => {}} />);
+  await waitFor(() => expect(reads).toBe(2));
+  await act(async () => { releasePost(applied()); });
+  await act(async () => { releaseDuring(ok(view)); });
+  await waitFor(() => expect(reads).toBe(3));
+  expect(screen.getByRole('combobox', { name: 'node-a carrierLine' })).toBeDisabled();
+  expect(JSON.parse(sessionStorage.getItem('reality-carrier-operation:7')!).desired).not.toBeNull();
+  await act(async () => { releaseAfter(ok(view)); });
+  await waitFor(() => expect(JSON.parse(sessionStorage.getItem('reality-carrier-operation:7')!).desired).toBeNull());
+});
