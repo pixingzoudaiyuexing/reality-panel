@@ -1,12 +1,25 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 const { mockGet, mockPatch, mockDelete } = vi.hoisted(() => ({ mockGet: vi.fn(), mockPatch: vi.fn(), mockDelete: vi.fn() }));
 vi.mock('../api/client', () => ({ default: { get: mockGet, patch: mockPatch, delete: mockDelete } }));
 
 import NodePool from './NodePool';
+import { message, Modal } from 'antd';
 
 const ok = <T,>(data: T) => ({ code: 0, message: 'ok', data });
+
+// AntD static roots are outside RTL's rendered root. Drain them before jsdom teardown.
+afterEach(async () => {
+  await act(async () => {
+    Modal.destroyAll();
+    message.destroy();
+  });
+  await waitFor(() => {
+    expect(document.querySelector('.ant-modal-confirm')).toBeNull();
+    expect(document.querySelector('.ant-message-notice')).toBeNull();
+  });
+});
 
 beforeEach(() => {
   mockGet.mockReset(); mockPatch.mockReset(); mockDelete.mockReset();
@@ -32,6 +45,7 @@ describe('NodePool', () => {
     fireEvent.change(screen.getByLabelText('poolNodeName'), { target: { value: 'Tokyo relay' } });
     fireEvent.click(screen.getByRole('button', { name: 'OK' }));
     await waitFor(() => expect(mockPatch).toHaveBeenCalledWith('/admin/node-pool/nodes/10/NODE_A', { display_name: 'Tokyo relay' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   });
 
   it('confirms offline deletion before calling the actual Pool retirement endpoint', async () => {
@@ -43,6 +57,8 @@ describe('NodePool', () => {
     expect(mockDelete).not.toHaveBeenCalled();
     fireEvent.click(screen.getAllByRole('button', { name: 'poolDelete' }).at(-1)!);
     await waitFor(() => expect(mockDelete).toHaveBeenCalledWith('/admin/node-pool/nodes/10/NODE_A'));
+    expect(await screen.findByText('poolDeleted')).toBeInTheDocument();
+    await waitFor(() => expect(document.querySelector('.ant-modal-confirm')).toBeNull());
   });
 });
 
@@ -57,4 +73,6 @@ it('offers Panel-local Delete for historical nodes without a credential or runti
   expect(mockDelete).not.toHaveBeenCalled();
   fireEvent.click(screen.getAllByRole('button', { name: 'poolDelete' }).at(-1)!);
   await waitFor(() => expect(mockDelete).toHaveBeenCalledWith('/admin/node-pool/nodes/4/LEGACY'));
+  expect(await screen.findByText('poolDeleted')).toBeInTheDocument();
+  await waitFor(() => expect(document.querySelector('.ant-modal-confirm')).toBeNull());
 });
