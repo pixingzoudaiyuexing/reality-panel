@@ -48,7 +48,7 @@ pub(crate) fn config_protocol_compatible(headers: &HeaderMap) -> bool {
 }
 
 pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let _publication = crate::service::legacy_upgrade::MUTATIONS.read().await;
+    let _publication = crate::service::node_pool::PUBLICATION.read().await;
     // v0.4.0: protocol-version gate. A node reporting a different
     // config_protocol_version (or none at all — pre-v0.4.0 node) must NOT
     // receive config it can't deserialize (e.g. the renamed node_transport
@@ -633,6 +633,7 @@ pub async fn report_status(
 ) -> Json<ApiResponse<()>> {
     // Exclude a report authenticated before the atomic retirement boundary.
     let _migration_lease = crate::service::legacy_upgrade::MUTATIONS.read().await;
+    let _publication = crate::service::node_pool::PUBLICATION.read().await;
     let identity = match authenticate_node(&state, &headers).await {
         Ok(identity) => Some(identity),
         Err(NodeAuthError::Unavailable) => {
@@ -785,6 +786,9 @@ pub async fn report_status(
                 false
             }
         };
+        // Only live authority publication belongs inside the retirement fence.
+        // Preference initialization and historical metrics do not revive identity.
+        drop(_publication);
         let business_group = match state.db.node_pool_system_group_id().await {
             Ok(anchor) => anchor != Some(g.id),
             Err(error) => {

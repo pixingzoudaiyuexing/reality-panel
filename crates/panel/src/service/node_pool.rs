@@ -5,6 +5,12 @@ use crate::node_identity::ReuseEligibleNodeId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+// Serialize live node publication with local retirement. The migration HTTP
+// middleware retains its own read lease through DELETE, so this fence must be
+// independent of that lease and never wait for provider reconciliation IO.
+pub(crate) static PUBLICATION: once_cell::sync::Lazy<tokio::sync::RwLock<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::RwLock::new(()));
+
 #[derive(Debug, Serialize)]
 pub struct PoolMembership {
     pub group_id: i64,
@@ -327,7 +333,7 @@ async fn retire_identity(
     let node_id = ReuseEligibleNodeId::parse(node_id).map_err(|_| "invalid node identity")?;
     // Reports/config publication already use this fence. Retire locally before
     // releasing it so a previously authenticated legacy write cannot resurrect.
-    let _publication = crate::service::legacy_upgrade::MUTATIONS.write().await;
+    let _publication = PUBLICATION.write().await;
     let _authority = crate::service::relay_failover::lock_automatic_policy().await;
     let _preference = crate::service::relay_preference::RELAY_PREFERENCE_MUTATION_LOCK
         .lock()

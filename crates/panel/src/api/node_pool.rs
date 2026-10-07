@@ -923,11 +923,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_delete_completes_through_real_main_migration_guard() {
+        let (state, _) = fixture().await;
+        state
+            .db
+            .set(
+                "node_status:10:OTHER",
+                r#"{"last_seen":"2000-01-01T00:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+        node_pool::list_nodes(state.db.as_ref()).await.unwrap();
+        // An independent request may retain this reader while Delete runs.
+        // Local retirement must not need to upgrade the migration lease.
+        let _other_migration_request = crate::service::legacy_upgrade::MUTATIONS.read().await;
+        assert!(crate::service::legacy_upgrade::load(state.db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        let app = crate::api::routes()
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::api::legacy_upgrade::guard,
+            ))
+            .with_state(state.clone());
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/admin/node-pool/nodes/10/LEGACY")
+            .header("Authorization", format!("Bearer {}", jwt(1, true)))
+            .body(Body::empty())
+            .unwrap();
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(2), app.oneshot(request))
+                .await
+                .expect("real main middleware must not deadlock local Pool Delete")
+                .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
+            0
+        );
+        assert!(state
+            .db
+            .get("node_status:10:LEGACY")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            crate::service::legacy_upgrade::retired(state.db.as_ref(), 10, "LEGACY",)
+                .await
+                .unwrap()
+        );
+        assert!(state
+            .db
+            .get("node_status:10:OTHER")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn historical_retirement_fences_inflight_status_and_late_ws_registration() {
         let (state, _) = fixture().await;
         node_pool::list_nodes(state.db.as_ref()).await.unwrap();
         // This lease represents a legacy report/config authenticated before Delete.
-        let publication = crate::service::legacy_upgrade::MUTATIONS.read().await;
+        let publication = crate::service::node_pool::PUBLICATION.read().await;
         let deleting = state.clone();
         let mut task =
             tokio::spawn(async move { node_pool::retire_node(&deleting, 10, "LEGACY").await });
@@ -1044,11 +1105,17 @@ mod tests {
             .header("Authorization", format!("Bearer {}", jwt(1, true)))
             .body(Body::empty())
             .unwrap();
-        let response = crate::api::routes()
-            .with_state(state.clone())
-            .oneshot(request)
-            .await
-            .unwrap();
+        let app = crate::api::routes()
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::api::legacy_upgrade::guard,
+            ))
+            .with_state(state.clone());
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(2), app.oneshot(request))
+                .await
+                .expect("online local Delete must complete through the real guard")
+                .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(channel.recv().await.is_none());
         assert!(state

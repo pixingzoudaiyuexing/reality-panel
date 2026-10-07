@@ -643,7 +643,7 @@ pub(crate) async fn registered_runtime_authority_still_active(
     node_id: Option<&str>,
     verified: Option<&VerifiedConcreteNode>,
 ) -> bool {
-    let _publication = crate::service::legacy_upgrade::MUTATIONS.read().await;
+    let _publication = crate::service::node_pool::PUBLICATION.read().await;
     if let Some(verified) = verified {
         matches!(
             verified_credential_still_active(state, verified).await,
@@ -671,7 +671,7 @@ pub(crate) async fn build_config_snapshot_for_node(
     verified_concrete_node: bool,
     runtime_enabled: bool,
 ) -> Option<NodeConfigSnapshot> {
-    let _publication = crate::service::legacy_upgrade::MUTATIONS.read().await;
+    let _publication = crate::service::node_pool::PUBLICATION.read().await;
     match crate::service::node_pool::legacy_config_authority_retired(
         db,
         group_id,
