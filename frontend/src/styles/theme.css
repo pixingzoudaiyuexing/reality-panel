@@ -983,7 +983,7 @@ html, body, #root {
 
 .rp-ssh-row {
   display: grid;
-  grid-template-columns: 32px minmax(150px, 1.2fr) 94px minmax(110px, 0.7fr) minmax(150px, 1fr) minmax(150px, 1fr) auto;
+  grid-template-columns: 32px minmax(140px, 1fr) minmax(150px, 1.2fr) 94px minmax(110px, 0.7fr) minmax(150px, 1fr) auto;
   gap: 8px;
   align-items: center;
   padding: 10px 0;

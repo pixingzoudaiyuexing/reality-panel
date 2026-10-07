@@ -56,6 +56,8 @@ describe('Node Bootstrap deployment modes', () => {
     renderPage();
     expect(screen.queryByLabelText('nodeBootstrapGroup 1')).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: /nodeBootstrapAddServer/ }));
+    await user.type(screen.getByLabelText('poolNodeName 1'), ' TEST-Standard-Name ');
+    await user.type(screen.getByLabelText('poolNodeName 2'), '测试-Lite节点');
     await user.type(screen.getByLabelText('nodeBootstrapHost 1'), 'node-a');
     await user.type(screen.getByLabelText('nodeBootstrapPassword 1'), 'secret-a');
     await user.type(screen.getByLabelText('nodeBootstrapHost 2'), 'node-b');
@@ -66,8 +68,8 @@ describe('Node Bootstrap deployment modes', () => {
     await waitFor(() => expect(mockPost.mock.calls.filter(([url]) => url === '/admin/node-deployments')).toHaveLength(2));
     expect(screen.getByRole('button', { name: /nodeBootstrapAddServer/ })).toBeDisabled();
     expect(screen.getByLabelText('nodeBootstrapHost 1')).toBeDisabled();
-    expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ host: 'node-a', confirmed_fingerprint: 'SHA256:node-a' }));
-    expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ host: 'node-b', confirmed_fingerprint: 'SHA256:node-b' }));
+    expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ host: 'node-a', display_name: 'TEST-Standard-Name', confirmed_fingerprint: 'SHA256:node-a' }));
+    expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ host: 'node-b', display_name: '测试-Lite节点', confirmed_fingerprint: 'SHA256:node-b' }));
     expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({ lite_mode: false }));
   });
 
@@ -100,7 +102,7 @@ describe('Node Bootstrap deployment modes', () => {
     await user.click(await screen.findByRole('tab', { name: 'manualBootstrapTab' }));
     await user.click(screen.getByRole('button', { name: /manualBootstrapCreate/ }));
 
-    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-enrollments', { profile: 'reality_camouflage' }));
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-enrollments', { profile: 'reality_camouflage', display_name: '' }));
     expect(screen.getByDisplayValue('one-time-enrollment-secret')).toBeInTheDocument();
     const command = screen.getByDisplayValue(/manual-bootstrap-launcher\.sh/);
     expect(command).not.toHaveValue(expect.stringContaining('one-time-enrollment-secret'));
@@ -180,4 +182,15 @@ describe('Destructive fresh reinstall', () => {
     await screen.findByText(`overwriteNewNode: ${newId}`);
     expect(screen.queryByText('overwriteExistingTitle')).not.toBeInTheDocument();
   });
+});
+
+
+it('trims the optional Manual Bootstrap name and binds it to that enrollment request', async () => {
+  const user = userEvent.setup();
+  mockPost.mockResolvedValue(ok(created()));
+  renderPage();
+  await user.click(screen.getByRole('tab', { name: 'manualBootstrapTab' }));
+  await user.type(screen.getByLabelText('poolNodeName'), '  手动节点  ');
+  await user.click(screen.getByRole('button', { name: /manualBootstrapCreate/ }));
+  await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-enrollments', { profile: 'reality_camouflage', display_name: '手动节点' }));
 });

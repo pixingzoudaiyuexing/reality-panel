@@ -24,3 +24,11 @@ export function carrierOperation(view: CarrierAffinityView | null, desired: Carr
   if (unknown || desired) return 'unknown';
   return 'idle';
 }
+
+
+/** A current authoritative snapshot, not a comparison with historical intent. */
+export function carrierBackendTerminal(view: CarrierAffinityView | null): boolean {
+  return !!view && view.transaction.state === 'idle' && !view.pending_policy
+    && !view.transaction.last_error && !view.transaction.rollback_error
+    && carrierOperation(view, view.active_policy, false, false) === 'ready';
+}

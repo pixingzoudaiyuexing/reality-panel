@@ -10820,3 +10820,156 @@ async fn legacy_single_upgrade_atomic_replacement_contract() {
     sqlx::query("INSERT INTO node_credentials(credential_id,home_group_id,node_id,generation,verifier_format,verifier_version,verifier_data,activated_at) VALUES ('old-credential',71,'LEGACY_OLD',1,'rp-node-sha256',1,?,datetime('now')),('staged-credential',72,'STAGED_NEW',1,'rp-node-sha256',1,?,datetime('now'))").bind(vec![3_u8;32]).bind(vec![4_u8;32]).execute(&db.pool).await.unwrap();
     crate::db::legacy_upgrade_contract_tests::replacement_contract(&db).await;
 }
+
+#[tokio::test]
+async fn historical_pool_delete_is_exact_and_keeps_other_nodes() {
+    let db = repo().await;
+    seed_group(&db, 71).await;
+    seed_group(&db, 72).await;
+    seed_group(&db, 73).await;
+    db.register_node_pool_identity(71, "OLD_NO_CREDENTIAL")
+        .await
+        .unwrap();
+    db.register_node_pool_identity(72, "OLD_NO_CREDENTIAL")
+        .await
+        .unwrap();
+    db.register_node_pool_identity(71, "OTHER_NODE")
+        .await
+        .unwrap();
+    db.insert_node_reuse_binding(73, 71, "OLD_NO_CREDENTIAL")
+        .await
+        .unwrap();
+    db.insert_node_reuse_binding(71, 72, "OLD_NO_CREDENTIAL")
+        .await
+        .unwrap();
+    db.set("node_status:71:OLD_NO_CREDENTIAL", "stale")
+        .await
+        .unwrap();
+    db.set("node_config_revision:71:OLD_NO_CREDENTIAL", "42")
+        .await
+        .unwrap();
+    db.set("node_status:72:OLD_NO_CREDENTIAL", "unrelated")
+        .await
+        .unwrap();
+    let id = crate::node_identity::ReuseEligibleNodeId::parse("OLD_NO_CREDENTIAL").unwrap();
+    assert!(db.retire_pool_native_node(71, &id).await.unwrap().retired);
+    assert!(db
+        .find_node_reuse_binding(73, 71, id.as_str())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .find_node_reuse_binding(71, 72, id.as_str())
+        .await
+        .unwrap()
+        .is_some());
+    assert!(db
+        .get("node_status:71:OLD_NO_CREDENTIAL")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .get("node_config_revision:71:OLD_NO_CREDENTIAL")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        db.get("node_status:72:OLD_NO_CREDENTIAL")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("unrelated")
+    );
+    // Even a lingering status source cannot recreate a retired legacy identity.
+    db.register_node_pool_identity(71, id.as_str())
+        .await
+        .unwrap();
+    let nodes = db.list_node_pool_records().await.unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert!(nodes
+        .iter()
+        .any(|n| n.identity_group_id == 72 && n.node_id == id.as_str()));
+    assert!(nodes
+        .iter()
+        .any(|n| n.identity_group_id == 71 && n.node_id == "OTHER_NODE"));
+    assert!(!db.retire_pool_native_node(71, &id).await.unwrap().retired);
+}
+
+#[tokio::test]
+async fn pending_display_name_binds_only_after_exact_credential_activation() {
+    let db = repo().await;
+    let group = db
+        .ensure_node_pool_system_group(1, "name-test")
+        .await
+        .unwrap();
+    let id = "11111111-1111-4111-8111-111111111111";
+    let key = crate::service::node_pool::pending_display_name_key(group.id, id);
+    db.create_manual_bootstrap_enrollment(&NewManualBootstrapEnrollment {
+        id: id.into(),
+        display_name: "测试-Lite节点".into(),
+        secret_verifier: "verifier".into(),
+        group_id: group.id,
+        profile: "reality_camouflage".into(),
+        created_by: 1,
+        created_at: "2026-10-07T00:00:00Z".into(),
+        expires_at: "2026-10-07T01:00:00Z".into(),
+    })
+    .await
+    .unwrap();
+    db.register_node_pool_identity(group.id, id).await.unwrap();
+    assert!(db.list_node_pool_records().await.unwrap().is_empty());
+    assert_eq!(
+        db.get(&key).await.unwrap().as_deref(),
+        Some("测试-Lite节点")
+    );
+    sqlx::query("INSERT INTO node_credentials(credential_id,home_group_id,node_id,generation,verifier_format,verifier_version,verifier_data,activated_at) VALUES ('name-credential',?,?,1,'rp-node-sha256',1,?,datetime('now'))")
+        .bind(group.id).bind(id).bind(vec![7_u8;32]).execute(&db.pool).await.unwrap();
+    db.register_node_pool_identity(group.id, id).await.unwrap();
+    let nodes = db.list_node_pool_records().await.unwrap();
+    assert_eq!(nodes[0].node_id, id);
+    assert_eq!(nodes[0].display_name, "测试-Lite节点");
+    assert!(db.get(&key).await.unwrap().is_none());
+    db.rename_node_pool_node(group.id, id, "Renamed")
+        .await
+        .unwrap();
+    db.register_node_pool_identity(group.id, id).await.unwrap();
+    assert_eq!(
+        db.list_node_pool_records().await.unwrap()[0].display_name,
+        "Renamed"
+    );
+    let expired = "22222222-2222-4222-8222-222222222222";
+    db.create_manual_bootstrap_enrollment(&NewManualBootstrapEnrollment {
+        id: expired.into(),
+        display_name: "Never live".into(),
+        secret_verifier: "verifier2".into(),
+        group_id: group.id,
+        profile: "reality_camouflage".into(),
+        created_by: 1,
+        created_at: "2026-10-07T00:00:00Z".into(),
+        expires_at: "2026-10-07T01:00:00Z".into(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        db.expire_manual_bootstrap_enrollment(expired, "2026-10-08T00:00:00Z")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(db
+        .get(&crate::service::node_pool::pending_display_name_key(
+            group.id, expired
+        ))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        db.find_manual_bootstrap_enrollment(expired)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        "EXPIRED"
+    );
+    assert_eq!(db.list_node_pool_records().await.unwrap().len(), 1);
+}

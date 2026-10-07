@@ -56,6 +56,8 @@ pub struct TestSshRequest {
 #[derive(Deserialize)]
 pub struct StartDeploymentRequest {
     #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
     pub group_id: i64,
     pub host: String,
     #[serde(default = "default_port")]
@@ -709,6 +711,10 @@ pub async fn start_deployment(
     Json(req): Json<StartDeploymentRequest>,
 ) -> Json<ApiResponse<DeploymentStatus>> {
     let _start = DEPLOYMENT_START_LOCK.lock().await;
+    let display_name = match crate::service::node_pool::normalize_display_name(&req.display_name) {
+        Ok(name) => name,
+        Err(message) => return error(422, message),
+    };
     if req.group_id != 0 {
         return error(400, "新节点自动进入节点池，无需选择业务分组");
     }
@@ -780,7 +786,7 @@ pub async fn start_deployment(
             fingerprint,
             group.token,
             panel_url,
-            (admin.user_id, Some(existing)),
+            (admin.user_id, Some(existing), display_name),
         )
         .await;
     });
@@ -816,9 +822,9 @@ async fn run_task(
     fingerprint: String,
     token: String,
     panel_url: String,
-    authorization: (i64, Option<ExistingInstallation>),
+    authorization: (i64, Option<ExistingInstallation>, String),
 ) {
-    let (actor_id, existing) = authorization;
+    let (actor_id, existing, display_name) = authorization;
     const ROLLBACK_TIMEOUT: Duration = Duration::from_secs(120);
 
     let secrets = Secrets {
@@ -972,6 +978,18 @@ async fn run_task(
         } else {
             String::new()
         };
+        if !display_name.is_empty() {
+            state
+                .db
+                .set(
+                    &crate::service::node_pool::pending_display_name_key(group_id, &fresh_id),
+                    &display_name,
+                )
+                .await
+                .map_err(|_| {
+                    DeployError::new("DATABASE_FAILED", "node name metadata unavailable")
+                })?;
+        }
         state
             .deployments
             .update(
@@ -2329,7 +2347,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             "SHA256:confirmed".into(),
             "node-token-secret".into(),
             "https://panel.test".into(),
-            (1, None),
+            (1, None, String::new()),
         )
         .await;
         state.deployments.status(&task.id).await.unwrap()
@@ -2365,7 +2383,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             "SHA256:confirmed".into(),
             anchor.token,
             "https://panel.test".into(),
-            (1, None),
+            (1, None, String::new()),
         )
         .await;
         let status = state.deployments.status(&task.id).await.unwrap();
@@ -3164,7 +3182,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             "SHA256:confirmed".into(),
             "node-token-secret".into(),
             "https://panel.test".into(),
-            (1, None),
+            (1, None, String::new()),
         )
         .await;
 
@@ -3518,7 +3536,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             "host".into(),
             "test-token".into(),
             "https://panel.test".into(),
-            (1, Some(view)),
+            (1, Some(view), "New candidate name".into()),
         )
         .await;
         let status = state.deployments.status(&task.id).await.unwrap();
@@ -3537,6 +3555,14 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             .is_none());
         let candidate = status.candidate_node_id.unwrap();
         assert_ne!(candidate, old);
+        assert!(state
+            .db
+            .get(&crate::service::node_pool::pending_display_name_key(
+                group, &candidate
+            ))
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(
             state
                 .db
@@ -3582,7 +3608,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             "host".into(),
             "test-token".into(),
             "https://panel.test".into(),
-            (1, Some(view)),
+            (1, Some(view), String::new()),
         )
         .await;
         assert!(runner.reset_calls.lock().await.is_empty());

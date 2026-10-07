@@ -107,7 +107,7 @@ export default function NodePool() {
           <Button onClick={() => setManaging(node)}>{t('poolManageGroups')}</Button>
           {node.online ? <Button onClick={() => uninstall(node)}>{t('poolUninstall')}</Button>
             : <Tooltip title={t('poolUninstallOffline')}><Button disabled>{t('poolUninstall')}</Button></Tooltip>}
-          {node.pool_native && <Button danger onClick={() => deleteNode(node)}>{t('poolDelete')}</Button>}
+          <Button danger onClick={() => deleteNode(node)}>{t('poolDelete')}</Button>
         </Space> },
       ]} />
     <Modal title={t('poolEditName')} open={!!editing} onCancel={() => setEditing(null)} onOk={() => void save()} confirmLoading={saving}>

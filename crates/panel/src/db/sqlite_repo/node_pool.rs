@@ -40,9 +40,10 @@ impl NodePoolRepository for SqliteRepository {
         crate::node_identity::ReuseEligibleNodeId::parse(node_id).map_err(|_| {
             DbError::Other(sqlx::Error::Protocol("invalid pool node identity".into()))
         })?;
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO node_pool_nodes (identity_group_id, node_id)
-            SELECT id, ? FROM device_groups WHERE id = ? AND NOT EXISTS (SELECT 1 FROM kvs WHERE key=?) AND (
+            "INSERT INTO node_pool_nodes (identity_group_id, node_id, display_name)
+            SELECT id, ?, COALESCE((SELECT value FROM kvs WHERE key=?), '') FROM device_groups WHERE id = ? AND NOT EXISTS (SELECT 1 FROM kvs WHERE key=?) AND (
                 id != COALESCE((SELECT group_id FROM node_pool_system_anchor WHERE singleton = 1), -1)
                 OR EXISTS (SELECT 1 FROM node_credentials
                            WHERE home_group_id = id AND node_id = ?
@@ -52,12 +53,17 @@ impl NodePoolRepository for SqliteRepository {
             ON CONFLICT (identity_group_id, node_id) DO NOTHING",
         )
         .bind(node_id)
+        .bind(crate::service::node_pool::pending_display_name_key(group_id, node_id))
         .bind(group_id)
         .bind(format!("legacy_v130_upgrade:retired:{group_id}:{node_id}"))
         .bind(node_id)
         .bind(node_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM kvs WHERE key=? AND EXISTS (SELECT 1 FROM node_pool_nodes WHERE identity_group_id=? AND node_id=?)")
+            .bind(crate::service::node_pool::pending_display_name_key(group_id, node_id))
+            .bind(group_id).bind(node_id).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -190,9 +196,13 @@ impl SqliteRepository {
                 .fetch_optional(&mut *tx)
                 .await?
         } else {
-            sqlx::query_scalar("SELECT 1 FROM node_pool_nodes WHERE identity_group_id=? AND node_id=?
-                AND identity_group_id=(SELECT group_id FROM node_pool_system_anchor WHERE singleton=1)")
-                .bind(group_id).bind(node_id.as_str()).fetch_optional(&mut *tx).await?
+            sqlx::query_scalar(
+                "SELECT 1 FROM node_pool_nodes WHERE identity_group_id=? AND node_id=?",
+            )
+            .bind(group_id)
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
         };
         if exists.is_none() {
             tx.rollback().await?;
@@ -311,6 +321,7 @@ impl SqliteRepository {
         for key in [
             format!("node_status:{group_id}:{}", node_id.as_str()),
             format!("node_config_revision:{group_id}:{}", node_id.as_str()),
+            crate::service::node_pool::pending_display_name_key(group_id, node_id.as_str()),
         ] {
             sqlx::query("DELETE FROM kvs WHERE key=?")
                 .bind(key)
@@ -322,13 +333,11 @@ impl SqliteRepository {
             .bind(node_id.as_str())
             .execute(&mut *tx)
             .await?;
-        if fresh_reset {
-            // Reuse the existing exact-identity retirement guard; no migration
-            // operation is created and no Group token is changed.
-            sqlx::query("INSERT INTO kvs(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
-                .bind(format!("legacy_v130_upgrade:retired:{group_id}:{}", node_id.as_str()))
-                .bind("SSH_FRESH_RETIRED").execute(&mut *tx).await?;
-        }
+        // Reuse the existing exact-identity retirement guard; no migration
+        // operation is created and no Group token is changed.
+        sqlx::query("INSERT INTO kvs(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            .bind(format!("legacy_v130_upgrade:retired:{group_id}:{}", node_id.as_str()))
+            .bind(if fresh_reset { "SSH_FRESH_RETIRED" } else { "PANEL_NODE_RETIRED" }).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(NodePoolRetirement {
             retired: true,

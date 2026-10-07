@@ -8,7 +8,7 @@ import type { Dict } from '../i18n/zh-CN';
 import { copyText } from '../utils/clipboard';
 
 const { Text } = Typography;
-type Values = { group_id?: number; host: string; port: number; username: string; password: string };
+type Values = { display_name: string; group_id?: number; host: string; port: number; username: string; password: string };
 type ExistingInstallation = { classification: 'CLEAN_HOST' | 'STALE_INACTIVE_RESIDUE' | 'MANAGED_EXISTING_NODE' | 'AMBIGUOUS_STATE'; old_node_id: string | null; version: string | null; profile: string | null; service_active: boolean; panel_present: boolean; online: boolean; credential_active: boolean; group_count: number; carrier_reference_count: number; reason: string | null; confirmation: string };
 type SshProbe = { existing?: ExistingInstallation; fingerprint: string; os: string; architecture: string };
 type DeployLog = { stage: string; message: string; at: string };
@@ -19,7 +19,7 @@ type EnrollmentState = 'PENDING' | 'CLAIMED' | 'VERIFYING' | 'LOCAL_COMMITTED' |
 type Enrollment = { id: string; group_id: number; state: EnrollmentState; expires_at: string; session_expires_at?: string | null; node_id?: string | null; last_error_category?: string | null };
 type CreatedEnrollment = { enrollment: Enrollment; enrollment_secret: string; launcher_command: string };
 
-const newRow = (id: number, groupId?: number): SshRow => ({ id, values: { group_id: groupId, host: '', port: 22, username: 'root', password: '' }, state: 'WAITING', probe: null, deployment: null, logs: [], error: null });
+const newRow = (id: number, groupId?: number): SshRow => ({ id, values: { display_name: '', group_id: groupId, host: '', port: 22, username: 'root', password: '' }, state: 'WAITING', probe: null, deployment: null, logs: [], error: null });
 const terminalEnrollment = (state: EnrollmentState) => ['SUCCESS', 'FAILED', 'EXPIRED'].includes(state);
 const enrollmentStateLabel: Record<EnrollmentState, keyof Dict> = { PENDING: 'manualBootstrapStatePENDING', CLAIMED: 'manualBootstrapStateCLAIMED', VERIFYING: 'manualBootstrapStateVERIFYING', LOCAL_COMMITTED: 'manualBootstrapStateLOCAL_COMMITTED', SUCCESS: 'manualBootstrapStateSUCCESS', FAILED: 'manualBootstrapStateFAILED', EXPIRED: 'manualBootstrapStateEXPIRED' };
 const rowColor: Record<RowState, string> = { WAITING: 'default', TESTING: 'processing', PASSED: 'success', FAILED: 'error', DEPLOYING: 'processing', SUCCESS: 'success' };
@@ -34,6 +34,7 @@ export default function NodeBootstrap() {
   const [rows, setRows] = useState<SshRow[]>([newRow(1)]);
   const [batchBusy, setBatchBusy] = useState(false);
   const [creatingEnrollment, setCreatingEnrollment] = useState(false);
+  const [manualName, setManualName] = useState('');
   const [manualResult, setManualResult] = useState<CreatedEnrollment | null>(null);
   const [secretVisible, setSecretVisible] = useState(false);
   const [mode, setMode] = useState('ssh');
@@ -113,7 +114,7 @@ export default function NodeBootstrap() {
     setRows((current) => current.map((row) => ({ ...row, state: 'DEPLOYING', error: null })));
     const results = await Promise.all(rows.map(async (row) => {
       try {
-        const response = await api.post<unknown, ApiEnvelope<Deployment>>('/admin/node-deployments', { ...row.values, confirmed_fingerprint: row.probe!.fingerprint, profile: 'reality_camouflage', lite_mode: liteMode });
+        const response = await api.post<unknown, ApiEnvelope<Deployment>>('/admin/node-deployments', { ...row.values, display_name: row.values.display_name.trim(), confirmed_fingerprint: row.probe!.fingerprint, profile: 'reality_camouflage', lite_mode: liteMode });
         if (!response.data) throw new Error(response.message);
         return { id: row.id, deployment: response.data, error: null };
       } catch (error) { return { id: row.id, deployment: null, error: errorText(error, t('nodeBootstrapStartFailed')) }; }
@@ -129,7 +130,7 @@ export default function NodeBootstrap() {
   const createEnrollment = async () => {
     setCreatingEnrollment(true);
     try {
-      const response = await api.post<unknown, ApiEnvelope<CreatedEnrollment>>('/admin/node-enrollments', { profile: 'reality_camouflage' });
+      const response = await api.post<unknown, ApiEnvelope<CreatedEnrollment>>('/admin/node-enrollments', { profile: 'reality_camouflage', display_name: manualName.trim() });
       if (!response.data) throw new Error(response.message);
       setManualResult(response.data); setSecretVisible(true); message.success(t('manualBootstrapCreated'));
     } catch (error) { message.error(errorText(error, t('manualBootstrapCreateFailed'))); }
@@ -161,6 +162,7 @@ export default function NodeBootstrap() {
     <div className="rp-ssh-batch" data-testid="ssh-batch">
       {rows.map((row, index) => <div className="rp-ssh-row" data-testid={`ssh-row-${row.id}`} key={row.id}>
         <Text type="secondary">#{index + 1}</Text>
+        <Input className="rp-ssh-node-name" disabled={rowsLocked} aria-label={`${t('poolNodeName')} ${index + 1}`} value={row.values.display_name} placeholder={t('poolNodeNameOptional')} onChange={(event) => updateRow(row.id, { display_name: Array.from(event.target.value).slice(0, 128).join('') })} />
         <Input disabled={rowsLocked} aria-label={`${t('nodeBootstrapHost')} ${index + 1}`} value={row.values.host} placeholder={t('nodeBootstrapHost')} onChange={(event) => updateRow(row.id, { host: event.target.value })} />
         <InputNumber disabled={rowsLocked} aria-label={`${t('nodeBootstrapPort')} ${index + 1}`} min={1} max={65535} value={row.values.port} onChange={(value) => updateRow(row.id, { port: value ?? 22 })} />
         <Input disabled={rowsLocked} aria-label={`${t('nodeBootstrapUser')} ${index + 1}`} value={row.values.username} onChange={(event) => updateRow(row.id, { username: event.target.value })} />
@@ -197,7 +199,7 @@ export default function NodeBootstrap() {
   const enrollmentTag = (state: EnrollmentState) => <Tag color={state === 'SUCCESS' ? 'green' : state === 'FAILED' || state === 'EXPIRED' ? 'red' : state === 'LOCAL_COMMITTED' ? 'gold' : 'blue'}>{t(enrollmentStateLabel[state])}</Tag>;
   const manualContent = <>
     <Alert type="info" showIcon message={t('manualBootstrapDescription')} description={t('manualBootstrapNoSsh')} style={{ marginBottom: 16 }} />
-    {!manualResult ? <Space orientation="vertical" style={{ width: '100%' }}><Button type="primary" icon={<CloudUploadOutlined />} loading={creatingEnrollment} onClick={() => void createEnrollment()}>{t('manualBootstrapCreate')}</Button></Space> : <section><Descriptions size="small" column={1} items={[{ key: 'state', label: t('status'), children: enrollmentTag(manualResult.enrollment.state) }, { key: 'expires', label: t('manualBootstrapExpiresAt'), children: manualResult.enrollment.expires_at }, ...(manualResult.enrollment.node_id ? [{ key: 'node', label: t('nodeStatus'), children: manualResult.enrollment.node_id }] : []), ...(manualResult.enrollment.last_error_category ? [{ key: 'error', label: t('manualBootstrapLastError'), children: manualResult.enrollment.last_error_category }] : [])]} />
+    {!manualResult ? <Space orientation="vertical" style={{ width: '100%' }}><Input aria-label={t('poolNodeName')} value={manualName} placeholder={t('poolNodeNameOptional')} disabled={creatingEnrollment} onChange={(event) => setManualName(Array.from(event.target.value).slice(0, 128).join(''))} /><Button type="primary" icon={<CloudUploadOutlined />} loading={creatingEnrollment} onClick={() => void createEnrollment()}>{t('manualBootstrapCreate')}</Button></Space> : <section><Descriptions size="small" column={1} items={[{ key: 'state', label: t('status'), children: enrollmentTag(manualResult.enrollment.state) }, { key: 'expires', label: t('manualBootstrapExpiresAt'), children: manualResult.enrollment.expires_at }, ...(manualResult.enrollment.node_id ? [{ key: 'node', label: t('nodeStatus'), children: manualResult.enrollment.node_id }] : []), ...(manualResult.enrollment.last_error_category ? [{ key: 'error', label: t('manualBootstrapLastError'), children: manualResult.enrollment.last_error_category }] : [])]} />
       {manualResult.enrollment.state === 'LOCAL_COMMITTED' ? <Alert type="warning" showIcon message={t('manualBootstrapLocalCommitted')} style={{ marginTop: 12 }} /> : null}
       {secretVisible ? <Alert type="warning" showIcon message={t('manualBootstrapSecretOnceTitle')} description={<Space orientation="vertical" size={8} style={{ width: '100%' }}><Text>{t('manualBootstrapSecretOnceDescription')}</Text><Input.Password value={manualResult.enrollment_secret} readOnly visibilityToggle /><Button onClick={() => setSecretVisible(false)}>{t('manualBootstrapSecretAcknowledged')}</Button></Space>} style={{ marginTop: 12 }} /> : null}
       <div style={{ marginTop: 16 }}><Text strong>{t('manualBootstrapLauncherCommand')}</Text></div><Alert type="info" showIcon message={t('manualBootstrapLauncherHint')} style={{ margin: '8px 0' }} /><Input.TextArea value={manualResult.launcher_command} readOnly autoSize={{ minRows: 3, maxRows: 5 }} style={{ fontFamily: 'var(--rp-font-mono)', fontSize: 12 }} /><Button style={{ marginTop: 8 }} icon={<CopyOutlined />} onClick={() => void copyLauncher()}>{t('manualBootstrapCopyLauncher')}</Button>

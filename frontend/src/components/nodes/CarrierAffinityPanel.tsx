@@ -12,7 +12,7 @@ import {
   mutableCarrierBindings,
 } from './carrierCatalog';
 
-import { carrierOperation, carrierPolicyKey } from './carrierOperation';
+import { carrierBackendTerminal, carrierOperation, carrierPolicyKey } from './carrierOperation';
 import type { CarrierPolicy } from '../../api/types';
 
 const { Text } = Typography;
@@ -99,6 +99,8 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const [saving, setSaving] = useState(false);
   const requestInFlight = useRef(false);
   const readInFlight = useRef(false);
+  const mutationGeneration = useRef(0);
+  const [viewGeneration, setViewGeneration] = useState(-1);
   const operationKey = `reality-carrier-operation:${groupId}`;
   const [intent, setIntent] = useState<{ desired: CarrierPolicy | null; unknown: boolean; error: string | null; baseline?: string; observed?: boolean; pending?: boolean; baselineMode?: RoutingMode }>(() => {
     try { const stored = JSON.parse(sessionStorage.getItem(operationKey) ?? 'null'); return stored ? { ...stored, unknown: stored.unknown || stored.pending === true } : { desired: null, unknown: false, error: null }; }
@@ -110,17 +112,18 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const phase = intent.error && !saving && !['rolling_back', 'rolled_back', 'rollback_failed'].includes(backendPhase)
     ? 'failed' : unchangedUnknown && backendPhase === 'ready' ? 'unknown' : activeMode !== 'carrier' && !intent.desired && backendPhase === 'pending' ? 'idle' : backendPhase;
   useEffect(() => {
-    if (intent.desired && !intent.observed && (view?.pending_policy || ['switching', 'rolling_back'].includes(view?.transaction.state ?? ''))) {
+    if (viewGeneration === mutationGeneration.current && !loadError && intent.desired && !intent.observed && (view?.pending_policy || ['switching', 'rolling_back'].includes(view?.transaction.state ?? ''))) {
       setIntent((current) => ({ ...current, observed: true }));
     }
-  }, [intent.desired, intent.observed, view?.pending_policy, view?.transaction.state]);
+  }, [intent.desired, intent.observed, loadError, viewGeneration, view?.pending_policy, view?.transaction.state]);
   const polling = saving || ['syncing', 'rolling_back', 'pending', 'unknown'].includes(phase);
   const operationText = { submitting: 'carrierOperationSubmitting', unknown: 'carrierOperationUnknown', syncing: 'carrierOperationSyncing', pending: 'carrierOperationPending', ready: 'carrierOperationReady', failed: 'carrierOperationFailed', rolled_back: 'carrierOperationRolledBack', rollback_failed: 'carrierOperationRollbackFailed', rolling_back: 'carrierOperationRollingBack' } as const;
 
 
-  const load = useCallback(async () => {
+  const load = useCallback(async function loadCarrier() {
     if (readInFlight.current) return;
     readInFlight.current = true;
+    const generation = mutationGeneration.current;
     setLoading(true);
     try {
       const [affinityResult, linesResult] = await Promise.allSettled([
@@ -129,8 +132,11 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
       ]);
       const affinity = affinityResult.status === 'fulfilled' ? affinityResult.value : null;
       const lines = linesResult.status === 'fulfilled' ? linesResult.value : null;
+      // A GET started before a new POST cannot resolve that POST's intent.
+      if (generation !== mutationGeneration.current) return;
       if (!affinity || affinity.code !== 0 || !affinity.data) throw new Error('Carrier state unavailable');
       setView(affinity.data);
+      setViewGeneration(generation);
       setDraft(mutableCarrierBindings(affinity.data.pending_policy?.bindings ?? affinity.data.active_policy.bindings));
       setDraftDefaultNodeId(affinity.data.pending_policy?.default_node_id ?? affinity.data.active_policy.default_node_id ?? affinity.data.default_node_id);
       onViewChange?.(affinity.data);
@@ -146,11 +152,14 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
         onAvailabilityChange?.('error');
       }
     } catch {
+      if (generation !== mutationGeneration.current) return;
+      setViewGeneration(-1);
       setLoadError(true);
       onAvailabilityChange?.('error');
     } finally {
       readInFlight.current = false;
       setLoading(false);
+      if (generation !== mutationGeneration.current) void loadCarrier();
     }
   }, [groupId, onAvailabilityChange, onCatalogChange, onViewChange]);
 
@@ -161,11 +170,23 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
     return () => window.clearInterval(timer);
   }, [load, polling]);
 
+  useEffect(() => {
+    if (!intent.desired || intent.pending || intent.error || saving || requestInFlight.current
+      || loadError || viewGeneration !== mutationGeneration.current || !carrierBackendTerminal(view)) return;
+    const policyChanged = intent.baseline !== undefined && !!view && carrierPolicyKey(view.active_policy) === carrierPolicyKey(intent.desired)
+      && (intent.baseline !== carrierPolicyKey(view.active_policy) || (intent.baselineMode && intent.baselineMode !== activeMode));
+    // A lost response with no server takeover remains protected. Once observed,
+    // terminal server state wins even if another operation changed the policy.
+    if (intent.observed || !intent.unknown || policyChanged) {
+      setIntent({ desired: null, unknown: false, error: null });
+    }
+  }, [activeMode, intent, loadError, saving, view, viewGeneration]);
+
   const savedPolicy = view?.pending_policy ?? view?.active_policy;
   const dirty = normalize(draftDefaultNodeId, draft)
     !== normalize(savedPolicy?.default_node_id ?? view?.default_node_id, savedPolicy?.bindings ?? []);
   const transactionBusy = view?.transaction.state === 'switching' || view?.transaction.state === 'rolling_back';
-  const mutationLocked = polling || transactionBusy || view?.transaction.state === 'failed_manual_intervention';
+  const mutationLocked = polling || transactionBusy || backendPhase === 'rollback_failed' || backendPhase === 'failed';
   const catalogUnavailable = !catalog || catalog.stale;
   const status = view ? transactionLabel(view, t) : null;
   const effectiveDefaultNodeId = nodes.find((node) => node.preferred)?.node_id ?? view?.default_node_id;
@@ -204,6 +225,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const save = async () => {
     if (requestInFlight.current || (activeMode === 'carrier' && !dirty) || mutationLocked || catalogUnavailable || disabled) return;
     requestInFlight.current = true;
+    mutationGeneration.current += 1;
     const submitted = { desired: { default_node_id: draftDefaultNodeId, bindings: mutableCarrierBindings(draft) }, unknown: false, error: null, baseline: view ? carrierPolicyKey(view.active_policy) : undefined, observed: false, pending: true, baselineMode: activeMode };
     sessionStorage.setItem(operationKey, JSON.stringify(submitted));
     setIntent(submitted);
@@ -224,6 +246,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
       setIntent((current) => ({ ...current, unknown: true }));
       await load();
     } finally {
+      setIntent((current) => ({ ...current, pending: false }));
       requestInFlight.current = false;
       setSaving(false);
     }

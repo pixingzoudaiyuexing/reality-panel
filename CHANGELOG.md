@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.7] - 2026-10-07 (RC, unpublished)
+
+- Carrier clears historical browser intent only after a fresh authoritative terminal snapshot; lost responses and concurrent GET/POST ordering retain in-flight protection.
+- Every visible Pool identity supports exact Panel-local retirement, including legacy and offline nodes, without remote acknowledgement. History and unrelated identities are retained.
+- SSH batch and Manual Bootstrap accept optional Unicode display names bound to each final fresh UUID. No schema or protocol change.
+
+
 ## [1.4.6] - 2026-10-04 (RC, unpublished)
 
 - SSH Fresh install is a destructive reset and reinstall: old identity, credential and Panel URL mismatch diagnostics never disable deployment. Old known Pool identities are retired using existing Membership/Carrier/DNS cleanup; failed new candidates are cleared for direct retry. Selected Standard/Lite profile controls the result.

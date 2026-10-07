@@ -66,6 +66,8 @@ impl EnrollmentState {
 #[derive(Debug, Deserialize)]
 pub struct CreateEnrollmentRequest {
     #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
     pub group_id: i64,
     #[serde(default)]
     pub profile: ProvisioningProfile,
@@ -207,6 +209,10 @@ pub async fn create_enrollment(
     State(state): State<AppState>,
     Json(req): Json<CreateEnrollmentRequest>,
 ) -> Json<ApiResponse<CreatedEnrollment>> {
+    let display_name = match crate::service::node_pool::normalize_display_name(&req.display_name) {
+        Ok(name) => name,
+        Err(message) => return api_error(422, message),
+    };
     if req.group_id != 0 {
         return api_error(400, "新节点自动进入节点池，无需选择业务分组");
     }
@@ -236,6 +242,7 @@ pub async fn create_enrollment(
     let created_at = chrono::Utc::now();
     let expires_at = created_at + chrono::Duration::seconds(ENROLLMENT_CLAIM_WINDOW_SECS);
     let row = NewManualBootstrapEnrollment {
+        display_name,
         id: id.clone(),
         secret_verifier: secret_verifier(&state, &id, &secret),
         group_id: group.id,
@@ -1231,6 +1238,7 @@ mod tests {
         state
             .db
             .create_manual_bootstrap_enrollment(&NewManualBootstrapEnrollment {
+                display_name: String::new(),
                 id: id.clone(),
                 secret_verifier: secret_verifier(state, &id, &secret),
                 group_id: 7,
@@ -1256,12 +1264,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enrollment_display_name_is_validated_and_staged_without_a_live_node() {
+        let (state, _) = test_state().await;
+        for value in [
+            "  测试-Lite节点  ".to_owned(),
+            "测试-Lite节点".to_owned(),
+            "   ".to_owned(),
+            "🙂".repeat(128),
+        ] {
+            let Json(response) = create_enrollment(
+                AdminOnly { user_id: 1 },
+                State(state.clone()),
+                Json(CreateEnrollmentRequest {
+                    display_name: value.clone(),
+                    group_id: 0,
+                    profile: ProvisioningProfile::RealityCamouflage,
+                }),
+            )
+            .await;
+            assert_eq!(response.code, 0);
+            let created = response.data.unwrap();
+            let name = state
+                .db
+                .get(&crate::service::node_pool::pending_display_name_key(
+                    created.enrollment.group_id,
+                    &created.enrollment.id,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(name.as_deref().unwrap_or(""), value.trim());
+        }
+        for value in ["中".repeat(129), "bad\nname".to_owned()] {
+            let Json(response) = create_enrollment(
+                AdminOnly { user_id: 1 },
+                State(state.clone()),
+                Json(CreateEnrollmentRequest {
+                    display_name: value,
+                    group_id: 0,
+                    profile: ProvisioningProfile::RealityCamouflage,
+                }),
+            )
+            .await;
+            assert_eq!(response.code, 422);
+        }
+        assert!(state.db.list_node_pool_records().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn new_enrollment_uses_hidden_pool_and_requires_https() {
         let (state, _) = test_state().await;
         let Json(response) = create_enrollment(
             AdminOnly { user_id: 1 },
             State(state.clone()),
             Json(CreateEnrollmentRequest {
+                display_name: String::new(),
                 group_id: 0,
                 profile: ProvisioningProfile::RealityCamouflage,
             }),
@@ -1303,6 +1359,7 @@ mod tests {
             AdminOnly { user_id: 1 },
             State(http),
             Json(CreateEnrollmentRequest {
+                display_name: String::new(),
                 group_id: 0,
                 profile: ProvisioningProfile::RealityCamouflage,
             }),

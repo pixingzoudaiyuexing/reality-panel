@@ -285,15 +285,6 @@ pub async fn retire_node(
     node_id: &str,
 ) -> Result<Option<bool>, String> {
     let node_id = ReuseEligibleNodeId::parse(node_id).map_err(|_| "invalid node identity")?;
-    if state
-        .db
-        .node_pool_system_group_id()
-        .await
-        .map_err(|e| e.to_string())?
-        != Some(group_id)
-    {
-        return Ok(None);
-    }
     // A freshly activated identity may not have been visited by the Pool UI yet.
     // Reconcile existing credential/binding authority before the metadata lookup;
     // a derived record must never decide whether a live credential is retired.
@@ -837,5 +828,34 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+}
+
+/// Display-only metadata staged until this exact fresh identity is registered.
+pub(crate) fn pending_display_name_key(group_id: i64, node_id: &str) -> String {
+    format!("node_pool_pending_display_name:{group_id}:{node_id}")
+}
+
+pub(crate) fn normalize_display_name(value: &str) -> Result<String, &'static str> {
+    let value = value.trim();
+    if value.chars().count() > 128 || value.chars().any(char::is_control) {
+        return Err("节点名称最多 128 个字符，且不能包含控制字符");
+    }
+    Ok(value.to_owned())
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::normalize_display_name;
+    #[test]
+    fn display_name_is_optional_unicode_and_bounded_metadata() {
+        assert_eq!(normalize_display_name("   ").unwrap(), "");
+        assert_eq!(
+            normalize_display_name(" 测试-Lite节点 ").unwrap(),
+            "测试-Lite节点"
+        );
+        assert!(normalize_display_name(&"🙂".repeat(128)).is_ok());
+        assert!(normalize_display_name(&"中".repeat(129)).is_err());
+        assert!(normalize_display_name("bad\nname").is_err());
     }
 }

@@ -12,6 +12,7 @@ impl ManualBootstrapEnrollmentRepository for SqliteRepository {
         &self,
         enrollment: &NewManualBootstrapEnrollment,
     ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO manual_bootstrap_enrollments \
              (id, secret_verifier, group_id, profile, state, created_by, created_at, updated_at, expires_at) \
@@ -25,8 +26,19 @@ impl ManualBootstrapEnrollmentRepository for SqliteRepository {
         .bind(&enrollment.created_at)
         .bind(&enrollment.created_at)
         .bind(&enrollment.expires_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if !enrollment.display_name.is_empty() {
+            sqlx::query("INSERT INTO kvs(key,value) VALUES (?,?)")
+                .bind(crate::service::node_pool::pending_display_name_key(
+                    enrollment.group_id,
+                    &enrollment.id,
+                ))
+                .bind(&enrollment.display_name)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -103,6 +115,8 @@ impl ManualBootstrapEnrollmentRepository for SqliteRepository {
             .bind(&claim.now)
             .execute(&mut *tx)
             .await?;
+            sqlx::query("DELETE FROM kvs WHERE key IN (SELECT 'node_pool_pending_display_name:' || CAST(group_id AS TEXT) || ':' || id FROM manual_bootstrap_enrollments WHERE id=? AND state='EXPIRED')")
+                .bind(&claim.id).execute(&mut *tx).await?;
             tx.commit().await?;
             return Ok(ManualBootstrapClaimResult::Expired);
         }
@@ -118,6 +132,8 @@ impl ManualBootstrapEnrollmentRepository for SqliteRepository {
                 .execute(&mut *tx)
                 .await?;
             }
+            sqlx::query("DELETE FROM kvs WHERE key IN (SELECT 'node_pool_pending_display_name:' || CAST(group_id AS TEXT) || ':' || id FROM manual_bootstrap_enrollments WHERE id=? AND state='EXPIRED')")
+                .bind(&claim.id).execute(&mut *tx).await?;
             tx.commit().await?;
             return Ok(ManualBootstrapClaimResult::Expired);
         }
@@ -144,7 +160,8 @@ impl ManualBootstrapEnrollmentRepository for SqliteRepository {
         id: &str,
         now: &str,
     ) -> Result<u64, DbError> {
-        Ok(sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
             "UPDATE manual_bootstrap_enrollments SET state = 'EXPIRED', updated_at = ? \
              WHERE id = ? AND (\
                  (state = 'PENDING' AND expires_at <= ?) OR \
@@ -155,9 +172,13 @@ impl ManualBootstrapEnrollmentRepository for SqliteRepository {
         .bind(id)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
-        .rows_affected())
+        .rows_affected();
+        sqlx::query("DELETE FROM kvs WHERE key IN (SELECT 'node_pool_pending_display_name:' || CAST(group_id AS TEXT) || ':' || id FROM manual_bootstrap_enrollments WHERE id=? AND state IN ('EXPIRED','FAILED'))")
+            .bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     async fn record_manual_bootstrap_verification_error(
@@ -258,7 +279,8 @@ impl ManualBootstrapEnrollmentRepository for SqliteRepository {
         category: &str,
         now: &str,
     ) -> Result<u64, DbError> {
-        Ok(sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
             "UPDATE manual_bootstrap_enrollments SET \
                  state = CASE WHEN state IN ('CLAIMED','VERIFYING') THEN 'FAILED' ELSE state END, \
                  last_error_category = ?, updated_at = ? \
@@ -269,8 +291,12 @@ impl ManualBootstrapEnrollmentRepository for SqliteRepository {
         .bind(now)
         .bind(id)
         .bind(session_verifier)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
-        .rows_affected())
+        .rows_affected();
+        sqlx::query("DELETE FROM kvs WHERE key IN (SELECT 'node_pool_pending_display_name:' || CAST(group_id AS TEXT) || ':' || id FROM manual_bootstrap_enrollments WHERE id=? AND state IN ('EXPIRED','FAILED'))")
+            .bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(changed)
     }
 }

@@ -48,8 +48,8 @@ impl NodePoolRepository for PgRepository {
             .fetch_optional(&mut *tx)
             .await?;
         sqlx::query(
-            "INSERT INTO node_pool_nodes (identity_group_id, node_id)
-            SELECT id, $1 FROM device_groups WHERE id = $2 AND NOT EXISTS (SELECT 1 FROM kvs WHERE key=$3) AND (
+            "INSERT INTO node_pool_nodes (identity_group_id, node_id, display_name)
+            SELECT id, $1, COALESCE((SELECT value FROM kvs WHERE key=$4), '') FROM device_groups WHERE id = $2 AND NOT EXISTS (SELECT 1 FROM kvs WHERE key=$3) AND (
                 id != COALESCE((SELECT group_id FROM node_pool_system_anchor WHERE singleton = 1), -1)
                 OR EXISTS (SELECT 1 FROM node_credentials
                            WHERE home_group_id = id AND node_id = $1
@@ -61,8 +61,12 @@ impl NodePoolRepository for PgRepository {
         .bind(node_id)
         .bind(group_id)
         .bind(format!("legacy_v130_upgrade:retired:{group_id}:{node_id}"))
+        .bind(crate::service::node_pool::pending_display_name_key(group_id, node_id))
         .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM kvs WHERE key=$1 AND EXISTS (SELECT 1 FROM node_pool_nodes WHERE identity_group_id=$2 AND node_id=$3)")
+            .bind(crate::service::node_pool::pending_display_name_key(group_id, node_id))
+            .bind(group_id).bind(node_id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -189,9 +193,13 @@ impl PgRepository {
         let exists: Option<i32> = if fresh_reset {
             Some(1)
         } else {
-            sqlx::query_scalar("SELECT 1 FROM node_pool_nodes WHERE identity_group_id=$1 AND node_id=$2
-                AND identity_group_id=(SELECT group_id FROM node_pool_system_anchor WHERE singleton=1)")
-                .bind(group_id).bind(node_id.as_str()).fetch_optional(&mut *tx).await?
+            sqlx::query_scalar(
+                "SELECT 1 FROM node_pool_nodes WHERE identity_group_id=$1 AND node_id=$2",
+            )
+            .bind(group_id)
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
         };
         if exists.is_none() {
             return Ok(NodePoolRetirement::default());
@@ -302,6 +310,7 @@ impl PgRepository {
         for key in [
             format!("node_status:{group_id}:{}", node_id.as_str()),
             format!("node_config_revision:{group_id}:{}", node_id.as_str()),
+            crate::service::node_pool::pending_display_name_key(group_id, node_id.as_str()),
         ] {
             sqlx::query("DELETE FROM kvs WHERE key=$1")
                 .bind(key)
@@ -313,11 +322,9 @@ impl PgRepository {
             .bind(node_id.as_str())
             .execute(&mut *tx)
             .await?;
-        if fresh_reset {
-            sqlx::query("INSERT INTO kvs(key,value) VALUES ($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
-                .bind(format!("legacy_v130_upgrade:retired:{group_id}:{}", node_id.as_str()))
-                .bind("SSH_FRESH_RETIRED").execute(&mut *tx).await?;
-        }
+        sqlx::query("INSERT INTO kvs(key,value) VALUES ($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            .bind(format!("legacy_v130_upgrade:retired:{group_id}:{}", node_id.as_str()))
+            .bind(if fresh_reset { "SSH_FRESH_RETIRED" } else { "PANEL_NODE_RETIRED" }).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(NodePoolRetirement {
             retired: true,

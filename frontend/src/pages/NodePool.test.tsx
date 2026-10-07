@@ -45,3 +45,16 @@ describe('NodePool', () => {
     await waitFor(() => expect(mockDelete).toHaveBeenCalledWith('/admin/node-pool/nodes/10/NODE_A'));
   });
 });
+
+
+it('offers Panel-local Delete for historical nodes without a credential or runtime', async () => {
+  mockGet.mockResolvedValue(ok([{ identity_group_id: 4, node_id: 'LEGACY', pool_native: false, display_name: 'Old Node',
+    online: false, memberships: [], node_version: null, last_seen: null }]));
+  render(<NodePool />);
+  expect(await screen.findByText('Old Node')).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'poolDelete' }));
+  expect(await screen.findByText('poolDeleteImpact')).toBeInTheDocument();
+  expect(mockDelete).not.toHaveBeenCalled();
+  fireEvent.click(screen.getAllByRole('button', { name: 'poolDelete' }).at(-1)!);
+  await waitFor(() => expect(mockDelete).toHaveBeenCalledWith('/admin/node-pool/nodes/4/LEGACY'));
+});

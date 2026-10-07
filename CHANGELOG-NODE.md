@@ -1,5 +1,10 @@
 # Changelog — relay-node
 
+## [1.4.7] - 2026-10-07 (RC, unpublished)
+
+- Unified version with Panel 1.4.7; Node runtime, Config Protocol 10 and Lifecycle Protocol 1 are unchanged.
+
+
 ## [1.4.6] - 2026-10-04 (RC, unpublished)
 
 - Add a root-only Fresh reset helper independent of the existing exact-identity uninstall/legacy upgrade helpers. Validate product-owned paths before stopping runtime, clear all old claim/runtime/profile residue, and terminate owned installer sessions before failed-candidate cleanup.

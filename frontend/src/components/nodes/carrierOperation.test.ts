@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { carrierOperation } from './carrierOperation';
+import { carrierBackendTerminal, carrierOperation } from './carrierOperation';
 import type { CarrierAffinityView, CarrierPolicy } from '../../api/types';
 const desired: CarrierPolicy = { default_node_id: 'a', bindings: [{ line_id: 'Liantong', mode: 'node', node_id: 'a' }, { line_id: 'Liantong', mode: 'node', node_id: 'b' }] };
 const base: CarrierAffinityView = { group_id: 1, default_node_id: 'a', active_policy: desired, pending_policy: null, transaction: { state: 'idle', kind: null, started_at: null, last_error: null, rollback_error: null }, bindings: [], catalog_stale: false,
@@ -24,5 +24,25 @@ describe('authoritative Carrier operation', () => {
   });
   it('canonicalizes Multi-A membership independent of binding order', () => {
     expect(carrierOperation(base, { ...desired, bindings: [...desired.bindings].reverse() }, false, true)).toBe('ready');
+  });
+});
+
+
+describe('terminal Carrier snapshot', () => {
+  it('accepts idle propagated and not-eligible rows independently of historical intent', () => {
+    expect(carrierBackendTerminal(base)).toBe(true);
+    expect(carrierBackendTerminal({ ...base, dns_records: [{ ...base.dns_records![0], state: 'NOT_ELIGIBLE' }] })).toBe(true);
+  });
+  it.each(['switching', 'rolling_back', 'failed', 'failed_rolled_back', 'failed_manual_intervention'] as const)('rejects %s', (state) => {
+    expect(carrierBackendTerminal({ ...base, transaction: { ...base.transaction, state } })).toBe(false);
+  });
+  it.each(['PENDING', 'SYNCING', 'MUTATION_VERIFIED', 'FAILED', 'CONFLICT', 'MUTATION_OUTCOME_UNKNOWN'])('rejects %s DNS', (state) => {
+    expect(carrierBackendTerminal({ ...base, dns_records: [{ ...base.dns_records![0], state }] })).toBe(false);
+  });
+  it('rejects errors and pending policy even when transaction is idle', () => {
+    expect(carrierBackendTerminal({ ...base, pending_policy: desired })).toBe(false);
+    expect(carrierBackendTerminal({ ...base, transaction: { ...base.transaction, rollback_error: 'error' } })).toBe(false);
+    expect(carrierBackendTerminal({ ...base, dns_records: [{ ...base.dns_records![0], last_error: 'error' }] })).toBe(false);
+    expect(carrierBackendTerminal(null)).toBe(false);
   });
 });

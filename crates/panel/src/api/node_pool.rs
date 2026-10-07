@@ -286,11 +286,6 @@ pub async fn delete_node(
     if ReuseEligibleNodeId::parse(&node_id).is_err() {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    match state.db.node_pool_system_group_id().await {
-        Ok(Some(anchor)) if anchor == group_id => {}
-        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return unavailable(),
-    }
     match node_pool::retire_node(&state, group_id, &node_id).await {
         Ok(Some(needs_attention)) => {
             crate::api::node_ops::supersede_uninstall_after_admin_delete(
@@ -863,6 +858,62 @@ mod tests {
                 .is_none(),
             "repeated retirement must not touch the reinstalled Node"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_historical_identity_without_credential_retires_exact_scope() {
+        let (state, _) = fixture().await;
+        state
+            .db
+            .set(
+                "node_status:10:OTHER",
+                r#"{"last_seen":"2000-01-01T00:00:00Z"}"#,
+            )
+            .await
+            .unwrap();
+        let before = node_pool::list_nodes(state.db.as_ref()).await.unwrap();
+        assert!(before
+            .iter()
+            .any(|n| n.node_id == "LEGACY" && !n.pool_native && !n.credential_active));
+        let response = crate::api::routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/admin/node-pool/nodes/10/LEGACY")
+                    .header("Authorization", format!("Bearer {}", jwt(1, true)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let after = node_pool::list_nodes(state.db.as_ref()).await.unwrap();
+        assert!(!after.iter().any(|n| n.node_id == "LEGACY"));
+        assert!(after.iter().any(|n| n.node_id == "OTHER"));
+        assert!(
+            crate::service::legacy_upgrade::retired(state.db.as_ref(), 10, "LEGACY")
+                .await
+                .unwrap()
+        );
+        // The still-valid shared legacy Group token cannot restore this retired ID.
+        let response = crate::api::routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/node/config")
+                    .header("X-Config-Protocol-Version", "10")
+                    .header("X-Node-ID", "LEGACY")
+                    .header("Authorization", "Bearer test-group-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.status(),
+            StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+        ));
     }
 
     #[tokio::test]

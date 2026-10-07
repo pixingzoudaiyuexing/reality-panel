@@ -725,7 +725,7 @@ pub trait NodePoolRepository: Send + Sync {
         node_id: &str,
         name: &str,
     ) -> Result<u64, DbError>;
-    /// Retire one Pool-native identity atomically with its live credentials,
+    /// Retire one visible Pool identity atomically with its live credentials,
     /// pending enrollment authority, memberships, and current status.
     async fn retire_pool_native_node(
         &self,
@@ -1458,6 +1458,7 @@ pub struct ManualBootstrapEnrollment {
 
 #[derive(Debug, Clone)]
 pub struct NewManualBootstrapEnrollment {
+    pub display_name: String,
     pub id: String,
     pub secret_verifier: String,
     pub group_id: i64,

@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CarrierAffinityView, CarrierLineCatalog, RelayReadyNode, RoutingApplyResult } from '../../api/types';
 import type { Tfn } from './types';
 
@@ -292,7 +292,8 @@ describe('Carrier authoritative progress and refresh', () => {
     expect(await screen.findByTestId('carrier-operation')).toHaveTextContent('carrierOperationUnknown');
     mockGet.mockImplementation((url: string) => Promise.resolve(ok(url.endsWith('/carrier-lines') ? catalog : { ...view, active_policy: { default_node_id: 'node-b', bindings: [{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }] } })));
     fireEvent.click(screen.getByRole('button', { name: 'carrierOperationRefresh' }));
-    await waitFor(() => expect(screen.getByTestId('carrier-operation')).toHaveTextContent('carrierOperationReady'));
+    await waitFor(() => expect(JSON.parse(sessionStorage.getItem('reality-carrier-operation:7')!).desired).toBeNull());
+    expect(screen.queryByText('carrierOperationUnknown')).not.toBeInTheDocument();
     expect(mockApply).toHaveBeenCalledTimes(1);
   });
   it('does not use the old same-policy success to resolve an interrupted request', async () => {
@@ -307,8 +308,108 @@ describe('Carrier authoritative progress and refresh', () => {
     const policy = { default_node_id: 'node-a', bindings: [{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }] };
     sessionStorage.setItem('reality-carrier-operation:7', JSON.stringify({ desired: policy, unknown: true, baseline: JSON.stringify(policy), baselineMode: 'normal', observed: false }));
     arrange({}, nodes, 'carrier');
-    expect(await screen.findByTestId('carrier-operation')).toHaveTextContent('carrierOperationReady');
+    await waitFor(() => expect(JSON.parse(sessionStorage.getItem('reality-carrier-operation:7')!).desired).toBeNull());
+    expect(screen.queryByText('carrierOperationUnknown')).not.toBeInTheDocument();
     expect(mockApply).not.toHaveBeenCalled();
   });
 
+});
+
+
+describe('Carrier stale historical intent', () => {
+  beforeEach(() => { sessionStorage.clear(); vi.clearAllMocks(); mockApply.mockResolvedValue(applied()); });
+  const key = 'reality-carrier-operation:7';
+  const stale = { desired: { default_node_id: 'node-b', bindings: [] }, unknown: false, pending: false, observed: true, error: null };
+
+  it('clears the observed Production intent with different desired/active, including hard reload', async () => {
+    sessionStorage.setItem(key, JSON.stringify(stale));
+    const terminalDns = Array.from({ length: 24 }, (_, i) => ({ rule_id: i + 1, fqdn: `rp-test-${i}.example`, line_id: 'default', provider: 'huawei', state: 'PROPAGATED', last_error: null }));
+    const page = arrange({ dns_records: terminalDns }, nodes, 'carrier');
+    await waitFor(() => expect(JSON.parse(sessionStorage.getItem(key)!).desired).toBeNull());
+    expect(screen.queryByText('carrierOperationUnknown')).not.toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'node-a carrierLine' })).not.toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: '设为全网默认' }));
+    expect(screen.getByText('保存修改').closest('button')).toBeEnabled();
+    page.unmount();
+    arrange({}, nodes, 'carrier');
+    await screen.findByRole('combobox', { name: 'node-a carrierLine' });
+    expect(screen.queryByText('carrierOperationUnknown')).not.toBeInTheDocument();
+    expect(mockApply).not.toHaveBeenCalled();
+  });
+
+  it.each(['PENDING', 'SYNCING', 'FAILED', 'MUTATION_OUTCOME_UNKNOWN'])('does not clear %s DNS', async (state) => {
+    sessionStorage.setItem(key, JSON.stringify(stale));
+    arrange({ dns_records: [{ rule_id: 1, fqdn: 'test.example', line_id: 'default', provider: 'huawei', state, last_error: null }] }, nodes, 'carrier');
+    await screen.findByTestId('carrier-operation');
+    expect(JSON.parse(sessionStorage.getItem(key)!).desired).not.toBeNull();
+    expect(mockApply).not.toHaveBeenCalled();
+  });
+
+  it('does not clear historical intent on failed authoritative GET', async () => {
+    sessionStorage.setItem(key, JSON.stringify(stale));
+    mockGet.mockRejectedValue(new Error('read unavailable'));
+    render(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} activeMode="carrier" onApply={mockApply} />);
+    await screen.findByText('carrierLoadFailed');
+    expect(JSON.parse(sessionStorage.getItem(key)!).desired).not.toBeNull();
+  });
+
+  it.each(['switching' , 'rolling_back', 'failed_manual_intervention'] as const)('preserves protection for %s', async (state) => {
+    sessionStorage.setItem(key, JSON.stringify(stale));
+    arrange({ transaction: { ...view.transaction, state } }, nodes, 'carrier');
+    await screen.findByTestId('carrier-operation');
+    expect(JSON.parse(sessionStorage.getItem(key)!).desired).not.toBeNull();
+    expect(screen.getByRole('combobox', { name: 'node-a carrierLine' })).toBeDisabled();
+  });
+});
+
+
+describe('Carrier new mutation read ordering', () => {
+  beforeEach(() => { sessionStorage.clear(); vi.clearAllMocks(); mockApply.mockResolvedValue(applied()); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('keeps a lost response protected through server takeover then clears terminal differing intent', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    mockApply.mockRejectedValueOnce(new Error('lost response'));
+    let current = view;
+    mockGet.mockImplementation((url: string) => Promise.resolve(ok(url.endsWith('/carrier-lines') ? catalog : current)));
+    render(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} activeMode="carrier" onApply={mockApply} />);
+    await screen.findByText('✓ 全网默认');
+    fireEvent.click(screen.getByRole('button', { name: '设为全网默认' }));
+    fireEvent.click(screen.getByText('保存修改'));
+    expect(await screen.findByText('carrierOperationUnknown')).toBeInTheDocument();
+    expect(JSON.parse(sessionStorage.getItem('reality-carrier-operation:7')!).observed).toBe(false);
+    expect(screen.getByRole('combobox', { name: 'node-a carrierLine' })).toBeDisabled();
+    current = { ...view, pending_policy: { default_node_id: 'node-b', bindings: [] }, transaction: { ...view.transaction, state: 'switching' } };
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(screen.getByText('carrierOperationSyncing')).toBeInTheDocument();
+    expect(JSON.parse(sessionStorage.getItem('reality-carrier-operation:7')!).observed).toBe(true);
+    current = view;
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    await waitFor(() => expect(JSON.parse(sessionStorage.getItem('reality-carrier-operation:7')!).desired).toBeNull());
+    expect(screen.getByRole('combobox', { name: 'node-a carrierLine' })).not.toBeDisabled();
+    const reads = mockGet.mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(mockGet).toHaveBeenCalledTimes(reads);
+    expect(mockApply).toHaveBeenCalledTimes(1);
+  });
+
+  it('discards a GET from before a POST and cannot mark takeover from that old response', async () => {
+    let release: (value: ReturnType<typeof ok<CarrierAffinityView>>) => void = () => {};
+    let slow = false;
+    mockGet.mockImplementation((url: string) => url.endsWith('/carrier-lines') ? Promise.resolve(ok(catalog))
+      : slow ? new Promise((resolve) => { release = resolve; }) : Promise.resolve(ok(view)));
+    const page = render(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} activeMode="carrier" onApply={mockApply} />);
+    await screen.findByText('✓ 全网默认');
+    slow = true;
+    page.rerender(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} activeMode="carrier" onApply={mockApply} onViewChange={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: '设为全网默认' }));
+    mockApply.mockRejectedValueOnce(new Error('lost response'));
+    fireEvent.click(screen.getByText('保存修改'));
+    await waitFor(() => expect(mockApply).toHaveBeenCalledTimes(1));
+    slow = false;
+    await act(async () => { release(ok({ ...view, pending_policy: view.active_policy, transaction: { ...view.transaction, state: 'switching' } })); });
+    await waitFor(() => expect(screen.getByText('carrierOperationUnknown')).toBeInTheDocument());
+    expect(JSON.parse(sessionStorage.getItem('reality-carrier-operation:7')!).observed).toBe(false);
+    expect(screen.getByRole('combobox', { name: 'node-a carrierLine' })).toBeDisabled();
+  });
 });
