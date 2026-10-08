@@ -1274,7 +1274,7 @@ html, body, #root {
 
 /* Node Management V2: shared cards, live all-node overview and scoped rules. */
 .rp-node-management-body { margin-top: 20px; }
-.rp-node-group-cards { display: grid; gap: 16px; }
+.rp-node-group-cards { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .rp-node-group-card .ant-card-head { min-height: 54px; }
 .rp-node-group-meta { display: flex; flex-wrap: wrap; gap: 20px; margin-bottom: 12px; }
 .rp-node-group-meta > div { display: flex; gap: 8px; align-items: center; }
@@ -1288,7 +1288,7 @@ html, body, #root {
  .rp-node-group-meta { gap: 10px 16px; }
  .rp-rule-group-switch .ant-select { width: 100%; }
 }
-.rp-node-group-card .ant-card-head-title { min-width: 0; }
+.rp-node-group-card .ant-card-head-title { min-width: 0; max-width: 100%; }
 .rp-node-group-card .ant-card-head-title .ant-btn { max-width: 100%; height: auto; min-height: 32px; }
 .rp-node-group-card .ant-card-head-title .ant-typography { overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 767px) {
