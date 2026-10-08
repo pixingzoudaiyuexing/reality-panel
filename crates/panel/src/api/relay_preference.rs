@@ -17,6 +17,8 @@ pub struct SetRelayPreferenceRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct SetCarrierAffinityRequest {
+    #[serde(default)]
+    pub default_node_ids: Option<Vec<String>>,
     pub default_node_id: Option<String>,
     #[serde(default)]
     pub bindings: Vec<crate::service::relay_preference::CarrierLineBinding>,
@@ -331,6 +333,21 @@ pub async fn apply_routing(
     admin: AdminOnly,
     State(state): State<AppState>,
     Path(group_id): Path<i64>,
+    Json(request): Json<RoutingApplyEnvelope>,
+) -> Response {
+    crate::service::dnsmgr::with_provider_observations(apply_routing_inner(
+        admin,
+        State(state),
+        Path(group_id),
+        Json(request),
+    ))
+    .await
+}
+
+async fn apply_routing_inner(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
     Json(envelope): Json<RoutingApplyEnvelope>,
 ) -> Response {
     if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
@@ -338,6 +355,7 @@ pub async fn apply_routing(
     }
     let request = envelope.request;
     let warnings = if let crate::service::relay_preference::RoutingApplyRequest::Carrier {
+        default_node_ids,
         default_node_id,
         bindings,
     } = &request
@@ -346,6 +364,7 @@ pub async fn apply_routing(
             &state,
             group_id,
             &crate::service::relay_preference::CarrierPolicy {
+                default_node_ids: default_node_ids.clone(),
                 default_node_id: default_node_id.clone(),
                 bindings: bindings.clone(),
             },
@@ -580,11 +599,27 @@ pub async fn set_carrier_affinity(
     Path(group_id): Path<i64>,
     Json(request): Json<SetCarrierAffinityRequest>,
 ) -> Response {
+    crate::service::dnsmgr::with_provider_observations(set_carrier_affinity_inner(
+        admin,
+        State(state),
+        Path(group_id),
+        Json(request),
+    ))
+    .await
+}
+
+async fn set_carrier_affinity_inner(
+    admin: AdminOnly,
+    State(state): State<AppState>,
+    Path(group_id): Path<i64>,
+    Json(request): Json<SetCarrierAffinityRequest>,
+) -> Response {
     if let Err(response) = crate::api::node_pool::require_business_group(&state, group_id).await {
         return response;
     }
     use crate::service::relay_preference::CarrierPolicyApplyError;
     let policy = crate::service::relay_preference::CarrierPolicy {
+        default_node_ids: request.default_node_ids,
         default_node_id: request.default_node_id,
         bindings: request.bindings,
     };

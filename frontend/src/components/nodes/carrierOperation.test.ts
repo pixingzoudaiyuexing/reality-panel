@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { carrierBackendTerminal, carrierOperation } from './carrierOperation';
+import { carrierBackendTerminal, carrierOperation, carrierPolicyKey } from './carrierOperation';
 import type { CarrierAffinityView, CarrierPolicy } from '../../api/types';
 const desired: CarrierPolicy = { default_node_id: 'a', bindings: [{ line_id: 'Liantong', mode: 'node', node_id: 'a' }, { line_id: 'Liantong', mode: 'node', node_id: 'b' }] };
 const base: CarrierAffinityView = { group_id: 1, default_node_id: 'a', active_policy: desired, pending_policy: null, transaction: { state: 'idle', kind: null, started_at: null, last_error: null, rollback_error: null }, bindings: [], catalog_stale: false,
@@ -44,5 +44,13 @@ describe('terminal Carrier snapshot', () => {
     expect(carrierBackendTerminal({ ...base, transaction: { ...base.transaction, rollback_error: 'error' } })).toBe(false);
     expect(carrierBackendTerminal({ ...base, dns_records: [{ ...base.dns_records![0], last_error: 'error' }] })).toBe(false);
     expect(carrierBackendTerminal(null)).toBe(false);
+  });
+});
+
+describe('Carrier default set identity', () => {
+  it('compares full sets even when their anchor is unchanged', () => {
+    expect(carrierPolicyKey({ default_node_id: 'a', default_node_ids: ['a'], bindings: [] })).not.toBe(carrierPolicyKey({ default_node_id: 'a', default_node_ids: ['a', 'b'], bindings: [] }));
+    expect(carrierPolicyKey({ default_node_id: 'a', bindings: [] })).toBe(carrierPolicyKey({ default_node_ids: ['a'], bindings: [] }));
+    expect(carrierPolicyKey({ default_node_id: 'a', default_node_ids: [], bindings: [] })).not.toBe(carrierPolicyKey({ default_node_id: 'a', bindings: [] }));
   });
 });

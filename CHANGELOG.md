@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.8] - 2026-10-08 (RC, unpublished)
+
+- Carrier default checkboxes select multiple Node identities; one default A RRset and Follow Default lines contain their distinct IPv4 values. Legacy single-default policy remains readable; explicit empty selection remains empty. Other routing modes retain their single-default contracts.
+- DNS apply/worker scopes share complete zone observations, check fresh ownership for mutation candidates and verify every mutation by fresh provider readback. Existing durable jobs process up to four independent RRsets, serialize each RRset, and drain bounded batches after Carrier enqueue.
+- No schema/protocol/Node forwarding change. RC TEST validation and independent review are required before publication.
+
 ## [1.4.7] - 2026-10-07 (RC, unpublished)
 
 - Carrier clears historical browser intent only after a fresh authoritative terminal snapshot; lost responses and concurrent GET/POST ordering retain in-flight protection.

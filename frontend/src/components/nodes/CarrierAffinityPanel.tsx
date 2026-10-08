@@ -1,4 +1,4 @@
-import { Alert, Button, Empty, Select, Space, Spin, Tag, Typography } from 'antd';
+import { Alert, Button, Checkbox, Empty, Select, Space, Spin, Tag, Typography } from 'antd';
 import { LoadingOutlined, SaveOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import api from '../../api/client';
@@ -12,7 +12,7 @@ import {
   mutableCarrierBindings,
 } from './carrierCatalog';
 
-import { carrierBackendTerminal, carrierOperation, carrierPolicyKey } from './carrierOperation';
+import { carrierDefaultNodeIds, carrierBackendTerminal, carrierOperation, carrierPolicyKey } from './carrierOperation';
 import type { CarrierPolicy } from '../../api/types';
 
 const { Text } = Typography;
@@ -31,11 +31,6 @@ interface Props {
   onDirtyChange?: (dirty: boolean) => void;
 }
 
-function normalize(defaultNodeId: string | null | undefined, bindings: CarrierLineBinding[]): string {
-  return JSON.stringify({ default_node_id: defaultNodeId ?? null, bindings: [...bindings]
-    .map((binding) => ({ line_id: binding.line_id, mode: binding.mode, node_id: binding.node_id ?? null }))
-    .sort((left, right) => `${left.line_id}:${left.node_id ?? ''}`.localeCompare(`${right.line_id}:${right.node_id ?? ''}`)) });
-}
 
 function transactionLabel(view: CarrierAffinityView, t: Tfn) {
   switch (view.transaction.state) {
@@ -48,10 +43,10 @@ function transactionLabel(view: CarrierAffinityView, t: Tfn) {
   }
 }
 
-function nodeLines(bindings: CarrierLineBinding[], nodeId: string, defaultNodeId?: string | null): string[] {
+function nodeLines(bindings: CarrierLineBinding[], nodeId: string, defaultNodeIds: string[]): string[] {
   return bindings
     .filter((binding) => isCarrierMutableLineId(binding.line_id))
-    .filter((binding) => binding.mode === 'node' ? binding.node_id === nodeId : defaultNodeId === nodeId)
+    .filter((binding) => binding.mode === 'node' ? binding.node_id === nodeId : defaultNodeIds.includes(nodeId))
     .map((binding) => binding.line_id)
     .sort((left, right) => left.localeCompare(right));
 }
@@ -94,6 +89,7 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const [catalog, setCatalog] = useState<CarrierLineCatalog | null>(null);
   const [draft, setDraft] = useState<CarrierLineBinding[]>([]);
   const [draftDefaultNodeId, setDraftDefaultNodeId] = useState<string | null>(null);
+  const [draftDefaultNodeIds, setDraftDefaultNodeIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -104,7 +100,16 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const [viewGeneration, setViewGeneration] = useState(-1);
   const operationKey = `reality-carrier-operation:${groupId}`;
   const [intent, setIntent] = useState<{ desired: CarrierPolicy | null; unknown: boolean; error: string | null; baseline?: string; observed?: boolean; pending?: boolean; baselineMode?: RoutingMode }>(() => {
-    try { const stored = JSON.parse(sessionStorage.getItem(operationKey) ?? 'null'); return stored ? { ...stored, unknown: stored.unknown || stored.pending === true, pending: false } : { desired: null, unknown: false, error: null }; }
+    try {
+      const stored = JSON.parse(sessionStorage.getItem(operationKey) ?? 'null');
+      if (!stored) return { desired: null, unknown: false, error: null };
+      let baseline = stored.baseline;
+      // Pending operations saved by v1.4.7 retain their lost-response guard.
+      if (typeof baseline === 'string') {
+        try { const policy = JSON.parse(baseline); if (Array.isArray(policy.bindings)) baseline = carrierPolicyKey(policy); } catch { /* Keep unknown evidence protected. */ }
+      }
+      return { ...stored, baseline, unknown: stored.unknown || stored.pending === true, pending: false };
+    }
     catch { return { desired: null, unknown: false, error: null }; }
   });
   useEffect(() => { sessionStorage.setItem(operationKey, JSON.stringify(intent)); }, [intent, operationKey]);
@@ -139,7 +144,10 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
       setView(affinity.data);
       setViewGeneration(generation);
       setDraft(mutableCarrierBindings(affinity.data.pending_policy?.bindings ?? affinity.data.active_policy.bindings));
-      setDraftDefaultNodeId(affinity.data.pending_policy?.default_node_id ?? affinity.data.active_policy.default_node_id ?? affinity.data.default_node_id);
+      const policy = affinity.data.pending_policy ?? affinity.data.active_policy;
+      const ids = carrierDefaultNodeIds(policy, affinity.data.default_node_id);
+      setDraftDefaultNodeIds(ids);
+      setDraftDefaultNodeId(policy.default_node_id && ids.includes(policy.default_node_id) ? policy.default_node_id : ids[0] ?? null);
       onViewChange?.(affinity.data);
       if (lines?.code === 0 && lines.data) {
         setCatalog(lines.data);
@@ -184,8 +192,8 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   }, [activeMode, intent, loadError, saving, view, viewGeneration]);
 
   const savedPolicy = view?.pending_policy ?? view?.active_policy;
-  const dirty = normalize(draftDefaultNodeId, draft)
-    !== normalize(savedPolicy?.default_node_id ?? view?.default_node_id, savedPolicy?.bindings ?? []);
+  const dirty = carrierPolicyKey({ default_node_ids: draftDefaultNodeIds, bindings: draft })
+    !== carrierPolicyKey({ default_node_ids: carrierDefaultNodeIds(savedPolicy, view?.default_node_id), bindings: savedPolicy?.bindings ?? [] });
   const transactionBusy = view?.transaction.state === 'switching' || view?.transaction.state === 'rolling_back';
   const mutationLocked = polling || transactionBusy || backendPhase === 'rollback_failed' || backendPhase === 'failed';
   const catalogUnavailable = !catalog || catalog.stale;
@@ -207,20 +215,20 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
   const lineSelections = useMemo(() => {
     const selections = new Map<string, string[]>();
     for (const binding of draft) {
-      const nodeId = binding.mode === 'node' ? binding.node_id : draftDefaultNodeId;
-      if (nodeId && isCarrierMutableLineId(binding.line_id)) {
-        selections.set(binding.line_id, [...(selections.get(binding.line_id) ?? []), nodeId]);
+      const ids = binding.mode === 'node' ? (binding.node_id ? [binding.node_id] : []) : draftDefaultNodeIds;
+      if (isCarrierMutableLineId(binding.line_id)) {
+        selections.set(binding.line_id, [...new Set([...(selections.get(binding.line_id) ?? []), ...ids])]);
       }
     }
     return [...selections.entries()];
-  }, [draft, draftDefaultNodeId]);
+  }, [draft, draftDefaultNodeIds]);
 
   useEffect(() => {
     onDirtyChange?.(dirty);
   }, [dirty, onDirtyChange]);
 
   const assignLines = (nodeId: string, selected: string[]) => {
-    setDraft((current) => assignCarrierLines(current, nodeId, selected, draftDefaultNodeId));
+    setDraft((current) => assignCarrierLines(current, nodeId, selected, draftDefaultNodeIds));
   };
 
   const save = async () => {
@@ -228,13 +236,14 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
     requestInFlight.current = true;
     mutationGeneration.current += 1;
     setMutationVersion(mutationGeneration.current);
-    const submitted = { desired: { default_node_id: draftDefaultNodeId, bindings: mutableCarrierBindings(draft) }, unknown: false, error: null, baseline: view ? carrierPolicyKey(view.active_policy) : undefined, observed: false, pending: true, baselineMode: activeMode };
+    const submitted = { desired: { default_node_ids: draftDefaultNodeIds, default_node_id: draftDefaultNodeId, bindings: mutableCarrierBindings(draft) }, unknown: false, error: null, baseline: view ? carrierPolicyKey(view.active_policy) : undefined, observed: false, pending: true, baselineMode: activeMode };
     sessionStorage.setItem(operationKey, JSON.stringify(submitted));
     setIntent(submitted);
     setSaving(true);
     try {
       const result = await onApply({
         mode: 'carrier',
+        default_node_ids: draftDefaultNodeIds,
         default_node_id: draftDefaultNodeId,
         bindings: mutableCarrierBindings(draft),
       });
@@ -300,15 +309,20 @@ export function CarrierAffinityPanel({ groupId, nodes, t, onViewChange, onCatalo
               <Text code>{node.public_ipv4 ?? '-'}</Text>
               <Space orientation="vertical" size={4}>
                 <Space size={4}><Tag color={node.online ? 'green' : undefined}>{node.online ? t('online') : t('offline')}</Tag><Tag color={node.ready ? 'green' : 'orange'}>{node.ready ? t('relayReady') : t('relayNotReady')}</Tag></Space>
-                {draftDefaultNodeId === node.node_id ? (
-                  <Tag color="blue" data-testid="carrier-default-node-indicator">{t('carrierDefaultSelected')}</Tag>
-                ) : (
-                  <Button size="small" disabled={mutationLocked || disabled} onClick={() => setDraftDefaultNodeId(node.node_id)}>{t('carrierSetDefault')}</Button>
-                )}
+                <Checkbox
+                  aria-label={`${node.node_id} ${t('carrierAllNetworkDefault')}`}
+                  data-testid={draftDefaultNodeIds.includes(node.node_id) ? 'carrier-default-node-indicator' : undefined}
+                  checked={draftDefaultNodeIds.includes(node.node_id)} disabled={mutationLocked || disabled}
+                  onChange={(event) => {
+                    const ids = event.target.checked ? [...new Set([...draftDefaultNodeIds, node.node_id])].sort() : draftDefaultNodeIds.filter((id) => id !== node.node_id);
+                    setDraftDefaultNodeIds(ids);
+                    setDraftDefaultNodeId(draftDefaultNodeId && ids.includes(draftDefaultNodeId) ? draftDefaultNodeId : ids[0] ?? null);
+                  }}
+                />
                 {effectiveDefaultNodeId === node.node_id && activeMode !== 'carrier' ? <Text type="secondary">{t('routingEffectiveDefault')}</Text> : null}
               </Space>
               <Space orientation="vertical" size={4} style={{ width: '100%' }}>
-                <Select mode="multiple" showSearch aria-label={`${node.node_id} ${t('carrierLine')}`} value={nodeLines(draft, node.node_id, draftDefaultNodeId)} disabled={mutationLocked || catalogUnavailable || disabled} placeholder={t('carrierNotConfigured')} options={lineOptions} filterOption={(query, option) => carrierLineMatchesSearch(query, { value: String(option?.value ?? ''), label: String(option?.label ?? '') })} onChange={(values) => assignLines(node.node_id, values)} style={{ width: '100%' }} />
+                <Select mode="multiple" showSearch aria-label={`${node.node_id} ${t('carrierLine')}`} value={nodeLines(draft, node.node_id, draftDefaultNodeIds)} disabled={mutationLocked || catalogUnavailable || disabled} placeholder={t('carrierNotConfigured')} options={lineOptions} filterOption={(query, option) => carrierLineMatchesSearch(query, { value: String(option?.value ?? ''), label: String(option?.label ?? '') })} onChange={(values) => assignLines(node.node_id, values)} style={{ width: '100%' }} />
               </Space>
             </div>
           ))}

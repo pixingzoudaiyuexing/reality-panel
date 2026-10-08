@@ -92,6 +92,9 @@ pub struct CarrierLineBinding {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CarrierPolicy {
+    /// None is a legacy single-default policy; Some([]) is explicitly empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_node_ids: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_node_id: Option<String>,
     #[serde(default)]
@@ -136,6 +139,7 @@ fn carrier_line_uses_default_authority(line_id: &str) -> bool {
 
 fn carrier_policy_without_default_authority(policy: &CarrierPolicy) -> CarrierPolicy {
     CarrierPolicy {
+        default_node_ids: policy.default_node_ids.clone(),
         default_node_id: policy.default_node_id.clone(),
         bindings: policy
             .bindings
@@ -161,12 +165,68 @@ fn carrier_policy_has_follow_default_bindings(policy: &CarrierPolicy) -> bool {
 }
 
 impl CarrierPolicy {
+    /// Carrier DNS uses the entire canonical set; the anchor is compatibility only.
+    pub fn selected_default_nodes(&self) -> Vec<String> {
+        self.default_node_ids
+            .clone()
+            .unwrap_or_else(|| self.default_node_id.iter().cloned().collect())
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn inherit_legacy_default(&mut self, existing: &RelayPreferenceState) {
+        if self.default_node_ids.is_none() && self.default_node_id.is_none() {
+            self.default_node_ids = existing.carrier_policy.default_node_ids.clone();
+            self.default_node_id = existing
+                .carrier_policy
+                .default_node_id
+                .clone()
+                .or_else(|| existing.preferred_node_id.clone());
+        }
+    }
+
+    fn remove_default_node(&mut self, node_id: &str) {
+        let mut ids = self.selected_default_nodes();
+        if !ids.iter().any(|id| id == node_id) {
+            return;
+        }
+        ids.retain(|id| id != node_id);
+        if self
+            .default_node_id
+            .as_ref()
+            .is_none_or(|id| !ids.contains(id))
+        {
+            self.default_node_id = ids.first().cloned();
+        }
+        // Retirement makes even a legacy policy explicit, especially the last
+        // selection: absence must not re-enable legacy fallback/auto-selection.
+        self.default_node_ids = Some(ids);
+    }
     #[allow(dead_code)] // RC9-S4 persisted model; consumed by the Carrier Policy API in S5.
     pub fn normalize(mut self) -> Result<Self, CarrierPolicyValidationError> {
         if let Some(node_id) = self.default_node_id.as_mut() {
             *node_id = node_id.trim().to_string();
             if node_id.is_empty() || node_id.chars().any(char::is_control) {
                 return Err(CarrierPolicyValidationError::InvalidDefaultNodeId);
+            }
+        }
+        if let Some(ids) = self.default_node_ids.as_mut() {
+            for id in ids.iter_mut() {
+                *id = id.trim().to_owned();
+                if id.is_empty() || id.chars().any(char::is_control) {
+                    return Err(CarrierPolicyValidationError::InvalidDefaultNodeId);
+                }
+            }
+            ids.sort();
+            ids.dedup();
+            if self
+                .default_node_id
+                .as_ref()
+                .is_none_or(|id| !ids.contains(id))
+            {
+                self.default_node_id = ids.first().cloned();
             }
         }
         let mut seen = BTreeSet::new();
@@ -439,6 +499,8 @@ pub enum RoutingApplyRequest {
         default_node_id: String,
     },
     Carrier {
+        #[serde(default)]
+        default_node_ids: Option<Vec<String>>,
         default_node_id: Option<String>,
         #[serde(default)]
         bindings: Vec<CarrierLineBinding>,
@@ -1125,7 +1187,10 @@ async fn normalize_routing_state(
     if preference.active_routing_mode.is_none() {
         let mode = infer_legacy_routing_mode(db, group_id, preference).await?;
         preference.active_routing_mode = Some(mode);
-        if mode == RoutingMode::Carrier && preference.carrier_policy.default_node_id.is_none() {
+        if mode == RoutingMode::Carrier
+            && preference.carrier_policy.default_node_ids.is_none()
+            && preference.carrier_policy.default_node_id.is_none()
+        {
             preference.carrier_policy.default_node_id = preference.preferred_node_id.clone();
         }
         changed = true;
@@ -1203,7 +1268,10 @@ pub async fn get_routing_mode(
     } else {
         None
     };
-    let carrier = preference.carrier_policy.default_node_id.is_some();
+    let carrier = !preference
+        .carrier_policy
+        .selected_default_nodes()
+        .is_empty();
     let schedule = legacy_enabled_schedule(db, group_id).await.unwrap_or(false);
     Ok(RoutingModeView {
         group_id,
@@ -1388,15 +1456,29 @@ pub async fn resolve_dns_target_for_rule(
         Ok(preference) => preference,
         Err(_) => return Ok(RelayDnsTarget::Invalid("RELAY_PREFERENCE_INVALID")),
     };
+    if preference.active_routing_mode == Some(RoutingMode::Carrier)
+        && matches!(
+            preference.state,
+            RelayPreferencePhase::Switching | RelayPreferencePhase::RollingBack
+        )
+        && !preference.dns_records.iter().any(|record| {
+            record.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY
+                && rule_id.is_none_or(|id| record.rule_id == id)
+        })
+    {
+        // An unchanged default is omitted from the journal after preflight.
+        // It remains the full active set throughout target/rollback processing.
+        return resolve_carrier_default(db, group_id, &preference.carrier_policy).await;
+    }
     let selected_node_id = match preference.state {
         RelayPreferencePhase::Switching => {
-            if let Some(value) = rule_id
-                .and_then(|rule_id| {
-                    preference.dns_records.iter().find(|record| {
-                        record.rule_id == rule_id
-                            && record.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY
-                            && record.target_action == RelayDnsAction::Upsert
-                    })
+            if let Some(value) = preference
+                .dns_records
+                .iter()
+                .find(|record| {
+                    rule_id.is_none_or(|id| record.rule_id == id)
+                        && record.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY
+                        && record.target_action == RelayDnsAction::Upsert
                 })
                 .and_then(|record| record.target_value.as_deref())
             {
@@ -1414,19 +1496,19 @@ pub async fn resolve_dns_target_for_rule(
                 preference.transaction_kind,
                 Some(RelayTransactionKind::CarrierPolicyApply)
             ) {
-                preference.preferred_node_id.as_deref()
+                return resolve_carrier_default(db, group_id, &preference.carrier_policy).await;
             } else {
                 preference.pending_node_id.as_deref()
             }
         }
         RelayPreferencePhase::RollingBack => {
-            let rollback_value = rule_id
-                .and_then(|rule_id| {
-                    preference.dns_records.iter().find(|record| {
-                        record.rule_id == rule_id
-                            && record.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY
-                            && record.rollback_action == RelayDnsAction::Upsert
-                    })
+            let rollback_value = preference
+                .dns_records
+                .iter()
+                .find(|record| {
+                    rule_id.is_none_or(|id| record.rule_id == id)
+                        && record.line_key == crate::service::dnsmgr::DEFAULT_LINE_KEY
+                        && record.rollback_action == RelayDnsAction::Upsert
                 })
                 .and_then(|record| record.rollback_value.as_deref());
             if rollback_value.is_some() {
@@ -1445,7 +1527,23 @@ pub async fn resolve_dns_target_for_rule(
         RelayPreferencePhase::Failed
         | RelayPreferencePhase::FailedRolledBack
         | RelayPreferencePhase::FailedManualIntervention => return Ok(RelayDnsTarget::Frozen),
-        RelayPreferencePhase::Idle => preference.preferred_node_id.as_deref(),
+        RelayPreferencePhase::Idle => {
+            if resolved_routing_mode(db, group_id, &preference)
+                .await
+                .map_err(|error| DbError::Other(sqlx::Error::Protocol(error.to_string())))?
+                == RoutingMode::Carrier
+            {
+                let mut policy = preference.carrier_policy.clone();
+                policy.inherit_legacy_default(&preference);
+                if policy.default_node_ids.is_some() || !policy.selected_default_nodes().is_empty()
+                {
+                    return resolve_carrier_default(db, group_id, &policy).await;
+                }
+                // Legacy unconfigured Carrier used group.connect_host through NotSet.
+                return Ok(RelayDnsTarget::NotSet);
+            }
+            preference.preferred_node_id.as_deref()
+        }
     };
     match selected_node_id {
         Some(node_id) => stored_node_public_ipv4(db, group_id, node_id).await,
@@ -1460,6 +1558,8 @@ fn initialize_preference_if_unique_ready(
     if preference.state == RelayPreferencePhase::Idle
         && preference.preferred_node_id.is_none()
         && preference.pending_node_id.is_none()
+        && !(preference.active_routing_mode == Some(RoutingMode::Carrier)
+            && preference.carrier_policy.default_node_ids.is_some())
         && ready_node_ids.len() == 1
     {
         preference.preferred_node_id = ready_node_ids.first().cloned();
@@ -1581,7 +1681,11 @@ fn active_transaction_references_node(preference: &RelayPreferenceState, node_id
     ) && (preference.preferred_node_id.as_deref() == Some(node_id)
         || preference.pending_node_id.as_deref() == Some(node_id)
         || preference.normal_default_node_id.as_deref() == Some(node_id)
-        || preference.carrier_policy.default_node_id.as_deref() == Some(node_id)
+        || preference
+            .carrier_policy
+            .selected_default_nodes()
+            .iter()
+            .any(|id| id == node_id)
         || preference
             .carrier_policy
             .bindings
@@ -1591,7 +1695,10 @@ fn active_transaction_references_node(preference: &RelayPreferenceState, node_id
             .pending_carrier_policy
             .as_ref()
             .is_some_and(|policy| {
-                policy.default_node_id.as_deref() == Some(node_id)
+                policy
+                    .selected_default_nodes()
+                    .iter()
+                    .any(|id| id == node_id)
                     || policy
                         .bindings
                         .iter()
@@ -1600,38 +1707,34 @@ fn active_transaction_references_node(preference: &RelayPreferenceState, node_id
 }
 
 fn remove_node_references(preference: &mut RelayPreferenceState, node_id: &str) {
-    let default_removed = preference
+    let old_preferred_removed = preference.preferred_node_id.as_deref() == Some(node_id);
+    preference.carrier_policy.remove_default_node(node_id);
+    let default_empty = preference
         .carrier_policy
-        .default_node_id
-        .as_deref()
-        .or(preference.preferred_node_id.as_deref())
-        == Some(node_id);
+        .selected_default_nodes()
+        .is_empty();
     preference.carrier_policy.bindings.retain(|binding| {
         binding.node_id.as_deref() != Some(node_id)
-            && !(default_removed && binding.mode == CarrierLineMode::FollowDefault)
+            && !(default_empty && binding.mode == CarrierLineMode::FollowDefault)
     });
     if let Some(pending) = preference.pending_carrier_policy.as_mut() {
-        let pending_default_removed = pending
-            .default_node_id
-            .as_deref()
-            .or(preference.preferred_node_id.as_deref())
-            == Some(node_id);
-        if pending.default_node_id.as_deref() == Some(node_id) {
-            pending.default_node_id = None;
-        }
+        pending.remove_default_node(node_id);
+        let empty = pending.selected_default_nodes().is_empty();
         pending.bindings.retain(|binding| {
             binding.node_id.as_deref() != Some(node_id)
-                && !(pending_default_removed && binding.mode == CarrierLineMode::FollowDefault)
+                && !(empty && binding.mode == CarrierLineMode::FollowDefault)
         });
     }
     if preference.normal_default_node_id.as_deref() == Some(node_id) {
         preference.normal_default_node_id = None;
     }
-    if preference.carrier_policy.default_node_id.as_deref() == Some(node_id) {
-        preference.carrier_policy.default_node_id = None;
-    }
-    if preference.preferred_node_id.as_deref() == Some(node_id) {
-        preference.preferred_node_id = None;
+    if old_preferred_removed {
+        preference.preferred_node_id =
+            if preference.active_routing_mode == Some(RoutingMode::Carrier) {
+                preference.carrier_policy.default_node_id.clone()
+            } else {
+                None
+            };
     }
     if preference.pending_node_id.as_deref() == Some(node_id) {
         preference.pending_node_id = None;
@@ -1811,7 +1914,7 @@ fn carrier_policy_transaction_diff(
     requested: &CarrierPolicy,
 ) -> Vec<CarrierPolicyChange> {
     let mut changes = carrier_policy_diff(active, requested);
-    if active.default_node_id != requested.default_node_id {
+    if active.selected_default_nodes() != requested.selected_default_nodes() {
         let active_by_line = carrier_bindings_by_line(active);
         for binding in requested
             .bindings
@@ -1832,24 +1935,6 @@ fn carrier_policy_transaction_diff(
         changes.sort_by(|left, right| left.line_id.cmp(&right.line_id));
     }
     changes
-}
-
-async fn default_relay_value(
-    db: &dyn Repository,
-    group_id: i64,
-    connect_host: &str,
-    preferred_node_id: Option<&str>,
-) -> Result<String, CarrierPolicyApplyError> {
-    if let Some(node_id) = preferred_node_id {
-        return match stored_node_public_ipv4(db, group_id, node_id).await? {
-            RelayDnsTarget::Resolved(value) => Ok(value),
-            RelayDnsTarget::NotSet | RelayDnsTarget::Frozen | RelayDnsTarget::Invalid(_) => Err(
-                CarrierPolicyApplyError::TargetPublicIpv4Invalid(node_id.into()),
-            ),
-        };
-    }
-    valid_public_ipv4(Some(connect_host))
-        .ok_or_else(|| CarrierPolicyApplyError::TargetPublicIpv4Invalid("default".into()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1902,30 +1987,18 @@ pub(crate) async fn carrier_line_desired_for_rule(
             });
         let value = match binding.mode {
             CarrierLineMode::FollowDefault => {
-                let node_id = preference
-                    .carrier_policy
-                    .default_node_id
-                    .as_deref()
-                    .or_else(|| {
-                        preference
-                            .active_routing_mode
-                            .is_none()
-                            .then_some(preference.preferred_node_id.as_deref())
-                            .flatten()
-                    });
-                match node_id {
-                    Some(node_id) => {
-                        match stored_node_public_ipv4(db, rule.device_group_in, node_id).await? {
-                            RelayDnsTarget::Resolved(value) => Some(value),
-                            RelayDnsTarget::NotSet
-                            | RelayDnsTarget::Frozen
-                            | RelayDnsTarget::Invalid(_) => None,
-                        }
-                    }
-                    None if preference.active_routing_mode.is_none() => {
+                let mut policy = preference.carrier_policy.clone();
+                if preference.active_routing_mode.is_none() {
+                    policy.inherit_legacy_default(&preference);
+                }
+                match resolve_carrier_default(db, rule.device_group_in, &policy).await? {
+                    RelayDnsTarget::Resolved(value) => Some(value),
+                    _ if policy.selected_default_nodes().is_empty()
+                        && preference.active_routing_mode.is_none() =>
+                    {
                         valid_public_ipv4(Some(&group.connect_host))
                     }
-                    None => None,
+                    _ => None,
                 }
             }
             CarrierLineMode::Node => match binding.node_id.as_deref() {
@@ -1957,7 +2030,14 @@ pub(crate) async fn carrier_line_desired_for_rule(
                 .into_iter()
                 .map(|ip| ip.to_string())
                 .collect::<BTreeSet<_>>();
-            values.insert(value);
+            values.extend(
+                crate::service::dnsmgr::decode_dns_values(&value)
+                    .map_err(|_| {
+                        DbError::Other(sqlx::Error::Protocol("invalid carrier DNS value".into()))
+                    })?
+                    .into_iter()
+                    .map(|ip| ip.to_string()),
+            );
             entry.value = Some(crate::service::dnsmgr::encode_dns_values(values));
         }
     }
@@ -2016,6 +2096,46 @@ fn carrier_sync_key(line_id: &str) -> String {
     }
 }
 
+fn carrier_default_value(policy: &CarrierPolicy, evaluated: &[EvaluatedNode]) -> Option<String> {
+    let ids = policy.selected_default_nodes();
+    if ids.is_empty() {
+        return None;
+    }
+    let values = ids
+        .iter()
+        .map(|id| {
+            evaluated
+                .iter()
+                .find(|node| node.info.node_id == *id)
+                .and_then(|node| valid_public_ipv4(node.public_ipv4.as_deref()))
+        })
+        .collect::<Option<BTreeSet<_>>>()?;
+    Some(crate::service::dnsmgr::encode_dns_values(values))
+}
+
+pub(crate) async fn resolve_carrier_default(
+    db: &dyn Repository,
+    group_id: i64,
+    policy: &CarrierPolicy,
+) -> Result<RelayDnsTarget, DbError> {
+    let ids = policy.selected_default_nodes();
+    if ids.is_empty() {
+        return Ok(RelayDnsTarget::Invalid("CARRIER_DEFAULT_REQUIRED"));
+    }
+    let mut values = BTreeSet::new();
+    for id in ids {
+        match stored_node_public_ipv4(db, group_id, &id).await? {
+            RelayDnsTarget::Resolved(value) => {
+                values.insert(value);
+            }
+            _ => return Ok(RelayDnsTarget::Invalid("TARGET_IPV4_UNAVAILABLE")),
+        }
+    }
+    Ok(RelayDnsTarget::Resolved(
+        crate::service::dnsmgr::encode_dns_values(values),
+    ))
+}
+
 fn carrier_binding_target(
     binding: &CarrierLineBinding,
     default_value: Option<&str>,
@@ -2070,7 +2190,14 @@ fn carrier_line_target(
         if let (_, Some(value)) =
             carrier_binding_target(binding, default_value, default_node_id, evaluated)?
         {
-            values.insert(value);
+            values.extend(
+                crate::service::dnsmgr::decode_dns_values(&value)
+                    .map_err(|_| {
+                        CarrierPolicyApplyError::TargetPublicIpv4Invalid("default".into())
+                    })?
+                    .into_iter()
+                    .map(|ip| ip.to_string()),
+            );
         }
     }
     Ok((!values.is_empty()).then(|| crate::service::dnsmgr::encode_dns_values(values)))
@@ -2085,8 +2212,8 @@ pub(crate) async fn validate_carrier_members(
     let nodes = evaluate_group_nodes(db, node_connections, group_id)
         .await
         .map_err(|error| CarrierPolicyApplyError::ProviderPreflight(error.to_string()))?;
-    for id in policy
-        .default_node_id
+    let defaults = policy.selected_default_nodes();
+    for id in defaults
         .iter()
         .chain(policy.bindings.iter().filter_map(|b| b.node_id.as_ref()))
     {
@@ -2215,16 +2342,27 @@ async fn build_mode_transition_records(
     evaluated: &[EvaluatedNode],
 ) -> Result<(Vec<RelayDnsTransactionRecord>, Option<String>), RoutingModeTransitionError> {
     let target_default = match target {
-        RoutingMode::Carrier => Some(
-            mode_default_target(
-                db,
-                evaluated,
-                group_id,
-                RoutingMode::Carrier,
-                preference.carrier_policy.default_node_id.as_deref(),
-            )
-            .await?,
-        ),
+        RoutingMode::Carrier => {
+            let ids = preference.carrier_policy.selected_default_nodes();
+            if ids.is_empty() {
+                return Err(RoutingModeTransitionError::CarrierDefaultRequired);
+            }
+            let mut values = BTreeSet::new();
+            for id in &ids {
+                let (_, ip) =
+                    mode_default_target(db, evaluated, group_id, RoutingMode::Carrier, Some(id))
+                        .await?;
+                values.insert(ip);
+            }
+            let anchor = preference
+                .carrier_policy
+                .default_node_id
+                .as_ref()
+                .filter(|id| ids.contains(id))
+                .cloned()
+                .unwrap_or_else(|| ids[0].clone());
+            Some((anchor, crate::service::dnsmgr::encode_dns_values(values)))
+        }
         RoutingMode::Normal => Some(
             mode_default_target(
                 db,
@@ -2235,6 +2373,27 @@ async fn build_mode_transition_records(
             )
             .await?,
         ),
+        RoutingMode::Schedule | RoutingMode::Failover
+            if source == RoutingMode::Carrier
+                && preference.carrier_policy.selected_default_nodes().len() > 1 =>
+        {
+            // These modes retain Carrier's compatibility anchor, not its full
+            // RRset. Legacy single-default exits need no new DNS journal entry.
+            Some(
+                mode_default_target(
+                    db,
+                    evaluated,
+                    group_id,
+                    RoutingMode::Carrier,
+                    preference
+                        .carrier_policy
+                        .default_node_id
+                        .as_deref()
+                        .or(preference.preferred_node_id.as_deref()),
+                )
+                .await?,
+            )
+        }
         RoutingMode::Schedule | RoutingMode::Failover => None,
     };
     let source_policy = (source == RoutingMode::Carrier)
@@ -2361,7 +2520,7 @@ pub async fn start_carrier_policy_apply(
     let _automatic_policy_guard = crate::service::relay_failover::lock_automatic_policy().await;
     let _guard = RELAY_PREFERENCE_MUTATION_LOCK.lock().await;
     let group = GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await?;
-    let Some(group) = group.filter(|group| group.group_type == "in") else {
+    let Some(_group) = group.filter(|group| group.group_type == "in") else {
         return Err(CarrierPolicyApplyError::InboundGroupNotFound);
     };
     let mut preference = load_preference(db, group_id)
@@ -2381,12 +2540,9 @@ pub async fn start_carrier_policy_apply(
     let active_mode = preference
         .active_routing_mode
         .expect("normalized routing state has active mode");
-    if requested.default_node_id.is_none() {
-        requested.default_node_id = preference
-            .carrier_policy
-            .default_node_id
-            .clone()
-            .or_else(|| preference.preferred_node_id.clone());
+    requested.inherit_legacy_default(&preference);
+    if active_mode == RoutingMode::Carrier && requested.selected_default_nodes().is_empty() {
+        return Err(CarrierPolicyApplyError::CarrierDefaultRequired);
     }
     if matches!(
         preference.state,
@@ -2396,15 +2552,21 @@ pub async fn start_carrier_policy_apply(
     ) {
         return Err(CarrierPolicyApplyError::TransactionInProgress);
     }
-    for node_id in requested.default_node_id.iter().map(String::as_str).chain(
-        requested
-            .bindings
+    let default_ids = requested.selected_default_nodes();
+    for node_id in
+        default_ids
             .iter()
-            .filter_map(|binding| match binding.mode {
-                CarrierLineMode::Node => binding.node_id.as_deref(),
-                CarrierLineMode::FollowDefault => requested.default_node_id.as_deref(),
-            }),
-    ) {
+            .map(String::as_str)
+            .chain(
+                requested
+                    .bindings
+                    .iter()
+                    .filter_map(|binding| match binding.mode {
+                        CarrierLineMode::Node => binding.node_id.as_deref(),
+                        CarrierLineMode::FollowDefault => requested.default_node_id.as_deref(),
+                    }),
+            )
+    {
         if node_is_uninstalling(db, group_id, node_id)
             .await
             .map_err(|error| match error {
@@ -2424,7 +2586,9 @@ pub async fn start_carrier_policy_apply(
     validate_carrier_members(db, node_connections, group_id, &requested).await?;
     let removed_legacy_default = active_policy != preference.carrier_policy;
     let mut changes = carrier_policy_transaction_diff(&active_policy, &requested);
-    let confirmed_lines = crate::service::dnsmgr::pending_confirmation_lines(db, group_id).await?;
+    let mut confirmed_lines =
+        crate::service::dnsmgr::pending_confirmation_lines(db, group_id).await?;
+    confirmed_lines.extend(crate::service::dnsmgr::observed_carrier_drift(group_id).await);
     let old_lines = carrier_bindings_by_line(&active_policy);
     let new_lines = carrier_bindings_by_line(&requested);
     for line_id in &confirmed_lines {
@@ -2441,7 +2605,8 @@ pub async fn start_carrier_policy_apply(
         }
     }
     changes.sort_by(|a, b| a.line_id.cmp(&b.line_id));
-    let default_changed = active_policy.default_node_id != requested.default_node_id
+    let default_changed = active_policy.selected_default_nodes()
+        != requested.selected_default_nodes()
         || confirmed_lines.contains("default");
     if active_mode != RoutingMode::Carrier {
         preference.carrier_policy = requested;
@@ -2450,7 +2615,7 @@ pub async fn start_carrier_policy_apply(
         return Ok(CarrierPolicyApplyOutcome::SavedInactive);
     }
     if changes.is_empty() && !default_changed {
-        if removed_legacy_default {
+        if removed_legacy_default || active_policy != requested {
             preference.carrier_policy = requested;
             preference.pending_carrier_policy = None;
             preference.transaction_kind = None;
@@ -2505,12 +2670,7 @@ pub async fn start_carrier_policy_apply(
         .default_node_id
         .as_deref()
         .ok_or(CarrierPolicyApplyError::CarrierDefaultRequired)?;
-    let carrier_default = evaluated
-        .iter()
-        .find(|node| node.info.node_id == carrier_default_node_id)
-        .ok_or_else(|| CarrierPolicyApplyError::NodeNotInGroup(carrier_default_node_id.into()))?;
-    let Some(carrier_default_value) = valid_public_ipv4(carrier_default.public_ipv4.as_deref())
-    else {
+    let Some(carrier_default_value) = carrier_default_value(&requested, &evaluated) else {
         preference.preferred_node_id = requested.default_node_id.clone();
         preference.carrier_policy = requested;
         preference.pending_carrier_policy = None;
@@ -2522,26 +2682,7 @@ pub async fn start_carrier_policy_apply(
         }
         return Ok(CarrierPolicyApplyOutcome::SavedIncomplete);
     };
-    let needs_default = changes.iter().any(|change| {
-        change.new.as_ref().is_some_and(|bindings| {
-            bindings
-                .iter()
-                .any(|binding| binding.mode == CarrierLineMode::FollowDefault)
-        })
-    });
-    let default_value = if needs_default {
-        Some(
-            default_relay_value(
-                db,
-                group_id,
-                &group.connect_host,
-                requested.default_node_id.as_deref(),
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
+    let default_value = Some(carrier_default_value.clone());
     let mut targets = BTreeMap::new();
     for change in &changes {
         if let Some(binding) = change.new.as_ref() {
@@ -2589,28 +2730,30 @@ pub async fn start_carrier_policy_apply(
             .trim()
             .trim_end_matches('.')
             .to_ascii_lowercase();
-        let snapshot = crate::service::dnsmgr::inspect_default_line_record_for_transaction(
-            db, &client, *rule_id,
-        )
-        .await
-        .map_err(|error| map_snapshot_error(*rule_id, "default", error))?;
-        let (rollback_action, rollback_value, rollback_record_id, rollback_provider_snapshot) =
-            snapshot_rollback(snapshot);
-        records.push(RelayDnsTransactionRecord {
-            rule_id: *rule_id,
-            fqdn: fqdn.clone(),
-            line_id: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
-            line_key: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
-            target_action: RelayDnsAction::Upsert,
-            target_value: Some(carrier_default_value.clone()),
-            rollback_action,
-            rollback_value,
-            target_record_id: None,
-            rollback_record_id,
-            rollback_provider_snapshot,
-            target_state: None,
-            target_error: None,
-        });
+        if default_changed || !crate::service::dnsmgr::has_provider_observations() {
+            let snapshot = crate::service::dnsmgr::inspect_default_line_record_for_transaction(
+                db, &client, *rule_id,
+            )
+            .await
+            .map_err(|error| map_snapshot_error(*rule_id, "default", error))?;
+            let (rollback_action, rollback_value, rollback_record_id, rollback_provider_snapshot) =
+                snapshot_rollback(snapshot);
+            records.push(RelayDnsTransactionRecord {
+                rule_id: *rule_id,
+                fqdn: fqdn.clone(),
+                line_id: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
+                line_key: crate::service::dnsmgr::DEFAULT_LINE_KEY.into(),
+                target_action: RelayDnsAction::Upsert,
+                target_value: Some(carrier_default_value.clone()),
+                rollback_action,
+                rollback_value,
+                target_record_id: None,
+                rollback_record_id,
+                rollback_provider_snapshot,
+                target_state: None,
+                target_error: None,
+            });
+        }
         for change in &changes {
             if change.new.is_some()
                 && targets
@@ -2648,6 +2791,14 @@ pub async fn start_carrier_policy_apply(
                 target_error: None,
             });
         }
+    }
+
+    if records.is_empty() {
+        preference.carrier_policy = requested;
+        preference.pending_carrier_policy = None;
+        store_preference(db, group_id, &preference).await?;
+        crate::service::dnsmgr::schedule_group_after_membership_change(db, group_id).await?;
+        return Ok(CarrierPolicyApplyOutcome::SavedIncomplete);
     }
 
     preference.carrier_policy = active_policy;
@@ -2708,7 +2859,12 @@ pub async fn transition_routing_mode(
             .await
             .map_err(|error| RoutingModeTransitionError::ProviderPreflight(error.to_string()))?;
     }
-    if target_mode == RoutingMode::Carrier && preference.carrier_policy.default_node_id.is_none() {
+    if target_mode == RoutingMode::Carrier
+        && preference
+            .carrier_policy
+            .selected_default_nodes()
+            .is_empty()
+    {
         return Err(RoutingModeTransitionError::CarrierDefaultRequired);
     }
 
@@ -3212,10 +3368,12 @@ pub async fn apply_routing_configuration(
                 .await
         }
         RoutingApplyRequest::Carrier {
+            default_node_ids,
             default_node_id,
             bindings,
         } => {
             let policy = CarrierPolicy {
+                default_node_ids,
                 default_node_id,
                 bindings,
             };
@@ -3390,16 +3548,7 @@ pub(crate) async fn refresh_carrier_desired(
         let rule_ids =
             crate::service::dnsmgr::eligible_rule_ids_for_group(state.db.as_ref(), group_id)
                 .await?;
-        let default_value = preference
-            .carrier_policy
-            .default_node_id
-            .as_deref()
-            .and_then(|id| {
-                evaluated
-                    .iter()
-                    .find(|node| node.info.node_id == id)
-                    .and_then(|node| valid_public_ipv4(node.public_ipv4.as_deref()))
-            });
+        let default_value = carrier_default_value(&preference.carrier_policy, &evaluated);
         for (line_id, bindings) in carrier_bindings_by_line(&preference.carrier_policy) {
             if carrier_line_uses_default_authority(line_id) {
                 continue;
@@ -4453,7 +4602,9 @@ async fn recheck_carrier_commit_targets(
     let Some(pending) = pending else {
         return Ok(Err("CARRIER_TRANSACTION_INCOMPLETE"));
     };
-    let bindings = carrier_bindings_by_line(pending);
+    let mut effective = pending.clone();
+    effective.inherit_legacy_default(preference);
+    let bindings = carrier_bindings_by_line(&effective);
     let mut changed_targets = BTreeMap::<&str, &str>::new();
     for record in preference
         .dns_records
@@ -4475,22 +4626,9 @@ async fn recheck_carrier_commit_targets(
     }
 
     let evaluated = evaluate_group_nodes(db, node_connections, group_id).await?;
-    let group = GroupRepository::find_by_id(db, group_id, &ResourceScope::All).await?;
-    let Some(group) = group.filter(|group| group.group_type == "in") else {
-        return Ok(Err("CARRIER_GROUP_UNAVAILABLE_AFTER_DNS"));
-    };
     for (line_id, expected_value) in changed_targets {
         if line_id == crate::service::dnsmgr::DEFAULT_LINE_KEY {
-            let Some(node_id) = pending.default_node_id.as_deref() else {
-                return Ok(Err("CARRIER_DEFAULT_NODE_MISSING"));
-            };
-            let Some(node) = evaluated
-                .iter()
-                .find(|candidate| candidate.info.node_id == node_id)
-            else {
-                return Ok(Err("CARRIER_DEFAULT_NODE_NOT_READY_AFTER_DNS"));
-            };
-            let Some(current_value) = valid_public_ipv4(node.public_ipv4.as_deref()) else {
+            let Some(current_value) = carrier_default_value(&effective, &evaluated) else {
                 return Ok(Err("CARRIER_DEFAULT_PUBLIC_IPV4_UNAVAILABLE_AFTER_DNS"));
             };
             if current_value != expected_value {
@@ -4505,14 +4643,7 @@ async fn recheck_carrier_commit_targets(
             .default_node_id
             .as_deref()
             .or(preference.preferred_node_id.as_deref());
-        let default_value = default_id
-            .and_then(|id| {
-                evaluated
-                    .iter()
-                    .find(|node| node.info.node_id == id)
-                    .and_then(|node| valid_public_ipv4(node.public_ipv4.as_deref()))
-            })
-            .or_else(|| valid_public_ipv4(Some(&group.connect_host)));
+        let default_value = carrier_default_value(&effective, &evaluated);
         let current_value =
             match carrier_line_target(binding, default_value.as_deref(), default_id, &evaluated) {
                 Ok(Some(value)) => value,
@@ -5108,7 +5239,9 @@ pub(crate) fn public_dns_error(error: Option<&str>) -> Option<String> {
             | "ROLLBACK_RULE_NOT_ELIGIBLE"
             | "DNS_ROLLBACK_FAILED"
             | "DNS_TARGET_CHANGED"
-            | "TARGET_IPV4_UNAVAILABLE" => category.to_owned(),
+            | "TARGET_IPV4_UNAVAILABLE"
+            | "CARRIER_TARGET_IPV4_UNAVAILABLE"
+            | "CARRIER_DEFAULT_REQUIRED" => category.to_owned(),
             _ => "DNS_OPERATION_FAILED".to_owned(),
         }
     })
@@ -5413,6 +5546,7 @@ mod tests {
         );
 
         preference.carrier_policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
@@ -5452,6 +5586,7 @@ mod tests {
         );
 
         preference.carrier_policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
@@ -5553,6 +5688,7 @@ mod tests {
         preference.active_routing_mode = Some(RoutingMode::Normal);
         preference.normal_default_node_id = preference.preferred_node_id.clone();
         preference.carrier_policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: Some("node-a".into()),
             bindings: vec![carrier_binding(
                 "Dianxin",
@@ -5640,10 +5776,12 @@ mod tests {
         preference.pending_routing_mode = Some(RoutingMode::Normal);
         preference.normal_default_node_id = preference.preferred_node_id.clone();
         preference.carrier_policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: preference.preferred_node_id.clone(),
             bindings: Vec::new(),
         };
         preference.pending_carrier_policy = Some(CarrierPolicy {
+            default_node_ids: None,
             default_node_id: Some("node-b".into()),
             bindings: vec![carrier_binding(
                 "Dianxin",
@@ -5764,6 +5902,7 @@ mod tests {
             &connections,
             7,
             RoutingApplyRequest::Carrier {
+                default_node_ids: None,
                 default_node_id: Some("node-b".into()),
                 bindings: Vec::new(),
             },
@@ -5902,6 +6041,7 @@ mod tests {
         preference.active_routing_mode = Some(RoutingMode::Normal);
         preference.normal_default_node_id = preference.preferred_node_id.clone();
         preference.carrier_policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
@@ -5929,6 +6069,7 @@ mod tests {
         preference.active_routing_mode = Some(RoutingMode::Carrier);
         preference.normal_default_node_id = Some("node-a".into());
         preference.carrier_policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: Some("node-a".into()),
             bindings: Vec::new(),
         };
@@ -5940,6 +6081,7 @@ mod tests {
                 &connections,
                 7,
                 CarrierPolicy {
+                    default_node_ids: None,
                     default_node_id: Some("missing-node".into()),
                     bindings: Vec::new(),
                 },
@@ -5962,6 +6104,7 @@ mod tests {
                 &connections,
                 7,
                 CarrierPolicy {
+                    default_node_ids: None,
                     default_node_id: Some("node-c".into()),
                     bindings: Vec::new(),
                 },
@@ -6086,6 +6229,7 @@ mod tests {
     #[test]
     fn carrier_policy_normalizes_and_roundtrips_without_display_data() {
         let policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![
                 CarrierLineBinding {
@@ -6112,6 +6256,7 @@ mod tests {
         );
 
         let case_sensitive = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![
                 CarrierLineBinding {
@@ -6132,6 +6277,7 @@ mod tests {
     #[test]
     fn carrier_policy_retains_distinct_members_on_one_line_and_rejects_identical_pairs() {
         let policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: Some("n1".into()),
             bindings: vec![
                 carrier_binding("unicom", CarrierLineMode::Node, Some("n6")),
@@ -6166,6 +6312,7 @@ mod tests {
     #[test]
     fn carrier_policy_rejects_duplicate_and_invalid_mode_payloads() {
         let duplicate = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![
                 CarrierLineBinding {
@@ -6186,6 +6333,7 @@ mod tests {
         );
         assert_eq!(
             CarrierPolicy {
+                default_node_ids: None,
                 default_node_id: None,
                 bindings: vec![CarrierLineBinding {
                     line_id: "Dianxin".into(),
@@ -6198,6 +6346,7 @@ mod tests {
         );
         assert_eq!(
             CarrierPolicy {
+                default_node_ids: None,
                 default_node_id: None,
                 bindings: vec![CarrierLineBinding {
                     line_id: "Dianxin".into(),
@@ -6215,6 +6364,7 @@ mod tests {
         for line_id in ["default", "Default", "default_view", "0"] {
             assert_eq!(
                 CarrierPolicy {
+                    default_node_ids: None,
                     default_node_id: None,
                     bindings: vec![CarrierLineBinding {
                         line_id: line_id.into(),
@@ -6240,10 +6390,12 @@ mod tests {
                 preferred_node_id: Some("node-a".into()),
                 pending_node_id: Some("node-b".into()),
                 carrier_policy: CarrierPolicy {
+                    default_node_ids: None,
                     default_node_id: Some("node-d".into()),
                     bindings: Vec::new(),
                 },
                 pending_carrier_policy: Some(CarrierPolicy {
+                    default_node_ids: None,
                     default_node_id: Some("node-e".into()),
                     bindings: Vec::new(),
                 }),
@@ -6274,6 +6426,7 @@ mod tests {
             pending_node_id: Some("node-a".into()),
             state: RelayPreferencePhase::FailedRolledBack,
             carrier_policy: CarrierPolicy {
+                default_node_ids: None,
                 default_node_id: Some("node-a".into()),
                 bindings: vec![carrier_binding(
                     "Dianxin",
@@ -6282,6 +6435,7 @@ mod tests {
                 )],
             },
             pending_carrier_policy: Some(CarrierPolicy {
+                default_node_ids: None,
                 default_node_id: Some("node-a".into()),
                 bindings: vec![carrier_binding(
                     "Liantong",
@@ -6318,6 +6472,7 @@ mod tests {
         let state = RelayPreferenceState {
             transaction_kind: Some(RelayTransactionKind::CarrierPolicyApply),
             pending_carrier_policy: Some(CarrierPolicy {
+                default_node_ids: None,
                 default_node_id: None,
                 bindings: vec![CarrierLineBinding {
                     line_id: "Dianxin".into(),
@@ -6695,6 +6850,7 @@ mod tests {
             &NodeConnections::new(),
             7,
             CarrierPolicy {
+                default_node_ids: None,
                 default_node_id: None,
                 bindings: vec![CarrierLineBinding {
                     line_id: "Dianxin".into(),
@@ -6719,6 +6875,7 @@ mod tests {
             &connections,
             7,
             CarrierPolicy {
+                default_node_ids: None,
                 default_node_id: None,
                 bindings: vec![carrier_binding(
                     "default",
@@ -6745,6 +6902,7 @@ mod tests {
         let (repo, connections, _) = switch_fixture().await;
         let mut preference = load_preference(&repo, 7).await.unwrap();
         preference.carrier_policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![carrier_binding(
                 "default_view",
@@ -7128,6 +7286,7 @@ mod tests {
     #[test]
     fn carrier_policy_diff_covers_upsert_delete_and_noop() {
         let active = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-b")),
@@ -7136,6 +7295,7 @@ mod tests {
         };
         assert!(carrier_policy_diff(&active, &active).is_empty());
         let requested = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-c")),
@@ -7163,6 +7323,7 @@ mod tests {
     #[test]
     fn carrier_default_change_reschedules_every_follow_default_line() {
         let active = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: Some("node-a".into()),
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::FollowDefault, None),
@@ -7170,6 +7331,7 @@ mod tests {
             ],
         };
         let requested = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: Some("node-b".into()),
             bindings: active.bindings.clone(),
         };
@@ -7301,6 +7463,7 @@ mod tests {
         preference.normal_default_node_id = Some("node-b".into());
         preference.preferred_node_id = Some("node-a".into());
         preference.carrier_policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: Some("node-a".into()),
             bindings: Vec::new(),
         };
@@ -7343,6 +7506,7 @@ mod tests {
     async fn carrier_apply_commits_only_after_every_line_converges() {
         let (repo, connections, _) = switch_fixture().await;
         let requested = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
@@ -7474,6 +7638,7 @@ mod tests {
         ] {
             let (repo, connections, _) = switch_fixture().await;
             let requested = CarrierPolicy {
+                default_node_ids: None,
                 default_node_id: None,
                 bindings: vec![carrier_binding(
                     "Dianxin",
@@ -7514,6 +7679,7 @@ mod tests {
     async fn carrier_commit_keeps_desired_targets_independent_of_health() {
         let (repo, connections, _) = switch_fixture().await;
         let active = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![carrier_binding(
                 "Liantong",
@@ -7522,6 +7688,7 @@ mod tests {
             )],
         };
         let requested = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![
                 carrier_binding("Liantong", CarrierLineMode::Node, Some("node-b")),
@@ -7559,6 +7726,7 @@ mod tests {
 
         let (repo, connections, _) = switch_fixture().await;
         let requested = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
@@ -7597,6 +7765,7 @@ mod tests {
         for remove_rule in [false, true] {
             let (repo, connections, _) = switch_fixture().await;
             let active = CarrierPolicy {
+                default_node_ids: None,
                 default_node_id: None,
                 bindings: vec![carrier_binding(
                     "Dianxin",
@@ -7684,6 +7853,7 @@ mod tests {
     async fn carrier_failure_rolls_back_old_and_created_records_after_restart() {
         let (repo, connections, _) = switch_fixture().await;
         let active = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
@@ -7716,6 +7886,7 @@ mod tests {
                 preferred_node_id: Some("node-a".into()),
                 carrier_policy: active.clone(),
                 pending_carrier_policy: Some(CarrierPolicy {
+                    default_node_ids: None,
                     default_node_id: None,
                     bindings: vec![
                         carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-c")),
@@ -7776,6 +7947,7 @@ mod tests {
     async fn rule_pause_resume_restores_active_carrier_policy_with_current_default() {
         let (repo, _, _) = switch_fixture().await;
         let active = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-b")),
@@ -7852,6 +8024,7 @@ mod tests {
         let (repo, _, _) = switch_fixture().await;
         let mut preference = load_preference(&repo, 7).await.unwrap();
         preference.carrier_policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
@@ -7886,6 +8059,7 @@ mod tests {
     async fn preferred_switch_journal_moves_default_and_follow_default_only() {
         let (repo, connections, _) = switch_fixture().await;
         let policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-b")),
@@ -8005,6 +8179,7 @@ mod tests {
     async fn preferred_switch_does_not_reschedule_unchanged_explicit_lines() {
         let (repo, _, _) = switch_fixture().await;
         let policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-b")),
@@ -8134,6 +8309,7 @@ mod tests {
             ));
         }
         let policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![
                 carrier_binding("Dianxin", CarrierLineMode::Node, Some("node-b")),
@@ -8198,6 +8374,7 @@ mod tests {
         preference.active_routing_mode = Some(RoutingMode::Normal);
         preference.normal_default_node_id = preference.preferred_node_id.clone();
         preference.carrier_policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: None,
             bindings: vec![carrier_binding(
                 "Dianxin",
@@ -9109,5 +9286,106 @@ mod tests {
             Some("POST_WRITE_NOT_VERIFIED")
         );
         assert_eq!(public_dns_error(None), None);
+    }
+}
+
+#[cfg(test)]
+mod carrier_default_set_tests {
+    use super::*;
+    fn policy(raw: &str) -> CarrierPolicy {
+        serde_json::from_str(raw).unwrap()
+    }
+    #[test]
+    fn explicit_empty_does_not_restore_legacy_anchor() {
+        let p = policy(r#"{"default_node_id":"a","default_node_ids":[],"bindings":[]}"#)
+            .normalize()
+            .unwrap();
+        assert_eq!(p.default_node_id, None);
+        assert_eq!(
+            serde_json::to_value(p).unwrap()["default_node_ids"],
+            serde_json::json!([])
+        );
+    }
+    #[test]
+    fn defaults_are_canonical_and_keep_selected_anchor() {
+        let p =
+            policy(r#"{"default_node_id":"b","default_node_ids":["c","b","a","b"],"bindings":[]}"#)
+                .normalize()
+                .unwrap();
+        assert_eq!(p.default_node_id.as_deref(), Some("b"));
+        assert_eq!(
+            serde_json::to_value(p).unwrap()["default_node_ids"],
+            serde_json::json!(["a", "b", "c"])
+        );
+    }
+    #[test]
+    fn same_anchor_changed_set_updates_follow_default() {
+        let a = policy(
+            r#"{"default_node_id":"a","default_node_ids":["a"],"bindings":[{"line_id":"Dianxin","mode":"follow_default"}]}"#,
+        );
+        let b = policy(
+            r#"{"default_node_id":"a","default_node_ids":["a","b"],"bindings":[{"line_id":"Dianxin","mode":"follow_default"}]}"#,
+        );
+        assert_eq!(carrier_policy_transaction_diff(&a, &b).len(), 1);
+    }
+    #[test]
+    fn deleting_primary_preserves_survivor_and_follow_default() {
+        let mut p = RelayPreferenceState {
+            active_routing_mode: Some(RoutingMode::Carrier),
+            preferred_node_id: Some("a".into()),
+            carrier_policy: policy(
+                r#"{"default_node_id":"a","default_node_ids":["a","b"],"bindings":[{"line_id":"Dianxin","mode":"follow_default"}]}"#,
+            ),
+            ..Default::default()
+        };
+        remove_node_references(&mut p, "a");
+        assert_eq!(p.carrier_policy.default_node_id.as_deref(), Some("b"));
+        assert_eq!(p.preferred_node_id.as_deref(), Some("b"));
+        assert_eq!(p.carrier_policy.bindings.len(), 1);
+        assert_eq!(
+            serde_json::to_value(p.carrier_policy).unwrap()["default_node_ids"],
+            serde_json::json!(["b"])
+        );
+    }
+    #[test]
+    fn explicit_empty_carrier_never_auto_selects_the_only_ready_node() {
+        let mut p = RelayPreferenceState {
+            active_routing_mode: Some(RoutingMode::Carrier),
+            carrier_policy: policy(r#"{"default_node_ids":[],"bindings":[]}"#),
+            ..Default::default()
+        };
+        assert!(!initialize_preference_if_unique_ready(
+            &mut p,
+            &["unselected".into()]
+        ));
+        assert_eq!(p.preferred_node_id, None);
+    }
+    #[test]
+    fn absent_new_field_preserves_legacy_single_default_wire_data() {
+        let p = policy(r#"{"default_node_id":"a","bindings":[]}"#)
+            .normalize()
+            .unwrap();
+        assert_eq!(p.selected_default_nodes(), vec!["a"]);
+        assert!(serde_json::to_value(p)
+            .unwrap()
+            .get("default_node_ids")
+            .is_none());
+    }
+
+    #[test]
+    fn retiring_the_last_legacy_default_leaves_an_explicit_empty_set() {
+        let mut p = RelayPreferenceState {
+            active_routing_mode: Some(RoutingMode::Carrier),
+            preferred_node_id: Some("a".into()),
+            carrier_policy: policy(r#"{"default_node_id":"a","bindings":[]}"#),
+            ..Default::default()
+        };
+        remove_node_references(&mut p, "a");
+        assert_eq!(p.carrier_policy.default_node_ids, Some(vec![]));
+        assert!(!initialize_preference_if_unique_ready(
+            &mut p,
+            &["b".into()]
+        ));
+        assert_eq!(p.preferred_node_id, None);
     }
 }

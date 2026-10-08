@@ -21,6 +21,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+mod observations;
 mod record_sets;
 pub(crate) use record_sets::{confirmation_token, pending_confirmation_lines, prepare_carrier_dns};
 pub(crate) use record_sets::{decode_dns_values, encode_dns_values, valid_dns_values};
@@ -29,6 +30,8 @@ const DISCOVERY_PAGE_LIMIT: u16 = 100;
 const DNSMGR_DEFAULT_WRITE_TTL: u32 = 600;
 const DNS_SYNC_TICK: Duration = Duration::from_secs(30);
 const DNS_SYNC_MAX_BATCH: i64 = 16;
+const DNS_SYNC_CONCURRENCY: usize = 4;
+const DNS_SYNC_MAX_DRAIN_BATCHES: usize = 4;
 const DNS_SYNC_MAX_ATTEMPTS: i32 = 6;
 const DNS_SYNC_BASE_BACKOFF_SECS: u64 = 5;
 const DNS_SYNC_MAX_BACKOFF_SECS: u64 = 300;
@@ -56,6 +59,58 @@ where
     }
     notify();
     true
+}
+
+pub(crate) async fn with_provider_observations<F: std::future::Future>(future: F) -> F::Output {
+    observations::scope(future).await
+}
+
+pub(crate) fn has_provider_observations() -> bool {
+    observations::active()
+}
+pub(crate) async fn observed_carrier_drift(group_id: i64) -> std::collections::BTreeSet<String> {
+    observations::drift_lines(group_id).await
+}
+pub(crate) async fn domain_detail(
+    client: &DnsMgrClient,
+    zone_id: u64,
+) -> Result<DnsMgrDomainDetail, DnsMgrError> {
+    observations::detail(client, zone_id).await
+}
+
+async fn provider_create_record(
+    client: &DnsMgrClient,
+    zone_id: u64,
+    request: &DnsMgrRecordMutation,
+) -> Result<crate::integrations::dnsmgr::DnsMgrMutationAccepted, DnsMgrError> {
+    observations::mutation(client, zone_id, async {
+        observations::invalidate(client, zone_id, Some(request), None).await;
+        client.create_record(zone_id, request).await
+    })
+    .await
+}
+async fn provider_update_record(
+    client: &DnsMgrClient,
+    zone_id: u64,
+    record_id: &str,
+    request: &DnsMgrRecordMutation,
+) -> Result<crate::integrations::dnsmgr::DnsMgrMutationAccepted, DnsMgrError> {
+    observations::mutation(client, zone_id, async {
+        observations::invalidate(client, zone_id, Some(request), Some(record_id)).await;
+        client.update_record(zone_id, record_id, request).await
+    })
+    .await
+}
+async fn provider_delete_record(
+    client: &DnsMgrClient,
+    zone_id: u64,
+    record_id: &str,
+) -> Result<crate::integrations::dnsmgr::DnsMgrMutationAccepted, DnsMgrError> {
+    observations::mutation(client, zone_id, async {
+        observations::invalidate(client, zone_id, None, Some(record_id)).await;
+        client.delete_record(zone_id, record_id).await
+    })
+    .await
 }
 
 /// KVS key holding the single Panel-wide DNSMgr integration configuration.
@@ -309,36 +364,63 @@ pub(crate) fn resolve_zone_from_inventory(
 
 #[allow(dead_code)] // Slice 3 foundation; consumed by Slice 4 ensure_record.
 pub(crate) async fn resolve_zone(client: &DnsMgrClient, fqdn: &NormalizedFqdn) -> ZoneResolution {
+    match observations::domains(client).await {
+        Ok(domains) => resolve_zone_from_inventory(fqdn, &domains)
+            .map(ZoneResolution::ZoneResolved)
+            .unwrap_or(ZoneResolution::NoMatchingZone),
+        Err(error) => ZoneResolution::UpstreamFailure(error),
+    }
+}
+
+async fn fetch_domain_inventory(client: &DnsMgrClient) -> Result<Vec<DnsMgrDomain>, DnsMgrError> {
     let mut domains = Vec::new();
     let mut offset = 0_u32;
+    let mut expected_total = None;
+    let mut ids = std::collections::HashSet::new();
     loop {
-        let page = match client
+        let page = client
             .list_domains(&DomainListParams {
                 offset,
                 limit: DISCOVERY_PAGE_LIMIT,
                 keyword: None,
             })
-            .await
-        {
-            Ok(page) => page,
-            Err(error) => return ZoneResolution::UpstreamFailure(error),
-        };
+            .await?;
         let count = page.rows.len();
-        domains.extend(page.rows);
-        if count == 0 || u64::from(offset).saturating_add(count as u64) >= page.total {
+        let end = u64::from(offset) + count as u64;
+        if page.authoritative_total {
+            if expected_total.is_some_and(|total| total != page.total)
+                || (count == 0 && end < page.total)
+                || end > page.total
+            {
+                return Err(DnsMgrError::ProtocolContractViolation(
+                    "contradictory domain pagination".into(),
+                ));
+            }
+            expected_total = Some(page.total);
+        }
+        for domain in page.rows {
+            if !ids.insert(domain.domain_id) {
+                return Err(DnsMgrError::ProtocolContractViolation(
+                    "duplicate domain pagination identity".into(),
+                ));
+            }
+            domains.push(domain);
+        }
+        if (page.authoritative_total && end == page.total)
+            || (!page.authoritative_total && count < DISCOVERY_PAGE_LIMIT as usize)
+        {
             break;
         }
-        let Some(next) = offset.checked_add(count as u32) else {
-            return ZoneResolution::UpstreamFailure(DnsMgrError::ProtocolContractViolation(
-                "domain pagination offset overflow".into(),
+        if count == 0 {
+            return Err(DnsMgrError::ProtocolContractViolation(
+                "incomplete domain pagination".into(),
             ));
-        };
-        offset = next;
+        }
+        offset = offset.checked_add(count as u32).ok_or_else(|| {
+            DnsMgrError::ProtocolContractViolation("domain pagination offset overflow".into())
+        })?;
     }
-
-    resolve_zone_from_inventory(fqdn, &domains)
-        .map(ZoneResolution::ZoneResolved)
-        .unwrap_or(ZoneResolution::NoMatchingZone)
+    Ok(domains)
 }
 
 #[allow(dead_code)] // Slice 3 foundation; consumed by Slice 4 ensure_record.
@@ -348,6 +430,22 @@ pub(crate) async fn discover_records(
     expected_type: DnsRecordType,
     expected_line: &ProviderLine,
 ) -> RecordDiscovery {
+    if !observations::active() {
+        return discover_records_fresh(client, zone, expected_type, expected_line).await;
+    }
+    match observations::prewrite_records(client, zone, expected_line).await {
+        Ok(records) => classify_records(zone, expected_type, expected_line, records),
+        Err(error) => RecordDiscovery::UpstreamFailure(error),
+    }
+}
+
+async fn discover_records_fresh(
+    client: &DnsMgrClient,
+    zone: &ResolvedZone,
+    expected_type: DnsRecordType,
+    expected_line: &ProviderLine,
+) -> RecordDiscovery {
+    let filtered_started = std::time::Instant::now();
     let filtered = match fetch_record_inventory(client, zone, Some(zone.host.as_str())).await {
         Ok(inventory) => inventory,
         Err(error) => return RecordDiscovery::UpstreamFailure(error),
@@ -367,16 +465,12 @@ pub(crate) async fn discover_records(
     // snapshot while the same record is present in the complete zone inventory.
     // Before treating filtered emptiness as authoritative absence (and possibly
     // scheduling a create), cross-check once without the provider-side filter.
-    let complete = match fetch_record_inventory(client, zone, None).await {
-        Ok(inventory) => inventory,
-        Err(error) => return RecordDiscovery::UpstreamFailure(error),
-    };
-    if !complete.complete {
-        return RecordDiscovery::UpstreamFailure(DnsMgrError::ProtocolContractViolation(
-            "DNSMgr returned an incomplete full-zone record inventory".into(),
-        ));
-    }
-    classify_records(zone, expected_type, expected_line, complete.records)
+    let complete =
+        match observations::complete_zone_inventory(client, zone, Some(filtered_started)).await {
+            Ok(records) => records,
+            Err(error) => return RecordDiscovery::UpstreamFailure(error),
+        };
+    classify_records(zone, expected_type, expected_line, complete)
 }
 
 struct RecordInventory {
@@ -392,6 +486,8 @@ async fn fetch_record_inventory(
     let mut records = Vec::new();
     let mut offset = 0_u32;
     let mut complete = false;
+    let mut expected_total = None;
+    let mut ids = std::collections::HashSet::new();
     loop {
         let page = client
             .list_records(
@@ -407,7 +503,22 @@ async fn fetch_record_inventory(
         let count = page.rows.len();
         let page_end = u64::from(offset).saturating_add(count as u64);
         let contradictory_empty = page.authoritative_total && count == 0 && page_end < page.total;
-        records.extend(page.rows);
+        if page.authoritative_total {
+            if expected_total.is_some_and(|total| total != page.total) || page_end > page.total {
+                return Err(DnsMgrError::ProtocolContractViolation(
+                    "contradictory record pagination".into(),
+                ));
+            }
+            expected_total = Some(page.total);
+        }
+        for record in page.rows {
+            if !ids.insert(record.record_id.clone()) {
+                return Err(DnsMgrError::ProtocolContractViolation(
+                    "duplicate record pagination identity".into(),
+                ));
+            }
+            records.push(record);
+        }
         let reached_total = page.authoritative_total && page_end >= page.total;
         let inferred_complete = !page.authoritative_total && count < DISCOVERY_PAGE_LIMIT as usize;
         if contradictory_empty {
@@ -711,6 +822,8 @@ pub(crate) async fn ensure_record(
     client: &DnsMgrClient,
     input: &EnsureRecordInput,
 ) -> EnsureRecordResult {
+    let _record =
+        observations::lock_record(&input.fqdn, input.record_type.as_str(), &input.line).await;
     if input.record_type == DnsRecordType::A
         && record_sets::uses_set_reconciliation(db, input).await
     {
@@ -746,7 +859,7 @@ pub(crate) async fn ensure_record(
             return EnsureRecordResult::Failed(EnsureRecordFailure::Upstream(error))
         }
     };
-    let detail = match client.get_domain(zone.domain_id).await {
+    let detail = match domain_detail(client, zone.domain_id).await {
         Ok(detail) => detail,
         Err(error) => return EnsureRecordResult::Failed(EnsureRecordFailure::Upstream(error)),
     };
@@ -771,7 +884,13 @@ pub(crate) async fn ensure_record(
         Err(_) => return EnsureRecordResult::Failed(EnsureRecordFailure::Database),
     };
 
-    let discovery = discover_records(client, &zone, input.record_type, &line).await;
+    let mut discovery = discover_records(client, &zone, input.record_type, &line).await;
+    let cached_correct = matches!(&discovery, RecordDiscovery::SingleMatchingRecord(record)
+        if record_value_matches(&record.record.values, expected_ip)
+            && binding_matches_record(binding.as_ref(), &fqdn, &zone, input.record_type, record));
+    if observations::active() && !cached_correct {
+        discovery = discover_records_fresh(client, &zone, input.record_type, &line).await;
+    }
     let detached_binding = if binding.is_none() {
         match &discovery {
             RecordDiscovery::SingleMatchingRecord(record) => {
@@ -962,6 +1081,8 @@ pub(crate) async fn ensure_record_absent(
     client: &DnsMgrClient,
     input: &DeleteRecordInput,
 ) -> DeleteRecordResult {
+    let _record =
+        observations::lock_record(&input.fqdn, input.record_type.as_str(), &input.line).await;
     match crate::service::relay_preference::dns_rollback_provider_snapshot(
         db,
         input.rule_id,
@@ -1014,7 +1135,7 @@ pub(crate) async fn ensure_record_absent(
             return DeleteRecordResult::Failed(EnsureRecordFailure::Upstream(error))
         }
     };
-    let detail = match client.get_domain(zone.domain_id).await {
+    let detail = match domain_detail(client, zone.domain_id).await {
         Ok(detail) => detail,
         Err(error) => return DeleteRecordResult::Failed(EnsureRecordFailure::Upstream(error)),
     };
@@ -1070,15 +1191,12 @@ pub(crate) async fn ensure_record_absent(
         return DeleteRecordResult::Failed(EnsureRecordFailure::OwnershipUnverified);
     }
 
-    let ambiguous = match client
-        .delete_record(zone.domain_id, &binding.record_id)
-        .await
-    {
+    let ambiguous = match provider_delete_record(client, zone.domain_id, &binding.record_id).await {
         Ok(_) => false,
         Err(error) if error.is_ambiguous_write() => true,
         Err(error) => return DeleteRecordResult::Failed(EnsureRecordFailure::Upstream(error)),
     };
-    let readback = discover_records(client, &zone, input.record_type, &line).await;
+    let readback = discover_records_fresh(client, &zone, input.record_type, &line).await;
     let line_record_remains = match readback {
         RecordDiscovery::NoRecord => false,
         RecordDiscovery::SingleMatchingRecord(_) | RecordDiscovery::MultipleMatchingRecords(_) => {
@@ -1373,12 +1491,12 @@ async fn create_and_verify(
     stale_binding: Option<&DnsRecordBinding>,
 ) -> EnsureRecordResult {
     let mutation = mutation_request(input, zone, line, ttl);
-    match client.create_record(zone.domain_id, &mutation).await {
+    match provider_create_record(client, zone.domain_id, &mutation).await {
         Ok(_) => {}
         Err(error) if error.is_ambiguous_write() => {
             // Re-read once to avoid a duplicate create, but never claim the
             // resulting identity: another actor may have won the race.
-            let _ = discover_records(client, zone, input.record_type, line).await;
+            let _ = discover_records_fresh(client, zone, input.record_type, line).await;
             if let Some(binding) = stale_binding {
                 let _ = set_binding_state(db, binding.id, "ERROR", Some("MUTATION_UNKNOWN")).await;
             }
@@ -1397,7 +1515,7 @@ async fn create_and_verify(
         }
     }
 
-    let verified = match discover_records(client, zone, input.record_type, line).await {
+    let verified = match discover_records_fresh(client, zone, input.record_type, line).await {
         RecordDiscovery::SingleMatchingRecord(record)
             if record_value_matches(
                 &record.record.values,
@@ -1463,9 +1581,8 @@ async fn update_provider_record_and_verify(
     require_unique_readback: bool,
 ) -> Result<(), EnsureRecordResult> {
     let mutation = mutation_request(input, zone, line, ttl);
-    let write_result = client
-        .update_record(zone.domain_id, &record.record.record_id, &mutation)
-        .await;
+    let write_result =
+        provider_update_record(client, zone.domain_id, &record.record.record_id, &mutation).await;
     let ambiguous = match write_result {
         Ok(_) => false,
         Err(error) if error.is_ambiguous_write() => true,
@@ -1486,7 +1603,7 @@ async fn update_provider_record_and_verify(
 
     let expected_ip = validate_ip_family(input.record_type, &input.expected_value)
         .expect("ensure_record validated the IP family");
-    let verified = discover_records(client, zone, input.record_type, line).await;
+    let verified = discover_records_fresh(client, zone, input.record_type, line).await;
     let exact = match verified {
         RecordDiscovery::SingleMatchingRecord(record) => Some(record),
         RecordDiscovery::MultipleMatchingRecords(records) if !require_unique_readback => records
@@ -1935,6 +2052,7 @@ async fn persist_desired(
     desired: &DnsDesiredRecord,
     force_schedule: bool,
 ) -> Result<(), crate::db::error::DbError> {
+    let _desired = observations::changing_desired().await;
     let now = utc_now();
     let existing = db
         .find_dns_record_sync(desired.rule_id, &desired.line.key)
@@ -2062,7 +2180,9 @@ pub(crate) async fn schedule_transaction_line(
         expected_value: value.unwrap_or_default().to_string(),
         line,
     };
-    persist_line_desired(db, &desired, action, value, true).await
+    persist_line_desired(db, &desired, action, value, true).await?;
+    notify_reconcile();
+    Ok(())
 }
 
 fn ambiguous_binding_matches_replacement(
@@ -2124,7 +2244,7 @@ async fn recover_ambiguous_binding_replacement(
 
     // Require a second stable provider read before transferring persisted
     // provenance to a replacement provider identity.
-    let confirmed = match discover_records(client, zone, record_type, line).await {
+    let confirmed = match discover_records_fresh(client, zone, record_type, line).await {
         RecordDiscovery::SingleMatchingRecord(record)
             if record.record.record_id == candidate.record.record_id
                 && ambiguous_binding_matches_replacement(
@@ -2244,8 +2364,7 @@ async fn inspect_line_record_inner(
             return Err(LineRecordSnapshotError::Provider(error))
         }
     };
-    let detail = client
-        .get_domain(zone.domain_id)
+    let detail = domain_detail(client, zone.domain_id)
         .await
         .map_err(LineRecordSnapshotError::Provider)?;
     let line = resolve_mutation_line(&requested, &detail).unwrap_or(requested);
@@ -2349,6 +2468,7 @@ async fn persist_line_desired(
     expected_value: Option<&str>,
     force_schedule: bool,
 ) -> Result<(), LineDesiredError> {
+    let _desired = observations::changing_desired().await;
     let now = utc_now();
     let existing = db
         .find_dns_record_sync(desired.rule_id, &desired.line.key)
@@ -2807,7 +2927,10 @@ pub(crate) async fn schedule_group_after_membership_change(
         persist_carrier_desired(db, id).await?;
         if preference.active_routing_mode
             == Some(crate::service::relay_preference::RoutingMode::Carrier)
-            && preference.carrier_policy.default_node_id.is_none()
+            && preference
+                .carrier_policy
+                .selected_default_nodes()
+                .is_empty()
             && preference.preferred_node_id.is_none()
         {
             project_line_desired(db, id, DEFAULT_LINE_KEY, "DELETE", None)
@@ -2820,22 +2943,22 @@ pub(crate) async fn schedule_group_after_membership_change(
         } else if preference.active_routing_mode
             == Some(crate::service::relay_preference::RoutingMode::Carrier)
         {
-            if let Some(node_id) = preference.carrier_policy.default_node_id.as_deref() {
-                if !matches!(
-                    crate::service::relay_preference::stored_node_public_ipv4(
-                        db, group_id, node_id
-                    )
-                    .await?,
-                    crate::service::relay_preference::RelayDnsTarget::Resolved(_)
-                ) {
-                    project_incomplete_line(db, id, DEFAULT_LINE_KEY)
-                        .await
-                        .map_err(|e| {
-                            crate::db::error::DbError::Other(sqlx::Error::Protocol(format!(
-                                "default incomplete projection failed: {e:?}"
-                            )))
-                        })?;
-                }
+            if !matches!(
+                crate::service::relay_preference::resolve_carrier_default(
+                    db,
+                    group_id,
+                    &preference.carrier_policy
+                )
+                .await?,
+                crate::service::relay_preference::RelayDnsTarget::Resolved(_)
+            ) {
+                project_incomplete_line(db, id, DEFAULT_LINE_KEY)
+                    .await
+                    .map_err(|e| {
+                        crate::db::error::DbError::Other(sqlx::Error::Protocol(format!(
+                            "default incomplete projection failed: {e:?}"
+                        )))
+                    })?;
             }
         }
     }
@@ -3035,6 +3158,7 @@ async fn reconcile_one(
     sync: DnsRecordSync,
     client: &DnsMgrClient,
 ) -> Vec<DnsAuditTransition> {
+    let _execution = observations::executing().await;
     if sync.desired_action == "DELETE" {
         return reconcile_delete(db, sync, client).await;
     }
@@ -3423,7 +3547,7 @@ pub(crate) async fn domain_preflight(
         }
         ZoneResolution::UpstreamFailure(_) => return Ok(result),
     };
-    let detail = match client.get_domain(zone.domain_id).await {
+    let detail = match domain_detail(&client, zone.domain_id).await {
         Ok(detail) => detail,
         Err(_) => return Ok(result),
     };
@@ -3490,7 +3614,11 @@ pub(crate) async fn load_client(db: &dyn Repository) -> Result<Option<DnsMgrClie
         .map(Some)
 }
 
-async fn reconciliation_tick(state: &AppState) {
+async fn reconciliation_tick(state: &AppState) -> usize {
+    with_provider_observations(reconciliation_batch(state)).await
+}
+
+async fn reconciliation_batch(state: &AppState) -> usize {
     let _migration_lease = crate::service::legacy_upgrade::MUTATIONS.read().await;
     crate::service::acme_dns01::cleanup_expired(state.db.as_ref()).await;
     // Fail unsafe switching transactions before refresh/due processing so a
@@ -3500,7 +3628,7 @@ async fn reconciliation_tick(state: &AppState) {
         Ok(raw) => DnsMgrSettings::from_json(raw.as_deref()),
         Err(error) => {
             tracing::error!("dns reconciliation: settings read failed: {}", error);
-            return;
+            return 0;
         }
     };
     if !settings.enabled || !settings.configured() {
@@ -3508,7 +3636,7 @@ async fn reconciliation_tick(state: &AppState) {
             tracing::error!("dns reconciliation: disabling sync state failed: {}", error);
         }
         crate::service::relay_preference::finalize_switching_preferences(state).await;
-        return;
+        return 0;
     }
     if let Err(error) = refresh_all_desired(state.db.as_ref()).await {
         tracing::error!(
@@ -3523,12 +3651,12 @@ async fn reconciliation_tick(state: &AppState) {
         Ok(Some(client)) => client,
         Ok(None) => {
             crate::service::relay_preference::finalize_switching_preferences(state).await;
-            return;
+            return 0;
         }
         Err(error) => {
             tracing::error!("dns reconciliation: client configuration failed: {}", error);
             crate::service::relay_preference::finalize_switching_preferences(state).await;
-            return;
+            return 0;
         }
     };
     let now = utc_now();
@@ -3537,17 +3665,38 @@ async fn reconciliation_tick(state: &AppState) {
         Err(error) => {
             tracing::error!("dns reconciliation: due-state query failed: {}", error);
             crate::service::relay_preference::finalize_switching_preferences(state).await;
-            return;
+            return 0;
         }
     };
-    // A single worker serializes provider writes. This is intentionally a
-    // bounded concurrency of one because DNSMgr has no idempotency key.
+    use futures_util::StreamExt;
+    let count = due.len();
+    let mut groups = std::collections::BTreeMap::new();
     for sync in due {
-        for audit in reconcile_one(state.db.as_ref(), sync, &client).await {
-            audit.record(state).await;
-        }
+        groups
+            .entry(observations::execution_key(
+                &sync.fqdn,
+                &sync.record_type,
+                &ProviderLine::from_provider(&sync.line, None),
+            ))
+            .or_insert_with(Vec::new)
+            .push(sync);
     }
+    futures_util::stream::iter(groups.into_values())
+        .map(|syncs| {
+            let client = &client;
+            async move {
+                for sync in syncs {
+                    for audit in reconcile_one(state.db.as_ref(), sync, client).await {
+                        audit.record(state).await;
+                    }
+                }
+            }
+        })
+        .buffer_unordered(DNS_SYNC_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
     crate::service::relay_preference::finalize_switching_preferences(state).await;
+    count
 }
 
 async fn list_executable_due_syncs(
@@ -3601,7 +3750,14 @@ pub fn spawn(state: AppState) {
                 _ = ticker.tick() => {}
                 _ = dns_reconcile_notify().notified() => {}
             }
-            reconciliation_tick(&state).await;
+            for _ in 0..DNS_SYNC_MAX_DRAIN_BATCHES {
+                if reconciliation_tick(&state).await < DNS_SYNC_MAX_BATCH as usize {
+                    break;
+                }
+                // Yield without introducing a timer between already-due batches.
+                notify_reconcile();
+                tokio::task::yield_now().await;
+            }
         }
     });
 }
@@ -4683,6 +4839,7 @@ mod tests {
         let (_, _node_a_rx) = connections.register(10, Some("node-a".into())).await;
         let (_, _node_b_rx) = connections.register(10, Some("node-b".into())).await;
         let policy = CarrierPolicy {
+            default_node_ids: None,
             default_node_id: Some("node-a".into()),
             bindings: vec![
                 CarrierLineBinding {
@@ -4735,6 +4892,15 @@ mod tests {
 
     #[tokio::test]
     async fn normal_carrier_roundtrip_commits_one_journal_and_retains_configuration() {
+        routing_modes_roundtrip(false).await;
+    }
+
+    #[tokio::test]
+    async fn multi_default_carrier_survives_normal_schedule_failover_roundtrips() {
+        routing_modes_roundtrip(true).await;
+    }
+
+    async fn routing_modes_roundtrip(multi_default: bool) {
         use crate::service::relay_preference::{
             CarrierLineBinding, CarrierLineMode, CarrierPolicy, RelayPreferenceState, RoutingMode,
             RoutingModeTransitionOutcome,
@@ -4792,6 +4958,7 @@ mod tests {
             .await
             .unwrap();
         let policy = CarrierPolicy {
+            default_node_ids: multi_default.then(|| vec!["node-a".into(), "node-b".into()]),
             default_node_id: Some("node-b".into()),
             bindings: vec![
                 CarrierLineBinding {
@@ -4833,6 +5000,7 @@ mod tests {
             &connections,
             10,
             crate::service::relay_preference::RoutingApplyRequest::Carrier {
+                default_node_ids: policy.default_node_ids.clone(),
                 default_node_id: policy.default_node_id.clone(),
                 bindings: policy.bindings.clone(),
             },
@@ -4892,11 +5060,13 @@ mod tests {
 
         let mut updated_policy = policy.clone();
         updated_policy.default_node_id = Some("node-a".into());
+        updated_policy.default_node_ids = multi_default.then(|| vec!["node-a".into()]);
         let active_apply = crate::service::relay_preference::apply_routing_configuration(
             &db,
             &connections,
             10,
             crate::service::relay_preference::RoutingApplyRequest::Carrier {
+                default_node_ids: updated_policy.default_node_ids.clone(),
                 default_node_id: updated_policy.default_node_id.clone(),
                 bindings: updated_policy.bindings.clone(),
             },
@@ -4933,6 +5103,40 @@ mod tests {
         assert_eq!(updated.carrier_policy, updated_policy);
         assert_eq!(updated.preferred_node_id.as_deref(), Some("node-a"));
 
+        if multi_default {
+            updated_policy.default_node_ids = Some(vec!["node-a".into(), "node-b".into()]);
+            crate::service::relay_preference::apply_routing_configuration(
+                &db,
+                &connections,
+                10,
+                crate::service::relay_preference::RoutingApplyRequest::Carrier {
+                    default_node_ids: updated_policy.default_node_ids.clone(),
+                    default_node_id: updated_policy.default_node_id.clone(),
+                    bindings: updated_policy.bindings.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            for sync in db.list_dns_record_syncs_for_rule(100).await.unwrap() {
+                reconcile_one(&db, sync, &mock.client).await;
+            }
+            crate::service::relay_preference::finalize_switching_group_for_test(
+                &db,
+                &connections,
+                10,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                crate::service::relay_preference::resolve_dns_target(&db, 10)
+                    .await
+                    .unwrap(),
+                crate::service::relay_preference::RelayDnsTarget::Resolved(encode_dns_values(
+                    ["192.0.2.20".to_owned(), "192.0.2.30".to_owned()].into()
+                ))
+            );
+        }
+
         db.set(
             crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY,
             r#"[{"id":"schedule-a","group_id":10,"target_node_id":"node-b","schedule_type":"daily","enabled":true,"created_at":"x","updated_at":"x","execute_at":null,"time":"12:00","utc_offset_minutes":0,"weekdays":[],"last_run_at":null,"last_run_slot":null,"last_result":null,"last_error":null}]"#,
@@ -4960,10 +5164,13 @@ mod tests {
             carrier_to_schedule.pending_routing_mode,
             Some(RoutingMode::Schedule)
         );
-        assert!(carrier_to_schedule
-            .dns_records
-            .iter()
-            .all(|record| record.line_key != DEFAULT_LINE_KEY));
+        assert_eq!(
+            carrier_to_schedule
+                .dns_records
+                .iter()
+                .any(|record| record.line_key == DEFAULT_LINE_KEY),
+            multi_default
+        );
         for sync in db.list_dns_record_syncs_for_rule(100).await.unwrap() {
             reconcile_one(&db, sync, &mock.client).await;
         }
@@ -5029,6 +5236,20 @@ mod tests {
                 .active_routing_mode,
                 Some(target_mode)
             );
+            let persisted: RelayPreferenceState =
+                serde_json::from_str(&db.get("relay_preference:10").await.unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(persisted.carrier_policy, updated_policy);
+            if multi_default && target_mode == RoutingMode::Carrier {
+                assert_eq!(
+                    crate::service::relay_preference::resolve_dns_target(&db, 10)
+                        .await
+                        .unwrap(),
+                    crate::service::relay_preference::RelayDnsTarget::Resolved(encode_dns_values(
+                        ["192.0.2.20".to_owned(), "192.0.2.30".to_owned()].into()
+                    ))
+                );
+            }
         }
 
         let normal_apply = crate::service::relay_preference::apply_routing_configuration(
@@ -5153,6 +5374,7 @@ mod tests {
                 &connections,
                 10,
                 crate::service::relay_preference::CarrierPolicy {
+                    default_node_ids: None,
                     default_node_id: Some("node-a".into()),
                     bindings: Vec::new(),
                 },
@@ -5394,6 +5616,7 @@ mod tests {
                 &connections,
                 10,
                 crate::service::relay_preference::CarrierPolicy {
+                    default_node_ids: None,
                     default_node_id: Some("node-a".into()),
                     bindings: Vec::new(),
                 },
@@ -6491,6 +6714,11 @@ mod tests {
         update_attempts: AtomicUsize,
         delete_attempts: AtomicUsize,
         list_attempts: AtomicUsize,
+        domain_attempts: AtomicUsize,
+        detail_attempts: AtomicUsize,
+        mutation_delay_ms: AtomicUsize,
+        active_mutations: AtomicUsize,
+        max_mutations: AtomicUsize,
         last_add_form: Mutex<Option<HashMap<String, String>>>,
         last_update_form: Mutex<Option<HashMap<String, String>>>,
     }
@@ -6552,6 +6780,11 @@ mod tests {
             update_attempts: AtomicUsize::new(0),
             delete_attempts: AtomicUsize::new(0),
             list_attempts: AtomicUsize::new(0),
+            domain_attempts: AtomicUsize::new(0),
+            detail_attempts: AtomicUsize::new(0),
+            mutation_delay_ms: AtomicUsize::new(0),
+            active_mutations: AtomicUsize::new(0),
+            max_mutations: AtomicUsize::new(0),
             last_add_form: Mutex::new(None),
             last_update_form: Mutex::new(None),
         });
@@ -6577,6 +6810,7 @@ mod tests {
     }
 
     async fn mock_domains(State(state): State<Arc<MockDnsState>>) -> Json<serde_json::Value> {
+        state.domain_attempts.fetch_add(1, Ordering::SeqCst);
         Json(json!({
             "total": 1,
             "rows": [{"id": 7, "name": "example.com", "type": *state.provider_type.lock().unwrap()}]
@@ -6584,6 +6818,7 @@ mod tests {
     }
 
     async fn mock_domain_detail(State(state): State<Arc<MockDnsState>>) -> Json<serde_json::Value> {
+        state.detail_attempts.fetch_add(1, Ordering::SeqCst);
         let record_lines = state
             .record_lines
             .lock()
@@ -6603,25 +6838,64 @@ mod tests {
         }))
     }
 
-    async fn mock_records(State(state): State<Arc<MockDnsState>>) -> Response {
+    async fn mock_records(
+        State(state): State<Arc<MockDnsState>>,
+        Form(form): Form<HashMap<String, String>>,
+    ) -> Response {
         state.list_attempts.fetch_add(1, Ordering::SeqCst);
         if state.read_failure.load(Ordering::SeqCst) {
             return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-        let rows = state
+        let all = state
             .records
             .lock()
             .unwrap()
             .iter()
+            .filter(|record| {
+                form.get("subdomain")
+                    .is_none_or(|host| record.host.eq_ignore_ascii_case(host))
+            })
             .map(record_json)
             .collect::<Vec<_>>();
-        Json(json!({"total": rows.len(), "rows": rows})).into_response()
+        let offset = form
+            .get("offset")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let limit = form
+            .get("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(100);
+        let rows = all
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        Json(json!({"total":all.len(), "rows":rows})).into_response()
+    }
+
+    struct MockMutationActivity<'a>(&'a MockDnsState);
+    impl Drop for MockMutationActivity<'_> {
+        fn drop(&mut self) {
+            self.0.active_mutations.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    async fn mock_mutation_activity(state: &MockDnsState) -> MockMutationActivity<'_> {
+        let active = state.active_mutations.fetch_add(1, Ordering::SeqCst) + 1;
+        state.max_mutations.fetch_max(active, Ordering::SeqCst);
+        let activity = MockMutationActivity(state);
+        let delay = state.mutation_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+        }
+        activity
     }
 
     async fn mock_add_record(
         State(state): State<Arc<MockDnsState>>,
         Form(form): Form<HashMap<String, String>>,
     ) -> Response {
+        let _activity = mock_mutation_activity(&state).await;
         let attempt = state.add_attempts.fetch_add(1, Ordering::SeqCst) + 1;
         *state.last_add_form.lock().unwrap() = Some(form.clone());
         if state.reject_writes.load(Ordering::SeqCst)
@@ -6655,6 +6929,7 @@ mod tests {
         State(state): State<Arc<MockDnsState>>,
         Form(form): Form<HashMap<String, String>>,
     ) -> Response {
+        let _activity = mock_mutation_activity(&state).await;
         state.update_attempts.fetch_add(1, Ordering::SeqCst);
         *state.last_update_form.lock().unwrap() = Some(form.clone());
         if matches!(
@@ -6679,6 +6954,7 @@ mod tests {
         State(state): State<Arc<MockDnsState>>,
         Form(form): Form<HashMap<String, String>>,
     ) -> Response {
+        let _activity = mock_mutation_activity(&state).await;
         let attempt = state.delete_attempts.fetch_add(1, Ordering::SeqCst) + 1;
         if state.temporary_delete_at.load(Ordering::SeqCst) == attempt {
             return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -7639,6 +7915,7 @@ mod tests {
                 &connections,
                 10,
                 crate::service::relay_preference::CarrierPolicy {
+                    default_node_ids: None,
                     default_node_id: Some("node-a".into()),
                     bindings: Vec::new(),
                 },

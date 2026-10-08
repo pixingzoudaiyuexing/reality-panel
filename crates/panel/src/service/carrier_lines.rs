@@ -262,8 +262,7 @@ async fn fetch_provider_catalog(
 
     let mut provider_zones = BTreeMap::new();
     for zone_id in zones {
-        let detail = client
-            .get_domain(zone_id)
+        let detail = crate::service::dnsmgr::domain_detail(&client, zone_id)
             .await
             .map_err(CarrierLineCatalogError::Provider)?;
         provider_zones.insert(

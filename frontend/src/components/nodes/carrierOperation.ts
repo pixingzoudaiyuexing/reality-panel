@@ -1,7 +1,12 @@
 import type { CarrierAffinityView, CarrierPolicy } from '../../api/types';
 
+/** Missing is legacy; an explicit empty list must never restore the anchor. */
+export function carrierDefaultNodeIds(policy?: CarrierPolicy | null, legacyDefault?: string | null): string[] {
+  return [...new Set(policy?.default_node_ids ?? (policy?.default_node_id ? [policy.default_node_id] : legacyDefault ? [legacyDefault] : []))].sort();
+}
+
 export function carrierPolicyKey(policy: CarrierPolicy): string {
-  return JSON.stringify({ default_node_id: policy.default_node_id ?? null,
+  return JSON.stringify({ default_node_ids: carrierDefaultNodeIds(policy),
     bindings: policy.bindings.filter((b) => b.line_id !== 'default').map((b) => ({ line_id: b.line_id, mode: b.mode, node_id: b.node_id ?? null }))
       .sort((a, b) => `${a.line_id}:${a.mode}:${a.node_id}`.localeCompare(`${b.line_id}:${b.mode}:${b.node_id}`)) });
 }

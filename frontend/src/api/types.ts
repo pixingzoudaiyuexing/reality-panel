@@ -446,6 +446,7 @@ export interface CarrierLineBinding {
 }
 
 export interface CarrierPolicy {
+  default_node_ids?: string[] | null;
   default_node_id?: string | null;
   bindings: CarrierLineBinding[];
 }
@@ -464,7 +465,7 @@ export interface RoutingModeView {
 
 export type RoutingApplyRequest =
   | { mode: 'normal'; default_node_id: string }
-  | { mode: 'carrier'; default_node_id: string | null; bindings: CarrierLineBinding[]; dns_confirmation?: string }
+  | { mode: 'carrier'; default_node_ids?: string[] | null; default_node_id: string | null; bindings: CarrierLineBinding[]; dns_confirmation?: string }
   | { mode: 'schedule' }
   | { mode: 'failover'; health_check_port: number; failure_after_seconds: number };
 

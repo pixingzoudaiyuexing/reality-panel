@@ -82,6 +82,15 @@ impl fmt::Debug for DnsMgrClient {
 }
 
 impl DnsMgrClient {
+    /// In-memory cache partition only; this never changes provider authentication.
+    pub(crate) fn observation_identity(&self) -> String {
+        format!(
+            "{}:{}:{:x}",
+            self.config.base_url,
+            self.config.uid,
+            Md5::digest(self.config.api_key.as_bytes())
+        )
+    }
     pub(crate) fn new(config: DnsMgrClientConfig) -> Result<Self, DnsMgrError> {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)

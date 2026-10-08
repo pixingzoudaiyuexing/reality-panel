@@ -73,6 +73,13 @@ const applied = (over: Partial<RoutingApplyResult> = {}): RoutingApplyResult => 
 });
 const mockApply = vi.fn(async () => applied());
 
+function selectOnlyDefaultB() {
+  const a = screen.getByRole('checkbox', { name: 'node-a 全网默认' });
+  const b = screen.getByRole('checkbox', { name: 'node-b 全网默认' });
+  if ((a as HTMLInputElement).checked) fireEvent.click(a);
+  if (!(b as HTMLInputElement).checked) fireEvent.click(b);
+}
+
 function arrange(over: Partial<CarrierAffinityView> = {}, displayedNodes = nodes, activeMode: 'normal' | 'carrier' = 'normal', catalogResponse: CarrierLineCatalog = catalog) {
   const response = { ...view, ...over };
   mockGet.mockImplementation((url: string) => Promise.resolve(ok(url.endsWith('/carrier-lines') ? catalogResponse : response)));
@@ -93,6 +100,30 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     expect(screen.getByLabelText('node-b carrierLine')).toBeEnabled();
   });
 
+  it('keeps multiple defaults independently selected and submits the full set', async () => {
+    arrange({ active_policy: { default_node_id: 'node-a', default_node_ids: ['node-a'], bindings: [] } });
+    expect(await screen.findByRole('checkbox', { name: 'node-a 全网默认' })).toBeChecked();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'node-b 全网默认' }));
+    expect(screen.getByRole('checkbox', { name: 'node-a 全网默认' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'node-b 全网默认' })).toBeChecked();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'node-a 全网默认' }));
+    expect(screen.getByRole('checkbox', { name: 'node-b 全网默认' })).toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: /保存并启用/ }));
+    await waitFor(() => expect(mockApply).toHaveBeenCalledWith({ mode: 'carrier', default_node_id: 'node-b', default_node_ids: ['node-b'], bindings: [] }));
+  });
+  it('reloads all saved defaults and respects an explicit empty set', async () => {
+    const mounted = arrange({ active_policy: { default_node_id: 'node-a', default_node_ids: ['node-a', 'node-b'], bindings: [] } });
+    expect(await screen.findByRole('checkbox', { name: 'node-a 全网默认' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'node-b 全网默认' })).toBeChecked();
+    mounted.unmount();
+    arrange({ active_policy: { default_node_id: 'node-a', default_node_ids: [], bindings: [] } });
+    expect(await screen.findByRole('checkbox', { name: 'node-a 全网默认' })).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'node-b 全网默认' })).not.toBeChecked();
+  });
+  it('keeps other inherited members when editing one default Relay line', () => {
+    expect(assignCarrierLines([{ line_id: 'Dianxin', mode: 'follow_default' }], 'node-a', [], ['node-a', 'node-b'])).toEqual([{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }]);
+  });
+
   it('assigns the same line to another Relay without removing the first', () => {
     expect(assignCarrierLines(view.active_policy.bindings, 'node-a', ['default', 'Dianxin'], view.default_node_id)).toEqual([
       { line_id: 'Dianxin', mode: 'node', node_id: 'node-a' },
@@ -109,10 +140,10 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     ]);
   });
 
-  it('shows default only as a derived fixed indicator on the preferred Relay', async () => {
+  it('loads a legacy default as one checked Relay', async () => {
     arrange();
     const preferred = await screen.findByTestId('carrier-node-node-a');
-    expect(within(preferred).getByTestId('carrier-default-node-indicator')).toHaveTextContent('✓ 全网默认');
+    expect(within(preferred).getByRole('checkbox', { name: 'node-a 全网默认' })).toBeChecked();
     expect(within(screen.getByTestId('carrier-node-node-b')).queryByTestId('carrier-default-node-indicator')).not.toBeInTheDocument();
     expect(screen.getByText('carrierLegacyDefaultBinding')).toBeInTheDocument();
 
@@ -158,14 +189,14 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     arrange({ active_policy: { ...view.active_policy, default_node_id: 'node-b' } });
     await screen.findByTestId('carrier-node-node-a');
     expect(within(screen.getByTestId('carrier-node-node-a')).queryByTestId('carrier-default-node-indicator')).not.toBeInTheDocument();
-    expect(within(screen.getByTestId('carrier-node-node-b')).getByTestId('carrier-default-node-indicator')).toHaveTextContent('✓ 全网默认');
+    expect(within(screen.getByTestId('carrier-node-node-b')).getByRole('checkbox', { name: 'node-b 全网默认' })).toBeChecked();
   });
 
   it('changes Carrier default only in the draft until Apply', async () => {
     arrange();
     const nodeB = await screen.findByTestId('carrier-node-node-b');
-    fireEvent.click(within(nodeB).getByRole('button', { name: '设为全网默认' }));
-    expect(within(nodeB).getByTestId('carrier-default-node-indicator')).toHaveTextContent('✓ 全网默认');
+    selectOnlyDefaultB();
+    expect(within(nodeB).getByRole('checkbox', { name: 'node-b 全网默认' })).toBeChecked();
     expect(mockApply).not.toHaveBeenCalled();
   });
 
@@ -175,6 +206,7 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     await waitFor(() => expect(mockApply).toHaveBeenCalledTimes(1));
     expect(mockApply).toHaveBeenCalledWith({
       mode: 'carrier',
+      default_node_ids: ['node-a'],
       default_node_id: 'node-a',
       bindings: [{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }],
     });
@@ -224,6 +256,7 @@ describe('CarrierAffinityPanel node-oriented editor', () => {
     fireEvent.click(screen.getByRole('button', { name: /保存并启用/ }));
     await waitFor(() => expect(mockApply).toHaveBeenCalledWith({
       mode: 'carrier',
+      default_node_ids: ['node-a'],
       default_node_id: 'node-a',
       bindings: [{ line_id: 'Dianxin', mode: 'node', node_id: 'node-b' }],
     }));
@@ -286,7 +319,8 @@ describe('Carrier authoritative progress and refresh', () => {
   it('recovers a lost response through reads without a second apply', async () => {
     mockApply.mockRejectedValueOnce(new Error('response lost'));
     arrange({}, nodes, 'carrier');
-    fireEvent.click(await screen.findByRole('button', { name: '设为全网默认' }));
+    await screen.findByRole('checkbox', { name: 'node-b 全网默认' });
+    selectOnlyDefaultB();
     fireEvent.click(screen.getByRole('button', { name: /保存修改/ }));
     await waitFor(() => expect(mockApply).toHaveBeenCalledTimes(1));
     expect(await screen.findByTestId('carrier-operation')).toHaveTextContent('carrierOperationUnknown');
@@ -328,7 +362,7 @@ describe('Carrier stale historical intent', () => {
     await waitFor(() => expect(JSON.parse(sessionStorage.getItem(key)!).desired).toBeNull());
     expect(screen.queryByText('carrierOperationUnknown')).not.toBeInTheDocument();
     expect(screen.getByRole('combobox', { name: 'node-a carrierLine' })).not.toBeDisabled();
-    fireEvent.click(screen.getByRole('button', { name: '设为全网默认' }));
+    selectOnlyDefaultB();
     expect(screen.getByText('保存修改').closest('button')).toBeEnabled();
     page.unmount();
     arrange({}, nodes, 'carrier');
@@ -373,8 +407,8 @@ describe('Carrier new mutation read ordering', () => {
     let current = view;
     mockGet.mockImplementation((url: string) => Promise.resolve(ok(url.endsWith('/carrier-lines') ? catalog : current)));
     render(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} activeMode="carrier" onApply={mockApply} />);
-    await screen.findByText('✓ 全网默认');
-    fireEvent.click(screen.getByRole('button', { name: '设为全网默认' }));
+    await screen.findByRole('checkbox', { name: 'node-a 全网默认' });
+    selectOnlyDefaultB();
     fireEvent.click(screen.getByText('保存修改'));
     expect(await screen.findByText('carrierOperationUnknown')).toBeInTheDocument();
     expect(JSON.parse(sessionStorage.getItem('reality-carrier-operation:7')!).observed).toBe(false);
@@ -399,10 +433,10 @@ describe('Carrier new mutation read ordering', () => {
     mockGet.mockImplementation((url: string) => url.endsWith('/carrier-lines') ? Promise.resolve(ok(catalog))
       : slow ? new Promise((resolve) => { release = resolve; }) : Promise.resolve(ok(view)));
     const page = render(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} activeMode="carrier" onApply={mockApply} />);
-    await screen.findByText('✓ 全网默认');
+    await screen.findByRole('checkbox', { name: 'node-a 全网默认' });
     slow = true;
     page.rerender(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} activeMode="carrier" onApply={mockApply} onViewChange={() => {}} />);
-    fireEvent.click(screen.getByRole('button', { name: '设为全网默认' }));
+    selectOnlyDefaultB();
     mockApply.mockRejectedValueOnce(new Error('lost response'));
     fireEvent.click(screen.getByText('保存修改'));
     await waitFor(() => expect(mockApply).toHaveBeenCalledTimes(1));
@@ -437,8 +471,8 @@ it('requires a GET begun after the POST settled before releasing a new mutation'
     return new Promise((resolve) => { if (reads === 2) releaseDuring = resolve; else releaseAfter = resolve; });
   });
   const page = render(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} activeMode="carrier" onApply={mockApply} />);
-  await screen.findByText('✓ 全网默认');
-  fireEvent.click(screen.getByRole('button', { name: '设为全网默认' }));
+  await screen.findByRole('checkbox', { name: 'node-a 全网默认' });
+  selectOnlyDefaultB();
   fireEvent.click(screen.getByText('保存修改'));
   page.rerender(<CarrierAffinityPanel groupId={7} nodes={nodes} t={t} activeMode="carrier" onApply={mockApply} onViewChange={() => {}} />);
   await waitFor(() => expect(reads).toBe(2));

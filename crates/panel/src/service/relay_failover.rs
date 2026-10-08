@@ -1817,6 +1817,7 @@ mod tests {
         let (repo, connections) = test_repo().await;
         let preference = crate::service::relay_preference::RelayPreferenceState {
             carrier_policy: crate::service::relay_preference::CarrierPolicy {
+                default_node_ids: None,
                 default_node_id: None,
                 bindings: vec![crate::service::relay_preference::CarrierLineBinding {
                     line_id: "Dianxin".into(),
@@ -1845,6 +1846,7 @@ mod tests {
                 &connections,
                 1,
                 crate::service::relay_preference::CarrierPolicy {
+                    default_node_ids: None,
                     default_node_id: None,
                     bindings: vec![crate::service::relay_preference::CarrierLineBinding {
                         line_id: "Dianxin".into(),

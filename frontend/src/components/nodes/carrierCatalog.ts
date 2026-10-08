@@ -14,12 +14,15 @@ export function assignCarrierLines(
   bindings: CarrierLineBinding[],
   nodeId: string,
   selected: string[],
-  defaultNodeId?: string | null,
+  defaultNodes?: string | readonly string[] | null,
 ): CarrierLineBinding[] {
   const mutableSelected = selected.filter(isCarrierMutableLineId);
-  const next = mutableCarrierBindings(bindings).filter((binding) => {
-    const effectiveNodeId = binding.mode === 'node' ? binding.node_id : defaultNodeId;
-    return effectiveNodeId !== nodeId && !(binding.mode === 'follow_default' && mutableSelected.includes(binding.line_id));
+  const defaults = typeof defaultNodes === 'string' ? [defaultNodes] : defaultNodes ?? [];
+  const next = mutableCarrierBindings(bindings).flatMap((binding): CarrierLineBinding[] => {
+    if (binding.mode === 'node') return binding.node_id === nodeId ? [] : [binding];
+    if (!defaults.includes(nodeId) && !mutableSelected.includes(binding.line_id)) return [binding];
+    // Editing one inherited member materializes the other members, preserving them.
+    return defaults.filter((id) => id !== nodeId).map((id) => ({ ...binding, mode: 'node', node_id: id }));
   });
   next.push(...mutableSelected.map((lineId) => ({ line_id: lineId, mode: 'node' as const, node_id: nodeId })));
   return next.sort((left, right) => `${left.line_id}:${left.node_id ?? ''}`.localeCompare(`${right.line_id}:${right.node_id ?? ''}`));

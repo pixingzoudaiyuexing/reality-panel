@@ -16,6 +16,7 @@ mod multi_a_acceptance {
 
     fn policy(default: &str, selections: &[(&str, &str)]) -> CarrierPolicy {
         CarrierPolicy {
+            default_node_ids: None,
             default_node_id: Some(default.into()),
             bindings: selections
                 .iter()
@@ -1135,4 +1136,103 @@ mod multi_a_acceptance {
             "UPSERT"
         );
     }
+    async fn apply_defaults(f: &Fixture, ids: &[&str]) {
+        let body = json!({"mode":"carrier", "default_node_id":"n1", "default_node_ids":ids,
+            "bindings":[{"line_id":"unicom", "mode":"follow_default"}]});
+        let (status, result) = http(f, "PUT", "/groups/10/routing-apply", body).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{result}");
+        assert_eq!(result["code"], 0, "{result}");
+        refresh_all_desired(f.db.as_ref()).await.unwrap();
+        reconcile_group(f, 10).await;
+        assert_eq!(preference::load_preference(f.db.as_ref(), 10).await.unwrap().state, preference::RelayPreferencePhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn carrier_default_one_two_three_and_follow_default_round_trip() {
+        let f = fixture().await;
+        for (ids, ips) in [
+            (vec!["n1"], vec!["1.1.1.1"]),
+            (vec!["n1", "n2"], vec!["1.1.1.1", "2.2.2.2"]),
+            (vec!["n1", "n2", "n6"], vec!["1.1.1.1", "2.2.2.2", "6.6.6.6"]),
+            (vec!["n2", "n6"], vec!["2.2.2.2", "6.6.6.6"]),
+        ] {
+            apply_defaults(&f, &ids).await;
+            assert_eq!(actual_values(&f, "op1", "default"), expected(&ips));
+            assert_eq!(actual_values(&f, "op1", "unicom"), expected(&ips));
+            let p = preference::load_preference(f.db.as_ref(), 10).await.unwrap();
+            assert_eq!(p.carrier_policy.selected_default_nodes(), ids);
+            assert_eq!(preference::resolve_dns_target(f.db.as_ref(), 10).await.unwrap(), preference::RelayDnsTarget::Resolved(encode_dns_values(expected(&ips))));
+        }
+    }
+
+    #[tokio::test]
+    async fn carrier_default_delete_non_primary_primary_and_last_preserves_rrset_survivors() {
+        let f = fixture().await;
+        apply_defaults(&f, &["n1", "n2", "n6"]).await;
+        for (remove, survivors, ips) in [
+            ("n2", vec!["n1", "n6"], vec!["1.1.1.1", "6.6.6.6"]),
+            ("n1", vec!["n6"], vec!["6.6.6.6"]),
+            ("n6", vec![], vec![]),
+        ] {
+            let (status, result) = http(&f, "DELETE", &format!("/admin/node-pool/nodes/{}/{remove}", f.anchor), json!({})).await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{result}");
+            assert_eq!(result["code"], 0);
+            refresh_all_desired(f.db.as_ref()).await.unwrap();
+            reconcile_group(&f, 10).await;
+            let p = preference::load_preference(f.db.as_ref(), 10).await.unwrap();
+            assert_eq!(p.carrier_policy.selected_default_nodes(), survivors);
+            assert_eq!(actual_values(&f, "op1", "default"), expected(&ips));
+            assert_eq!(actual_values(&f, "op1", "unicom"), expected(&ips));
+            if !ips.is_empty() { assert_eq!(p.carrier_policy.bindings.len(), 1); }
+        }
+        let (_, result) = http(&f, "PUT", "/groups/10/routing-apply", json!({"mode":"carrier","default_node_ids":[],"bindings":[]})).await;
+        assert_ne!(result["code"], 0);
+        assert!(actual_values(&f, "op1", "default").is_empty());
+    }
+
+    #[tokio::test]
+    async fn carrier_default_missing_non_primary_ip_preserves_selection_and_freezes_dns() {
+        let f = fixture().await;
+        apply_defaults(&f, &["n1", "n2"]).await;
+        f.db.set(&format!("node_status:{}:n6", f.anchor), &json!({"node_id":"n6","public_ipv4_reported":true,"last_seen":"2000-01-01T00:00:00Z"}).to_string()).await.unwrap();
+        let (_, response) = http(&f, "PUT", "/groups/10/routing-apply", json!({"mode":"carrier", "default_node_ids":["n1","n2","n6"], "default_node_id":"n1", "bindings":[{"line_id":"unicom","mode":"follow_default"}]})).await;
+        assert_eq!(response["code"], 0, "{response}");
+        assert_eq!(response["data"]["dns_complete"], false);
+        let p = preference::load_preference(f.db.as_ref(), 10).await.unwrap();
+        assert_eq!(p.carrier_policy.selected_default_nodes(), vec!["n1","n2","n6"]);
+        assert_eq!(actual_values(&f, "op1", "default"), expected(&["1.1.1.1","2.2.2.2"]));
+        assert_eq!(f.db.find_dns_record_sync(100, DEFAULT_LINE_KEY).await.unwrap().unwrap().last_error_category.as_deref(), Some("CARRIER_TARGET_IPV4_UNAVAILABLE"));
+    }
+
+    #[tokio::test]
+    async fn carrier_duplicate_ipv4_retains_selected_node_identities() {
+        let f = fixture().await;
+        f.db.set(&format!("node_status:{}:n2", f.anchor), &json!({"node_id":"n2","public_ipv4":"1.1.1.1","public_ipv4_reported":true,"last_seen":"2000-01-01T00:00:00Z"}).to_string()).await.unwrap();
+        apply_defaults(&f, &["n1", "n2"]).await;
+        assert_eq!(actual_values(&f, "op1", "default"), expected(&["1.1.1.1"]));
+        assert_eq!(preference::load_preference(f.db.as_ref(), 10).await.unwrap().carrier_policy.selected_default_nodes(), vec!["n1","n2"]);
+    }
+
+    #[tokio::test]
+    async fn carrier_non_primary_ip_change_rolls_back_the_complete_multi_default_rrset() {
+        let f = fixture().await;
+        apply_defaults(&f, &["n1", "n2"]).await;
+        let (_, response) = http(&f, "PUT", "/groups/10/routing-apply", json!({"mode":"carrier", "default_node_ids":["n1","n6"], "default_node_id":"n1", "bindings":[{"line_id":"unicom","mode":"follow_default"}]})).await;
+        assert_eq!(response["code"], 0, "{response}");
+        for sync in f.db.list_dns_record_syncs_for_rule(100).await.unwrap() {
+            reconcile_one(f.db.as_ref(), sync, &f.mock.client).await;
+        }
+        assert_eq!(actual_values(&f, "op1", "default"), expected(&["1.1.1.1","6.6.6.6"]));
+        f.db.set(&format!("node_status:{}:n6", f.anchor), &json!({"node_id":"n6","public_ipv4":"9.9.9.9","public_ipv4_reported":true,"last_seen":"2000-01-01T00:00:00Z"}).to_string()).await.unwrap();
+        preference::finalize_switching_group_for_test(f.db.as_ref(), &f.connections, 10).await.unwrap();
+        assert_eq!(preference::load_preference(f.db.as_ref(), 10).await.unwrap().state, preference::RelayPreferencePhase::RollingBack);
+        refresh_all_desired(f.db.as_ref()).await.unwrap();
+        reconcile_group(&f, 10).await;
+        assert_eq!(preference::load_preference(f.db.as_ref(), 10).await.unwrap().state, preference::RelayPreferencePhase::FailedRolledBack);
+        assert_eq!(actual_values(&f, "op1", "default"), expected(&["1.1.1.1","2.2.2.2"]));
+        assert_eq!(actual_values(&f, "op1", "unicom"), expected(&["1.1.1.1","2.2.2.2"]));
+    }
+
+    include!("fast_sync_tests.rs");
+
 }
