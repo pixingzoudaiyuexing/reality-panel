@@ -1,5 +1,9 @@
 # Changelog — relay-node
 
+## [1.4.9] - 2026-10-08
+
+- Unified release version with Panel 1.4.9. Node runtime and forwarding behavior are unchanged; Config Protocol 10 and Lifecycle Protocol 1 are unchanged. No new legacy upgrader or migration behavior is included.
+
 ## [1.4.8] - 2026-10-08 (RC, unpublished)
 
 - Unified version with Panel 1.4.8; Node runtime, Config Protocol 10 and Lifecycle Protocol 1 are unchanged.

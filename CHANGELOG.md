@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.9] - 2026-10-08
+
+- Consolidate Groups, Node Pool and Node Status navigation into Node Management with by-group and all-node views; preserve physical-identity deduplication, monitoring, membership, lifecycle operations and legacy URLs.
+- Rules use a dynamic Group selector and one table, filtering before independent pagination. Default selection is page-local; explicit cross-page selection resets correctly on scope changes and completed batch operations. Existing rule management and diagnosis remain available.
+- Preserve existing backend permissions, Carrier/default multi-node selection, dynamic DNS line catalogs and all four routing modes. Correct the Global Default multi-node hint. No backend business, Node forwarding, schema or protocol change; Config Protocol 10 and Lifecycle Protocol 1 remain unchanged.
+
 ## [1.4.8] - 2026-10-08 (RC, unpublished)
 
 - Carrier default checkboxes select multiple Node identities; one default A RRset and Follow Default lines contain their distinct IPv4 values. Legacy single-default policy remains readable; explicit empty selection remains empty. Other routing modes retain their single-default contracts.
