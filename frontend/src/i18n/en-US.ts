@@ -555,7 +555,7 @@ export const enUS: Dict = {
   carrierSave: 'Apply line policy',
   carrierLoadFailed: 'Could not load the carrier line policy',
   carrierSaveFailed: 'Could not apply the carrier line policy',
-  carrierMultiNodeHint: 'A carrier line can select multiple nodes; Global Default still selects one.',
+  carrierMultiNodeHint: 'Carrier lines and Global Default can each select multiple nodes.',
   carrierLineSelections: 'Nodes selected for each line',
   dnsOverwriteConfirmTitle: 'Confirm DNS overwrite',
   dnsOverwriteConfirmDescription: 'Existing records have unverified ownership or a CNAME conflict. Confirmation replaces only the names and carrier lines shown below.',

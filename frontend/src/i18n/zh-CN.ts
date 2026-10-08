@@ -551,7 +551,7 @@ export const zhCN = {
   carrierSave: '应用线路策略',
   carrierLoadFailed: '运营商线路策略加载失败',
   carrierSaveFailed: '运营商线路策略应用失败',
-  carrierMultiNodeHint: '同一运营商线路可选择多个节点；全网默认仍选择一个节点。',
+  carrierMultiNodeHint: '同一运营商线路及全网默认均可选择多个节点。',
   carrierLineSelections: '线路对应节点',
   dnsOverwriteConfirmTitle: '确认覆盖 DNS 记录',
   dnsOverwriteConfirmDescription: '现有记录的归属无法确认或存在 CNAME 冲突。确认后仅覆盖下列域名及运营商线路的记录。',
