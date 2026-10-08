@@ -395,7 +395,7 @@ export default function NodeStatus({ flat = false, embedded = false, poolNodes =
             <Button icon={<UnorderedListOutlined />} onClick={() => setBackgroundTasksOpen(true)}>{t('backgroundTasks')}</Button>
           </Badge>
           <Button icon={<SyncOutlined />} onClick={() => void openBatchUpgrade()}>{t('batchUpgradeAll')}</Button>
-          <Button type="primary" icon={<CloudUploadOutlined />} onClick={() => navigate('/node-bootstrap')}>{t('nodeBootstrapTitle')}</Button>
+          {!flat && !embedded && <Button type="primary" icon={<CloudUploadOutlined />} onClick={() => navigate('/node-bootstrap')}>{t('nodeBootstrapTitle')}</Button>}
         </Space>
       )}
     </div>

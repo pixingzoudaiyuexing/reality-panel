@@ -1,7 +1,7 @@
 import { Button, Drawer, Segmented } from 'antd';
-import { CloudServerOutlined } from '@ant-design/icons';
+import { CloudServerOutlined, CloudUploadOutlined } from '@ant-design/icons';
 import { useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../auth/useAuth';
 import { useI18n } from '../i18n/context';
 import Groups from './Groups';
@@ -11,12 +11,13 @@ import NodeStatus from './NodeStatus';
 /** A single entry point; data authorization remains in the existing APIs. */
 export default function NodeManagement() {
   const { t } = useI18n();
+  const navigate = useNavigate();
   const [ownedGroupsOpen, setOwnedGroupsOpen] = useState(false);
   const { isAdmin } = useAuth();
   const [params, setParams] = useSearchParams();
   const view = params.get('view') === 'all' ? 'all' : 'groups';
   return <>
-    <div className="rp-page-header"><h2 className="rp-page-title"><CloudServerOutlined /> {t('nodeManagement')}</h2></div>
+    <div className="rp-page-header"><h2 className="rp-page-title"><CloudServerOutlined /> {t('nodeManagement')}</h2>{isAdmin && <Button type="primary" icon={<CloudUploadOutlined />} onClick={() => navigate('/node-bootstrap')}>{t('nodeBootstrapTitle')}</Button>}</div>
     <Segmented aria-label={t('nodeManagement')} value={view} options={[
       { label: t('nodeViewGroups'), value: 'groups' }, { label: t('nodeViewAll'), value: 'all' },
     ]} onChange={value => setParams({ view: String(value) })} />
