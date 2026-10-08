@@ -1,32 +1,43 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Alert, Button, Input, Modal, Space, Table, Tag, Tooltip, message } from 'antd';
-import { CloudServerOutlined, EditOutlined, ReloadOutlined } from '@ant-design/icons';
+import { Alert, Button, Input, Modal, Space, Table, Tag, Tooltip, Dropdown, message } from 'antd';
+import { CloudServerOutlined, EditOutlined, ReloadOutlined, MoreOutlined } from '@ant-design/icons';
 import api from '../api/client';
 import type { ApiEnvelope, NodeOperation, PoolNode } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { poolNodeKey, poolNodeName } from '../components/nodes/poolNodeName';
 import { NodeReusePanel } from '../components/nodes/NodeReusePanel';
 
-export default function NodePool() {
+interface Props {
+  renderNodes?: (nodes: PoolNode[], actions: (node: PoolNode) => React.ReactNode, reload: () => void, metadataAvailable: boolean) => React.ReactNode;
+}
+export default function NodePool({ renderNodes }: Props = {}) {
   const { t } = useI18n();
   const [nodes, setNodes] = useState<PoolNode[]>([]);
+  const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
   const [editing, setEditing] = useState<PoolNode | null>(null);
   const [name, setName] = useState('');
   const [saving, setSaving] = useState(false);
   const [managing, setManaging] = useState<PoolNode | null>(null);
-  const load = useCallback(async () => {
-    setLoading(true);
+  const embedded = !!renderNodes;
+  const load = useCallback(async (showLoading = true) => {
+    if (showLoading) setLoading(true);
     try {
       const result = await api.get<unknown, ApiEnvelope<PoolNode[]>>('/admin/node-pool/nodes');
       if (result.code !== 0 || !result.data) throw new Error('unavailable');
       setNodes(result.data);
+      setLoaded(true);
       setFailed(false);
     } catch { setFailed(true); }
     finally { setLoading(false); }
   }, []);
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    void load();
+    if (!embedded) return;
+    const timer = window.setInterval(() => void load(false), 10000);
+    return () => window.clearInterval(timer);
+  }, [load, embedded]);
   const save = async () => {
     if (!editing) return;
     setSaving(true);
@@ -88,12 +99,25 @@ export default function NodePool() {
       } catch { message.error(t('poolDeleteFailed')); }
     },
   });
+  const actions = (node: PoolNode) => renderNodes ? <Dropdown menu={{ items: [
+    { key: 'rename', label: t('poolEditName'), onClick: () => { setEditing(node); setName(node.display_name); } },
+    { key: 'groups', label: t('poolManageGroups'), onClick: () => setManaging(node) },
+    { key: 'uninstall', label: node.online ? t('poolUninstall') : t('poolUninstallOffline'), disabled: !node.online, onClick: () => uninstall(node) },
+    { key: 'delete', label: t('poolDelete'), danger: true, onClick: () => deleteNode(node) },
+  ] }}><Button size="small" icon={<MoreOutlined />}>{t('nodePoolActions')}</Button></Dropdown> : <Space wrap>
+          <Button icon={<EditOutlined />} onClick={() => { setEditing(node); setName(node.display_name); }}>{t('edit')}</Button>
+          <Button onClick={() => setManaging(node)}>{t('poolManageGroups')}</Button>
+          {node.online ? <Button onClick={() => uninstall(node)}>{t('poolUninstall')}</Button>
+            : <Tooltip title={t('poolUninstallOffline')}><Button disabled>{t('poolUninstall')}</Button></Tooltip>}
+          <Button danger onClick={() => deleteNode(node)}>{t('poolDelete')}</Button>
+        </Space>;
   return <>
     <div className="rp-page-header">
-      <h2 className="rp-page-title"><CloudServerOutlined /> {t('nodePool')}</h2>
+      {!renderNodes && <h2 className="rp-page-title"><CloudServerOutlined /> {t('nodePool')}</h2>}
       <Button icon={<ReloadOutlined />} onClick={() => void load()}>{t('refresh')}</Button>
     </div>
     {failed && <Alert type="error" showIcon title={t('poolLoadFailed')} />}
+    {renderNodes ? renderNodes(nodes, actions, () => void load(), loaded && !failed) : (
     <Table rowKey={poolNodeKey} dataSource={nodes} loading={loading} scroll={{ x: 950 }}
       columns={[
         { title: t('poolNodeName'), render: (_: unknown, node: PoolNode) => <span title={node.node_id}>{poolNodeName(node)}</span> },
@@ -102,14 +126,9 @@ export default function NodePool() {
         { title: t('nodeVersion'), dataIndex: 'node_version', render: (value: string | null) => value || '-' },
         { title: t('poolMemberships'), render: (_: unknown, node: PoolNode) => node.memberships.map(m => <Tag key={m.group_id}>{m.group_name}</Tag>) },
         { title: t('lastSeen'), dataIndex: 'last_seen', render: (value: string | null) => value || '-' },
-        { title: t('action'), render: (_: unknown, node: PoolNode) => <Space wrap>
-          <Button icon={<EditOutlined />} onClick={() => { setEditing(node); setName(node.display_name); }}>{t('edit')}</Button>
-          <Button onClick={() => setManaging(node)}>{t('poolManageGroups')}</Button>
-          {node.online ? <Button onClick={() => uninstall(node)}>{t('poolUninstall')}</Button>
-            : <Tooltip title={t('poolUninstallOffline')}><Button disabled>{t('poolUninstall')}</Button></Tooltip>}
-          <Button danger onClick={() => deleteNode(node)}>{t('poolDelete')}</Button>
-        </Space> },
+        { title: t('action'), render: (_: unknown, node: PoolNode) => actions(node) },
       ]} />
+    )}
     <Modal title={t('poolEditName')} open={!!editing} onCancel={() => setEditing(null)} onOk={() => void save()} confirmLoading={saving}>
       <Input aria-label={t('poolNodeName')} value={name} maxLength={128} onChange={e => setName(e.target.value)} />
     </Modal>

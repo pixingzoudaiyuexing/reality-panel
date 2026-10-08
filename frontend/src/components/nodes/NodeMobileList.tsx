@@ -14,6 +14,9 @@ import {
 } from './NodeStatusCells';
 
 interface Props {
+  canDeleteStatus?: (row: NodeDisplayRow) => boolean;
+  nodeLabel?: (row: NodeDisplayRow) => React.ReactNode;
+  managementActions?: (row: NodeDisplayRow) => React.ReactNode;
   rows: NodeDisplayRow[];
   panelProtocol: number;
   /** v1.2: the latest NODE release (bare, e.g. "1.1.0"). Nodes compare their
@@ -36,7 +39,7 @@ interface Props {
 
 /** Mobile node cards reuse the same data presentation and actions as the
  * desktop table, but reorder them for status-first scanning without a table. */
-export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {}, onDelete, relayNodes = [], showRelayReady = false }: Props) {
+export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', nodeVersionCheckFailed = false, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {}, onDelete, relayNodes = [], showRelayReady = false, nodeLabel, managementActions, canDeleteStatus }: Props) {
   const relayById = new Map(relayNodes.map((node) => [node.node_id, node]));
 
   return (
@@ -51,6 +54,7 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
             className={`rp-node-mobile-card ${r.online ? '' : 'rp-node-offline-card'}`}
             data-testid="node-mobile-card"
           >
+            {nodeLabel?.(r)}
             <div className="rp-node-mobile-topline">
               <NodeStatusCell
                 row={r}
@@ -69,9 +73,10 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
                 openDetail={openDetail}
                 onLifecycle={onLifecycle}
                 onUpgrade={onUpgrade}
-                onDelete={onDelete}
+                onDelete={canDeleteStatus && !canDeleteStatus(r) ? undefined : onDelete}
               />
             </div>
+            {managementActions?.(r)}
             <NetworkCell row={r} t={t} />
             <div className="rp-node-mobile-connections"><NodeConnectionsCell row={r} /></div>
             <NodeResourcesCell row={r} t={t} />

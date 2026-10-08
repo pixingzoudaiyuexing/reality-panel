@@ -307,7 +307,7 @@ describe('Rules lightweight background refresh', () => {
     await flush();
     fireEvent.click(screen.getByTitle('2'));
     await flush();
-    const section = screen.getByTestId('rules-group-7');
+    const section = document.querySelector('.rp-rules-table') as HTMLElement;
     const row = screen.getByText('rule-21').closest('tr') as HTMLElement;
     fireEvent.click(within(section).getAllByRole('checkbox')[1]);
     fireEvent.click(within(row).getByRole('button', { name: /edit/ }));

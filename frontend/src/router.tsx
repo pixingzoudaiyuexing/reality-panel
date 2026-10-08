@@ -5,7 +5,7 @@
 // not a blanket suppression of real warnings).
 /* eslint-disable react-refresh/only-export-components */
 import { lazy, Suspense } from 'react';
-import { createBrowserRouter } from 'react-router-dom';
+import { Navigate, createBrowserRouter } from 'react-router-dom';
 import { Spin } from 'antd';
 // EAGER: the authenticated shell + its route guards load up front so the
 // sidebar/menu renders immediately after login (and the guards run before any
@@ -21,11 +21,9 @@ const Login = lazy(() => import('./pages/Login'));
 const Register = lazy(() => import('./pages/Register'));
 const ForcePasswordChange = lazy(() => import('./pages/ForcePasswordChange'));
 const Rules = lazy(() => import('./pages/Rules'));
-const Groups = lazy(() => import('./pages/Groups'));
+const NodeManagement = lazy(() => import('./pages/NodeManagement'));
 const Users = lazy(() => import('./pages/Users'));
-const NodeStatus = lazy(() => import('./pages/NodeStatus'));
 const NodeBootstrap = lazy(() => import('./pages/NodeBootstrap'));
-const NodePool = lazy(() => import('./pages/NodePool'));
 const Account = lazy(() => import('./pages/Account'));
 const SystemSettings = lazy(() => import('./pages/SystemSettings'));
 const Plans = lazy(() => import('./pages/Plans'));
@@ -72,11 +70,12 @@ export const router = createBrowserRouter([
       { index: true, element: <RoleHome /> },
       // Owner-scoped resources — any authenticated user manages their own.
       { path: 'rules', element: <Rules /> },
-      { path: 'groups', element: <Groups /> },
-      { path: 'nodes', element: <NodeStatus /> },
-      { path: 'node-status', element: <NodeStatus /> },
+      { path: 'node-management', element: <NodeManagement /> },
+      { path: 'groups', element: <Navigate to="/node-management?view=groups" replace /> },
+      { path: 'nodes', element: <Navigate to="/node-management?view=all" replace /> },
+      { path: 'node-status', element: <Navigate to="/node-management?view=all" replace /> },
       { path: 'node-bootstrap', element: <RequireAdmin><NodeBootstrap /></RequireAdmin> },
-      { path: 'node-pool', element: <RequireAdmin><NodePool /></RequireAdmin> },
+      { path: 'node-pool', element: <RequireAdmin><Navigate to="/node-management?view=all" replace /></RequireAdmin> },
       // v1.0.8: self-service shop (plan purchase + order history).
       { path: 'shop', element: <Shop /> },
       // v1.0.8: admin plan management (CRUD).

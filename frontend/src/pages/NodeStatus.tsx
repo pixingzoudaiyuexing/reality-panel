@@ -3,9 +3,13 @@ import { Spin, Result, Empty, Modal, message, Button, Drawer, Input, Tag, Typogr
 import { CloudUploadOutlined, CopyOutlined, LineChartOutlined, ReloadOutlined, UnorderedListOutlined, SyncOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
-import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog, RelayReadyNode, BatchUpgradeOperation, BatchUpgradePreview, BatchUpgradeItemStatus } from '../api/types';
+import type { ApiEnvelope, DeviceGroup, NodeStatus, SharedNodeSummary, NodeDisplayRow, NodeLifecycleAction, NodeOperation, NodeArtifactCatalog, PoolNode, RelayReadyNode, BatchUpgradeOperation, BatchUpgradePreview, BatchUpgradeItemStatus } from '../api/types';
 import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
+import { NodeDesktopTable } from '../components/nodes/NodeDesktopTable';
+import { NodeMobileList } from '../components/nodes/NodeMobileList';
+import { managementRows, statusNodeKey } from '../components/nodes/managementRows';
+import { poolNodeKey, poolNodeName } from '../components/nodes/poolNodeName';
 import { NodeGroupSection } from '../components/nodes/NodeGroupSection';
 import { NodeDetailDrawer } from '../components/nodes/NodeDetailDrawer';
 import { stableGroupedRows } from '../components/nodes/sort';
@@ -55,7 +59,16 @@ function useIsMobile(breakpoint = 768): boolean {
  * users read /nodes/shared (server-side field filtering — the frontend never
  * hides sensitive fields client-side).
  */
-export default function NodeStatus() {
+interface Props {
+  flat?: boolean;
+  embedded?: boolean;
+  poolNodes?: PoolNode[];
+  poolMetadataAvailable?: boolean;
+  onPoolChanged?: () => void;
+  poolActions?: (node: PoolNode) => React.ReactNode;
+  focusIdentity?: string;
+}
+export default function NodeStatus({ flat = false, embedded = false, poolNodes = [], poolActions, poolMetadataAvailable = true, onPoolChanged, focusIdentity }: Props = {}) {
   const { t } = useI18n();
   const { isAdmin } = useAuth();
   const navigate = useNavigate();
@@ -64,6 +77,7 @@ export default function NodeStatus() {
   const [adminRows, setAdminRows] = useState<NodeStatus[] | null>(null);
   const [userRows, setUserRows] = useState<SharedNodeSummary[] | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
+  const [nodeSearch, setNodeSearch] = useState('');
   const [artifactVersions, setArtifactVersions] = useState<Record<string, string>>({});
   const [panelProtocol, setPanelProtocol] = useState(0);
   const [inboundGroupIds, setInboundGroupIds] = useState<Set<number>>(() => new Set());
@@ -332,7 +346,27 @@ export default function NodeStatus() {
     }
   };
 
-  const rows: AnyNodeRow[] | null = isAdmin ? adminRows : userRows;
+  const reportedRows = isAdmin ? adminRows : userRows;
+  const rows = useMemo(() => {
+    if (!reportedRows) return null;
+    const combined = flat && isAdmin ? managementRows(reportedRows, poolNodes) : reportedRows;
+    return focusIdentity ? combined.filter(row => statusNodeKey(row) === focusIdentity) : combined;
+  }, [reportedRows, flat, isAdmin, poolNodes, focusIdentity]);
+  const poolByIdentity = new Map(poolNodes.map(node => [poolNodeKey(node), node]));
+  const nodeLabel = (row: NodeDisplayRow) => {
+    const pool = poolByIdentity.get(statusNodeKey(row));
+    return <Space orientation="vertical" size={2}>
+      <Typography.Text strong>{pool ? poolNodeName(pool) : row.group_name || row.public_ipv4 || row.node_id || '-'}</Typography.Text>
+      {pool && <span><Tag>{pool.pool_native ? 'Pool-native' : 'Legacy'}</Tag><Tag color={pool.runtime_verified ? 'green' : undefined}>{t(pool.runtime_verified ? 'runtimeVerified' : 'runtimeUnverified')}</Tag></span>}
+      <span>{pool ? (pool.memberships.length ? pool.memberships.map(member => <Tag key={member.group_id}>{member.group_name}</Tag>) : <Typography.Text type="secondary">{t('noGroupMembership')}</Typography.Text>) : <Tag>{row.group_name || `#${row.group_id}`}</Tag>}</span>
+      {pool && !reportedRows?.some(report => statusNodeKey(report) === statusNodeKey(row)) ? <Typography.Text type="secondary">{t('nodeNoReport')}</Typography.Text> : null}
+    </Space>;
+  };
+  const visibleNodes = rows?.filter(row => {
+    const pool = poolByIdentity.get(statusNodeKey(row));
+    const q = nodeSearch.trim().toLowerCase();
+    return !q || [pool?.display_name, row.group_name, row.public_ipv4, row.public_ipv6, row.node_id].some(value => value?.toLowerCase().includes(q));
+  }) ?? [];
   const groups = useMemo(() => (rows ? stableGroupedRows(rows) : null), [rows]);
 
   useEffect(() => {
@@ -349,13 +383,13 @@ export default function NodeStatus() {
     persistExpandedGroupId(next);
   };
 
-  const title = t('nodeStatus');
+  const title = t(flat ? 'nodeViewAll' : 'nodeStatus');
   const activeTaskCount = backgroundTasks.filter((operation) => !terminalOperationStatuses.has(operation.status)).length
     + batchOperations.filter((batch) => !terminalBatchStatuses.has(batch.status)).length;
   const pageTitle = (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-      <h2 className="rp-page-title"><LineChartOutlined /> {title}</h2>
-      {isAdmin && (
+      {!flat && !embedded && <h2 className="rp-page-title"><LineChartOutlined /> {title}</h2>}
+      {isAdmin && !focusIdentity && (
         <Space wrap>
           <Badge count={activeTaskCount} size="small">
             <Button icon={<UnorderedListOutlined />} onClick={() => setBackgroundTasksOpen(true)}>{t('backgroundTasks')}</Button>
@@ -413,7 +447,19 @@ export default function NodeStatus() {
   return (
     <>
       {pageTitle}
-      {groups.map(([gid, groupRows]) => (
+      {flat ? <>
+        {!focusIdentity && <Input aria-label={t('nodesSearch')} placeholder={t('nodesSearch')} value={nodeSearch} allowClear onChange={event => setNodeSearch(event.target.value)} style={{ maxWidth: 340, margin: '12px 0' }} />}
+        {isMobile ? <NodeMobileList rows={visibleNodes} panelProtocol={panelProtocol} t={t} openDetail={setDetailRow}
+          nodeLabel={nodeLabel} onLifecycle={isAdmin ? handleLifecycle : undefined} artifactVersions={artifactVersions}
+          onDelete={isAdmin ? handleDelete : undefined}
+          canDeleteStatus={row => poolMetadataAvailable && !poolByIdentity.has(statusNodeKey(row))}
+          managementActions={poolActions ? row => { const pool = poolByIdentity.get(statusNodeKey(row)); return pool ? poolActions(pool) : null; } : undefined} />
+          : <NodeDesktopTable rows={visibleNodes} panelProtocol={panelProtocol} latestNodeVersion="" nodeVersionCheckFailed={false} t={t} openDetail={setDetailRow}
+            nodeLabel={nodeLabel} onLifecycle={isAdmin ? handleLifecycle : undefined} artifactVersions={artifactVersions}
+            onDelete={isAdmin ? handleDelete : undefined}
+          canDeleteStatus={row => poolMetadataAvailable && !poolByIdentity.has(statusNodeKey(row))}
+            managementActions={poolActions ? row => { const pool = poolByIdentity.get(statusNodeKey(row)); return pool ? poolActions(pool) : null; } : undefined} />}
+      </> : groups.map(([gid, groupRows]) => (
         <NodeGroupSection
           key={gid}
           rows={groupRows}
@@ -438,7 +484,7 @@ export default function NodeStatus() {
         onClose={() => setDetailRow(null)}
         isAdmin={isAdmin}
         panelProtocol={panelProtocol}
-        onDeleted={refresh}
+        onDeleted={() => { refresh(); onPoolChanged?.(); }}
       />
       <NodeDiagnosisDrawer target={nodeDiagnosisTarget} onClose={() => setNodeDiagnosisTarget(null)} t={t} />
       <Drawer

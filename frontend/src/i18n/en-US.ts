@@ -1,6 +1,23 @@
 import type { Dict } from './zh-CN';
 
 export const enUS: Dict = {
+  runtimeVerified: 'Runtime verified',
+  runtimeUnverified: 'Runtime unverified',
+
+  nodeManagement: 'Node management',
+  nodeViewGroups: 'By group',
+  nodeViewAll: 'All nodes',
+  nodeInspect: 'Monitor and actions',
+  selectFilteredRules: 'Select all {count} filtered rules (across pages)',
+  selectionPageOnly: 'Selection is limited to this page and clears when you change pages.',
+  selectionAcrossPages: 'Selection spans pages. Batch actions affect all selected rules.',
+  noGroupMembership: 'No business group',
+  nodeNoReport: 'No telemetry report yet',
+  nodePoolActions: 'Node management actions',
+  groupSettings: 'Group settings',
+  nodesSearch: 'Search node name or IP',
+  groupsSearch: 'Search groups',
+
   domainCheck: 'Check domain',
   domainCheckAbsent: 'No A/CNAME record found. Panel can create it later.',
   domainCheckOwned: 'A Panel-managed A record already exists.',

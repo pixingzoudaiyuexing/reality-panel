@@ -5,7 +5,6 @@ import {
   DashboardOutlined,
   ApiOutlined,
   CloudServerOutlined,
-  CloudUploadOutlined,
   UserOutlined,
   LogoutOutlined,
   LockOutlined,
@@ -48,7 +47,7 @@ export default function MainLayout() {
     { key: '/account', icon: <UserOutlined />, label: t('personalCenter') },
     { key: '/shop', icon: <ShoppingOutlined />, label: t('shop') },
     { key: '/rules', icon: <ApiOutlined />, label: t('myRules') },
-    { key: '/nodes', icon: <CloudServerOutlined />, label: t('availableNodes') },
+    { key: '/node-management', icon: <CloudServerOutlined />, label: t('nodeManagement') },
   ];
   // v1.2.4: the admin list had grown to seven top-level entries. Grouped into
   // two submenus by what they ARE, not just to shorten the list:
@@ -72,9 +71,6 @@ export default function MainLayout() {
     { key: '/audit-log', label: t('auditLog') },
   ];
   const adminOnlyItems = [
-    { key: '/node-pool', icon: <CloudServerOutlined />, label: t('nodePool') },
-    { key: '/groups', icon: <CloudServerOutlined />, label: t('deviceGroups') },
-    { key: '/node-bootstrap', icon: <CloudUploadOutlined />, label: t('nodeBootstrapTitle') },
     {
       key: 'grp-billing',
       icon: <TeamOutlined />,

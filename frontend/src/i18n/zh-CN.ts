@@ -1,4 +1,21 @@
 export const zhCN = {
+  runtimeVerified: '运行已验证',
+  runtimeUnverified: '运行未验证',
+
+  nodeManagement: '节点管理',
+  nodeViewGroups: '按分组',
+  nodeViewAll: '全部节点',
+  nodeInspect: '监控与操作',
+  selectFilteredRules: '选择当前筛选的全部 {count} 条（跨页）',
+  selectionPageOnly: '默认仅选择当前页；翻页后清除选择。',
+  selectionAcrossPages: '已明确选择跨页规则，批量操作将作用于所有已选规则。',
+  noGroupMembership: '未加入业务分组',
+  nodeNoReport: '尚无监控报告',
+  nodePoolActions: '节点管理操作',
+  groupSettings: '分组设置',
+  nodesSearch: '搜索节点名称或 IP',
+  groupsSearch: '搜索分组',
+
   domainCheck: '检查域名',
   domainCheckAbsent: '未发现 A/CNAME 记录，可由 Panel 后续创建。',
   domainCheckOwned: '已存在 Panel 管理的 A 记录。',

@@ -275,6 +275,7 @@ export default function Rules() {
   const [ruleSearch, setRuleSearch] = useState('');
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
+  const [acrossPages, setAcrossPages] = useState(false);
   const backgroundRefreshInFlight = useRef(false);
 
   const ownerUid = filterOwnerUid ?? (isAdmin ? (user?.id ?? null) : null);
@@ -373,7 +374,14 @@ export default function Rules() {
     } finally { setLoading(false); }
   }, [isAdmin, scopedRulesUrl]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    setRules([]);
+    setSelectedRowKeys([]);
+    setAcrossPages(false);
+    setCurrentPage(1);
+    setSelectedGroup(null);
+    void load();
+  }, [load]);
 
   const backgroundRefresh = useCallback(async () => {
     if (backgroundRefreshInFlight.current) return;
@@ -442,7 +450,6 @@ export default function Rules() {
   };
   // v0.4.9: group lookup map for the "group name" column + filter. Memoized so
   // the column render + filter options share one derivation.
-  const groupMap = useMemo(() => new Map(groups.map(g => [g.id, g])), [groups]);
   // v1.0.8: group-name + listen-IP lookup for the rule columns. A regular user
   // does NOT own the (admin-owned) device groups, so GET /groups returns none
   // for them and the columns rendered "未知分组 / 未配置". Their AUTHORIZED
@@ -491,23 +498,14 @@ export default function Rules() {
     return visibleRules.slice(start, start + RULES_PAGE_SIZE);
   }, [currentPage, visibleRules]);
 
-  const visibleGroupCounts = useMemo(() => {
-    const counts = new Map<number, number>();
-    for (const rule of visibleRules) {
-      counts.set(rule.device_group_in, (counts.get(rule.device_group_in) ?? 0) + 1);
-    }
-    return counts;
-  }, [visibleRules]);
-
-  const groupedPagedRules = useMemo(() => {
-    const grouped = new Map<number, ForwardRule[]>();
-    for (const rule of pagedRules) {
-      const group = grouped.get(rule.device_group_in);
-      if (group) group.push(rule);
-      else grouped.set(rule.device_group_in, [rule]);
-    }
-    return Array.from(grouped.entries());
-  }, [pagedRules]);
+  // Remove stale selections after a refresh, owner change, or filter change.
+  useEffect(() => {
+    const allowed = new Set((acrossPages ? visibleRules : pagedRules).map(rule => rule.id));
+    setSelectedRowKeys(current => {
+      const next = current.filter(id => allowed.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [acrossPages, visibleRules, pagedRules]);
 
   const handleCreate = async (values: {
     name: string; listen_port: number | null; protocol: string;
@@ -1346,7 +1344,7 @@ export default function Rules() {
 
   const rowSelectionFor = (groupRules: ForwardRule[]) => ({
     selectedRowKeys,
-    preserveSelectedRowKeys: true,
+    preserveSelectedRowKeys: acrossPages,
     columnWidth: RULE_SELECTION_COLUMN_WIDTH,
     onSelect: (record: ForwardRule, selected: boolean) => {
       setSelectedRowKeys(current => selected
@@ -1363,7 +1361,6 @@ export default function Rules() {
     hideSelectAll: groupRules.length === 0,
   });
 
-  const groupLabel = (groupId: number) => groupInfo.get(groupId)?.name ?? `${t('unknownGroup')} (#${groupId})`;
 
   return (
     <>
@@ -1374,8 +1371,27 @@ export default function Rules() {
           <Dropdown menu={{ items: exportMenuItems }}>
             <Button icon={<DownloadOutlined />}>{t('exportImport')}</Button>
           </Dropdown>
-          <Button type="primary" icon={<PlusOutlined />} disabled={!isAdmin && sharedLoadFailed} onClick={() => { createForm.resetFields(); setCreateOpen(true); }}>{t('addRule')}</Button>
+          <Button type="primary" icon={<PlusOutlined />} disabled={!isAdmin && sharedLoadFailed} onClick={() => { createForm.resetFields(); if (selectedGroup !== null) createForm.setFieldsValue({ device_group_in: selectedGroup }); setCreateOpen(true); }}>{t('addRule')}</Button>
         </Space>
+      </div>
+      <div className="rp-rule-group-switch" data-testid="rules-group-switch">
+          {/* v0.4.9: filter by inbound group. Only groups that actually have
+              rules are offered, so the list stays short for large fleets. */}
+          <Select
+            className="rp-rules-group-filter"
+            style={{ minWidth: 180 }}
+            allowClear
+            aria-label={t('filterByGroup')}
+            placeholder={t('allRules')}
+            value={selectedGroup ?? undefined}
+            onChange={(v: number | undefined) => { setSelectedGroup(v ?? null); setSelectedRowKeys([]); setAcrossPages(false); setCurrentPage(1); }}
+            options={Array.from(new Set([...allInGroups.map(group => group.id), ...rules.map(r => r.device_group_in)]))
+              .map(gid => {
+                const g = groupInfo.get(gid);
+                return { value: gid, label: g ? g.name : `${t('unknownGroup')} (#${gid})` };
+              })}
+          />
+        <Text type="secondary">{t('ruleCount').replace('{count}', String(visibleRules.length))}</Text>
       </div>
       <div className="rp-rules-toolbar" data-testid="rules-toolbar">
         <Space size={8} wrap>
@@ -1385,24 +1401,10 @@ export default function Rules() {
             prefix={<SearchOutlined />}
             placeholder={t('searchRulePlaceholder')}
             value={ruleSearch}
-            onChange={(e) => { setRuleSearch(e.target.value); setSelectedRowKeys([]); setCurrentPage(1); }}
+            onChange={(e) => { setRuleSearch(e.target.value); setSelectedRowKeys([]); setAcrossPages(false); setCurrentPage(1); }}
             style={{ width: 220 }}
           />
-          {/* v0.4.9: filter by inbound group. Only groups that actually have
-              rules are offered, so the list stays short for large fleets. */}
-          <Select
-            className="rp-rules-group-filter"
-            style={{ minWidth: 180 }}
-            allowClear
-            placeholder={t('filterByGroup')}
-            value={selectedGroup ?? undefined}
-            onChange={(v: number | undefined) => { setSelectedGroup(v ?? null); setSelectedRowKeys([]); setCurrentPage(1); }}
-            options={Array.from(new Set(rules.map(r => r.device_group_in)))
-              .map(gid => {
-                const g = groupMap.get(gid);
-                return { value: gid, label: g ? g.name : `${t('unknownGroup')} (#${gid})` };
-              })}
-          />
+
         </Space>
       </div>
       {selectedRowKeys.length > 0 ? (
@@ -1428,7 +1430,7 @@ export default function Rules() {
               <Button danger icon={<DeleteOutlined />}>{t('batchDelete')}</Button>
             </Popconfirm>
           </Space>
-          <Button type="text" onClick={() => setSelectedRowKeys([])}>{t('cancelSelection')}</Button>
+          <Button type="text" onClick={() => { setSelectedRowKeys([]); setAcrossPages(false); }}>{t('cancelSelection')}</Button>
         </div>
       ) : null}
       {/* v0.4.20: admin viewing another user's rules — show who. */}
@@ -1459,39 +1461,24 @@ export default function Rules() {
           action={<Button size="small" onClick={() => void load()}>{t('retry')}</Button>}
         />
       )}
-      {groupedPagedRules.length === 0 && (!loadFailed || rules.length > 0) ? (
-        <Table
-          rowSelection={rowSelectionFor([])}
-          dataSource={[]}
-          columns={columns}
-          rowKey="id"
-          loading={loading}
-          locale={{ emptyText: t('rulesEmpty') }}
-          pagination={false}
-          className="rp-rules-table"
-          scroll={{ x: RULE_TABLE_SCROLL_X }}
-        />
-      ) : groupedPagedRules.map(([groupId, groupRules]) => (
-        <section className="rp-rules-group-section" data-testid={`rules-group-${groupId}`} key={groupId}>
-          <div className="rp-rules-group-header">
-            <Text strong className="rp-rules-group-title" title={groupLabel(groupId)}>{groupLabel(groupId)}</Text>
-            <Text type="secondary">
-              {t('ruleCount').replace('{count}', String(visibleGroupCounts.get(groupId) ?? groupRules.length))}
-            </Text>
-          </div>
-          <Table
-            rowSelection={rowSelectionFor(groupRules)}
-            dataSource={groupRules}
-            columns={columns}
-            rowKey="id"
-            loading={loading}
-            locale={{ emptyText: t('rulesEmpty') }}
-            pagination={false}
-            className="rp-rules-table"
-            scroll={{ x: RULE_TABLE_SCROLL_X }}
-          />
-        </section>
-      ))}
+      <div className="rp-rule-selection-scope">
+        <Text type="secondary">{t(acrossPages ? 'selectionAcrossPages' : 'selectionPageOnly')}</Text>
+        {visibleRules.length > RULES_PAGE_SIZE && !acrossPages ? <Button type="link" onClick={() => {
+          setAcrossPages(true);
+          setSelectedRowKeys(visibleRules.map(rule => rule.id));
+        }}>{t('selectFilteredRules').replace('{count}', String(visibleRules.length))}</Button> : null}
+      </div>
+      {(!loadFailed || rules.length > 0) && <Table
+        rowSelection={rowSelectionFor(pagedRules)}
+        dataSource={pagedRules}
+        columns={selectedGroup === null ? [{ title: t('groupName'), key: 'group', width: 150, render: (_: unknown, rule: ForwardRule) => groupInfo.get(rule.device_group_in)?.name ?? `${t('unknownGroup')} (#${rule.device_group_in})` }, ...columns] : columns}
+        rowKey="id"
+        loading={loading}
+        locale={{ emptyText: t('rulesEmpty') }}
+        pagination={false}
+        className="rp-rules-table"
+        scroll={{ x: RULE_TABLE_SCROLL_X }}
+      />}
       {visibleRules.length > RULES_PAGE_SIZE ? (
         <div className="rp-rules-pagination" data-testid="rules-pagination">
           <Pagination
@@ -1499,7 +1486,7 @@ export default function Rules() {
             pageSize={RULES_PAGE_SIZE}
             total={visibleRules.length}
             showSizeChanger={false}
-            onChange={setCurrentPage}
+            onChange={(page) => { setCurrentPage(page); if (!acrossPages) setSelectedRowKeys([]); }}
           />
         </div>
       ) : null}

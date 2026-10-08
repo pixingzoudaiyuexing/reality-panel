@@ -82,7 +82,7 @@ beforeEach(() => {
   setupAdmin();
 });
 
-describe('Rules grouped compact layout', () => {
+describe('Rules group-switch single-table layout', () => {
   const visibleRuleEditor = () => Array.from(document.querySelectorAll<HTMLElement>('.rp-rule-editor-modal'))
     .find((modal) => modal.style.display !== 'none') ?? null;
 
@@ -128,13 +128,13 @@ describe('Rules grouped compact layout', () => {
     expect(header).toContainElement(screen.getByRole('button', { name: /exportImport/ }));
     expect(header).toContainElement(screen.getByRole('button', { name: /addRule/ }));
     expect(toolbar).toContainElement(screen.getByPlaceholderText('searchRulePlaceholder'));
-    expect(toolbar).toContainElement(screen.getByRole('combobox'));
+    expect(screen.getByTestId('rules-group-switch')).toContainElement(screen.getByRole('combobox'));
   });
 
-  it('uses six compact columns plus selection and no group-name column', async () => {
+  it('uses compact columns and identifies groups in the all-rules view', async () => {
     render(<Rules />);
     await screen.findByText('rule-1');
-    expect(screen.queryByRole('columnheader', { name: 'groupName' })).toBeNull();
+    expect(screen.getByRole('columnheader', { name: 'groupName' })).toBeInTheDocument();
     for (const title of ['ruleColumn', 'ruleEntry', 'protocolForward', 'target', 'status', 'action']) {
       expect(screen.getByRole('columnheader', { name: title })).toBeInTheDocument();
     }
@@ -144,15 +144,13 @@ describe('Rules grouped compact layout', () => {
     expect(RULES_PAGE_SIZE).toBe(20);
   });
 
-  it('groups the current page and shows filtered totals in lightweight headers', async () => {
+  it('shows one table even when rules belong to different groups', async () => {
     setupAdmin([rule(1), rule(2), rule(3, { device_group_in: 8 })], [group(7, 'tokyo'), group(8, 'osaka')]);
     render(<Rules />);
-    const tokyo = await screen.findByTestId('rules-group-7');
-    const osaka = screen.getByTestId('rules-group-8');
-    expect(within(tokyo).getByText('tokyo')).toBeInTheDocument();
-    expect(within(tokyo).getByText('ruleCount')).toBeInTheDocument();
-    expect(within(osaka).getByText('osaka')).toBeInTheDocument();
-    expect(within(osaka).getByText('ruleCount')).toBeInTheDocument();
+    await screen.findByText('rule-3');
+    expect(document.querySelectorAll('.rp-rules-table')).toHaveLength(1);
+    expect(screen.queryByTestId('rules-group-7')).toBeNull();
+    expect(screen.getAllByRole('columnheader', { name: 'action' })).toHaveLength(1);
   });
 
   it('formats group counts naturally in Chinese and English', () => {
@@ -467,13 +465,12 @@ describe('Rules grouped compact layout', () => {
     expect(payload).not.toHaveProperty('load_balance_strategy');
   });
 
-  it('merges selection across group tables and exposes a cancellable batch bar', async () => {
+  it('selects visible rows in one table and exposes a cancellable batch bar', async () => {
     setupAdmin([rule(1), rule(2, { device_group_in: 8 })], [group(7, 'tokyo'), group(8, 'osaka')]);
     render(<Rules />);
-    const tokyo = await screen.findByTestId('rules-group-7');
-    const osaka = screen.getByTestId('rules-group-8');
-    fireEvent.click(within(tokyo).getAllByRole('checkbox')[1]);
-    fireEvent.click(within(osaka).getAllByRole('checkbox')[1]);
+    await screen.findByText('rule-2');
+    fireEvent.click(screen.getAllByRole('checkbox')[1]);
+    fireEvent.click(screen.getAllByRole('checkbox')[2]);
     const batchbar = screen.getByTestId('rules-batchbar');
     expect(batchbar).toHaveAttribute('data-selected-count', '2');
     fireEvent.click(within(batchbar).getByRole('button', { name: 'cancelSelection' }));
@@ -482,22 +479,65 @@ describe('Rules grouped compact layout', () => {
 
   it('clears hidden selections when search criteria change', async () => {
     render(<Rules />);
-    const section = await screen.findByTestId('rules-group-7');
+    await screen.findByText('rule-1');
+    const section = document.querySelector('.rp-rules-table') as HTMLElement;
     fireEvent.click(within(section).getAllByRole('checkbox')[1]);
     expect(screen.getByTestId('rules-batchbar')).toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText('searchRulePlaceholder'), { target: { value: 'missing' } });
     expect(screen.queryByTestId('rules-batchbar')).toBeNull();
   });
 
-  it('paginates globally before grouping and keeps full filtered group totals', async () => {
+  it('paginates the single filtered table', async () => {
     setupAdmin(Array.from({ length: 25 }, (_, index) => rule(index + 1)));
     render(<Rules />);
-    const section = await screen.findByTestId('rules-group-7');
-    expect(within(section).getByText('ruleCount')).toBeInTheDocument();
+    await screen.findByText('rule-1');
+    const section = document.querySelector('.rp-rules-table') as HTMLElement;
+    expect(section).toBeInTheDocument();
     expect(document.querySelectorAll('.rp-rules-table .ant-table-tbody .ant-table-row')).toHaveLength(20);
     expect(screen.getByTestId('rules-pagination')).toBeInTheDocument();
     fireEvent.click(screen.getByTitle('2'));
     expect(await screen.findByText('rule-25')).toBeInTheDocument();
     expect(document.querySelectorAll('.rp-rules-table .ant-table-tbody .ant-table-row')).toHaveLength(5);
   });
+  it('header select-all is page-local and changing pages clears it', async () => {
+    setupAdmin(Array.from({ length: 25 }, (_, index) => rule(index + 1)));
+    render(<Rules />);
+    await screen.findByText('rule-1');
+    fireEvent.click(screen.getAllByRole('checkbox')[0]);
+    expect(screen.getByTestId('rules-batchbar')).toHaveAttribute('data-selected-count', '20');
+    fireEvent.click(screen.getByTitle('2'));
+    await screen.findByText('rule-25');
+    expect(screen.queryByTestId('rules-batchbar')).toBeNull();
+    fireEvent.click(screen.getAllByRole('checkbox')[0]);
+    expect(screen.getByTestId('rules-batchbar')).toHaveAttribute('data-selected-count', '5');
+  });
+
+  it('only explicit cross-page selection survives pagination and batch payload is exact', async () => {
+    setupAdmin(Array.from({ length: 25 }, (_, index) => rule(index + 1)));
+    render(<Rules />);
+    await screen.findByText('rule-1');
+    fireEvent.click(screen.getByRole('button', { name: 'selectFilteredRules' }));
+    expect(screen.getByTestId('rules-batchbar')).toHaveAttribute('data-selected-count', '25');
+    fireEvent.click(screen.getByTitle('2'));
+    await screen.findByText('rule-25');
+    expect(screen.getByTestId('rules-batchbar')).toHaveAttribute('data-selected-count', '25');
+    fireEvent.click(screen.getByRole('button', { name: /batchPause/ }));
+    await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(25));
+    expect(mockPut.mock.calls.map(call => call[0]).sort()).toEqual(Array.from({ length: 25 }, (_, i) => `/rules/${i + 1}`).sort());
+  }, 15000);
+
+  it('changes group with isolated pagination, hidden group column, and cleared selection', async () => {
+    setupAdmin([...Array.from({ length: 25 }, (_, index) => rule(index + 1)), rule(26, { device_group_in: 8 })], [group(7, 'tokyo'), group(8, 'osaka')]);
+    render(<Rules />);
+    await screen.findByText('rule-1');
+    fireEvent.click(screen.getAllByRole('checkbox')[0]);
+    fireEvent.mouseDown(screen.getByRole('combobox'));
+    fireEvent.click(await screen.findByText('osaka', { selector: '.ant-select-item-option-content' }));
+    await screen.findByText('rule-26');
+    expect(screen.queryByText('rule-1')).toBeNull();
+    expect(screen.queryByTestId('rules-pagination')).toBeNull();
+    expect(screen.queryByTestId('rules-batchbar')).toBeNull();
+    expect(screen.queryByRole('columnheader', { name: 'groupName' })).toBeNull();
+  });
+
 });

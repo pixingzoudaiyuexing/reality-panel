@@ -162,11 +162,11 @@ describe('NodeStatus page data source', () => {
     renderPage();
     await flush();
 
-    expect(screen.getByText('shared-grp')).toBeInTheDocument();
+    expect(screen.getAllByText('shared-grp').length).toBeGreaterThan(0);
     expect(mockGet).toHaveBeenCalledWith('/nodes/shared');
     expect(mockGet).not.toHaveBeenCalledWith('/nodes');
     expect(mockGet).not.toHaveBeenCalledWith('/admin/node-artifacts');
-    expect(screen.queryByRole('button', { name: 'batchUpgradeAll' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /batchUpgradeAll/ })).toBeNull();
   });
 
   it('mounts Relay preference management only for admin inbound groups', async () => {
@@ -879,5 +879,31 @@ describe('NodeStatus responsive node layout', () => {
     expect(screen.getByRole('dialog')).toBeInTheDocument();
     page.unmount();
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
+  });
+});
+
+describe('Node Management flat monitor permissions and lifecycle', () => {
+  it('regular-user flat view reads only authorized summaries and has no admin controls', async () => {
+    mockUseAuth.mockReturnValue({ isAdmin: false });
+    mockGet.mockImplementation((url: string) => url === '/nodes/shared' ? Promise.resolve(ok([sharedNode])) : Promise.reject(new Error('admin request forbidden')));
+    render(<MemoryRouter><NodeStatus flat /></MemoryRouter>);
+    await flush();
+    expect(screen.getAllByText('shared-grp').length).toBeGreaterThan(0);
+    expect(screen.getByTestId('node-resources-cell')).toBeInTheDocument();
+    expect(screen.queryByText('batchUpgradeAll')).toBeNull();
+    expect(mockGet.mock.calls.map(call => call[0])).toEqual(['/nodes/shared']);
+  });
+  it('flat admin view keeps live monitors and lifecycle controls', async () => {
+    mockUseAuth.mockReturnValue({ isAdmin: true });
+    mockGet.mockImplementation((url: string) => {
+      if (url === '/nodes') return Promise.resolve(ok([adminNode]));
+      if (url === '/admin/node-artifacts') return Promise.resolve(artifactCatalog);
+      return Promise.resolve(ok([]));
+    });
+    render(<MemoryRouter><NodeStatus flat /></MemoryRouter>);
+    await flush();
+    expect(screen.getByTestId('node-resources-cell')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /batchUpgradeAll/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /backgroundTasks/ })).toBeInTheDocument();
   });
 });

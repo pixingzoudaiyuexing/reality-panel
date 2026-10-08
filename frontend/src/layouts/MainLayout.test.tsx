@@ -38,4 +38,11 @@ describe('MainLayout desktop scroll wiring', () => {
     expect(screen.getByRole('button', { name: 'changePassword' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'logout' })).toBeInTheDocument();
   });
+  it('has a single Node Management entry and retains Rules navigation', () => {
+    render(<MainLayout />);
+    expect(screen.getAllByRole('menuitem', { name: /nodeManagement/ })).toHaveLength(1);
+    expect(screen.getByRole('menuitem', { name: /myRules/ })).toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: /deviceGroups|nodePool|availableNodes/ })).toBeNull();
+  });
+
 });

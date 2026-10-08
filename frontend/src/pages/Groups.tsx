@@ -1,4 +1,4 @@
-import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Typography, Tag, Tooltip, Alert, Switch } from 'antd';
+import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Typography, Tag, Tooltip, Alert, Switch, Card, Empty, Spin, Drawer } from 'antd';
 import { PlusOutlined, ReloadOutlined, EditOutlined, CloudServerOutlined, ApiOutlined, SafetyCertificateOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useState } from 'react';
 import api from '../api/client';
@@ -7,6 +7,9 @@ import { useI18n } from '../i18n/context';
 import { useAuth } from '../auth/useAuth';
 import { RelayPreferencePanel } from '../components/nodes/RelayPreferencePanel';
 import { GroupPoolPicker } from '../components/nodes/GroupPoolPicker';
+import NodeStatusPage from './NodeStatus';
+import { NodeDiagnosisDrawer } from '../components/diagnosis/NodeDiagnosisDrawer';
+import { NodeResourcesCell, NodeConnectionsCell, NodeTrafficCell } from '../components/nodes/NodeStatusCells';
 import { poolNodeName, poolNodeKey } from '../components/nodes/poolNodeName';
 
 const { Text } = Typography;
@@ -24,8 +27,13 @@ function usesConnectHost(g: { group_type: string }): boolean {
 
 const dash = <span style={{ color: 'var(--rp-text-tertiary)' }}>-</span>;
 
-export default function Groups() {
+export default function Groups({ cards = false }: { cards?: boolean } = {}) {
   const { t } = useI18n();
+  const [expandedCard, setExpandedCard] = useState<number | null>(null);
+  const [groupSearch, setGroupSearch] = useState('');
+  const [inspecting, setInspecting] = useState<string | null>(null);
+  const [diagnosis, setDiagnosis] = useState<{ groupId: number; nodeId: string; label: string } | null>(null);
+  const [groupsFailed, setGroupsFailed] = useState(false);
   const { isAdmin } = useAuth();
   const [groups, setGroups] = useState<DeviceGroup[]>([]);
   const [users, setUsers] = useState<User[]>([]);
@@ -64,7 +72,9 @@ export default function Groups() {
     setLoading(true);
     try {
       const g = await api.get<unknown, ApiEnvelope<DeviceGroup[]>>('/groups');
-      setGroups(g.data || []);
+      if (g.code !== 0 || !g.data) throw new Error('groups unavailable');
+      setGroups(g.data);
+      setGroupsFailed(false);
       if (isAdmin) {
         try {
           const u = await api.get<unknown, ApiEnvelope<User[]>>('/admin/users');
@@ -88,16 +98,21 @@ export default function Groups() {
           setNodes(n.data || []);
         } catch { setNodes([]); }
       }
-    } finally { setLoading(false); }
+    } catch { setGroupsFailed(true); } finally { setLoading(false); }
   }, [isAdmin]);
 
   useEffect(() => { load(); }, [load]);
 
   // ── Node helpers ──
   const nodesByGroup = useCallback((groupId: number): NodeStatus[] => {
-    if (isAdmin) return poolNodes.filter(n => n.memberships.some(m => m.group_id === groupId)).map(n => ({
-      ...n, group_id: groupId, last_seen: n.last_seen || '',
-    } as NodeStatus));
+    if (isAdmin) {
+      const members = poolNodes.filter(node => node.memberships.some(member => member.group_id === groupId));
+      const mapped = members.map(node => ({
+        ...nodes.find(report => report.group_id === node.identity_group_id && report.node_id === node.node_id),
+        ...node, group_id: groupId, last_seen: node.last_seen || '',
+      } as NodeStatus));
+      return [...mapped, ...nodes.filter(report => report.group_id === groupId && !members.some(node => node.identity_group_id === report.group_id && node.node_id === report.node_id))];
+    }
     return nodes.filter(n => n.group_id === groupId);
   }, [isAdmin, nodes, poolNodes]);
 
@@ -335,7 +350,7 @@ export default function Groups() {
   const expandedRowRender = (g: DeviceGroup) => {
     const groupNodes = nodesByGroup(g.id);
     const routingPanel = isAdmin && g.group_type === 'in'
-      ? <RelayPreferencePanel key={groupNodes.map(node => poolNodeKey(node as unknown as PoolNode)).sort().join('|')} groupId={g.id} t={t} />
+      ? <RelayPreferencePanel onDiagnoseNode={node => setDiagnosis({ groupId: g.id, nodeId: node.node_id, label: node.public_ipv4 || node.node_id })} key={groupNodes.map(node => poolNodeKey(node as unknown as PoolNode)).sort().join('|')} groupId={g.id} t={t} />
       : null;
     if (groupNodes.length === 0) {
       return (
@@ -358,14 +373,15 @@ export default function Groups() {
           pagination={false}
           size="small"
           columns={[
-            { title: t('poolNodeName'), key: 'name', width: 150, render: (_: unknown, n: NodeStatus) => isAdmin ? poolNodeName(n as unknown as PoolNode) : n.public_ipv4 || n.public_ipv6 || '-' },
+            { title: t('poolNodeName'), key: 'name', width: 150, render: (_: unknown, n: NodeStatus) => <Button type="link" onClick={() => setInspecting('identity_group_id' in n ? poolNodeKey(n as unknown as PoolNode) : `${n.group_id}:${n.node_id}`)}>{isAdmin && 'identity_group_id' in n ? poolNodeName(n as unknown as PoolNode) : n.group_name || n.public_ipv4 || n.public_ipv6 || '-'}</Button> },
             { title: 'IP', key: 'ip', render: (_: unknown, n: NodeStatus) => <Space orientation="vertical" size={0}><span>{n.public_ipv4 || n.public_ip || '-'}</span><span>{n.public_ipv6}</span></Space> },
             { title: t('status'), dataIndex: 'online', key: 'online', width: 80, render: (v: boolean) => <Tag color={v ? 'green' : 'default'}>{v ? t('online') : t('offline')}</Tag> },
             { title: t('nodeVersion'), dataIndex: 'node_version', key: 'version', width: 90, render: (v: string | undefined) => v ? <span className="rp-mono" style={{ fontSize: 12 }}>{v}</span> : '-' },
+            ...(cards ? [{ title: t('nodeResources'), key: 'resources', render: (_: unknown, node: NodeStatus) => <NodeResourcesCell row={node} t={t} /> }, { title: 'TCP / UDP', key: 'connections', render: (_: unknown, node: NodeStatus) => <NodeConnectionsCell row={node} /> }, { title: t('traffic'), key: 'traffic', render: (_: unknown, node: NodeStatus) => <NodeTrafficCell row={node} /> }] : []),
             { title: t('lastSeen'), dataIndex: 'last_seen', key: 'last_seen', width: 120, render: (v: string | undefined) => v ? <span style={{ fontSize: 12 }}>{v}</span> : '-' },
             ...(isAdmin ? [{ title: t('action'), key: 'remove', render: (_: unknown, n: NodeStatus) => {
               const node = n as unknown as PoolNode;
-              if (node.identity_group_id === g.id) return null;
+              if (!('identity_group_id' in n) || node.identity_group_id === g.id) return null;
               return <Popconfirm title={t('nodeReuseRemoveConfirm')} description={t(node.online ? 'nodeReuseRemoveImpact' : 'nodeReuseRemovedOffline')} onConfirm={() => removeMember(g.id, node)}>
                 <Button danger size="small">{t('nodeReuseRemove')}</Button>
               </Popconfirm>;
@@ -377,17 +393,33 @@ export default function Groups() {
     );
   };
 
+  const visibleGroups = groups.filter(group => group.name.toLowerCase().includes(groupSearch.trim().toLowerCase()));
+
   return (
     <>
+      {groupsFailed && <Alert type="error" showIcon title={t('loadFailed')} description={t('loadFailedRetry')} action={<Button onClick={() => void load()}>{t('retry')}</Button>} />}
       {isAdmin && poolFailed && <Alert type="error" showIcon title={t('poolLoadFailed')} />}
       {isAdmin && poolGroup && poolOpen && <GroupPoolPicker group={poolGroup} onClose={() => setPoolOpen(false)} onChanged={load} />}
       <div className="rp-page-header">
-        <h2 className="rp-page-title"><CloudServerOutlined /> {t('deviceGroups')}</h2>
+        {!cards && <h2 className="rp-page-title"><CloudServerOutlined /> {t('deviceGroups')}</h2>}
         <Space>
           <Button icon={<ReloadOutlined />} onClick={load}>{t('refresh')}</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>{t('addGroup')}</Button>
         </Space>
       </div>
+      {cards ? <>
+        <Input aria-label={t('groupsSearch')} placeholder={t('groupsSearch')} value={groupSearch} allowClear onChange={event => setGroupSearch(event.target.value)} style={{ maxWidth: 340, marginBottom: 16 }} />
+        {loading ? <Spin /> : visibleGroups.length === 0 ? (groupsFailed ? null : <Empty />) : <div className="rp-node-group-cards">
+          {visibleGroups.map(group => <Card key={group.id} className="rp-node-group-card"
+            title={<Button type="text" onClick={() => setExpandedCard(expandedCard === group.id ? null : group.id)} aria-expanded={expandedCard === group.id}><Typography.Text strong>{group.name}</Typography.Text><Tag style={{ marginLeft: 12 }}>{typeLabel(group.group_type)}</Tag></Button>}
+            extra={columns.find(column => column.key === 'action')?.render?.(undefined as never, group)}>
+            <div className="rp-node-group-meta">
+              {columns.filter(column => !['name', 'group_type', 'id', 'action'].includes(column.key)).map(column => <div key={column.key}><Typography.Text type="secondary">{column.title}</Typography.Text><span>{column.render ? column.render(group[column.dataIndex as keyof DeviceGroup] as never, group) : String(group[column.dataIndex as keyof DeviceGroup] ?? '-')}</span></div>)}
+            </div>
+            {expandedCard === group.id ? expandedRowRender(group) : null}
+          </Card>)}
+        </div>}
+      </> : (
       <Table
         dataSource={groups}
         columns={columns}
@@ -399,6 +431,11 @@ export default function Groups() {
           rowExpandable: () => true,
         }}
       />
+      )}
+      <NodeDiagnosisDrawer target={diagnosis} onClose={() => setDiagnosis(null)} t={t} />
+      <Drawer title={t('nodeInspect')} open={!!inspecting} onClose={() => setInspecting(null)} size="90%" destroyOnHidden>
+        {inspecting && <NodeStatusPage flat poolNodes={isAdmin ? poolNodes : []} focusIdentity={inspecting} />}
+      </Drawer>
 
       <Modal title={t('addGroup')} open={createOpen} onCancel={() => setCreateOpen(false)} onOk={() => createForm.submit()} okText={t('create')} cancelText={t('cancel')}>
         <Form form={createForm} onFinish={handleCreate} layout="vertical">

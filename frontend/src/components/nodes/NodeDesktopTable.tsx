@@ -13,6 +13,9 @@ import {
 } from './NodeStatusCells';
 
 interface Props {
+  canDeleteStatus?: (row: NodeDisplayRow) => boolean;
+  nodeLabel?: (row: NodeDisplayRow) => React.ReactNode;
+  managementActions?: (row: NodeDisplayRow) => React.ReactNode;
   rows: NodeDisplayRow[];
   panelProtocol: number;
   /** v1.2: the latest NODE release (bare, e.g. "1.1.0"). Nodes compare their
@@ -39,10 +42,11 @@ interface Props {
 /** Desktop table for one group's nodes. Both admin and user share the same
  *  columns — the permission difference is in the data source (admin reads
  *  /nodes, user reads /nodes/shared) and the detail drawer. */
-export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {}, onDelete, relayNodes = [], showRelayReady = false }: Props) {
+export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeVersionCheckFailed, t, openDetail, onUpgrade, onLifecycle, artifactVersions = {}, onDelete, relayNodes = [], showRelayReady = false, nodeLabel, managementActions, canDeleteStatus }: Props) {
   const relayById = new Map(relayNodes.map((node) => [node.node_id, node]));
 
   const columns = [
+    ...(nodeLabel ? [{ title: t('poolNodeName'), key: 'identity', width: 210, render: (_: unknown, row: NodeDisplayRow) => nodeLabel(row) }] : []),
     {
       title: t('status'), key: 'status', width: 116, fixed: 'left' as const,
       render: (_: unknown, r: NodeDisplayRow) => (
@@ -83,8 +87,9 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
       ),
     },
     {
-      title: t('nodeOperations'), key: 'actions', width: 166, fixed: 'right' as const,
+      title: t('nodeOperations'), key: 'actions', width: managementActions ? 270 : 166, fixed: 'right' as const,
       render: (_: unknown, r: NodeDisplayRow) => (
+        <>
         <NodeActionControls
           row={r}
           panelProtocol={panelProtocol}
@@ -95,8 +100,10 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
           openDetail={openDetail}
           onLifecycle={onLifecycle}
           onUpgrade={onUpgrade}
-          onDelete={onDelete}
+          onDelete={canDeleteStatus && !canDeleteStatus(r) ? undefined : onDelete}
         />
+        {managementActions?.(r)}
+        </>
       ),
     },
   ];

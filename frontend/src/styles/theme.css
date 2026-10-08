@@ -1271,3 +1271,27 @@ html, body, #root {
   width: 100%;
   max-width: 252px;
 }
+
+/* Node Management V2: shared cards, live all-node overview and scoped rules. */
+.rp-node-management-body { margin-top: 20px; }
+.rp-node-group-cards { display: grid; gap: 16px; }
+.rp-node-group-card .ant-card-head { min-height: 54px; }
+.rp-node-group-meta { display: flex; flex-wrap: wrap; gap: 20px; margin-bottom: 12px; }
+.rp-node-group-meta > div { display: flex; gap: 8px; align-items: center; }
+.rp-node-group-actions { margin-bottom: 12px; }
+.rp-rule-group-switch { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--rp-border); margin-bottom: 16px; }
+.rp-rule-group-switch .ant-select { min-width: 240px !important; }
+.rp-rule-selection-scope { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; font-size: 12px; }
+@media (max-width: 767px) {
+ .rp-node-group-card .ant-card-head { padding: 0 12px; }
+ .rp-node-group-card .ant-card-body { padding: 12px; overflow-x: auto; }
+ .rp-node-group-meta { gap: 10px 16px; }
+ .rp-rule-group-switch .ant-select { width: 100%; }
+}
+.rp-node-group-card .ant-card-head-title { min-width: 0; }
+.rp-node-group-card .ant-card-head-title .ant-btn { max-width: 100%; height: auto; min-height: 32px; }
+.rp-node-group-card .ant-card-head-title .ant-typography { overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 767px) {
+ .rp-node-group-card .ant-card-head-wrapper { align-items: flex-start; flex-direction: column; padding: 10px 0; gap: 8px; }
+ .rp-node-group-card .ant-card-extra { margin-inline-start: 0; }
+}
