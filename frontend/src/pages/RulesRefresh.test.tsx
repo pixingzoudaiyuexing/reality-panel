@@ -1,8 +1,9 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { mockGet, refreshCurrentUser } = vi.hoisted(() => ({
+const { mockGet, refreshCurrentUser, route } = vi.hoisted(() => ({
   mockGet: vi.fn(),
+  route: { query: '' },
   refreshCurrentUser: vi.fn(),
 }));
 
@@ -24,7 +25,7 @@ vi.mock('../auth/useAuth', () => ({
 }));
 
 vi.mock('react-router-dom', () => ({
-  useSearchParams: () => [new URLSearchParams(), vi.fn()],
+  useSearchParams: () => [new URLSearchParams(route.query), vi.fn()],
 }));
 
 import Rules from './Rules';
@@ -103,6 +104,7 @@ function initialResponse(url: string) {
 }
 
 beforeEach(() => {
+  route.query = '';
   vi.useFakeTimers();
   mockGet.mockReset();
   refreshCurrentUser.mockReset();
@@ -115,6 +117,47 @@ afterEach(() => {
 });
 
 describe('Rules lightweight background refresh', () => {
+  it.each(['initial', 'background'])('rejects a late %s response after switching owner scope', async (phase) => {
+    let complete!: (value: ReturnType<typeof ok<typeof rule[]>>) => void;
+    const late = new Promise<ReturnType<typeof ok<typeof rule[]>>>(resolve => { complete = resolve; });
+    mockGet.mockImplementation((url: string) => url === '/rules?owner_uid=1' && phase === 'initial' ? late : initialResponse(url));
+    const view = render(<Rules />);
+    await flush();
+    if (phase === 'background') {
+      mockGet.mockImplementation((url: string) => url === '/rules?owner_uid=1' ? late : initialResponse(url));
+      await flush(10000);
+    }
+    route.query = 'owner_uid=2';
+    mockGet.mockImplementation((url: string) => url === '/rules?owner_uid=2'
+      ? Promise.resolve(ok([{ ...rule, id: 2, uid: 2, name: 'owner-two-rule' }])) : initialResponse(url));
+    view.rerender(<Rules />);
+    await flush();
+    expect(screen.getByText('owner-two-rule')).toBeInTheDocument();
+    complete(ok([{ ...rule, name: 'stale-owner-one-rule' }]));
+    await flush();
+    expect(screen.getByText('owner-two-rule')).toBeInTheDocument();
+    expect(screen.queryByText('stale-owner-one-rule')).not.toBeInTheDocument();
+    expect(screen.queryByText('rulesLoadFailed')).not.toBeInTheDocument();
+  });
+
+  it('ignores failure and loading writes from an obsolete owner request', async () => {
+    let fail!: (reason: Error) => void;
+    const late = new Promise<never>((_, reject) => { fail = reject; });
+    mockGet.mockImplementation((url: string) => url === '/rules?owner_uid=1' ? late : initialResponse(url));
+    const view = render(<Rules />);
+    await flush();
+    route.query = 'owner_uid=2';
+    mockGet.mockImplementation((url: string) => url === '/rules?owner_uid=2'
+      ? Promise.resolve(ok([{ ...rule, id: 2, uid: 2, name: 'owner-two-rule' }])) : initialResponse(url));
+    view.rerender(<Rules />);
+    await flush();
+    fail(new Error('old owner failed'));
+    await flush();
+    expect(screen.getByText('owner-two-rule')).toBeInTheDocument();
+    expect(screen.queryByText('rulesLoadFailed')).not.toBeInTheDocument();
+    expect(document.querySelector('.ant-spin-spinning')).toBeNull();
+  });
+
   it('shows an inline retry when the initial rules request fails', async () => {
     mockGet.mockImplementation((url: string) => {
       if (url === '/rules?owner_uid=1') return Promise.reject(new Error('database unavailable'));

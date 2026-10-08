@@ -354,7 +354,12 @@ export default function Groups({ cards = false }: { cards?: boolean } = {}) {
   const expandedRowRender = (g: DeviceGroup) => {
     const groupNodes = nodesByGroup(g.id);
     const routingPanel = isAdmin && g.group_type === 'in'
-      ? <RelayPreferencePanel onDiagnoseNode={node => setDiagnosis({ groupId: g.id, nodeId: node.node_id, label: node.public_ipv4 || node.node_id })} key={groupNodes.map(node => poolNodeKey(node as unknown as PoolNode)).sort().join('|')} groupId={g.id} t={t} />
+      ? <RelayPreferencePanel onDiagnoseNode={poolFailed ? undefined : node => {
+        const candidates = poolNodes.filter(member => member.node_id === node.node_id && member.memberships.some(binding => binding.group_id === g.id));
+        if (candidates.length !== 1) { message.error(t('poolLoadFailed')); return; }
+        const member = candidates[0];
+        setDiagnosis({ groupId: member.identity_group_id, nodeId: member.node_id, label: poolNodeName(member) });
+      }} key={groupNodes.map(node => poolNodeKey(node as unknown as PoolNode)).sort().join('|')} groupId={g.id} t={t} />
       : null;
     if (groupNodes.length === 0) {
       return (

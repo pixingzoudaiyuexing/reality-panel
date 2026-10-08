@@ -524,6 +524,38 @@ describe('Rules group-switch single-table layout', () => {
     fireEvent.click(screen.getByRole('button', { name: /batchPause/ }));
     await waitFor(() => expect(mockPut).toHaveBeenCalledTimes(25));
     expect(mockPut.mock.calls.map(call => call[0]).sort()).toEqual(Array.from({ length: 25 }, (_, i) => `/rules/${i + 1}`).sort());
+    await waitFor(() => expect(screen.queryByTestId('rules-batchbar')).toBeNull());
+    expect(screen.getByText('selectionPageOnly')).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole('checkbox')[1]);
+    fireEvent.click(screen.getByTitle('1'));
+    await waitFor(() => expect(screen.queryByTestId('rules-batchbar')).toBeNull());
+  }, 15000);
+
+  it.each(['batchDelete', 'batchRestart'])('resets cross-page mode after completed %s', async (action) => {
+    setupAdmin(Array.from({ length: 21 }, (_, index) => rule(index + 1)));
+    render(<Rules />);
+    await screen.findByText('rule-1');
+    fireEvent.click(screen.getByRole('button', { name: 'selectFilteredRules' }));
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(action + '$') }));
+    const confirmation = await screen.findByRole('tooltip');
+    fireEvent.click(within(confirmation).getByRole('button', { name: /OK/ }));
+    await waitFor(() => expect(action === 'batchDelete' ? mockDelete : mockPost).toHaveBeenCalledTimes(21));
+    await waitFor(() => expect(screen.queryByTestId('rules-batchbar')).toBeNull());
+    expect(screen.getByText('selectionPageOnly')).toBeInTheDocument();
+  }, 15000);
+
+  it('allows leaving cross-page mode when all selected rows were unchecked', async () => {
+    setupAdmin(Array.from({ length: 25 }, (_, index) => rule(index + 1)));
+    render(<Rules />);
+    await screen.findByText('rule-1');
+    fireEvent.click(screen.getByRole('button', { name: 'selectFilteredRules' }));
+    fireEvent.click(screen.getAllByRole('checkbox')[0]);
+    fireEvent.click(screen.getByTitle('2'));
+    await screen.findByText('rule-25');
+    fireEvent.click(screen.getAllByRole('checkbox')[0]);
+    expect(screen.queryByTestId('rules-batchbar')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'cancelSelection' }));
+    expect(screen.getByText('selectionPageOnly')).toBeInTheDocument();
   }, 15000);
 
   it('changes group with isolated pagination, hidden group column, and cleared selection', async () => {

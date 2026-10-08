@@ -2,7 +2,7 @@ import { DomainPreflight } from '../components/nodes/DomainPreflight';
 import { Table, Button, Modal, Form, Input, InputNumber, Select, Space, message, Popconfirm, Popover, Tag, Alert, Typography, Dropdown, Switch, Tabs, Tooltip, Pagination, Collapse } from 'antd';
 import type { MenuProps } from 'antd';
 import { PlusOutlined, ReloadOutlined, EditOutlined, ApiOutlined, CopyOutlined, DownloadOutlined, UploadOutlined, PauseCircleOutlined, PlayCircleOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined, MedicineBoxOutlined, QuestionCircleOutlined, ThunderboltOutlined, SearchOutlined, MoreOutlined } from '@ant-design/icons';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import api from '../api/client';
 import type { ApiEnvelope, ForwardRule, DeviceGroup, User, UserSelf, RuleTargetInput, SharedGroupSummary, RestartResponse, ReapplyResponse, NodeStatus, PoolNode, RuleDnsStatus } from '../api/types';
@@ -276,16 +276,30 @@ export default function Rules() {
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
   const [acrossPages, setAcrossPages] = useState(false);
-  const backgroundRefreshInFlight = useRef(false);
 
   const ownerUid = filterOwnerUid ?? (isAdmin ? (user?.id ?? null) : null);
   const scopedRulesUrl = ownerUid ? `/rules?owner_uid=${ownerUid}` : '/rules';
+  const scopeKey = `${isAdmin}:${scopedRulesUrl}`;
+  const requestScope = useRef({ key: scopeKey, generation: 0, loading: false });
+  const backgroundRefreshInFlight = useRef<{ scope: { key: string; generation: number; loading: boolean }; generation: number } | null>(null);
+  // Commit the new owner scope before browser events or old async completions
+  // can select/mutate rows. Each load also invalidates older refresh responses.
+  useLayoutEffect(() => {
+    requestScope.current = { key: scopeKey, generation: 0, loading: false };
+    return () => { requestScope.current.generation++; };
+  }, [scopeKey]);
+
 
   useEffect(() => {
     void refreshCurrentUser();
   }, [refreshCurrentUser]);
 
   const load = useCallback(async () => {
+    const scope = requestScope.current;
+    if (scope.key !== scopeKey) return;
+    const generation = ++scope.generation;
+    scope.loading = true;
+    const current = () => requestScope.current === scope && scope.generation === generation;
     setLoading(true);
     try {
       // v0.4.10: /admin/users is admin-only and NOT in the main Promise.all —
@@ -302,46 +316,63 @@ export default function Rules() {
       ]);
       if (r.code !== 0) throw new Error(r.message || 'rules load failed');
       if (g.code !== 0) throw new Error(g.message || 'groups load failed');
+      if (!current()) return;
       setRules(r.data || []);
+      if (!current()) return;
       setGroups(g.data || []);
       if (isAdmin) {
         try {
           const u = await api.get<unknown, ApiEnvelope<User[]>>('/admin/users');
+          if (!current()) return;
           setUsers(u.data || []);
         } catch {
           // Non-fatal: owner column falls back to "#uid" labels.
+          if (!current()) return;
           setUsers([]);
         }
         try {
           const n = await api.get<unknown, ApiEnvelope<NodeStatus[]>>('/nodes');
+          if (!current()) return;
           setNodeStatuses(n.data || []);
         } catch {
+          if (!current()) return;
           setNodeStatuses([]);
         }
         try {
           const pool = await api.get<unknown, ApiEnvelope<PoolNode[]>>('/admin/node-pool/nodes');
+          if (!current()) return;
           setPoolNodes(pool.code === 0 ? pool.data || [] : []);
         } catch {
+          if (!current()) return;
           setPoolNodes([]);
         }
         try {
           const dns = await api.get<unknown, ApiEnvelope<RuleDnsStatus[]>>('/admin/rules/dns-status');
+          if (!current()) return;
           setDnsStatuses(dns.data || []);
         } catch {
+          if (!current()) return;
           setDnsStatuses([]);
         }
+        if (!current()) return;
         setSelfQuota(null);
       } else {
+        if (!current()) return;
         setUsers([]);
+        if (!current()) return;
         setNodeStatuses([]);
+        if (!current()) return;
         setPoolNodes([]);
+        if (!current()) return;
         setDnsStatuses([]);
         // v1.0.7: a regular user only ever sees their own rules, so one /user/me
         // read gives the quota needed to flag all of them. Non-fatal on failure.
         try {
           const me = await api.get<unknown, ApiEnvelope<UserSelf>>('/user/me');
+          if (!current()) return;
           setSelfQuota(me.data ? { used: me.data.traffic_used, limit: me.data.traffic_limit } : null);
         } catch {
+          if (!current()) return;
           setSelfQuota(null);
         }
       }
@@ -354,27 +385,36 @@ export default function Rules() {
         try {
           const sg = await api.get<unknown, ApiEnvelope<SharedGroupSummary[]>>('/groups/shared');
           if (sg.code !== 0) {
+            if (!current()) return;
             setSharedLoadFailed(true);
+            if (!current()) return;
             setSharedGroups([]);
           } else {
+            if (!current()) return;
             setSharedLoadFailed(false);
+            if (!current()) return;
             setSharedGroups(sg.data || []);
           }
         } catch {
+          if (!current()) return;
           setSharedLoadFailed(true);
+          if (!current()) return;
           setSharedGroups([]);
         }
       } else {
+        if (!current()) return;
         setSharedLoadFailed(false);
+        if (!current()) return;
         setSharedGroups([]);
       }
+      if (!current()) return;
       setLoadFailed(false);
     } catch {
+      if (!current()) return;
       setLoadFailed(true);
-    } finally { setLoading(false); }
-  }, [isAdmin, scopedRulesUrl]);
-
-  useEffect(() => {
+    } finally { if (current()) { scope.loading = false; setLoading(false); } }
+  }, [isAdmin, scopedRulesUrl, scopeKey]);
+  useLayoutEffect(() => {
     setRules([]);
     setSelectedRowKeys([]);
     setAcrossPages(false);
@@ -384,8 +424,13 @@ export default function Rules() {
   }, [load]);
 
   const backgroundRefresh = useCallback(async () => {
-    if (backgroundRefreshInFlight.current) return;
-    backgroundRefreshInFlight.current = true;
+    const scope = requestScope.current;
+    if (scope.key !== scopeKey) return;
+    const generation = scope.generation;
+    if (scope.loading || (backgroundRefreshInFlight.current?.scope === scope && backgroundRefreshInFlight.current.generation === generation)) return;
+    const ticket = { scope, generation };
+    backgroundRefreshInFlight.current = ticket;
+    const current = () => requestScope.current === scope && scope.generation === generation;
     try {
       if (isAdmin) {
         const [rulesResult, nodesResult, dnsResult, poolResult] = await Promise.allSettled([
@@ -394,6 +439,7 @@ export default function Rules() {
           api.get<unknown, ApiEnvelope<RuleDnsStatus[]>>('/admin/rules/dns-status'),
           api.get<unknown, ApiEnvelope<PoolNode[]>>('/admin/node-pool/nodes'),
         ]);
+        if (!current()) return;
         if (rulesResult.status === 'fulfilled' && rulesResult.value.code === 0) {
           setRules(rulesResult.value.data || []);
           setLoadFailed(false);
@@ -412,6 +458,7 @@ export default function Rules() {
           api.get<unknown, ApiEnvelope<ForwardRule[]>>(scopedRulesUrl),
           api.get<unknown, ApiEnvelope<UserSelf>>('/user/me'),
         ]);
+        if (!current()) return;
         if (rulesResult.status === 'fulfilled' && rulesResult.value.code === 0) {
           setRules(rulesResult.value.data || []);
           setLoadFailed(false);
@@ -426,9 +473,9 @@ export default function Rules() {
         }
       }
     } finally {
-      backgroundRefreshInFlight.current = false;
+      if (backgroundRefreshInFlight.current === ticket) backgroundRefreshInFlight.current = null;
     }
-  }, [isAdmin, scopedRulesUrl]);
+  }, [isAdmin, scopedRulesUrl, scopeKey]);
 
   useEffect(() => {
     const timer = window.setInterval(() => void backgroundRefresh(), 10000);
@@ -760,6 +807,7 @@ export default function Rules() {
       message.warning(t('batchPartial').replace('{ok}', String(ok)).replace('{fail}', String(fail)));
     }
     setSelectedRowKeys([]);
+    setAcrossPages(false);
     load();
   };
 
@@ -784,6 +832,7 @@ export default function Rules() {
       message.warning(t('batchPartial').replace('{ok}', String(ok)).replace('{fail}', String(fail)));
     }
     setSelectedRowKeys([]);
+    setAcrossPages(false);
     load();
   };
 
@@ -855,6 +904,7 @@ export default function Rules() {
       );
     }
     setSelectedRowKeys([]);
+    setAcrossPages(false);
   };
 
   const handleDnsRetry = async (ruleId: number) => {
@@ -1463,6 +1513,7 @@ export default function Rules() {
       )}
       <div className="rp-rule-selection-scope">
         <Text type="secondary">{t(acrossPages ? 'selectionAcrossPages' : 'selectionPageOnly')}</Text>
+        {acrossPages && selectedRowKeys.length === 0 ? <Button type="link" onClick={() => setAcrossPages(false)}>{t('cancelSelection')}</Button> : null}
         {visibleRules.length > RULES_PAGE_SIZE && !acrossPages ? <Button type="link" onClick={() => {
           setAcrossPages(true);
           setSelectedRowKeys(visibleRules.map(rule => rule.id));
