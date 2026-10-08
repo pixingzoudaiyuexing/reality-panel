@@ -2942,8 +2942,7 @@ pub(crate) async fn schedule_group_after_membership_change(
                 })?;
         } else if preference.active_routing_mode
             == Some(crate::service::relay_preference::RoutingMode::Carrier)
-        {
-            if !matches!(
+            && !matches!(
                 crate::service::relay_preference::resolve_carrier_default(
                     db,
                     group_id,
@@ -2951,15 +2950,15 @@ pub(crate) async fn schedule_group_after_membership_change(
                 )
                 .await?,
                 crate::service::relay_preference::RelayDnsTarget::Resolved(_)
-            ) {
-                project_incomplete_line(db, id, DEFAULT_LINE_KEY)
-                    .await
-                    .map_err(|e| {
-                        crate::db::error::DbError::Other(sqlx::Error::Protocol(format!(
-                            "default incomplete projection failed: {e:?}"
-                        )))
-                    })?;
-            }
+            )
+        {
+            project_incomplete_line(db, id, DEFAULT_LINE_KEY)
+                .await
+                .map_err(|e| {
+                    crate::db::error::DbError::Other(sqlx::Error::Protocol(format!(
+                        "default incomplete projection failed: {e:?}"
+                    )))
+                })?;
         }
     }
     notify_reconcile();
