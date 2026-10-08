@@ -111,10 +111,14 @@ export default function Groups({ cards = false }: { cards?: boolean } = {}) {
         ...nodes.find(report => report.group_id === node.identity_group_id && report.node_id === node.node_id),
         ...node, group_id: groupId, last_seen: node.last_seen || '',
       } as NodeStatus));
-      return [...mapped, ...nodes.filter(report => report.group_id === groupId && !members.some(node => node.identity_group_id === report.group_id && node.node_id === report.node_id))];
+      // Pool membership is authoritative for business groups. Never turn a
+      // stale business-group report into an extra member of a reused Node.
+      // Monitor and anonymous legacy status rows have no such Pool requirement.
+      const monitor = groups.some(group => group.id === groupId && group.group_type === 'monitor');
+      return [...mapped, ...nodes.filter(report => report.group_id === groupId && (monitor || !report.node_id) && !members.some(node => node.identity_group_id === report.group_id && node.node_id === report.node_id))];
     }
     return nodes.filter(n => n.group_id === groupId);
-  }, [isAdmin, nodes, poolNodes]);
+  }, [isAdmin, nodes, poolNodes, groups]);
 
   const openPool = (group: DeviceGroup) => { setPoolGroup(group); setPoolOpen(true); };
   const removeMember = async (groupId: number, node: PoolNode) => {
