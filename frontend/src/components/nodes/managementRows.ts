@@ -2,7 +2,7 @@ import type { NodeDisplayRow, PoolNode, SharedNodeSummary } from '../../api/type
 import { poolNodeKey, poolNodeName } from './poolNodeName';
 import { compareNodeRows } from './sort';
 
-export const statusNodeKey = (row: NodeDisplayRow) => `${row.group_id}:${row.node_id || 'legacy'}`;
+export const statusNodeKey = (row: NodeDisplayRow) => `${row.group_id}:${row.node_id || ''}`;
 
 /** Pool records survive missing status reports. Status-only/monitor/legacy rows
  * remain visible. Never infer identity from a public IP or a bare node ID. */

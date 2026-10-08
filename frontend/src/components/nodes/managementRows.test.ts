@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { NodeDisplayRow, PoolNode } from '../../api/types';
-import { managementRows } from './managementRows';
+import { managementRows, statusNodeKey } from './managementRows';
 const pool = (group: number, id: string): PoolNode => ({ identity_group_id: group, node_id: id, display_name: '',
   pool_native: true, public_ipv4: '203.0.113.1', public_ipv6: null, online: false, node_version: '1.4.8', last_seen: null,
   credential_ready: true, credential_active: true, safe_to_add: true, migration_incomplete: false, recovery_available: false,
@@ -8,6 +8,9 @@ const pool = (group: number, id: string): PoolNode => ({ identity_group_id: grou
 const row = (group: number, id: string | null): NodeDisplayRow => ({ group_id: group, node_id: id, online: true,
   cpu: 42, mem: 30, connections: 12, uptime: 100, last_seen: 'last', public_ipv4: '203.0.113.1' });
 describe('all-node identity and status projection', () => {
+  it('keeps an anonymous legacy status distinct from a concrete node named legacy', () => {
+    expect(statusNodeKey(row(1, null))).not.toBe(statusNodeKey(row(1, 'legacy')));
+  });
   it('joins by composite identity and retains each same-ID or same-IP identity', () => {
     const rows = managementRows([row(1, 'same'), row(2, 'same'), row(3, 'other')], [pool(1, 'same')]);
     expect(rows).toHaveLength(3);

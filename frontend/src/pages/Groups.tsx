@@ -373,7 +373,7 @@ export default function Groups({ cards = false }: { cards?: boolean } = {}) {
           pagination={false}
           size="small"
           columns={[
-            { title: t('poolNodeName'), key: 'name', width: 150, render: (_: unknown, n: NodeStatus) => <Button type="link" onClick={() => setInspecting('identity_group_id' in n ? poolNodeKey(n as unknown as PoolNode) : `${n.group_id}:${n.node_id}`)}>{isAdmin && 'identity_group_id' in n ? poolNodeName(n as unknown as PoolNode) : n.group_name || n.public_ipv4 || n.public_ipv6 || '-'}</Button> },
+            { title: t('poolNodeName'), key: 'name', width: 150, render: (_: unknown, n: NodeStatus) => <Button type="link" onClick={() => setInspecting('identity_group_id' in n ? poolNodeKey(n as unknown as PoolNode) : `${n.group_id}:${n.node_id || ''}`)}>{isAdmin && 'identity_group_id' in n ? poolNodeName(n as unknown as PoolNode) : n.group_name || n.public_ipv4 || n.public_ipv6 || '-'}</Button> },
             { title: 'IP', key: 'ip', render: (_: unknown, n: NodeStatus) => <Space orientation="vertical" size={0}><span>{n.public_ipv4 || n.public_ip || '-'}</span><span>{n.public_ipv6}</span></Space> },
             { title: t('status'), dataIndex: 'online', key: 'online', width: 80, render: (v: boolean) => <Tag color={v ? 'green' : 'default'}>{v ? t('online') : t('offline')}</Tag> },
             { title: t('nodeVersion'), dataIndex: 'node_version', key: 'version', width: 90, render: (v: string | undefined) => v ? <span className="rp-mono" style={{ fontSize: 12 }}>{v}</span> : '-' },

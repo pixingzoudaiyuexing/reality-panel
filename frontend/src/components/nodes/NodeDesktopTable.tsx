@@ -112,7 +112,7 @@ export function NodeDesktopTable({ rows, panelProtocol, latestNodeVersion, nodeV
     <Table
       dataSource={rows}
       columns={columns}
-      rowKey={(r) => `${r.group_id}:${r.node_id || 'legacy'}`}
+      rowKey={(r) => `${r.group_id}:${r.node_id || ''}`}
       // v1.2.5: offline rows are greyed (see .rp-node-offline in theme.css).
       // Their numbers are the last report, not a live reading — and since these
       // rows now stay listed for 24h instead of 2 minutes, telling them apart

@@ -47,7 +47,7 @@ export function NodeMobileList({ rows, panelProtocol, latestNodeVersion = '', no
       {rows.map((r) => {
         return (
           <div
-            key={`${r.group_id}:${r.node_id || 'none'}`}
+            key={`${r.group_id}:${r.node_id || ''}`}
             // v1.2.5: offline cards are greyed, same signal as the desktop
             // table's offline rows — every figure on the card is the node's
             // last report rather than a live reading.
