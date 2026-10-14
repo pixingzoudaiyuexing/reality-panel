@@ -71,6 +71,15 @@ class RetryCleanup(unittest.TestCase):
                 self.file(retry.UNIT,UNIT+extra)
                 self.assertIsNone(retry.inspection(self.root)['retry_snapshot'])
                 self.assertTrue((self.root/'opt/relay-node/node-id').exists())
+    def test_custom_runtime_directory_and_multiple_directories_are_protected(self):
+        self.residue()
+        for directory in ['operator-state','relay-node operator-state','/run/operator-state']:
+            with self.subTest(directory=directory):
+                self.file(retry.UNIT,UNIT+'RuntimeDirectory='+directory+'\n')
+                self.assertIsNone(retry.inspection(self.root)['retry_snapshot'])
+                self.assertTrue((self.root/'opt/relay-node/node-id').exists())
+        self.file(retry.UNIT,UNIT+'RuntimeDirectory=relay-node\nRuntimeDirectoryMode=0755\n')
+        self.assertIsNotNone(retry.inspection(self.root)['retry_snapshot'])
     def test_parent_symlink_and_custom_working_directory_are_protected(self):
         self.residue();self.file(retry.UNIT, UNIT.replace('WorkingDirectory=/opt/relay-node', 'WorkingDirectory=/other-program'))
         self.assertIsNone(retry.inspection(self.root)['retry_snapshot'])
@@ -78,12 +87,37 @@ class RetryCleanup(unittest.TestCase):
         target = self.root/'opt/relay-node'; target.rename(self.root/'owned-backup'); target.symlink_to(self.root/'owned-backup')
         self.assertIsNone(retry.inspection(self.root)['retry_snapshot'])
         self.assertTrue((self.root/'owned-backup/node-id').exists())
+    def test_product_mounts_fail_before_any_file_deletion(self):
+        self.residue();before={str(p):p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        for name in ('/opt/relay-node','/etc/relay-node'):
+            with self.subTest(name=name),patch.object(retry.os.path,'ismount',side_effect=lambda p:str(p)==str(self.root/name.lstrip('/'))):
+                self.assertIsNone(retry.inspection(self.root)['retry_snapshot'])
+                with self.assertRaises(ValueError):retry.cleanup(self.root,'clean','unused')
+                self.assertEqual(before,{str(p):p.read_bytes() for p in self.root.rglob('*') if p.is_file()})
     def test_effective_systemd_dropins_and_foreign_loaded_fragment_block_stop(self):
         for fragment,dropins in [(retry.UNIT,'/run/systemd/system/relay-node.service.d/override.conf'), (retry.UNIT,'/usr/lib/systemd/system/relay-node.service.d/override.conf'), ('/other-program.service','')]:
             with self.subTest(fragment=fragment,dropins=dropins),patch.object(retry.subprocess,'check_output',side_effect=[fragment,dropins]),patch.object(retry.subprocess,'run') as stop:
                 with self.assertRaises(ValueError):retry.validate_loaded_service(True)
                 stop.assert_not_called()
-        with patch.object(retry.subprocess,'check_output',side_effect=[retry.UNIT,'']):retry.validate_loaded_service(True)
+        with patch.object(retry.subprocess,'check_output',side_effect=[retry.UNIT,'','','','relay-node']):retry.validate_loaded_service(True)
+    def test_cached_stop_hooks_and_runtime_directory_are_protected(self):
+        for output in [[retry.UNIT,'','operator-stop'],[retry.UNIT,'','','operator-poststop'],[retry.UNIT,'','','','operator-state']]:
+            with self.subTest(output=output),patch.object(retry.subprocess,'check_output',side_effect=output),patch.object(retry.subprocess,'run') as stop:
+                with self.assertRaises(ValueError):retry.validate_loaded_service(True)
+                stop.assert_not_called()
+    def test_runtime_unknown_file_symlink_and_socket_scope(self):
+        self.residue();runtime=self.root/'run/relay-node';runtime.mkdir(parents=True)
+        unknown=self.file('/run/relay-node/operator-state','keep')
+        self.assertIsNone(retry.inspection(self.root)['retry_snapshot']);unknown.unlink()
+        import socket
+        server=socket.socket(socket.AF_UNIX);self.addCleanup(server.close)
+        previous=Path.cwd()
+        try:
+            os.chdir(runtime);server.bind('relay-panel-pp-strip-443.sock')
+        finally:os.chdir(previous)
+        self.assertIsNotNone(retry.inspection(self.root)['retry_snapshot'])
+        runtime.rename(self.root/'run/other-program');runtime.symlink_to(self.root/'run/other-program')
+        self.assertIsNone(retry.inspection(self.root)['retry_snapshot'])
     def test_interrupted_unit_removal_refreshes_cache_without_stopping_unknown_service(self):
         with patch.object(retry.subprocess,'check_output',side_effect=[retry.UNIT,'','inactive','0','','','inactive','0']),patch.object(retry.subprocess,'run') as command:
             retry.validate_loaded_service(False)

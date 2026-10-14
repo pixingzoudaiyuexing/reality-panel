@@ -134,10 +134,23 @@ def owned_unit(raw):
                 ('Service', 'ExecStart'): '/opt/relay-node/relay-node'}
     if any(entries.get(key) != value for key, value in expected.items()):
         raise ValueError('relay-node unit is not product-owned')
+    optional = {('Unit', 'After'): {'network-online.target nginx.service', 'network-online.target docker.service nginx.service'},
+                ('Unit', 'Wants'): {'network-online.target'},
+                ('Service', 'Type'): {'simple'},
+                ('Service', 'RuntimeDirectory'): {'relay-node'},
+                ('Service', 'RuntimeDirectoryMode'): {'0755'},
+                ('Service', 'Restart'): {'always'},
+                ('Service', 'RestartSec'): {'3'},
+                ('Service', 'LimitNOFILE'): {'65536'},
+                ('Install', 'WantedBy'): {'multi-user.target'}}
+    if any(value not in optional[key] for key, value in entries.items() if key in optional):
+        raise ValueError('custom service resource values are protected')
 
 
 def plan(root):
     root = Path(root)
+    for directory in ('/opt/relay-node', '/etc/relay-node'):
+        checked(root, directory, directory=True)
     removals = []
     ids = set()
     failed_ids = set()
@@ -149,6 +162,13 @@ def plan(root):
         ids.add(node)
     if unit:
         owned_unit(unit)
+        runtime = checked(root, '/run/relay-node', directory=True)
+        if runtime.exists():
+            for entry in runtime.iterdir():
+                meta = entry.lstat()
+                match = re.fullmatch(r'relay-panel-pp-strip-([0-9]+)\.sock', entry.name)
+                if not match or not 1 <= int(match[1]) <= 65535 or not stat.S_ISSOCK(meta.st_mode) or meta.st_uid != os.geteuid():
+                    raise ValueError('unknown service runtime resource is protected')
     dropins = checked(root, UNIT + '.d', directory=True)
     if dropins.exists() and any(dropins.iterdir()):
         raise ValueError('service overrides are protected')
@@ -316,6 +336,14 @@ def validate_loaded_service(unit_exists):
         stopped()
     if loaded and (not unit_exists or loaded != UNIT):
         raise ValueError('loaded service is not the owned unit')
+    if unit_exists and loaded:
+        for key in ('ExecStop', 'ExecStopPost'):
+            value = subprocess.check_output(['systemctl', 'show', '--property=' + key, '--value', 'relay-node.service'], timeout=10, text=True).strip()
+            if value:
+                raise ValueError('cached service stop commands are protected')
+        runtime = subprocess.check_output(['systemctl', 'show', '--property=RuntimeDirectory', '--value', 'relay-node.service'], timeout=10, text=True).strip()
+        if runtime not in ('', 'relay-node'):
+            raise ValueError('cached service runtime resources are protected')
 
 
 def cleanup(root, phase, expected_snapshot):
