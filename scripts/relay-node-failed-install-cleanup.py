@@ -298,6 +298,15 @@ def validate_loaded_service(unit_exists):
     dropins = subprocess.check_output(['systemctl', 'show', '--property=DropInPaths', '--value', 'relay-node.service'], timeout=10, text=True).strip()
     if dropins:
         raise ValueError('effective service overrides are protected')
+    if not unit_exists and loaded == UNIT:
+        # A prior interrupted cleanup may already have unlinked our unit.
+        # Refresh systemd's cache, then require no loaded replacement; never
+        # stop a cached service whose file/ownership can no longer be verified.
+        subprocess.run(['systemctl', 'daemon-reload'], check=True, timeout=20)
+        loaded = subprocess.check_output(['systemctl', 'show', '--property=FragmentPath', '--value', 'relay-node.service'], timeout=10, text=True).strip()
+        dropins = subprocess.check_output(['systemctl', 'show', '--property=DropInPaths', '--value', 'relay-node.service'], timeout=10, text=True).strip()
+        if loaded or dropins:
+            raise ValueError('replacement service is protected')
     if loaded and (not unit_exists or loaded != UNIT):
         raise ValueError('loaded service is not the owned unit')
 

@@ -84,6 +84,13 @@ class RetryCleanup(unittest.TestCase):
                 with self.assertRaises(ValueError):retry.validate_loaded_service(True)
                 stop.assert_not_called()
         with patch.object(retry.subprocess,'check_output',side_effect=[retry.UNIT,'']):retry.validate_loaded_service(True)
+    def test_interrupted_unit_removal_refreshes_cache_without_stopping_unknown_service(self):
+        with patch.object(retry.subprocess,'check_output',side_effect=[retry.UNIT,'','','']),patch.object(retry.subprocess,'run') as command:
+            retry.validate_loaded_service(False)
+            command.assert_called_once_with(['systemctl','daemon-reload'],check=True,timeout=20)
+        with patch.object(retry.subprocess,'check_output',side_effect=[retry.UNIT,'','/usr/lib/systemd/system/relay-node.service','']),patch.object(retry.subprocess,'run') as command:
+            with self.assertRaises(ValueError):retry.validate_loaded_service(False)
+            command.assert_called_once_with(['systemctl','daemon-reload'],check=True,timeout=20)
     def test_committed_transaction_cannot_authorize_failed_retry(self):
         self.residue();base='/tmp/relay-panel-bootstrap-'+NODE
         self.file(base+'/bootstrap.sh','#!/usr/bin/env bash\n# RelayPanel Stage 1 bootstrap.\n')
