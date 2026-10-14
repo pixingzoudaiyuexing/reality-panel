@@ -10984,3 +10984,72 @@ async fn pending_display_name_binds_only_after_exact_credential_activation() {
     );
     assert_eq!(db.list_node_pool_records().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn failed_retry_retirement_guards_membership_and_routing_in_transaction() {
+    let db = repo().await;
+    let anchor = db
+        .ensure_node_pool_system_group(1, "retry-pg-token")
+        .await
+        .unwrap();
+    let node =
+        crate::node_identity::ReuseEligibleNodeId::parse("11111111-1111-4111-8111-111111111111")
+            .unwrap();
+    seed_group(&db, 71).await;
+    sqlx::query("INSERT INTO node_credentials(credential_id,home_group_id,node_id,generation,verifier_format,verifier_version,verifier_data,activated_at) VALUES ('retry-guard',?,?,1,'rp-node-sha256',1,?,datetime('now'))")
+        .bind(anchor.id).bind(node.as_str()).bind(vec![7_u8;32]).execute(&db.pool).await.unwrap();
+    assert!(matches!(
+        db.create_node_reuse_binding_if_active(71, anchor.id, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Created(_)
+    ));
+    assert!(db
+        .retire_installation_node(anchor.id, &node, true)
+        .await
+        .is_err());
+    assert!(db
+        .find_node_reuse_binding(71, anchor.id, node.as_str())
+        .await
+        .unwrap()
+        .is_some());
+    assert!(db
+        .find_active_node_credential_for_runtime("retry-guard")
+        .await
+        .unwrap()
+        .is_some());
+    db.delete_node_reuse_binding(71, anchor.id, node.as_str())
+        .await
+        .unwrap();
+    let policy = serde_json::to_string(&crate::service::relay_preference::RelayPreferenceState {
+        preferred_node_id: Some(node.as_str().into()),
+        ..Default::default()
+    })
+    .unwrap();
+    db.set("relay_preference:71", &policy).await.unwrap();
+    assert!(db
+        .retire_installation_node(anchor.id, &node, true)
+        .await
+        .is_err());
+    assert_eq!(
+        db.get("relay_preference:71").await.unwrap().as_deref(),
+        Some(policy.as_str())
+    );
+    assert!(db
+        .find_active_node_credential_for_runtime("retry-guard")
+        .await
+        .unwrap()
+        .is_some());
+    // The ordinary explicit Fresh replacement retains its cleanup contract.
+    assert!(
+        db.retire_installation_node(anchor.id, &node, false)
+            .await
+            .unwrap()
+            .retired
+    );
+    assert!(db
+        .find_active_node_credential_for_runtime("retry-guard")
+        .await
+        .unwrap()
+        .is_none());
+}

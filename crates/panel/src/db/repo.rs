@@ -738,6 +738,7 @@ pub trait NodePoolRepository: Send + Sync {
         &self,
         group_id: i64,
         node_id: &ReuseEligibleNodeId,
+        require_unreferenced: bool,
     ) -> Result<NodePoolRetirement, DbError>;
     /// Persist a verified status only while that exact credential remains
     /// current. Serializes with retirement to reject in-flight reports.

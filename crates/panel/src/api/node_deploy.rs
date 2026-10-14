@@ -1078,7 +1078,7 @@ async fn run_task(
                 )
                 .await;
             for (old_group, old_id) in old_ids {
-                existing::retire_host_identity(&state, old_group, &old_id, actor_id).await?;
+                existing::retire_host_identity(&state, old_group, &old_id, actor_id, false).await?;
             }
             state
                 .deployments
@@ -1300,7 +1300,8 @@ async fn run_task(
                         .runner
                         .fresh_reset(&ssh, &fingerprint, &artifact, "stop")
                         .await?;
-                    existing::retire_host_identity(&state, group_id, &candidate, actor_id).await?;
+                    existing::retire_host_identity(&state, group_id, &candidate, actor_id, false)
+                        .await?;
                     state
                         .deployments
                         .runner
@@ -4530,6 +4531,116 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
     }
 
     #[tokio::test]
+    async fn failed_retry_keeps_membership_committed_after_last_precheck() {
+        use crate::db::repo::{NewNodeCredentialCandidate, NodeReuseBindingCreateResult};
+        use crate::node_credential::{NodeCredentialSecret, NodeCredentialVerifier};
+        let (mut state, _, mut facts, _) = failed_retry_fixture(FakeBehavior::Success).await;
+        let id = facts.node_id.clone().unwrap();
+        let group = state.db.node_pool_system_group_id().await.unwrap().unwrap();
+        let node = crate::node_identity::ReuseEligibleNodeId::parse(&id).unwrap();
+        let credential = "55555555-5555-4555-8555-555555555555";
+        let row = state
+            .db
+            .allocate_node_credential_candidate(&NewNodeCredentialCandidate {
+                credential_id: credential.into(),
+                home_group_id: group,
+                node_id: node.clone(),
+                verifier: NodeCredentialVerifier::derive(
+                    credential,
+                    group,
+                    &node,
+                    &NodeCredentialSecret::generate().unwrap(),
+                ),
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .activate_node_credential(credential, group, &node, row.generation)
+            .await
+            .unwrap();
+        facts.retry_failed_ids = vec![id.clone()];
+        let mut next = FakeRunner::new(FakeBehavior::Success);
+        next.host_facts = facts.clone();
+        let runner = Arc::new(next);
+        state.deployments.runner = runner.clone();
+        state
+            .db
+            .insert_group(
+                "business race",
+                "in",
+                "business-race",
+                1,
+                "",
+                "",
+                1.0,
+                false,
+            )
+            .await
+            .unwrap();
+        let business = state
+            .db
+            .find_by_token("business-race")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        // Hold the existing publication fence: retirement waits here only after
+        // cancel_retry_candidates' last authority check has already succeeded.
+        let fence = crate::service::node_pool::PUBLICATION.read().await;
+        let reply = retry_request(&state, &facts, None).await;
+        assert_eq!(reply.code, 0);
+        let task = reply.data.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runner
+                    .retry_calls
+                    .lock()
+                    .await
+                    .contains(&"stop".to_string())
+                    && tokio::time::timeout(
+                        Duration::from_millis(20),
+                        crate::service::node_pool::PUBLICATION.read(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            state
+                .db
+                .create_node_reuse_binding_if_active(business, group, &node)
+                .await
+                .unwrap(),
+            NodeReuseBindingCreateResult::Created(_)
+        ));
+        drop(fence);
+        let status = wait_for_fake_deployment(&state, &task.id).await;
+        assert_eq!(status.status, "FAILED");
+        assert!(status.message.starts_with("IDENTITY_RETIREMENT_FAILED:"));
+        assert_eq!(*runner.retry_calls.lock().await, ["check", "stop"]);
+        assert_eq!(runner.install_calls.load(Ordering::SeqCst), 0);
+        assert!(state
+            .db
+            .find_node_reuse_binding(business, group, &id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime(credential)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn exact_active_failed_candidate_is_retired_but_business_bound_candidate_is_protected() {
         use crate::db::repo::NewNodeCredentialCandidate;
         use crate::node_credential::{NodeCredentialSecret, NodeCredentialVerifier};
@@ -4700,7 +4811,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
         .await
         .unwrap();
         assert_eq!(identities, vec![(old_group, old.into())]);
-        existing::retire_host_identity(&state, old_group, node.as_str(), 1)
+        existing::retire_host_identity(&state, old_group, node.as_str(), 1, false)
             .await
             .unwrap();
         assert!(state

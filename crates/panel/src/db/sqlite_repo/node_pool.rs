@@ -90,15 +90,16 @@ impl NodePoolRepository for SqliteRepository {
         group_id: i64,
         node_id: &crate::node_identity::ReuseEligibleNodeId,
     ) -> Result<NodePoolRetirement, DbError> {
-        self.retire_installation_inner(group_id, node_id, false)
+        self.retire_installation_inner(group_id, node_id, false, false)
             .await
     }
     async fn retire_installation_node(
         &self,
         group_id: i64,
         node_id: &crate::node_identity::ReuseEligibleNodeId,
+        require_unreferenced: bool,
     ) -> Result<NodePoolRetirement, DbError> {
-        self.retire_installation_inner(group_id, node_id, true)
+        self.retire_installation_inner(group_id, node_id, true, require_unreferenced)
             .await
     }
 
@@ -183,6 +184,7 @@ impl SqliteRepository {
         group_id: i64,
         node_id: &crate::node_identity::ReuseEligibleNodeId,
         fresh_reset: bool,
+        require_unreferenced: bool,
     ) -> Result<NodePoolRetirement, DbError> {
         let mut tx = self.pool.begin().await?;
         // Own the SQLite writer slot before inspecting any identity state.
@@ -221,6 +223,23 @@ impl SqliteRepository {
                 raw,
                 node_id.as_str(),
             )?);
+        }
+        // Failed-install retry may retire an unreferenced candidate only.
+        // This check owns the same writer/Home-Group lock as membership admission.
+        if require_unreferenced {
+            let membership: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM node_reuse_bindings WHERE home_group_id=? AND node_id=? LIMIT 1",
+            )
+            .bind(group_id)
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if membership.is_some() || !referenced_groups.is_empty() {
+                tx.rollback().await?;
+                return Err(DbError::Other(sqlx::Error::Protocol(
+                    "FAILED_RETRY_REFERENCED".into(),
+                )));
+            }
         }
         let mut routing_groups = Vec::new();
         let mut needs_attention = false;

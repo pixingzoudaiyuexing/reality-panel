@@ -17,6 +17,78 @@ use crate::db::repo::*;
 use relay_shared::protocol::TrafficEntry;
 
 #[tokio::test]
+async fn pg_failed_retry_retirement_guards_membership_and_routing_in_transaction() {
+    let Some(db) = repo("failed_retry_retirement_guard").await else {
+        return;
+    };
+    let anchor = db
+        .ensure_node_pool_system_group(1, "retry-pg-token")
+        .await
+        .unwrap();
+    let node =
+        crate::node_identity::ReuseEligibleNodeId::parse("11111111-1111-4111-8111-111111111111")
+            .unwrap();
+    seed_group(&db, 71).await;
+    sqlx::query("INSERT INTO node_credentials(credential_id,home_group_id,node_id,generation,verifier_format,verifier_version,verifier_data,activated_at) VALUES ('retry-guard',$1,$2,1,'rp-node-sha256',1,$3,now()::text)")
+        .bind(anchor.id).bind(node.as_str()).bind(vec![7_u8;32]).execute(&db.pool).await.unwrap();
+    assert!(matches!(
+        db.create_node_reuse_binding_if_active(71, anchor.id, &node)
+            .await
+            .unwrap(),
+        NodeReuseBindingCreateResult::Created(_)
+    ));
+    assert!(db
+        .retire_installation_node(anchor.id, &node, true)
+        .await
+        .is_err());
+    assert!(db
+        .find_node_reuse_binding(71, anchor.id, node.as_str())
+        .await
+        .unwrap()
+        .is_some());
+    assert!(db
+        .find_active_node_credential_for_runtime("retry-guard")
+        .await
+        .unwrap()
+        .is_some());
+    db.delete_node_reuse_binding(71, anchor.id, node.as_str())
+        .await
+        .unwrap();
+    let policy = serde_json::to_string(&crate::service::relay_preference::RelayPreferenceState {
+        preferred_node_id: Some(node.as_str().into()),
+        ..Default::default()
+    })
+    .unwrap();
+    db.set("relay_preference:71", &policy).await.unwrap();
+    assert!(db
+        .retire_installation_node(anchor.id, &node, true)
+        .await
+        .is_err());
+    assert_eq!(
+        db.get("relay_preference:71").await.unwrap().as_deref(),
+        Some(policy.as_str())
+    );
+    assert!(db
+        .find_active_node_credential_for_runtime("retry-guard")
+        .await
+        .unwrap()
+        .is_some());
+    // The ordinary explicit Fresh replacement retains its cleanup contract.
+    assert!(
+        db.retire_installation_node(anchor.id, &node, false)
+            .await
+            .unwrap()
+            .retired
+    );
+    assert!(db
+        .find_active_node_credential_for_runtime("retry-guard")
+        .await
+        .unwrap()
+        .is_none());
+    cleanup(&db).await;
+}
+
+#[tokio::test]
 async fn pg_pool_retirement_revokes_and_prevents_registry_recreation() {
     let Some(db) = repo("pool_retirement").await else {
         return;

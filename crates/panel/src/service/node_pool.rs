@@ -311,7 +311,7 @@ pub async fn retire_node(
         return Ok(None);
     }
 
-    retire_identity(state, group_id, node_id.as_str(), false).await
+    retire_identity(state, group_id, node_id.as_str(), false, false).await
 }
 
 /// A verified SSH destructive reset supplies host-local identity evidence.
@@ -320,8 +320,9 @@ pub(crate) async fn retire_installation_identity(
     state: &crate::api::AppState,
     group_id: i64,
     node_id: &str,
+    require_unreferenced: bool,
 ) -> Result<Option<bool>, String> {
-    retire_identity(state, group_id, node_id, true).await
+    retire_identity(state, group_id, node_id, true, require_unreferenced).await
 }
 
 async fn retire_identity(
@@ -329,6 +330,7 @@ async fn retire_identity(
     group_id: i64,
     node_id: &str,
     fresh_reset: bool,
+    require_unreferenced: bool,
 ) -> Result<Option<bool>, String> {
     let node_id = ReuseEligibleNodeId::parse(node_id).map_err(|_| "invalid node identity")?;
     // Reports/config publication already use this fence. Retire locally before
@@ -356,7 +358,10 @@ async fn retire_identity(
         .lock()
         .await;
     let retired = if fresh_reset {
-        state.db.retire_installation_node(group_id, &node_id).await
+        state
+            .db
+            .retire_installation_node(group_id, &node_id, require_unreferenced)
+            .await
     } else {
         state.db.retire_pool_native_node(group_id, &node_id).await
     }
