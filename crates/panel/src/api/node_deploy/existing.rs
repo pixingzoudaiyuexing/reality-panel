@@ -19,6 +19,14 @@ pub(super) struct HostFacts {
     pub state_phase: Option<String>,
     pub residue_owned: bool,
     pub ambiguity: Option<String>,
+    #[serde(default)]
+    pub retry_snapshot: Option<String>,
+    #[serde(default)]
+    pub retry_node_ids: Vec<String>,
+    #[serde(default)]
+    pub retry_failed_ids: Vec<String>,
+    #[serde(default)]
+    pub retry_blocker: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -35,11 +43,239 @@ pub struct ExistingInstallation {
     pub carrier_reference_count: usize,
     pub reason: Option<String>,
     pub confirmation: String,
+    pub retry_confirmation: Option<String>,
+    pub retry_blocker: Option<String>,
+    #[serde(skip)]
+    pub(super) retry_authorized: bool,
     #[serde(skip)]
     pub(super) identity_group_id: Option<i64>,
 }
 
 pub(super) async fn detect(
+    state: &AppState,
+    facts: &HostFacts,
+    fingerprint: &str,
+    target_lite: bool,
+) -> Result<ExistingInstallation, DeployError> {
+    let mut view = detect_installation(state, facts, fingerprint, target_lite).await?;
+    if facts.retry_snapshot.is_some() {
+        match retry_authority(state, facts, fingerprint, target_lite).await {
+            Ok(confirmation) => view.retry_confirmation = Some(confirmation),
+            Err(_) => {
+                view.retry_blocker =
+                    Some("残留关联已使用的节点身份或资源，不能按失败安装重试清理".into())
+            }
+        }
+    }
+    Ok(view)
+}
+
+/// Only locally inspected candidates, never deployments matching a hostname.
+pub(super) async fn retry_authority(
+    state: &AppState,
+    facts: &HostFacts,
+    fingerprint: &str,
+    lite: bool,
+) -> Result<String, DeployError> {
+    let snapshot = facts
+        .retry_snapshot
+        .as_deref()
+        .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(retry_error)?;
+    if facts.retry_blocker.is_some()
+        || facts.retry_node_ids.len() > 1
+        || facts
+            .retry_failed_ids
+            .iter()
+            .any(|id| !facts.retry_node_ids.contains(id))
+    {
+        return Err(retry_error());
+    }
+    let anchor = state
+        .db
+        .node_pool_system_group_id()
+        .await
+        .map_err(db_error)?;
+    let identities = state
+        .db
+        .discover_node_pool_identities()
+        .await
+        .map_err(db_error)?;
+    let pool = node_pool::list_nodes(state.db.as_ref())
+        .await
+        .map_err(db_error)?;
+    let mut claim_states = Vec::new();
+    for id in &facts.retry_node_ids {
+        let failed_task = state.deployments.tasks.lock().await.values().any(|task| {
+            task.status.status == "FAILED"
+                && task.ssh_fingerprint.as_deref() == Some(fingerprint)
+                && task.status.candidate_node_id.as_deref() == Some(id.as_str())
+        });
+        let failed_candidate = facts.retry_failed_ids.contains(id) || failed_task;
+        let node = ReuseEligibleNodeId::parse(id).map_err(|_| retry_error())?;
+        if identities
+            .iter()
+            .any(|identity| identity.node_id == *id && Some(identity.home_group_id) != anchor)
+        {
+            return Err(retry_error());
+        }
+        if pool.iter().any(|record| {
+            record.node_id == *id
+                && (Some(record.identity_group_id) != anchor
+                    || (record.online && !failed_candidate)
+                    || !record.memberships.is_empty())
+        }) {
+            return Err(retry_error());
+        }
+        let Some(group) = anchor else {
+            continue;
+        };
+        if (state
+            .node_connections
+            .online_node_ids(group)
+            .await
+            .contains(id)
+            && !failed_candidate)
+            || state.node_operations.has_active_for_node(group, id)
+            || crate::api::node_ops::has_active_durable_uninstall(state, group, id)
+                .await
+                .map_err(|_| retry_error())?
+        {
+            return Err(retry_error());
+        }
+        if crate::service::legacy_upgrade::load(state.db.as_ref())
+            .await
+            .map_err(|_| retry_error())?
+            .is_some_and(|(_, op)| {
+                op.active()
+                    && ((op.old.home_group_id == group && op.old.node_id == *id)
+                        || (op.new.home_group_id == group && op.new.node_id == *id))
+            })
+        {
+            return Err(retry_error());
+        }
+        // Routing references are checked with the same parser as exact retirement.
+        for prefix in [
+            crate::service::relay_preference::RELAY_PREFERENCE_KEY_PREFIX,
+            crate::service::relay_failover::RELAY_FAILOVER_KEY_PREFIX,
+        ] {
+            for (key, raw) in state.db.scan_prefix(prefix).await.map_err(db_error)? {
+                if !node_pool::routing_reference_groups(&key, &raw, id)
+                    .map_err(db_error)?
+                    .is_empty()
+                {
+                    return Err(retry_error());
+                }
+            }
+        }
+        if let Some(raw) = state
+            .db
+            .get(crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY)
+            .await
+            .map_err(db_error)?
+        {
+            if !node_pool::routing_reference_groups(
+                crate::service::relay_schedule::RELAY_SWITCH_SCHEDULES_KEY,
+                &raw,
+                id,
+            )
+            .map_err(db_error)?
+            .is_empty()
+            {
+                return Err(retry_error());
+            }
+        }
+        let active = state
+            .db
+            .find_current_active_node_credential_for_identity(group, &node)
+            .await
+            .map_err(db_error)?
+            .is_some();
+        if active && !failed_candidate {
+            return Err(retry_error());
+        }
+        if let Some(claim) = state
+            .db
+            .find_node_credential_claim(id)
+            .await
+            .map_err(db_error)?
+        {
+            if claim.node_id != *id
+                || claim.home_group_id != group
+                || claim.approval_ref != format!("node-pool-bootstrap:{id}")
+            {
+                return Err(retry_error());
+            }
+            claim_states.push((id, claim.state, active));
+        } else if active {
+            return Err(retry_error());
+        }
+    }
+    let raw = serde_json::to_vec(&(
+        "failed-install-retry/v1",
+        fingerprint,
+        lite,
+        snapshot,
+        &facts.retry_node_ids,
+        claim_states,
+    ))
+    .map_err(|_| retry_error())?;
+    Ok(hex::encode(Sha256::digest(raw)))
+}
+
+pub(super) async fn cancel_retry_candidates(
+    state: &AppState,
+    facts: &HostFacts,
+    fingerprint: &str,
+    lite: bool,
+    actor: i64,
+) -> Result<(), DeployError> {
+    retry_authority(state, facts, fingerprint, lite).await?;
+    let Some(group) = state
+        .db
+        .node_pool_system_group_id()
+        .await
+        .map_err(db_error)?
+    else {
+        return Ok(());
+    };
+    for id in &facts.retry_node_ids {
+        let Some(claim) = state
+            .db
+            .find_node_credential_claim(id)
+            .await
+            .map_err(db_error)?
+        else {
+            continue;
+        };
+        if claim.node_id != *id
+            || claim.home_group_id != group
+            || claim.approval_ref != format!("node-pool-bootstrap:{id}")
+        {
+            return Err(retry_error());
+        }
+        let node = ReuseEligibleNodeId::parse(id).map_err(|_| retry_error())?;
+        state
+            .db
+            .cancel_node_credential_claim(id, group, &node, chrono::Utc::now())
+            .await
+            .map_err(db_error)?;
+        // Cancellation arbitrates activation; an activation that won must still
+        // satisfy the same failed-candidate and no-business-reference checks.
+        retry_authority(state, facts, fingerprint, lite).await?;
+        retire_host_identity(state, group, id, actor).await?;
+    }
+    Ok(())
+}
+
+fn retry_error() -> DeployError {
+    DeployError::new(
+        "FAILED_RETRY_PROTECTED",
+        "仅可清理当前失败安装残留；已使用或其他节点身份受到保护",
+    )
+}
+
+async fn detect_installation(
     state: &AppState,
     facts: &HostFacts,
     fingerprint: &str,
@@ -58,13 +294,20 @@ pub(super) async fn detect(
         carrier_reference_count: 0,
         reason: facts.ambiguity.clone(),
         confirmation: String::new(),
+        retry_confirmation: None,
+        retry_blocker: facts.retry_blocker.clone(),
+        retry_authorized: false,
         identity_group_id: None,
     };
     if facts.ambiguity.is_some() {
         return Ok(result);
     }
     let Some(id) = facts.node_id.as_deref() else {
-        result.classification = "CLEAN_HOST";
+        if facts.retry_snapshot.is_none() {
+            result.classification = "CLEAN_HOST";
+        } else {
+            result.reason = Some("存在失败安装残留，尚无完整节点身份".into());
+        }
         return Ok(result);
     };
     let id = match ReuseEligibleNodeId::parse(id) {

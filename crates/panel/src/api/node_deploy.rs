@@ -67,6 +67,8 @@ pub struct StartDeploymentRequest {
     pub password: String,
     pub confirmed_fingerprint: String,
     #[serde(default)]
+    pub retry_confirmation: String,
+    #[serde(default)]
     pub profile: ProvisioningProfile,
     #[serde(default)]
     pub lite_mode: bool,
@@ -288,6 +290,13 @@ trait DeploymentRunner: Send + Sync {
         artifact: &ProvisioningArtifact,
         phase: &str,
     ) -> Result<(), DeployError>;
+    async fn failed_retry_cleanup(
+        &self,
+        ssh: &SshInput,
+        fingerprint: &str,
+        phase: &str,
+        snapshot: &str,
+    ) -> Result<(), DeployError>;
     async fn probe(&self, ssh: &SshInput) -> Result<SshProbe, DeployError>;
     async fn preflight(&self, ssh: &SshInput, fingerprint: &str) -> Result<Preflight, DeployError>;
     async fn artifact(&self, architecture: &str) -> Result<ProvisioningArtifact, DeployError>;
@@ -351,9 +360,12 @@ impl DeploymentRunner for SystemSshRunner {
             let script = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
                 "../../../../scripts/relay-node-existing-install.py"
             ));
+            let cleanup = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+                "../../../../scripts/relay-node-failed-install-cleanup.py"
+            ));
             let output = exec(
                 &mut session,
-                &format!("python3 -c 'import base64;exec(base64.b64decode(\"{script}\"))'"),
+                &format!("python3 -c 'import base64; ns={{\"__name__\":\"retry_helper\"}};exec(base64.b64decode(\"{cleanup}\"),ns);exec(base64.b64decode(\"{script}\"),{{\"__name__\":\"__main__\",\"failed_retry_inspection\":ns[\"inspection\"]}})'"),
             )?;
             serde_json::from_str(&output)
                 .map_err(|_| DeployError::new("EXISTING_STATE_AMBIGUOUS", "安装检测未返回有效状态"))
@@ -397,6 +409,35 @@ impl DeploymentRunner for SystemSshRunner {
         .await
         .map_err(|_| DeployError::new("REPLACEMENT_CLEANUP_FAILED", "旧身份清理未完成"))?
     }
+    async fn failed_retry_cleanup(
+        &self,
+        ssh: &SshInput,
+        fingerprint: &str,
+        phase: &str,
+        snapshot: &str,
+    ) -> Result<(), DeployError> {
+        if !matches!(phase, "check" | "stop" | "clean")
+            || snapshot.len() != 64
+            || !snapshot.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(DeployError::new(
+                "FAILED_RETRY_PROTECTED",
+                "invalid cleanup authority",
+            ));
+        }
+        let input = ssh.clone_without_secret_debug();
+        let fingerprint = fingerprint.to_string();
+        let phase = phase.to_string();
+        let snapshot = snapshot.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut session = connect(&input, Some(&fingerprint))?;
+            authenticate(&mut session, &input)?;
+            let script = base64::engine::general_purpose::STANDARD.encode(include_bytes!("../../../../scripts/relay-node-failed-install-cleanup.py"));
+            exec(&mut session, &format!("python3 -c 'import base64,sys;sys.argv=[\"failed-retry\",\"{phase}\",\"{snapshot}\"];exec(base64.b64decode(\"{script}\"))'"))
+                .map(|_| ()).map_err(|_| DeployError::new("FAILED_RETRY_CLEANUP_BLOCKED", "残留清理未完成或范围已改变；请重新检测并确认后重试"))
+        }).await.map_err(|_| DeployError::new("FAILED_RETRY_CLEANUP_BLOCKED", "cleanup worker terminated"))?
+    }
+
     async fn probe(&self, ssh: &SshInput) -> Result<SshProbe, DeployError> {
         let input = ssh.clone_without_secret_debug();
         tokio::task::spawn_blocking(move || {
@@ -726,14 +767,23 @@ pub async fn start_deployment(
         Ok(value) => value,
         Err(message) => return error(400, message),
     };
-    let existing = match state.deployments.runner.inspect(&ssh, &fingerprint).await {
+    let mut existing = match state.deployments.runner.inspect(&ssh, &fingerprint).await {
         Ok(facts) => match existing::detect(&state, &facts, &fingerprint, req.lite_mode).await {
             Ok(value) => value,
             Err(_) => return error(409, "无法确认旧节点状态"),
         },
         Err(_) => return error(409, "无法安全检测现有节点；未修改旧节点"),
     };
-    if let Err(err) = requires_fresh_reset(Some(&existing)) {
+    if !req.retry_confirmation.is_empty() {
+        if existing.classification == "CLEAN_HOST"
+            || existing.retry_confirmation.as_deref() != Some(req.retry_confirmation.as_str())
+        {
+            return error(409, "重试确认无效或残留已改变；请重新检测并确认");
+        }
+        existing.retry_authorized = true;
+    } else if existing.retry_confirmation.is_some() {
+        return error(409, "请确认清理失败安装残留并重新安装");
+    } else if let Err(err) = requires_fresh_reset(Some(&existing)) {
         return error(409, &err.message);
     }
     if state
@@ -862,7 +912,14 @@ async fn run_task(
         .await
         .is_some_and(|task| task.lite_mode);
     let bootstrap_identity = Arc::new(Mutex::new(id.clone()));
-    let reset_classification = requires_fresh_reset(existing.as_ref());
+    let failed_retry = existing
+        .as_ref()
+        .is_some_and(|install| install.retry_authorized);
+    let reset_classification = if failed_retry {
+        Ok(false)
+    } else {
+        requires_fresh_reset(existing.as_ref())
+    };
     let destructive_fresh = matches!(reset_classification, Ok(true));
     let reset_started = Arc::new(AtomicBool::new(false));
     let reset_completed = Arc::new(AtomicBool::new(false));
@@ -900,6 +957,74 @@ async fn run_task(
                 &secrets,
             )
             .await;
+        if failed_retry {
+            let authorized = existing.as_ref().ok_or_else(|| {
+                DeployError::new("FAILED_RETRY_PROTECTED", "retry authority missing")
+            })?;
+            let facts = state.deployments.runner.inspect(&ssh, &fingerprint).await?;
+            let confirmation =
+                existing::retry_authority(&state, &facts, &fingerprint, lite_mode).await?;
+            if authorized.retry_confirmation.as_deref() != Some(confirmation.as_str()) {
+                return Err(DeployError::new(
+                    "FAILED_RETRY_PROTECTED",
+                    "残留范围已改变；请重新检测并确认",
+                ));
+            }
+            let snapshot = facts.retry_snapshot.as_deref().ok_or_else(|| {
+                DeployError::new("FAILED_RETRY_PROTECTED", "cleanup snapshot missing")
+            })?;
+            state
+                .deployments
+                .runner
+                .failed_retry_cleanup(&ssh, &fingerprint, "check", snapshot)
+                .await?;
+            state
+                .deployments
+                .update(
+                    &id,
+                    DeploymentStage::Preflight,
+                    "RUNNING",
+                    "正在停止当前失败安装的产品服务与安装进程",
+                    &secrets,
+                )
+                .await;
+            state
+                .deployments
+                .runner
+                .failed_retry_cleanup(&ssh, &fingerprint, "stop", snapshot)
+                .await?;
+            let stopped = state.deployments.runner.inspect(&ssh, &fingerprint).await?;
+            if stopped
+                .retry_node_ids
+                .iter()
+                .any(|node| !facts.retry_node_ids.contains(node))
+                || stopped.retry_blocker.is_some()
+            {
+                return Err(DeployError::new(
+                    "FAILED_RETRY_PROTECTED",
+                    "停止后出现其他身份或资源冲突；未删除残留",
+                ));
+            }
+            existing::cancel_retry_candidates(&state, &facts, &fingerprint, lite_mode, actor_id)
+                .await?;
+            if let Some(snapshot) = stopped.retry_snapshot.as_deref() {
+                state
+                    .deployments
+                    .runner
+                    .failed_retry_cleanup(&ssh, &fingerprint, "clean", snapshot)
+                    .await?;
+            }
+            state
+                .deployments
+                .update(
+                    &id,
+                    DeploymentStage::Preflight,
+                    "RUNNING",
+                    "失败安装残留已清理；正在创建全新节点身份",
+                    &secrets,
+                )
+                .await;
+        }
         let artifact = state
             .deployments
             .runner
@@ -1702,7 +1827,10 @@ mod tests {
 
     struct FakeRunner {
         host_facts: HostFacts,
+        later_host_facts: Option<HostFacts>,
+        inspect_calls: AtomicUsize,
         reset_calls: Arc<Mutex<Vec<String>>>,
+        retry_calls: Arc<Mutex<Vec<String>>>,
         behavior: FakeBehavior,
         install_calls: Arc<AtomicUsize>,
         pool_config_seen: Arc<Mutex<Option<String>>>,
@@ -1714,7 +1842,10 @@ mod tests {
         fn new(behavior: FakeBehavior) -> Self {
             Self {
                 host_facts: HostFacts::default(),
+                later_host_facts: None,
+                inspect_calls: AtomicUsize::new(0),
                 reset_calls: Arc::new(Mutex::new(Vec::new())),
+                retry_calls: Arc::new(Mutex::new(Vec::new())),
                 behavior,
                 install_calls: Arc::new(AtomicUsize::new(0)),
                 pool_config_seen: Arc::new(Mutex::new(None)),
@@ -1731,6 +1862,11 @@ mod tests {
             _ssh: &SshInput,
             _fingerprint: &str,
         ) -> Result<HostFacts, DeployError> {
+            if self.inspect_calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                if let Some(facts) = &self.later_host_facts {
+                    return Ok(facts.clone());
+                }
+            }
             Ok(self.host_facts.clone())
         }
         async fn fresh_reset(
@@ -1743,6 +1879,22 @@ mod tests {
             self.reset_calls.lock().await.push(phase.into());
             if matches!(self.behavior, FakeBehavior::ResetFailure(failed) if failed == phase) {
                 return Err(DeployError::new("RESET_FAILED", "fixture cleanup failed"));
+            }
+            Ok(())
+        }
+        async fn failed_retry_cleanup(
+            &self,
+            _ssh: &SshInput,
+            _fingerprint: &str,
+            phase: &str,
+            _snapshot: &str,
+        ) -> Result<(), DeployError> {
+            self.retry_calls.lock().await.push(phase.into());
+            if matches!(self.behavior, FakeBehavior::ResetFailure(failed) if failed == phase) {
+                return Err(DeployError::new(
+                    "FAILED_RETRY_CLEANUP_BLOCKED",
+                    "fixture retry cleanup failed",
+                ));
             }
             Ok(())
         }
@@ -3493,6 +3645,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             state_phase: Some("ACTIVE_CONFIRMED".into()),
             residue_owned: true,
             ambiguity: None,
+            ..HostFacts::default()
         };
         (state, facts)
     }
@@ -4042,6 +4195,403 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
         assert!(state
             .db
             .get(&format!("node_status:{group}:{unrelated}"))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    async fn failed_retry_fixture(
+        behavior: FakeBehavior,
+    ) -> (AppState, Arc<FakeRunner>, HostFacts, String) {
+        // A healthy unrelated node at the same SSH hostname must survive retry.
+        let (mut state, unrelated) = existing_fixture().await;
+        let anchor = unrelated.identity_group_id.unwrap();
+        let prior = state
+            .deployments
+            .insert(
+                anchor,
+                "node.example".into(),
+                ProvisioningProfile::RealityCamouflage,
+                false,
+            )
+            .await;
+        {
+            let mut tasks = state.deployments.tasks.lock().await;
+            let old = tasks.get_mut(&prior.id).unwrap();
+            old.status.status = "SUCCESS".into();
+            old.status.node_id = unrelated.node_id;
+        }
+        let failed_id = "33333333-3333-4333-8333-333333333333";
+        super::super::provisioning::pool_credential_bootstrap_config(&state, failed_id, anchor, 1)
+            .await
+            .unwrap();
+        let facts = HostFacts {
+            node_id: Some(failed_id.into()),
+            ambiguity: Some("installed binary version cannot be verified".into()),
+            residue_owned: true,
+            retry_snapshot: Some("a".repeat(64)),
+            retry_node_ids: vec![failed_id.into()],
+            ..HostFacts::default()
+        };
+        let mut runner = FakeRunner::new(behavior);
+        runner.host_facts = facts.clone();
+        let runner = Arc::new(runner);
+        state.deployments.runner = runner.clone();
+        state.deployments.online_timeout = Duration::from_millis(5);
+        (state, runner, facts, unrelated.credential_id.unwrap())
+    }
+
+    async fn retry_request(
+        state: &AppState,
+        facts: &HostFacts,
+        confirmation: Option<String>,
+    ) -> ApiResponse<DeploymentStatus> {
+        let view = existing::detect(state, facts, "SHA256:fake", false)
+            .await
+            .unwrap();
+        let confirmation = confirmation.unwrap_or_else(|| view.retry_confirmation.unwrap());
+        let req: StartDeploymentRequest = serde_json::from_value(serde_json::json!({
+            "host":"node.example", "password":"fixture-only", "confirmed_fingerprint":"SHA256:fake", "retry_confirmation":confirmation
+        })).unwrap();
+        start_deployment(AdminOnly { user_id: 1 }, State(state.clone()), Json(req))
+            .await
+            .0
+    }
+
+    #[tokio::test]
+    async fn confirmed_failed_install_retry_enters_new_bootstrap_without_binary_reset() {
+        let (state, runner, facts, protected_credential) =
+            failed_retry_fixture(FakeBehavior::Success).await;
+        let reply = retry_request(&state, &facts, None).await;
+        assert_eq!(reply.code, 0, "{}", reply.message);
+        let task = reply.data.unwrap();
+        let status = wait_for_fake_deployment(&state, &task.id).await;
+        assert_eq!(*runner.retry_calls.lock().await, ["check", "stop", "clean"]);
+        assert!(runner.reset_calls.lock().await.is_empty());
+        assert_eq!(runner.install_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(status.candidate_node_id.as_deref(), Some(task.id.as_str()));
+        assert_ne!(status.candidate_node_id, facts.node_id);
+        let config = runner.pool_config_seen.lock().await.clone().unwrap();
+        assert!(config.contains(&format!("POOL_NODE_ID='{}'", task.id)));
+        assert_eq!(
+            state
+                .db
+                .find_node_credential_claim(facts.node_id.as_deref().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "CANCELLED"
+        );
+        assert_eq!(
+            state
+                .db
+                .find_node_credential_claim(&task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "CANCELLED"
+        );
+        assert!(status.message.starts_with("IDENTITY_MISMATCH:"));
+        assert_eq!(runner.rollback_calls.load(Ordering::SeqCst), 1);
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime(&protected_credential)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_install_without_complete_local_identity_can_retry_through_worker() {
+        let (mut state, _, mut facts, protected) =
+            failed_retry_fixture(FakeBehavior::InstallFailure("INSTALL_FAILED")).await;
+        facts.node_id = None;
+        facts.ambiguity = None;
+        facts.retry_node_ids.clear();
+        let view = existing::detect(&state, &facts, "SHA256:fake", false)
+            .await
+            .unwrap();
+        assert_eq!(view.classification, "AMBIGUOUS_STATE");
+        assert!(view.retry_confirmation.is_some());
+        let mut next = FakeRunner::new(FakeBehavior::InstallFailure("INSTALL_FAILED"));
+        next.host_facts = facts.clone();
+        let runner = Arc::new(next);
+        state.deployments.runner = runner.clone();
+        let reply = retry_request(&state, &facts, None).await;
+        assert_eq!(reply.code, 0, "{}", reply.message);
+        let task = reply.data.unwrap();
+        let status = wait_for_fake_deployment(&state, &task.id).await;
+        assert!(status.message.starts_with("INSTALL_FAILED:"));
+        assert_eq!(*runner.retry_calls.lock().await, ["check", "stop", "clean"]);
+        assert_eq!(runner.install_calls.load(Ordering::SeqCst), 1);
+        assert!(runner.reset_calls.lock().await.is_empty());
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime(&protected)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn incomplete_old_credentials_do_not_block_confirmed_failed_retry() {
+        let (mut state, _, mut facts, protected) =
+            failed_retry_fixture(FakeBehavior::InstallFailure("INSTALL_FAILED")).await;
+        facts.credential_id = Some("broken-old-credential".into());
+        facts.credential_verifier = None;
+        facts.identity_group_id = None;
+        let mut next = FakeRunner::new(FakeBehavior::InstallFailure("INSTALL_FAILED"));
+        next.host_facts = facts.clone();
+        let runner = Arc::new(next);
+        state.deployments.runner = runner.clone();
+        let reply = retry_request(&state, &facts, None).await;
+        assert_eq!(reply.code, 0, "{}", reply.message);
+        let task = reply.data.unwrap();
+        let status = wait_for_fake_deployment(&state, &task.id).await;
+        assert!(status.message.starts_with("INSTALL_FAILED:"));
+        assert_eq!(*runner.retry_calls.lock().await, ["check", "stop", "clean"]);
+        assert_eq!(runner.install_calls.load(Ordering::SeqCst), 1);
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime(&protected)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_or_wrong_scope_failed_retry_never_mutates() {
+        let (state, runner, facts, protected) = failed_retry_fixture(FakeBehavior::Success).await;
+        for confirmation in [String::new(), "wrong-scope".into()] {
+            let reply = retry_request(&state, &facts, Some(confirmation)).await;
+            assert_eq!(reply.code, 409);
+            assert!(reply.data.is_none());
+        }
+        assert!(runner.retry_calls.lock().await.is_empty());
+        assert!(runner.reset_calls.lock().await.is_empty());
+        assert_eq!(runner.install_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .db
+                .find_node_credential_claim(facts.node_id.as_deref().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "APPROVED"
+        );
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime(&protected)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_retry_rejects_changed_files_or_ssh_target_confirmation() {
+        let (mut state, runner, facts, _) = failed_retry_fixture(FakeBehavior::Success).await;
+        let view = existing::detect(&state, &facts, "SHA256:fake", false)
+            .await
+            .unwrap();
+        let different_host = existing::detect(&state, &facts, "SHA256:other", false)
+            .await
+            .unwrap();
+        assert_ne!(view.retry_confirmation, different_host.retry_confirmation);
+        let mut changed = facts.clone();
+        changed.retry_snapshot = Some("b".repeat(64));
+        let mut next = FakeRunner::new(FakeBehavior::Success);
+        next.host_facts = changed.clone();
+        state.deployments.runner = Arc::new(next);
+        let reply = retry_request(&state, &changed, view.retry_confirmation).await;
+        assert_eq!(reply.code, 409);
+        assert!(runner.retry_calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_interruption_then_confirmed_retry_is_recoverable() {
+        let (mut state, runner, facts, protected) =
+            failed_retry_fixture(FakeBehavior::ResetFailure("clean")).await;
+        let first = retry_request(&state, &facts, None).await;
+        assert_eq!(first.code, 0);
+        let first = first.data.unwrap();
+        let failed = wait_for_fake_deployment(&state, &first.id).await;
+        assert!(failed.message.starts_with("FAILED_RETRY_CLEANUP_BLOCKED:"));
+        assert_eq!(runner.install_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .db
+                .find_node_credential_claim(facts.node_id.as_deref().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "CANCELLED"
+        );
+        let mut next = FakeRunner::new(FakeBehavior::InstallFailure("INSTALL_FAILED"));
+        next.host_facts = facts.clone();
+        let next = Arc::new(next);
+        state.deployments.runner = next.clone();
+        let second = retry_request(&state, &facts, None).await;
+        assert_eq!(second.code, 0, "{}", second.message);
+        let second = second.data.unwrap();
+        let status = wait_for_fake_deployment(&state, &second.id).await;
+        assert!(status.message.starts_with("INSTALL_FAILED:"));
+        assert_ne!(first.id, second.id);
+        assert_eq!(next.install_calls.load(Ordering::SeqCst), 1);
+        assert!(next.reset_calls.lock().await.is_empty());
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime(&protected)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn worker_rechecks_retry_snapshot_before_any_stop_or_cleanup() {
+        let (mut state, _, facts, _) = failed_retry_fixture(FakeBehavior::Success).await;
+        let mut changed = facts.clone();
+        changed.retry_snapshot = Some("b".repeat(64));
+        let mut next = FakeRunner::new(FakeBehavior::Success);
+        next.host_facts = facts.clone();
+        next.later_host_facts = Some(changed);
+        let runner = Arc::new(next);
+        state.deployments.runner = runner.clone();
+        let reply = retry_request(&state, &facts, None).await;
+        assert_eq!(reply.code, 0);
+        let task = reply.data.unwrap();
+        let status = wait_for_fake_deployment(&state, &task.id).await;
+        assert!(status.message.starts_with("FAILED_RETRY_PROTECTED:"));
+        assert!(runner.retry_calls.lock().await.is_empty());
+        assert!(runner.reset_calls.lock().await.is_empty());
+        assert_eq!(runner.install_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .db
+                .find_node_credential_claim(facts.node_id.as_deref().unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "APPROVED"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_active_failed_candidate_is_retired_but_business_bound_candidate_is_protected() {
+        use crate::db::repo::NewNodeCredentialCandidate;
+        use crate::node_credential::{NodeCredentialSecret, NodeCredentialVerifier};
+        let (mut state, _, mut facts, protected) =
+            failed_retry_fixture(FakeBehavior::InstallFailure("INSTALL_FAILED")).await;
+        let id = facts.node_id.as_deref().unwrap().to_string();
+        let group = state.db.node_pool_system_group_id().await.unwrap().unwrap();
+        let node = crate::node_identity::ReuseEligibleNodeId::parse(&id).unwrap();
+        let credential = "44444444-4444-4444-8444-444444444444";
+        let row = state
+            .db
+            .allocate_node_credential_candidate(&NewNodeCredentialCandidate {
+                credential_id: credential.into(),
+                home_group_id: group,
+                node_id: node.clone(),
+                verifier: NodeCredentialVerifier::derive(
+                    credential,
+                    group,
+                    &node,
+                    &NodeCredentialSecret::generate().unwrap(),
+                ),
+            })
+            .await
+            .unwrap();
+        state
+            .db
+            .activate_node_credential(credential, group, &node, row.generation)
+            .await
+            .unwrap();
+        assert!(
+            existing::retry_authority(&state, &facts, "SHA256:fake", false)
+                .await
+                .is_err()
+        );
+        facts.retry_failed_ids = vec![id.clone()];
+        assert!(
+            existing::retry_authority(&state, &facts, "SHA256:fake", false)
+                .await
+                .is_ok()
+        );
+        state
+            .db
+            .insert_group("business", "in", "business-test", 1, "", "", 1.0, false)
+            .await
+            .unwrap();
+        let business = state
+            .db
+            .find_by_token("business-test")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        state
+            .db
+            .insert_node_reuse_binding(business, group, &id)
+            .await
+            .unwrap();
+        assert!(
+            existing::retry_authority(&state, &facts, "SHA256:fake", false)
+                .await
+                .is_err()
+        );
+        state
+            .db
+            .delete_node_reuse_binding(business, group, &id)
+            .await
+            .unwrap();
+        let mut next = FakeRunner::new(FakeBehavior::InstallFailure("INSTALL_FAILED"));
+        next.host_facts = facts.clone();
+        let runner = Arc::new(next);
+        state.deployments.runner = runner.clone();
+        let reply = retry_request(&state, &facts, None).await;
+        assert_eq!(reply.code, 0, "{}", reply.message);
+        let task = reply.data.unwrap();
+        wait_for_fake_deployment(&state, &task.id).await;
+        assert_eq!(runner.install_calls.load(Ordering::SeqCst), 1);
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime(credential)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime(&protected)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_retry_never_retires_unrelated_active_identity_or_unsafe_local_scope() {
+        let (mut state, runner, mut facts, protected) =
+            failed_retry_fixture(FakeBehavior::Success).await;
+        facts.retry_node_ids = vec!["11111111-1111-4111-8111-111111111111".into()];
+        let view = existing::detect(&state, &facts, "SHA256:fake", false)
+            .await
+            .unwrap();
+        assert!(view.retry_confirmation.is_none());
+        facts.retry_node_ids = Vec::new();
+        facts.retry_blocker = Some("symlink / foreign service".into());
+        let mut next = FakeRunner::new(FakeBehavior::Success);
+        next.host_facts = facts.clone();
+        state.deployments.runner = Arc::new(next);
+        let reply = retry_request(&state, &facts, Some("must-not-authorize".into())).await;
+        assert_eq!(reply.code, 409);
+        assert!(runner.retry_calls.lock().await.is_empty());
+        assert_eq!(runner.install_calls.load(Ordering::SeqCst), 0);
+        assert!(state
+            .db
+            .find_active_node_credential_for_runtime(&protected)
             .await
             .unwrap()
             .is_some());

@@ -160,7 +160,7 @@ describe('Destructive fresh reinstall', () => {
     expect(mockPost.mock.calls.filter(([url]) => url === '/admin/node-deployments')).toHaveLength(0);
     expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeEnabled();
   });
-  it.each(['MANAGED_EXISTING_NODE', 'STALE_INACTIVE_RESIDUE', 'AMBIGUOUS_STATE'])('installs %s with only the confirmed SSH fingerprint', async (classification) => {
+  it.each(['MANAGED_EXISTING_NODE', 'STALE_INACTIVE_RESIDUE'])('installs %s with only the confirmed SSH fingerprint', async (classification) => {
     const user = await inspectExisting({ ...managed, classification, reason: 'old identity / credential / Panel mismatch' });
     expect(screen.getByText('freshResetInconsistent')).toBeInTheDocument();
     expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeEnabled();
@@ -184,6 +184,37 @@ describe('Destructive fresh reinstall', () => {
   });
 });
 
+describe('Confirmed failed-install retry', () => {
+  const failed = { ...managed, classification: 'AMBIGUOUS_STATE', retry_confirmation: 'retry-target-snapshot', reason: 'old version unreadable' };
+  it('blocks unsafe ambiguous residue without promising cleanup', async () => {
+    await inspectExisting({ ...managed, classification: 'AMBIGUOUS_STATE', reason: 'ownership conflict' });
+    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeDisabled();
+    expect(screen.getByText('failedRetryProtected')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'failedRetryAction' })).not.toBeInTheDocument();
+    expect(mockPost.mock.calls.filter(([url]) => url === '/admin/node-deployments')).toHaveLength(0);
+  });
+  it('requires a second confirmation and cancellation makes no deployment request', async () => {
+    const user = await inspectExisting(failed);
+    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: 'failedRetryAction' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('node-a')).toBeInTheDocument();
+    expect(within(dialog).getByText('failedRetryScope')).toBeInTheDocument();
+    await user.click(within(dialog).getByRole('button', { name: 'cancel' }));
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    expect(mockPost.mock.calls.filter(([url]) => url === '/admin/node-deployments')).toHaveLength(0);
+  });
+  it('sends explicit scoped retry intent only after confirmation', async () => {
+    const user = await inspectExisting(failed);
+    await user.click(screen.getByRole('button', { name: 'failedRetryAction' }));
+    const dialog = await screen.findByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: 'failedRetryAction' }));
+    await waitFor(() => expect(mockPost).toHaveBeenCalledWith('/admin/node-deployments', expect.objectContaining({
+      host: 'node-a', confirmed_fingerprint: 'SHA256:node-a', retry_confirmation: 'retry-target-snapshot',
+    })));
+    expect(mockPost.mock.calls.filter(([url]) => url === '/admin/node-deployments')).toHaveLength(1);
+  });
+});
 
 it('trims the optional Manual Bootstrap name and binds it to that enrollment request', async () => {
   const user = userEvent.setup();

@@ -5,6 +5,7 @@ The Panel converts these facts to a separate, allowlisted administrator DTO.
 No writes or cleanup are performed here.
 """
 import base64
+import importlib.util
 import hashlib
 import json
 import os
@@ -69,11 +70,21 @@ def local_candidates():
     return sorted(candidates)
 
 
+def retry_inspection(root):
+    if 'failed_retry_inspection' in globals():
+        return failed_retry_inspection(root)
+    spec = importlib.util.spec_from_file_location('failed_retry', Path(__file__).with_name('relay-node-failed-install-cleanup.py'))
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    return helper.inspection(root)
+
+
 def inspect():
     facts = dict(node_id=None, version=None, profile=None, service_active=False,
                  panel_url=None, identity_group_id=None, credential_id=None,
                  credential_verifier=None, runtime_valid=False, state_phase=None,
                  residue_owned=False, ambiguity=None, candidate_node_ids=local_candidates())
+    facts.update(retry_inspection(ROOT))
     try:
         facts['node_id'] = (regular('/opt/relay-node/node-id') or '').strip() or None
         env = regular('/etc/relay-node/relay-node.env', True) or regular('/etc/relay-panel/node.env', True) or ''

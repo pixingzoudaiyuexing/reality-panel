@@ -1,10 +1,10 @@
 # Version status
 
-The stable release is `v1.4.10` (the exact published source is recorded in its SOURCE_COMMIT asset).
+The stable release is `v1.4.11` (the exact published source is recorded in its SOURCE_COMMIT asset).
 The accepted UI product RC is `065038a4fa7098b912cb3a4e33e742cd15542080`; the final release adds only version/publication metadata.
 v1.4.9 unifies Node Management navigation and Group-scoped rule pagination/selection. Backend business behavior and Node runtime are unchanged from v1.4.8. Production upgrades remain an Owner decision.
 
-v1.4.10 fixes SSH CLEAN_HOST classification: no old-install reset is invoked on a clean host. Ambiguous inspection blocks destructive installation; confirmed managed installations and owned inactive residue retain scoped cleanup. Physical deployment verification is waived for this patch. Debian 10 GLIBC compatibility remains an independent issue and is not proven by this fix.
+v1.4.11 adds an explicit administrator-confirmed failed-install residue retry. CLEAN_HOST still installs directly; unsafe resources and used/foreign identities remain protected. Cleanup does not depend on Node binaries, and generates a fresh identity after scoped cleanup. Physical deployment verification is waived for this patch. Debian 10 GLIBC compatibility remains independent and unverified.
 
 Reality Panel uses one application release version for Panel and Node. Published assets and checksums remain immutable. Candidate TEST acceptance and official publication are separate. Config Protocol remains `10`, Lifecycle Protocol remains `1`.
 
@@ -29,9 +29,9 @@ Panel embeds its Bootstrap, credential, lifecycle and one-time migration scripts
 
 ## Version sources
 
-- `crates/panel/Cargo.toml`, `crates/node/Cargo.toml` and their Cargo.lock entries: `1.4.10`.
+- `crates/panel/Cargo.toml`, `crates/node/Cargo.toml` and their Cargo.lock entries: `1.4.11`.
 - Panel configuration and both `--version` commands derive from their package version.
-- Legacy compatibility `scripts/relay-node-install.sh` SCRIPT_VERSION: `1.4.10`.
+- Legacy compatibility `scripts/relay-node-install.sh` SCRIPT_VERSION: `1.4.11`.
 - Workspace has no application version. Shared crate `0.1.0` and private frontend package `0.0.0` are independently versioned and are not public release versions.
 - GitHub release tag is validated against Panel/Node package versions. The release workflow generates VERSION, SOURCE_COMMIT and the release installer default tag.
 - Installer and updater resolve an explicit tag or the latest published stable Release; there is no unpublished latest fallback.
@@ -39,8 +39,8 @@ Panel embeds its Bootstrap, credential, lifecycle and one-time migration scripts
 - Docker files do not carry an application version; images remain compatibility material, not the automatic formal release path.
 
 ```bash
-bash scripts/release-check.sh 1.4.10
-bash scripts/release-version-contract.test.sh v1.4.10
+bash scripts/release-check.sh 1.4.11
+bash scripts/release-version-contract.test.sh v1.4.11
 cargo build --workspace --release --locked
 ```
 

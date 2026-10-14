@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.11] - 2026-10-15
+
+- Add an explicit per-server, second-confirmed failed SSH installation retry. Revalidate the SSH fingerprint and exact residue snapshot in the API and worker, clean only owned Reality Node files/service/failed transaction data with Python, then generate a new identity and normal Bootstrap. Cleanup never executes an old or new Node binary.
+- Protect symlinks, hardlinks, unknown service overrides/files, other identities and business references. Cancel/retire only the exact local failed Pool claim; never collect identities by hostname. Keep CLEAN_HOST direct installation, normal managed replacement and existing activation/rollback arbitration.
+- Add real API/worker FakeRunner regressions, filesystem cleanup and frontend confirmation tests. No schema, Node runtime, DNS/Carrier model, protocol or GLIBC compatibility change. Physical TEST deployment is explicitly waived and Debian 10 runtime compatibility remains unverified.
+
 ## [1.4.10] - 2026-10-14
 
 - SSH installation uses the detected classification instead of the presence of a detection result: CLEAN_HOST proceeds directly to fresh identity creation and Bootstrap, without old-installation reset or retirement. MANAGED_EXISTING_NODE and STALE_INACTIVE_RESIDUE retain the existing scoped reset flow. AMBIGUOUS_STATE is rejected before mutation; reset eligibility is rechecked before the destructive phases.

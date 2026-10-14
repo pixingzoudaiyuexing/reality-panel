@@ -1,5 +1,9 @@
 # Changelog — relay-node
 
+## [1.4.11] - 2026-10-15
+
+- Unified version with Panel 1.4.11. Node runtime, forwarding, Config Protocol 10 and Lifecycle Protocol 1 remain unchanged. Failed-install retry cleanup is a Panel-owned Python path; no new GLIBC compatibility or historical Legacy upgrader change.
+
 ## [1.4.10] - 2026-10-14
 
 - Unified version with Panel 1.4.10. Node forwarding/runtime, Config Protocol 10 and Lifecycle Protocol 1 are unchanged. This release fixes Panel SSH installation classification and does not change the Node GLIBC compatibility baseline or historical Legacy upgrader.

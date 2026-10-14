@@ -9,7 +9,7 @@ import { copyText } from '../utils/clipboard';
 
 const { Text } = Typography;
 type Values = { display_name: string; group_id?: number; host: string; port: number; username: string; password: string };
-type ExistingInstallation = { classification: 'CLEAN_HOST' | 'STALE_INACTIVE_RESIDUE' | 'MANAGED_EXISTING_NODE' | 'AMBIGUOUS_STATE'; old_node_id: string | null; version: string | null; profile: string | null; service_active: boolean; panel_present: boolean; online: boolean; credential_active: boolean; group_count: number; carrier_reference_count: number; reason: string | null; confirmation: string };
+type ExistingInstallation = { classification: 'CLEAN_HOST' | 'STALE_INACTIVE_RESIDUE' | 'MANAGED_EXISTING_NODE' | 'AMBIGUOUS_STATE'; old_node_id: string | null; version: string | null; profile: string | null; service_active: boolean; panel_present: boolean; online: boolean; credential_active: boolean; group_count: number; carrier_reference_count: number; reason: string | null; confirmation: string; retry_confirmation?: string | null; retry_blocker?: string | null };
 type SshProbe = { existing?: ExistingInstallation; fingerprint: string; os: string; architecture: string };
 type DeployLog = { stage: string; message: string; at: string };
 type Deployment = { id: string; group_id: number; host: string; stage: string; status: string; message: string; node_id?: string | null; candidate_node_id?: string | null; profile: 'reality_camouflage'; lite_mode: boolean; capabilities?: ProvisioningCapabilities | null };
@@ -99,7 +99,7 @@ export default function NodeBootstrap() {
     setBatchBusy(false);
   };
 
-  const canDeploy = (row: SshRow) => row.state === 'PASSED' && Boolean(row.probe);
+  const canDeploy = (row: SshRow) => row.state === 'PASSED' && Boolean(row.probe) && !row.probe?.existing?.retry_confirmation && row.probe?.existing?.classification !== 'AMBIGUOUS_STATE';
   const confirmReset = () => new Promise<boolean>((resolve) => Modal.confirm({
     title: t('freshResetConfirm'),
     content: <Space orientation="vertical"><Text>{t('freshResetWarning')}</Text><Text type="secondary">{t('overwriteMembershipNotCopied')}</Text></Space>,
@@ -107,14 +107,13 @@ export default function NodeBootstrap() {
     onOk: () => resolve(true), onCancel: () => resolve(false),
   }));
 
-  const deployAll = async () => {
-    if (!rows.every(canDeploy)) return;
-    if (rows.some((row) => row.probe?.existing && row.probe.existing.classification !== 'CLEAN_HOST') && !await confirmReset()) return;
+  const deployRows = async (selected: SshRow[], failedRetry = false) => {
+    const selectedIds = new Set(selected.map(row => row.id));
     setBatchBusy(true);
-    setRows((current) => current.map((row) => ({ ...row, state: 'DEPLOYING', error: null })));
-    const results = await Promise.all(rows.map(async (row) => {
+    setRows((current) => current.map((row) => selectedIds.has(row.id) ? ({ ...row, state: 'DEPLOYING', error: null }) : row));
+    const results = await Promise.all(selected.map(async (row) => {
       try {
-        const response = await api.post<unknown, ApiEnvelope<Deployment>>('/admin/node-deployments', { ...row.values, display_name: row.values.display_name.trim(), confirmed_fingerprint: row.probe!.fingerprint, profile: 'reality_camouflage', lite_mode: liteMode });
+        const response = await api.post<unknown, ApiEnvelope<Deployment>>('/admin/node-deployments', { ...row.values, display_name: row.values.display_name.trim(), confirmed_fingerprint: row.probe!.fingerprint, profile: 'reality_camouflage', lite_mode: liteMode, ...(failedRetry ? { retry_confirmation: row.probe!.existing!.retry_confirmation } : {}) });
         if (!response.data) throw new Error(response.message);
         return { id: row.id, deployment: response.data, error: null };
       } catch (error) { return { id: row.id, deployment: null, error: errorText(error, t('nodeBootstrapStartFailed')) }; }
@@ -125,6 +124,23 @@ export default function NodeBootstrap() {
       return { ...row, deployment: result.deployment, state: result.deployment ? 'DEPLOYING' : 'FAILED', error: result.error, values: { ...row.values, password: '' } };
     }));
     setBatchBusy(false);
+  };
+
+  const deployAll = async () => {
+    if (!rows.every(canDeploy)) return;
+    if (rows.some(row => row.probe?.existing && row.probe.existing.classification !== 'CLEAN_HOST') && !await confirmReset()) return;
+    await deployRows(rows);
+  };
+
+  const retryFailed = async (row: SshRow) => {
+    if (batchBusy || row.state !== 'PASSED' || !row.probe?.existing?.retry_confirmation) return;
+    const confirmed = await new Promise<boolean>(resolve => Modal.confirm({
+      title: t('failedRetryConfirm'),
+      content: <Space orientation="vertical"><Text strong>{row.values.host}</Text><Text>{t('failedRetryScope')}</Text><Text>{t('failedRetryNewIdentity')}</Text></Space>,
+      okText: t('failedRetryAction'), cancelText: t('cancel'), okButtonProps: { danger: true },
+      onOk: () => resolve(true), onCancel: () => resolve(false),
+    }));
+    if (confirmed) await deployRows([row], true);
   };
 
   const createEnrollment = async () => {
@@ -186,7 +202,10 @@ export default function NodeBootstrap() {
             { key: 'panel', label: t('overwritePanelIdentity'), children: ambiguous ? t('overwriteUnverified') : `${t(old.panel_present ? 'overwritePresent' : 'overwriteAbsent')} · ${t(old.credential_active ? 'overwriteCredentialActive' : 'overwriteCredentialInactive')}` },
             { key: 'refs', label: t('overwriteRelations'), children: ambiguous ? t('overwriteUnverified') : `${old.group_count} ${t('overwriteGroups')} · ${old.carrier_reference_count} ${t('overwriteCarrierRefs')}` },
           ]} />
-          {old.reason ? <Text>{t('freshResetInconsistent')}</Text> : <Text>{t('overwriteRetirementWarning')}</Text>}
+          {old.retry_confirmation ? <>
+            <Text>{t('failedRetryScope')}</Text>
+            <Button danger disabled={batchBusy || row.state !== 'PASSED'} onClick={() => void retryFailed(row)}>{t('failedRetryAction')}</Button>
+          </> : old.classification === 'AMBIGUOUS_STATE' ? <Text type="danger">{old.retry_blocker || t('failedRetryProtected')}</Text> : <Text>{t(old.reason ? 'freshResetInconsistent' : 'overwriteRetirementWarning')}</Text>}
         </Space>} />;
     })}
     <Space wrap style={{ marginTop: 12 }}>
