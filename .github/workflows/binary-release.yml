@@ -46,7 +46,9 @@ jobs:
         run: |
           cp scripts/v1410-publication-builder.py "$RUNNER_TEMP/builder.py"
           [[ "$FROZEN_SOURCE" =~ ^[a-f0-9]{40}$ ]]
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git checkout --detach "$FROZEN_SOURCE"
+          printf 'publication-evidence/\nrelease-dist/\n' >> .git/info/exclude
           test -z "$(git status --porcelain)"
       - name: Existing Debian12 build dependencies
         run: |
