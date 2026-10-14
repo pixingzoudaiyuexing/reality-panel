@@ -20,7 +20,9 @@ try:
  raw=(e/'rust-tests.log').read_text();assert 'S3 REAL POSTGRES RUNTIME AUTH CONTRACT: EXECUTED' in raw
  nums=[list(map(int,m)) for m in re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out',raw)];summary={'passed':sum(n[0] for n in nums),'failed':sum(n[1] for n in nums),'ignored':sum(n[2] for n in nums),'filtered':sum(n[4] for n in nums),'real_pg_executed':True};assert summary['failed']==summary['ignored']==summary['filtered']==0;(e/'rust-summary.json').write_text(json.dumps(summary,indent=2))
  for name,args in [('npm-ci',['npm','ci','--no-audit','--no-fund']),('typecheck',['npm','run','typecheck']),('frontend-lint',['npm','run','lint']),('frontend-tests',['npm','test','--','--maxWorkers=1','--reporter=json','--outputFile='+str(e/'frontend-results.json')]),('frontend-build',['npm','run','build'])]:gate(name,args,root/'frontend')
- gate('debug-build',['cargo','build','--workspace','--locked']);gate('loopback-e2e',['python3','tests/e2e_test.py']);integrity()
+ gate('debug-build',['cargo','build','--workspace','--locked']);sandbox=e/'loopback-sandbox';sandbox.mkdir();archive=subprocess.check_output(['git','archive','HEAD']);subprocess.run(['tar','-xf','-','-C',str(sandbox)],input=archive,check=True);(sandbox/'target/debug').mkdir(parents=True)
+ for binary in ['relay-panel','relay-node']:shutil.copyfile(root/'target/debug'/binary,sandbox/'target/debug'/binary);(sandbox/'target/debug'/binary).chmod(0o755)
+ gate('loopback-e2e',['python3','tests/e2e_test.py'],sandbox);integrity()
  gate('optimized-build',['cargo','build','--release','--locked','-p','relay-panel','-p','relay-node']);integrity();assets.mkdir()
  for src,dst in [('target/release/relay-panel','reality-panel-linux-amd64'),('target/release/relay-node','reality-node-linux-amd64'),('install.sh','install.sh'),('deploy.sh','deploy.sh'),('update.sh','update.sh'),('scripts/relay-node-install.sh','relay-node-install.sh')]:shutil.copyfile(root/src,assets/dst);(assets/dst).chmod(0o755)
  (assets/'VERSION').write_text('1.4.11\n');(assets/'SOURCE_COMMIT').write_text(head+'\n')
