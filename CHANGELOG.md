@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.4.10] - 2026-10-14
+
+- SSH installation uses the detected classification instead of the presence of a detection result: CLEAN_HOST proceeds directly to fresh identity creation and Bootstrap, without old-installation reset or retirement. MANAGED_EXISTING_NODE and STALE_INACTIVE_RESIDUE retain the existing scoped reset flow. AMBIGUOUS_STATE is rejected before mutation; reset eligibility is rechecked before the destructive phases.
+- Regression tests exercise the real deployment entry/worker with an isolated database and fake SSH boundary. No Debian support, GLIBC toolchain, forwarding runtime, DNS/Carrier, schema, protocol or frontend change. Physical node deployment acceptance was explicitly waived; this patch does not prove Debian 10 Node binary compatibility.
+
 ## [1.4.9] - 2026-10-08
 
 - Consolidate Groups, Node Pool and Node Status navigation into Node Management with by-group and all-node views; preserve physical-identity deduplication, monitoring, membership, lifecycle operations and legacy URLs.

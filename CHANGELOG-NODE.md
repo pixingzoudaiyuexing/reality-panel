@@ -1,5 +1,9 @@
 # Changelog — relay-node
 
+## [1.4.10] - 2026-10-14
+
+- Unified version with Panel 1.4.10. Node forwarding/runtime, Config Protocol 10 and Lifecycle Protocol 1 are unchanged. This release fixes Panel SSH installation classification and does not change the Node GLIBC compatibility baseline or historical Legacy upgrader.
+
 ## [1.4.9] - 2026-10-08
 
 - Unified release version with Panel 1.4.9. Node runtime and forwarding behavior are unchanged; Config Protocol 10 and Lifecycle Protocol 1 are unchanged. No new legacy upgrader or migration behavior is included.
