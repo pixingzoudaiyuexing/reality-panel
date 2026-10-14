@@ -103,6 +103,39 @@ def file_hash(path):
     return digest.hexdigest()
 
 
+def owned_unit(raw):
+    allowed = {
+        'Unit': {'Description', 'After', 'Wants'},
+        'Service': {'Type', 'RuntimeDirectory', 'RuntimeDirectoryMode', 'EnvironmentFile',
+                    'WorkingDirectory', 'ExecStart', 'Restart', 'RestartSec', 'LimitNOFILE'},
+        'Install': {'WantedBy'},
+    }
+    section = None
+    entries = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith(('#', ';')):
+            continue
+        if line.endswith('\\'):
+            raise ValueError('continued service directives are protected')
+        if line.startswith('[') and line.endswith(']'):
+            section = line[1:-1]
+            if section not in allowed:
+                raise ValueError('unknown service section is protected')
+            continue
+        key, sep, value = line.partition('=')
+        key, value = key.strip(), value.strip()
+        if not sep or key not in allowed.get(section, set()) or (section, key) in entries:
+            raise ValueError('custom or duplicate service directives are protected')
+        entries[section, key] = value
+    expected = {('Unit', 'Description'): 'Reality Panel relay-node',
+                ('Service', 'EnvironmentFile'): ENV,
+                ('Service', 'WorkingDirectory'): '/opt/relay-node',
+                ('Service', 'ExecStart'): '/opt/relay-node/relay-node'}
+    if any(entries.get(key) != value for key, value in expected.items()):
+        raise ValueError('relay-node unit is not product-owned')
+
+
 def plan(root):
     root = Path(root)
     removals = []
@@ -114,14 +147,8 @@ def plan(root):
     unit = text(root, UNIT)
     if valid_id(node):
         ids.add(node)
-    unit_values = values('\n'.join(line for line in unit.splitlines() if not line.lstrip().startswith(('#', ';'))))
-    if unit and (unit_values.get('ExecStart') != '/opt/relay-node/relay-node'
-                 or unit_values.get('Description') != 'Reality Panel relay-node'
-                 or unit_values.get('EnvironmentFile') != ENV
-                 or unit_values.get('WorkingDirectory') != '/opt/relay-node'
-                 or any(key.startswith('Exec') and key != 'ExecStart' for key in unit_values)
-                 or sum(line.startswith('ExecStart=') for line in unit.splitlines()) != 1):
-        raise ValueError('relay-node unit is not product-owned')
+    if unit:
+        owned_unit(unit)
     dropins = checked(root, UNIT + '.d', directory=True)
     if dropins.exists() and any(dropins.iterdir()):
         raise ValueError('service overrides are protected')

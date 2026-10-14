@@ -275,7 +275,7 @@ pub(super) async fn cancel_retry_candidates(
         // Cancellation arbitrates activation; an activation that won must still
         // satisfy the same failed-candidate and no-business-reference checks.
         retry_authority(state, facts, fingerprint, lite).await?;
-        retire_host_identity(state, group, id, actor).await?;
+        retire_host_identity(state, group, id, actor, true).await?;
     }
     Ok(())
 }
@@ -624,10 +624,11 @@ pub(super) async fn retire_host_identity(
     group: i64,
     id: &str,
     actor: i64,
+    require_unreferenced: bool,
 ) -> Result<(), DeployError> {
     let node = ReuseEligibleNodeId::parse(id).map_err(|_| retirement_error())?;
     // Existing atomic Pool delete preserves independent history and schedules DNS.
-    node_pool::retire_installation_identity(state, group, id)
+    node_pool::retire_installation_identity(state, group, id, require_unreferenced)
         .await
         .map_err(|_| retirement_error())?;
     for claim in state
@@ -646,7 +647,7 @@ pub(super) async fn retire_host_identity(
     }
     // Cancellation serializes with activation. An activation that won the race
     // is retired through the same authority transaction before local cleanup.
-    node_pool::retire_installation_identity(state, group, id)
+    node_pool::retire_installation_identity(state, group, id, require_unreferenced)
         .await
         .map_err(|_| retirement_error())?;
     if state

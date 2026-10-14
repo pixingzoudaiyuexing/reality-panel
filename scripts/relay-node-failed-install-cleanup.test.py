@@ -64,6 +64,13 @@ class RetryCleanup(unittest.TestCase):
         self.assertIsNone(retry.inspection(self.root)['retry_snapshot'])
         self.file(retry.UNIT, UNIT);self.file(retry.UNIT+'.d/custom.conf','ExecStart=/usr/bin/other-program')
         self.assertIsNone(retry.inspection(self.root)['retry_snapshot']);self.assertTrue((self.root/'opt/relay-node/node-id').exists())
+    def test_indented_execstop_duplicate_start_and_continuation_are_protected(self):
+        self.residue()
+        for extra in ['  ExecStop = /usr/bin/operator-stop-shared-resource\n', '  ExecStart = /opt/relay-node/relay-node\n', 'ExecStart=/opt/relay-node/\\\nrelay-node\n', 'RootDirectory=/other-program\n']:
+            with self.subTest(extra=extra):
+                self.file(retry.UNIT,UNIT+extra)
+                self.assertIsNone(retry.inspection(self.root)['retry_snapshot'])
+                self.assertTrue((self.root/'opt/relay-node/node-id').exists())
     def test_parent_symlink_and_custom_working_directory_are_protected(self):
         self.residue();self.file(retry.UNIT, UNIT.replace('WorkingDirectory=/opt/relay-node', 'WorkingDirectory=/other-program'))
         self.assertIsNone(retry.inspection(self.root)['retry_snapshot'])
