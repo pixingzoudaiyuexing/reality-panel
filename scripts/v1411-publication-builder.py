@@ -1,18 +1,21 @@
 from pathlib import Path
 import os,subprocess,json,time,hashlib,shutil,tarfile,gzip,re
 root=Path.cwd();e=root/'publication-evidence';e.mkdir();assets=root/'release-dist';head=os.environ['FROZEN_SOURCE'];results=[]
-os.environ.update(CARGO_BUILD_JOBS='1',CARGO_INCREMENTAL='0',CARGO_PROFILE_DEV_DEBUG='0',CARGO_PROFILE_TEST_DEBUG='0',CI='true',TZ='UTC')
+os.environ.update(CARGO_BUILD_JOBS='1',CARGO_INCREMENTAL='0',CARGO_PROFILE_DEV_DEBUG='0',CARGO_PROFILE_TEST_DEBUG='0',CI='true',TZ='UTC',PYTHONDONTWRITEBYTECODE='1')
 assert not any(k.startswith('CARGO_PROFILE_RELEASE') for k in os.environ)
 def inventory(folder):return {str(p.relative_to(folder)):hashlib.sha256(p.read_bytes()).hexdigest() for p in folder.rglob('*') if p.is_file()}
 def integrity():
  assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==head
- assert not subprocess.check_output(['git','status','--porcelain'])
+ status=subprocess.check_output(['git','status','--porcelain'],text=True)
+ if status:(e/'source-status-failure.json').write_text(json.dumps({'head':head,'status':status},indent=2))
+ assert not status,status
  assert all(hashlib.sha256(Path(n).read_bytes()).hexdigest()==v for n,v in frozen.items())
 def gate(name,args,cwd=root):
  print('START',name,flush=True);start=time.monotonic()
  with (e/(name+'.log')).open('w') as log:p=subprocess.run(args,cwd=cwd,env=os.environ,stdout=log,stderr=subprocess.STDOUT)
  results.append({'gate':name,'rc':p.returncode,'seconds':round(time.monotonic()-start,3),'command':args});(e/'gates-progress.json').write_text(json.dumps(results,indent=2));print('END',name,p.returncode,flush=True)
  if p.returncode:raise RuntimeError('RELEASE GATE FAILED: '+name)
+ integrity()
 frozen={n:hashlib.sha256(Path(n).read_bytes()).hexdigest() for n in subprocess.check_output(['git','ls-files'],text=True).splitlines()};tree=subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip();(e/'frozen-source.json').write_text(json.dumps({'head':head,'tree':tree,'hashes':frozen},indent=2));integrity()
 try:
  gate('shell-syntax',['python3','-c',"import subprocess; p=subprocess.check_output(['git','ls-files','*.sh'],text=True).splitlines();[subprocess.run(['bash','-n',x],check=True) for x in p];print('PASS',len(p))"])
