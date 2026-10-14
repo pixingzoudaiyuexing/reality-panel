@@ -14,6 +14,7 @@ spec.loader.exec_module(retry)
 NODE = '11111111-1111-4111-8111-111111111111'
 OTHER = '22222222-2222-4222-8222-222222222222'
 UNIT = '[Unit]\nDescription=Reality Panel relay-node\n[Service]\nEnvironmentFile=/etc/relay-node/relay-node.env\nWorkingDirectory=/opt/relay-node\nExecStart=/opt/relay-node/relay-node\n'
+EXEC = '{ path=/opt/relay-node/relay-node ; argv[]=/opt/relay-node/relay-node ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }'
 
 class RetryCleanup(unittest.TestCase):
     def setUp(self):
@@ -99,7 +100,17 @@ class RetryCleanup(unittest.TestCase):
             with self.subTest(fragment=fragment,dropins=dropins),patch.object(retry.subprocess,'check_output',side_effect=[fragment,dropins]),patch.object(retry.subprocess,'run') as stop:
                 with self.assertRaises(ValueError):retry.validate_loaded_service(True)
                 stop.assert_not_called()
-        with patch.object(retry.subprocess,'check_output',side_effect=[retry.UNIT,'','','','relay-node']):retry.validate_loaded_service(True)
+        with patch.object(retry.subprocess,'check_output',side_effect=[retry.UNIT,'','','','relay-node',EXEC,'0']):retry.validate_loaded_service(True)
+    def test_cached_start_command_and_foreign_main_process_are_protected(self):
+        prefix=[retry.UNIT,'','','','relay-node']
+        for command in [EXEC.replace('/opt/relay-node/relay-node','/usr/bin/operator-program'),EXEC.replace('argv[]=/opt/relay-node/relay-node','argv[]=/opt/relay-node/relay-node --other'),EXEC+EXEC,'']:
+            with self.subTest(command=command),patch.object(retry.subprocess,'check_output',side_effect=prefix+[command]),patch.object(retry.subprocess,'run') as stop:
+                with self.assertRaises(ValueError):retry.validate_loaded_service(True)
+                stop.assert_not_called()
+        with patch.object(retry.subprocess,'check_output',side_effect=prefix+[EXEC,'123']),patch.object(retry,'process_identity',return_value=([b'/usr/bin/operator-program'],'start')),patch.object(retry.subprocess,'run') as stop:
+            with self.assertRaises(ValueError):retry.validate_loaded_service(True)
+            stop.assert_not_called()
+        with patch.object(retry.subprocess,'check_output',side_effect=prefix+[EXEC,'123']),patch.object(retry,'process_identity',return_value=([b'/opt/relay-node/relay-node'],'start')):retry.validate_loaded_service(True)
     def test_cached_stop_hooks_and_runtime_directory_are_protected(self):
         for output in [[retry.UNIT,'','operator-stop'],[retry.UNIT,'','','operator-poststop'],[retry.UNIT,'','','','operator-state']]:
             with self.subTest(output=output),patch.object(retry.subprocess,'check_output',side_effect=output),patch.object(retry.subprocess,'run') as stop:

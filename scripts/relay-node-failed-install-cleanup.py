@@ -344,6 +344,16 @@ def validate_loaded_service(unit_exists):
         runtime = subprocess.check_output(['systemctl', 'show', '--property=RuntimeDirectory', '--value', 'relay-node.service'], timeout=10, text=True).strip()
         if runtime not in ('', 'relay-node'):
             raise ValueError('cached service runtime resources are protected')
+        command = subprocess.check_output(['systemctl', 'show', '--property=ExecStart', '--value', 'relay-node.service'], timeout=10, text=True).strip()
+        if not re.fullmatch(r'\{ path=/opt/relay-node/relay-node ; argv\[\]=/opt/relay-node/relay-node ; ignore_errors=no ; [^{}]*\}', command):
+            raise ValueError('cached service command is not product-owned')
+        pid = subprocess.check_output(['systemctl', 'show', '--property=MainPID', '--value', 'relay-node.service'], timeout=10, text=True).strip()
+        if not pid.isdigit():
+            raise ValueError('loaded service process cannot be verified')
+        if int(pid):
+            argv, _ = process_identity(int(pid))
+            if argv != [b'/opt/relay-node/relay-node']:
+                raise ValueError('another service process is protected')
 
 
 def cleanup(root, phase, expected_snapshot):
