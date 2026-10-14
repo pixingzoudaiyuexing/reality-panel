@@ -58,7 +58,19 @@ pub(super) async fn detect(
     target_lite: bool,
 ) -> Result<ExistingInstallation, DeployError> {
     let mut view = detect_installation(state, facts, fingerprint, target_lite).await?;
-    if facts.retry_snapshot.is_some() {
+    let failed_task = state.deployments.tasks.lock().await.values().any(|task| {
+        task.status.status == "FAILED"
+            && task.ssh_fingerprint.as_deref() == Some(fingerprint)
+            && task
+                .status
+                .candidate_node_id
+                .as_ref()
+                .is_some_and(|id| facts.retry_node_ids.contains(id))
+    });
+    let failed_retry = view.classification == "AMBIGUOUS_STATE"
+        || !facts.retry_failed_ids.is_empty()
+        || failed_task;
+    if facts.retry_snapshot.is_some() && failed_retry {
         match retry_authority(state, facts, fingerprint, target_lite).await {
             Ok(confirmation) => view.retry_confirmation = Some(confirmation),
             Err(_) => {

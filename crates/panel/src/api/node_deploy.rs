@@ -4259,6 +4259,55 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
     }
 
     #[tokio::test]
+    async fn ordinary_managed_and_stale_snapshots_keep_original_api_worker_path() {
+        for retired in [false, true] {
+            let (mut state, mut facts) = existing_fixture().await;
+            if retired {
+                crate::service::node_pool::retire_node(
+                    &state,
+                    facts.identity_group_id.unwrap(),
+                    facts.node_id.as_deref().unwrap(),
+                )
+                .await
+                .unwrap();
+                facts.service_active = false;
+            }
+            // The real shipped detector reports this plan even for ordinary
+            // inactive residue; the plan alone must not change install intent.
+            facts.retry_snapshot = Some("a".repeat(64));
+            facts.retry_node_ids = vec![facts.node_id.clone().unwrap()];
+            let view = existing::detect(&state, &facts, "SHA256:fake", false)
+                .await
+                .unwrap();
+            assert_eq!(
+                view.classification,
+                if retired {
+                    "STALE_INACTIVE_RESIDUE"
+                } else {
+                    "MANAGED_EXISTING_NODE"
+                }
+            );
+            assert!(view.retry_confirmation.is_none());
+            let mut next = FakeRunner::new(FakeBehavior::InstallFailure("INSTALL_FAILED"));
+            next.host_facts = facts;
+            let runner = Arc::new(next);
+            state.deployments.runner = runner.clone();
+            let req: StartDeploymentRequest = serde_json::from_value(serde_json::json!({"host":"node.example","password":"test-only","confirmed_fingerprint":"SHA256:fake"})).unwrap();
+            let Json(reply) =
+                start_deployment(AdminOnly { user_id: 1 }, State(state.clone()), Json(req)).await;
+            assert_eq!(reply.code, 0, "{}", reply.message);
+            let task = reply.data.unwrap();
+            wait_for_fake_deployment(&state, &task.id).await;
+            assert_eq!(
+                *runner.reset_calls.lock().await,
+                ["check", "stop", "clean", "stop", "clean"]
+            );
+            assert!(runner.retry_calls.lock().await.is_empty());
+            assert_eq!(runner.install_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn confirmed_failed_install_retry_enters_new_bootstrap_without_binary_reset() {
         let (state, runner, facts, protected_credential) =
             failed_retry_fixture(FakeBehavior::Success).await;

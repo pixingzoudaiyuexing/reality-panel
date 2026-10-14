@@ -266,6 +266,15 @@ def inspection(root):
                     retry_blocker='产品路径、资源归属或正在使用的身份无法安全清理')
 
 
+def validate_loaded_service(unit_exists):
+    loaded = subprocess.check_output(['systemctl', 'show', '--property=FragmentPath', '--value', 'relay-node.service'], timeout=10, text=True).strip()
+    dropins = subprocess.check_output(['systemctl', 'show', '--property=DropInPaths', '--value', 'relay-node.service'], timeout=10, text=True).strip()
+    if dropins:
+        raise ValueError('effective service overrides are protected')
+    if loaded and (not unit_exists or loaded != UNIT):
+        raise ValueError('loaded service is not the owned unit')
+
+
 def cleanup(root, phase, expected_snapshot):
     root = Path(root)
     if phase not in ('check', 'stop', 'clean'):
@@ -288,9 +297,7 @@ def cleanup(root, phase, expected_snapshot):
             if os.geteuid() != 0:
                 raise ValueError('root required')
             unit = checked(root, UNIT)
-            loaded = subprocess.check_output(['systemctl', 'show', '--property=FragmentPath', '--value', 'relay-node.service'], timeout=10, text=True).strip()
-            if loaded and (not unit.exists() or loaded != UNIT):
-                raise ValueError('loaded service is not the owned unit')
+            validate_loaded_service(unit.exists())
             if unit.exists():
                 subprocess.run(['systemctl', 'stop', 'relay-node.service'], check=True, timeout=20)
             for pid, argv, start in p['installers']:

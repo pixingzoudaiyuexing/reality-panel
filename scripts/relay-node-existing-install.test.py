@@ -44,6 +44,15 @@ class Inspection(unittest.TestCase):
     def test_clean_host(self):
         self.assertIsNone(module.inspect()['node_id'])
 
+    def test_owned_inactive_residue_has_retry_snapshot_but_no_failed_install_evidence(self):
+        self.installed()
+        self.file('/etc/systemd/system/relay-node.service', '[Unit]\nDescription=Reality Panel relay-node\n[Service]\nEnvironmentFile=/etc/relay-node/relay-node.env\nWorkingDirectory=/opt/relay-node\nExecStart=/opt/relay-node/relay-node\n')
+        facts = module.inspect()
+        self.assertIsNone(facts['ambiguity'])
+        self.assertIsNotNone(facts['retry_snapshot'])
+        self.assertEqual(facts['retry_node_ids'],[NODE])
+        self.assertEqual(facts['retry_failed_ids'],[])
+
     def test_installed_exact_auth_is_verified_without_exporting_secret(self):
         self.installed(); secret = self.auth()
         facts = module.inspect()
