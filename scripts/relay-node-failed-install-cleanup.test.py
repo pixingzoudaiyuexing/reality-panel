@@ -71,6 +71,12 @@ class RetryCleanup(unittest.TestCase):
         target = self.root/'opt/relay-node'; target.rename(self.root/'owned-backup'); target.symlink_to(self.root/'owned-backup')
         self.assertIsNone(retry.inspection(self.root)['retry_snapshot'])
         self.assertTrue((self.root/'owned-backup/node-id').exists())
+    def test_effective_systemd_dropins_and_foreign_loaded_fragment_block_stop(self):
+        for fragment,dropins in [(retry.UNIT,'/run/systemd/system/relay-node.service.d/override.conf'), (retry.UNIT,'/usr/lib/systemd/system/relay-node.service.d/override.conf'), ('/other-program.service','')]:
+            with self.subTest(fragment=fragment,dropins=dropins),patch.object(retry.subprocess,'check_output',side_effect=[fragment,dropins]),patch.object(retry.subprocess,'run') as stop:
+                with self.assertRaises(ValueError):retry.validate_loaded_service(True)
+                stop.assert_not_called()
+        with patch.object(retry.subprocess,'check_output',side_effect=[retry.UNIT,'']):retry.validate_loaded_service(True)
     def test_committed_transaction_cannot_authorize_failed_retry(self):
         self.residue();base='/tmp/relay-panel-bootstrap-'+NODE
         self.file(base+'/bootstrap.sh','#!/usr/bin/env bash\n# RelayPanel Stage 1 bootstrap.\n')
