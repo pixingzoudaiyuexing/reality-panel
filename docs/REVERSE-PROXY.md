@@ -230,3 +230,8 @@ For `RELAYPANEL_WEB_MODE=caddy`:
   fatal. Port `443/udp` is also published so Caddy can serve HTTP/3.
 - `PUBLIC_PANEL_URL` defaults to `https://${RELAYPANEL_DOMAIN}` and existing
   values are preserved on upgrade.
+
+
+## SSH installation probe timing
+
+The SSH test endpoint (`POST /api/v1/admin/node-deployments/fingerprint`) has a 45-second backend request budget and a 60-second browser timeout. Keep the reverse proxy read timeout at least 60 seconds for this endpoint (the Nginx default is 60 seconds). Ordinary browser API calls remain at 10 seconds. A shorter custom proxy deadline can still end the HTTP request; the UI reports that request/network failure and does not treat it as a rejected SSH password. This does not change installer timeouts or authorize deployment after incomplete inspection.

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.12] - 2026-10-19
+
+- Give SSH connection testing its own 60-second browser request budget while ordinary APIs retain 10 seconds. Bound the backend probe to 45 seconds with current-stage diagnostics, preserving complete installation inspection, fingerprint checks, CLEAN_HOST and confirmed failed-install retry protections.
+- Preserve safe backend business/HTTP errors, distinguish browser timeout/cancellation/network errors and redact the supplied password. Separate DNS/TCP, handshake, authentication, remote OS/Python and installation-state failures; suppress private remote command output from probe errors. Try remaining resolved SSH addresses within one shared TCP budget.
+- Add actual Axios/loopback HTTP delayed-response regression and authenticated API/FakeRunner, TCP/handshake and existing installation regression tests. No real-server deployment or external network diagnosis is claimed.
+
 ## [1.4.11] - 2026-10-15
 
 - Add an explicit per-server, second-confirmed failed SSH installation retry. Revalidate the SSH fingerprint and exact residue snapshot in the API and worker, clean only owned Reality Node files/service/failed transaction data with Python, then generate a new identity and normal Bootstrap. Cleanup never executes an old or new Node binary.

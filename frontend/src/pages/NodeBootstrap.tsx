@@ -24,8 +24,12 @@ const terminalEnrollment = (state: EnrollmentState) => ['SUCCESS', 'FAILED', 'EX
 const enrollmentStateLabel: Record<EnrollmentState, keyof Dict> = { PENDING: 'manualBootstrapStatePENDING', CLAIMED: 'manualBootstrapStateCLAIMED', VERIFYING: 'manualBootstrapStateVERIFYING', LOCAL_COMMITTED: 'manualBootstrapStateLOCAL_COMMITTED', SUCCESS: 'manualBootstrapStateSUCCESS', FAILED: 'manualBootstrapStateFAILED', EXPIRED: 'manualBootstrapStateEXPIRED' };
 const rowColor: Record<RowState, string> = { WAITING: 'default', TESTING: 'processing', PASSED: 'success', FAILED: 'error', DEPLOYING: 'processing', SUCCESS: 'success' };
 
-function errorText(error: unknown, fallback: string) {
-  return (error as { response?: { data?: { message?: string } } })?.response?.data?.message || fallback;
+function errorText(error: unknown, fallback: string, password = '') {
+  const detail = error as { response?: { data?: { message?: unknown } }; message?: unknown } | null;
+  const backend = detail?.response?.data?.message;
+  const text = typeof backend === 'string' && backend.trim() ? backend :
+    error instanceof Error && !['AxiosError', 'CanceledError'].includes(error.name) && error.message.trim() ? error.message : fallback;
+  return password ? text.split(password).join('[REDACTED]') : text;
 }
 
 export default function NodeBootstrap() {
@@ -86,10 +90,14 @@ export default function NodeBootstrap() {
     setRows((current) => current.map((row) => ({ ...row, state: 'TESTING', probe: null, error: null })));
     const results = await Promise.all(rows.map(async (row) => {
       try {
-        const response = await api.post<unknown, ApiEnvelope<SshProbe>>('/admin/node-deployments/fingerprint', { ...row.values, lite_mode: liteMode });
-        if (!response.data) throw new Error(response.message);
+        const response = await api.post<unknown, ApiEnvelope<SshProbe>>('/admin/node-deployments/fingerprint', { ...row.values, lite_mode: liteMode }, { timeout: 60_000 });
+        if (response.code !== 0 || !response.data) throw new Error(response.message);
         return { id: row.id, probe: response.data, error: null };
-      } catch (error) { return { id: row.id, probe: null, error: errorText(error, t('nodeBootstrapSshFailed')) }; }
+      } catch (error) {
+        const code = (error as { code?: string } | null)?.code;
+        const fallback = t(code === 'ECONNABORTED' || code === 'ETIMEDOUT' ? 'nodeBootstrapProbeTimeout' : code === 'ERR_CANCELED' ? 'nodeBootstrapProbeCanceled' : 'nodeBootstrapProbeNetworkFailed');
+        return { id: row.id, probe: null, error: errorText(error, fallback, row.values.password) };
+      }
     }));
     setRows((current) => current.map((row) => {
       const result = results.find((item) => item.id === row.id);
