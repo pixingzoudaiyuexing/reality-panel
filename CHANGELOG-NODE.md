@@ -1,5 +1,9 @@
 # Changelog — relay-node
 
+## [1.4.12] - 2026-10-19
+
+- Unified version with Panel 1.4.12. Node runtime/forwarding, Config Protocol 10 and Lifecycle Protocol 1 are unchanged. This patch fixes Panel SSH probe timeout/error handling; it does not change GLIBC compatibility or historical Legacy Upgrader targets.
+
 ## [1.4.11] - 2026-10-15
 
 - Unified version with Panel 1.4.11. Node runtime, forwarding, Config Protocol 10 and Lifecycle Protocol 1 remain unchanged. Failed-install retry cleanup is a Panel-owned Python path; no new GLIBC compatibility or historical Legacy upgrader change.

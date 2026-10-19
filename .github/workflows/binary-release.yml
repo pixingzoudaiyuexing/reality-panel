@@ -1,36 +1,85 @@
-name: v1.4.12 exact source upload only
+name: v1.4.12 isolated build and verification only
 on:
   workflow_dispatch:
     inputs:
-      bundle:
+      source:
         required: true
         type: string
 permissions:
-  contents: write
+  contents: read
+concurrency:
+  group: v1412-isolated-build
+  cancel-in-progress: false
 jobs:
-  upload:
+  build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 90
+    container: rust:1.96-bookworm
+    defaults:
+      run:
+        shell: bash
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: relaytest
+          POSTGRES_PASSWORD: relaytest
+          POSTGRES_DB: relaytest
+        options: >-
+          --health-cmd "pg_isready -U relaytest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_PG_URL: postgres://relaytest:relaytest@postgres:5432/relaytest
+      FROZEN_SOURCE: ${{ inputs.source }}
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-      - name: Verify and import exact authorized Git objects
-        env:
-          BUNDLE_DATA: ${{ inputs.bundle }}
+          persist-credentials: false
+      - name: Preserve helper and check out frozen product source
         run: |
-          python3 - <<'PYCODE'
-          import base64,hashlib,os,pathlib,subprocess
-          bundle=base64.b64decode(os.environ['BUNDLE_DATA'],validate=True)
-          assert hashlib.sha256(bundle).hexdigest() == '1ff4dad0695c732f55a29ca6487c842b20d00a2bad66fcb0d1c066e655f932bc'
-          path=pathlib.Path(os.environ['RUNNER_TEMP'])/'authorized-source.bundle'
-          path.write_bytes(bundle)
-          subprocess.run(['git','bundle','verify',str(path)],check=True)
-          subprocess.run(['git','fetch',str(path),'HEAD'],check=True)
-          head='168a5aba304cb1e7637940929c5c61a8ecf0488f'
-          subprocess.run(['git','merge-base','--is-ancestor','60435568b189358d58f821710dc445c9324c6980',head],check=True)
-          subprocess.run(['git','cat-file','-e',head+'^{commit}'],check=True)
-          assert subprocess.check_output(['git','rev-parse',head+'^{tree}'],text=True).strip()=='407ebf2c20d36054534b25f0ca61a6a4560a900e'
-          subprocess.run(['git','push','origin',head+':refs/heads/codex/v1412-ssh-probe-fix'],check=True)
-          print('EXACT 168a5aba304cb1e7637940929c5c61a8ecf0488f SOURCE UPLOADED',head)
-          PYCODE
+          cp scripts/v1412-publication-builder.py "$RUNNER_TEMP/builder.py"
+          [[ "$FROZEN_SOURCE" =~ ^[a-f0-9]{40}$ ]]
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git checkout --detach "$FROZEN_SOURCE"
+          printf 'publication-evidence/\nrelease-dist/\n' >> .git/info/exclude
+          test -z "$(git status --porcelain)"
+      - name: Existing Debian12 build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates file openssl sqlite3 pkg-config libssl-dev libssh2-1-dev zlib1g-dev python3 postgresql-client
+          rustup show
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target
+          key: v1412-linux-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            v1412-linux-cargo-
+            v1411-linux-cargo-
+            v1410-linux-cargo-
+      - name: No-skip locked gates and optimized ten-asset build
+        run: python3 "$RUNNER_TEMP/builder.py"
+      - name: Preserve diagnostics and verified assets
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v1412-verified-${{ inputs.source }}
+          path: |
+            publication-evidence/
+            release-dist/
+          if-no-files-found: error
+          retention-days: 14

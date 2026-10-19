@@ -39,6 +39,54 @@ afterEach(async () => {
 });
 
 describe('Node Bootstrap deployment modes', () => {
+  it.each([
+    [new Error('SSH_HANDSHAKE_FAILED: safe diagnostic'), 'SSH_HANDSHAKE_FAILED: safe diagnostic'],
+    [Object.assign(new Error('opaque Axios failure'), { name: 'AxiosError', response: { data: { message: 'SSH_AUTH_FAILED: safe rejection' } } }), 'SSH_AUTH_FAILED: safe rejection'],
+    [Object.assign(new Error('timeout of 60000ms exceeded'), { name: 'AxiosError', code: 'ECONNABORTED' }), 'nodeBootstrapProbeTimeout'],
+    [Object.assign(new Error('canceled'), { name: 'CanceledError', code: 'ERR_CANCELED' }), 'nodeBootstrapProbeCanceled'],
+    [Object.assign(new Error('Network Error'), { name: 'AxiosError', code: 'ERR_NETWORK' }), 'nodeBootstrapProbeNetworkFailed'],
+    [new Error('unsafe fixture-only diagnostic'), 'unsafe [REDACTED] diagnostic'],
+  ])('shows the correct probe error for %s', async (failure, visible) => {
+    const user = userEvent.setup();
+    mockPost.mockRejectedValue(failure);
+    renderPage();
+    await user.type(screen.getByLabelText('nodeBootstrapHost 1'), 'node-a');
+    await user.type(screen.getByLabelText('nodeBootstrapPassword 1'), 'fixture-only');
+    await user.click(screen.getByRole('button', { name: /nodeBootstrapTestConnection/ }));
+    await screen.findByText(visible);
+    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeDisabled();
+  });
+
+  it('keeps a successful server result when another server probe fails', async () => {
+    const user = userEvent.setup();
+    mockPost.mockImplementation((_url: string, body: {host: string}) => Promise.resolve(body.host === 'node-b'
+      ? { code: 409, message: 'SSH_PYTHON_MISSING: safe installation check error', data: null }
+      : ok({ fingerprint: 'SHA256:node-a', os: 'Debian', architecture: 'amd64' })));
+    renderPage();
+    await user.click(screen.getByRole('button', { name: /nodeBootstrapAddServer/ }));
+    for (const [index, host] of [[1,'node-a'],[2,'node-b']] as const) {
+      await user.type(screen.getByLabelText(`nodeBootstrapHost ${index}`), host);
+      await user.type(screen.getByLabelText(`nodeBootstrapPassword ${index}`), 'fixture-only');
+    }
+    await user.click(screen.getByRole('button', { name: /nodeBootstrapTestConnection/ }));
+    await screen.findByText('nodeBootstrapRowPASSED');
+    await screen.findByText('nodeBootstrapRowFAILED');
+    expect(screen.getByText('SSH_PYTHON_MISSING: safe installation check error')).toBeInTheDocument();
+    expect(mockPost.mock.calls.filter(([url]) => url === '/admin/node-deployments')).toHaveLength(0);
+  });
+
+  it('preserves a safe backend business error from the SSH test envelope', async () => {
+    const user = userEvent.setup();
+    mockPost.mockResolvedValue(ok(null));
+    mockPost.mockResolvedValueOnce({ code: 409, message: 'EXISTING_STATE_COMMAND_FAILED: SSH 已连接，安装状态检测失败', data: null });
+    renderPage();
+    await user.type(screen.getByLabelText('nodeBootstrapHost 1'), 'node-a');
+    await user.type(screen.getByLabelText('nodeBootstrapPassword 1'), 'fixture-only');
+    await user.click(screen.getByRole('button', { name: /nodeBootstrapTestConnection/ }));
+    await screen.findByText('EXISTING_STATE_COMMAND_FAILED: SSH 已连接，安装状态检测失败');
+    expect(screen.getByText('nodeBootstrapDeploy').closest('button')).toBeDisabled();
+  });
+
   it('deploys into the pool without requiring a business group', async () => {
     renderPage();
     expect(screen.queryByText('relay-group')).not.toBeInTheDocument();

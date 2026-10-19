@@ -23,9 +23,9 @@ use sha2::{Digest, Sha256};
 use ssh2::Session;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{
-    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicU8, Ordering as AtomicOrdering},
     Arc,
 };
 use std::time::Duration;
@@ -35,6 +35,7 @@ static DEPLOYMENT_START_LOCK: once_cell::sync::Lazy<Mutex<()>> =
     once_cell::sync::Lazy::new(|| Mutex::new(()));
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_LOGS: usize = 100;
@@ -129,6 +130,7 @@ pub struct DeploymentRegistry {
     tasks: Arc<Mutex<HashMap<String, Task>>>,
     runner: Arc<dyn DeploymentRunner>,
     total_timeout: Duration,
+    probe_timeout: Duration,
     online_timeout: Duration,
     permits: Arc<Semaphore>,
 }
@@ -139,6 +141,7 @@ impl Default for DeploymentRegistry {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             runner: Arc::new(SystemSshRunner),
             total_timeout: TOTAL_TIMEOUT,
+            probe_timeout: PROBE_TIMEOUT,
             online_timeout: ONLINE_TIMEOUT,
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DEPLOYMENTS)),
         }
@@ -258,6 +261,19 @@ struct SshInput {
     port: u16,
     username: String,
     password: String,
+    probe_phase: Option<Arc<AtomicU8>>,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum ProbePhase {
+    Resolve,
+    Tcp,
+    Handshake,
+    Auth,
+    Os,
+    Inspect,
+    Classify,
 }
 
 struct Secrets {
@@ -357,18 +373,24 @@ impl DeploymentRunner for SystemSshRunner {
         tokio::task::spawn_blocking(move || {
             let mut session = connect(&input, Some(&fingerprint))?;
             authenticate(&mut session, &input)?;
+            input.set_phase(ProbePhase::Inspect);
+            exec_probe(&mut session, "command -v python3 >/dev/null 2>&1").map_err(|err| {
+                if err.category == "REMOTE_COMMAND_FAILED" {
+                    DeployError::new("SSH_PYTHON_MISSING", "SSH 已连接，远端缺少可用的 Python3；无法检测安装状态")
+                } else { probe_command_error(err, true) }
+            })?;
             let script = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
                 "../../../../scripts/relay-node-existing-install.py"
             ));
             let cleanup = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
                 "../../../../scripts/relay-node-failed-install-cleanup.py"
             ));
-            let output = exec(
+            let output = exec_probe(
                 &mut session,
                 &format!("python3 -c 'import base64; ns={{\"__name__\":\"retry_helper\"}};exec(base64.b64decode(\"{cleanup}\"),ns);exec(base64.b64decode(\"{script}\"),{{\"__name__\":\"__main__\",\"failed_retry_inspection\":ns[\"inspection\"]}})'"),
-            )?;
+            ).map_err(|err| probe_command_error(err, true))?;
             serde_json::from_str(&output)
-                .map_err(|_| DeployError::new("EXISTING_STATE_AMBIGUOUS", "安装检测未返回有效状态"))
+                .map_err(|_| DeployError::new("EXISTING_STATE_AMBIGUOUS", "SSH 已连接，安装检测未返回有效状态；未授权安装或清理"))
         })
         .await
         .map_err(|_| DeployError::new("EXISTING_STATE_UNAVAILABLE", "安装检测未完成"))?
@@ -444,8 +466,9 @@ impl DeploymentRunner for SystemSshRunner {
             let mut session = connect(&input, None)?;
             let fingerprint = host_fingerprint(&session)?;
             authenticate(&mut session, &input)?;
-            let output = exec(&mut session, "set -eu; . /etc/os-release; printf '%s|%s\\n' \"${PRETTY_NAME:-Linux}\" \"$(uname -m)\"")?;
-            let (os, architecture) = output.trim().rsplit_once('|').ok_or_else(|| DeployError::new("SSH_FAILED", "remote host did not return OS facts"))?;
+            input.set_phase(ProbePhase::Os);
+            let output = exec_probe(&mut session, "set -eu; . /etc/os-release; printf '%s|%s\\n' \"${PRETTY_NAME:-Linux}\" \"$(uname -m)\"").map_err(|err| probe_command_error(err, false))?;
+            let (os, architecture) = output.trim().rsplit_once('|').ok_or_else(|| DeployError::new("SSH_REMOTE_COMMAND_FAILED", "SSH 已连接，远端未返回有效系统信息"))?;
             Ok(SshProbe { fingerprint, os: os.into(), architecture: architecture.into(), existing: None })
         }).await.map_err(|_| DeployError::new("SSH_FAILED", "SSH probe worker terminated"))?
     }
@@ -675,12 +698,18 @@ async fn finish_remote_transaction(
 }
 
 impl SshInput {
+    fn set_phase(&self, phase: ProbePhase) {
+        if let Some(current) = &self.probe_phase {
+            current.store(phase as u8, AtomicOrdering::Relaxed);
+        }
+    }
     fn clone_without_secret_debug(&self) -> Self {
         Self {
             host: self.host.clone(),
             port: self.port,
             username: self.username.clone(),
             password: self.password.clone(),
+            probe_phase: self.probe_phase.clone(),
         }
     }
 }
@@ -690,60 +719,81 @@ pub async fn test_connection(
     State(state): State<AppState>,
     Json(req): Json<TestSshRequest>,
 ) -> Json<ApiResponse<SshProbe>> {
-    let ssh = match validate_ssh(req.host, req.port, req.username, req.password) {
+    let mut ssh = match validate_ssh(req.host, req.port, req.username, req.password) {
         Ok(value) => value,
         Err(message) => return error(400, message),
     };
-    match state.deployments.runner.probe(&ssh).await {
-        Ok(mut probe) => {
-            match state
-                .deployments
-                .runner
-                .inspect(&ssh, &probe.fingerprint)
-                .await
-            {
-                Ok(facts) => {
-                    match existing::detect(&state, &facts, &probe.fingerprint, req.lite_mode).await
-                    {
-                        Ok(existing) => {
-                            probe.existing = Some(existing);
-                            Json(ApiResponse::success(probe))
-                        }
-                        Err(err) => error(
-                            409,
-                            public_error(
-                                &err,
-                                &Secrets {
-                                    password: ssh.password,
-                                    node_token: String::new(),
-                                },
-                            ),
-                        ),
-                    }
-                }
-                Err(err) => error(
-                    409,
-                    public_error(
-                        &err,
-                        &Secrets {
-                            password: ssh.password,
-                            node_token: String::new(),
-                        },
-                    ),
+    let phase = Arc::new(AtomicU8::new(ProbePhase::Resolve as u8));
+    ssh.probe_phase = Some(phase.clone());
+    let mut checking_installation = false;
+    let work = async {
+        let mut probe = state.deployments.runner.probe(&ssh).await?;
+        checking_installation = true;
+        ssh.set_phase(ProbePhase::Inspect);
+        let facts = state
+            .deployments
+            .runner
+            .inspect(&ssh, &probe.fingerprint)
+            .await?;
+        ssh.set_phase(ProbePhase::Classify);
+        probe.existing =
+            Some(existing::detect(&state, &facts, &probe.fingerprint, req.lite_mode).await?);
+        Ok::<_, DeployError>(probe)
+    };
+    // A request budget, not a global install/command timeout. Dropping a blocking
+    // inspection does not kill it; its existing bounded read-only SSH work ends
+    // independently, and this path never starts an installer or grants a bypass.
+    let result = tokio::time::timeout(state.deployments.probe_timeout, work).await;
+    match result {
+        Ok(Ok(probe)) => Json(ApiResponse::success(probe)),
+        other => {
+            let err = match other {
+                Ok(Err(err)) => err,
+                Err(_) => probe_timeout_error(phase.load(AtomicOrdering::Relaxed)),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            error(
+                if checking_installation { 409 } else { 400 },
+                public_error(
+                    &err,
+                    &Secrets {
+                        password: ssh.password,
+                        node_token: String::new(),
+                    },
                 ),
-            }
+            )
         }
-        Err(err) => error(
-            400,
-            public_error(
-                &err,
-                &Secrets {
-                    password: ssh.password,
-                    node_token: String::new(),
-                },
-            ),
-        ),
     }
+}
+
+fn probe_timeout_error(phase: u8) -> DeployError {
+    let (category, message) = match phase {
+        p if p == ProbePhase::Resolve as u8 => {
+            ("SSH_RESOLVE_TIMEOUT", "SSH 主机解析阶段超时；未完成检测")
+        }
+        p if p == ProbePhase::Tcp as u8 => {
+            ("SSH_CONNECT_TIMEOUT", "SSH TCP 连接阶段超时；未完成检测")
+        }
+        p if p == ProbePhase::Handshake as u8 => {
+            ("SSH_HANDSHAKE_TIMEOUT", "SSH 握手阶段超时；未完成检测")
+        }
+        p if p == ProbePhase::Auth as u8 => {
+            ("SSH_AUTH_TIMEOUT", "SSH 密码认证阶段超时；不代表密码错误")
+        }
+        p if p == ProbePhase::Os as u8 => (
+            "SSH_REMOTE_COMMAND_TIMEOUT",
+            "SSH 已连接，获取远端系统信息超时",
+        ),
+        p if p == ProbePhase::Inspect as u8 => (
+            "EXISTING_STATE_TIMEOUT",
+            "SSH 已连接，远端安装状态检测超时；未授权安装或清理",
+        ),
+        _ => (
+            "EXISTING_STATE_TIMEOUT",
+            "SSH 已连接，Panel 本地身份检查超时；未授权安装或清理",
+        ),
+    };
+    DeployError::new(category, message)
 }
 
 pub async fn start_deployment(
@@ -1526,6 +1576,7 @@ fn validate_ssh(
         port,
         username,
         password,
+        probe_phase: None,
     })
 }
 
@@ -1593,27 +1644,35 @@ fn validate_preflight(facts: &Preflight) -> Result<(), DeployError> {
 }
 
 fn connect(ssh: &SshInput, expected_fingerprint: Option<&str>) -> Result<Session, DeployError> {
+    ssh.set_phase(ProbePhase::Resolve);
     let address = if ssh.host.contains(':') && !ssh.host.starts_with('[') {
         format!("[{}]:{}", ssh.host, ssh.port)
     } else {
         format!("{}:{}", ssh.host, ssh.port)
     };
-    let socket = address
+    let sockets: Vec<_> = address
         .to_socket_addrs()
-        .map_err(|_| DeployError::new("SSH_FAILED", "unable to resolve SSH host"))?
-        .next()
-        .ok_or_else(|| DeployError::new("SSH_FAILED", "SSH host has no reachable address"))?;
-    let tcp = TcpStream::connect_timeout(&socket, Duration::from_secs(15))
-        .map_err(|_| DeployError::new("SSH_FAILED", "SSH connection failed"))?;
+        .map_err(|_| DeployError::new("SSH_RESOLVE_FAILED", "无法解析 SSH 主机地址"))?
+        .collect();
+    ssh.set_phase(ProbePhase::Tcp);
+    let tcp = connect_addresses(&sockets, Duration::from_secs(15))?;
     tcp.set_read_timeout(Some(COMMAND_TIMEOUT)).ok();
     tcp.set_write_timeout(Some(COMMAND_TIMEOUT)).ok();
-    let mut session = Session::new()
-        .map_err(|_| DeployError::new("SSH_FAILED", "could not create SSH session"))?;
+    let mut session =
+        Session::new().map_err(|_| DeployError::new("SSH_SESSION_FAILED", "无法创建 SSH 会话"))?;
     session.set_tcp_stream(tcp);
     session.set_timeout(COMMAND_TIMEOUT.as_millis() as u32);
-    session
-        .handshake()
-        .map_err(|_| DeployError::new("SSH_FAILED", "SSH handshake failed"))?;
+    ssh.set_phase(ProbePhase::Handshake);
+    session.handshake().map_err(|err| {
+        if ssh_timeout(&err) {
+            DeployError::new("SSH_HANDSHAKE_TIMEOUT", "SSH 握手超时")
+        } else {
+            DeployError::new(
+                "SSH_HANDSHAKE_FAILED",
+                "SSH 握手失败；请检查 SSH 服务和协议兼容性",
+            )
+        }
+    })?;
     if let Some(expected) = expected_fingerprint {
         if host_fingerprint(&session)? != expected {
             return Err(DeployError::new(
@@ -1625,10 +1684,55 @@ fn connect(ssh: &SshInput, expected_fingerprint: Option<&str>) -> Result<Session
     Ok(session)
 }
 
+fn connect_addresses(sockets: &[SocketAddr], budget: Duration) -> Result<TcpStream, DeployError> {
+    if sockets.is_empty() {
+        return Err(DeployError::new(
+            "SSH_RESOLVE_FAILED",
+            "SSH 主机未返回 IP 地址",
+        ));
+    }
+    let deadline = std::time::Instant::now() + budget;
+    let mut timed_out = false;
+    for (index, socket) in sockets.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            break;
+        }
+        // Divide the remaining shared TCP budget so a first unreachable A/AAAA
+        // address cannot consume the entire budget before alternatives are tried.
+        let slice = remaining / (sockets.len() - index) as u32;
+        match TcpStream::connect_timeout(socket, slice.max(Duration::from_millis(1))) {
+            Ok(tcp) => return Ok(tcp),
+            Err(err) => {
+                timed_out |= matches!(
+                    err.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+            }
+        }
+    }
+    if timed_out {
+        Err(DeployError::new(
+            "SSH_CONNECT_TIMEOUT",
+            "SSH TCP 连接超时；请检查目标端口、防火墙和网络",
+        ))
+    } else {
+        Err(DeployError::new(
+            "SSH_TCP_UNREACHABLE",
+            "SSH TCP 连接失败；目标端口拒绝连接或网络不可达",
+        ))
+    }
+}
+
+fn ssh_timeout(err: &ssh2::Error) -> bool {
+    matches!(err.code(), ssh2::ErrorCode::Session(-9 | -30))
+}
+
 fn host_fingerprint(session: &Session) -> Result<String, DeployError> {
-    let (key, _) = session
-        .host_key()
-        .ok_or_else(|| DeployError::new("SSH_FAILED", "SSH server did not provide a host key"))?;
+    let (key, _) = session.host_key().ok_or_else(|| {
+        DeployError::new("SSH_HOST_KEY_FAILED", "SSH 服务器未提供可校验的 host key")
+    })?;
     Ok(format!(
         "SHA256:{}",
         base64::engine::general_purpose::STANDARD_NO_PAD.encode(Sha256::digest(key))
@@ -1636,9 +1740,10 @@ fn host_fingerprint(session: &Session) -> Result<String, DeployError> {
 }
 
 fn authenticate(session: &mut Session, ssh: &SshInput) -> Result<(), DeployError> {
+    ssh.set_phase(ProbePhase::Auth);
     session
         .userauth_password(&ssh.username, &ssh.password)
-        .map_err(|_| DeployError::new("SSH_AUTH_FAILED", "SSH authentication failed"))?;
+        .map_err(authentication_error)?;
     if session.authenticated() {
         Ok(())
     } else {
@@ -1649,28 +1754,92 @@ fn authenticate(session: &mut Session, ssh: &SshInput) -> Result<(), DeployError
     }
 }
 
+fn authentication_error(err: ssh2::Error) -> DeployError {
+    if ssh_timeout(&err) {
+        DeployError::new("SSH_AUTH_TIMEOUT", "SSH 密码认证阶段超时；不代表密码错误")
+    } else if matches!(err.code(), ssh2::ErrorCode::Session(-18 | -15)) {
+        DeployError::new(
+            "SSH_AUTH_FAILED",
+            "SSH 密码认证被服务器拒绝；请检查账号或服务器允许的认证方式",
+        )
+    } else {
+        DeployError::new("SSH_AUTH_ERROR", "SSH 认证阶段通信失败；未确认密码是否有效")
+    }
+}
+
+fn probe_command_error(err: DeployError, inspecting: bool) -> DeployError {
+    if err.category == "SSH_COMMAND_TIMEOUT" {
+        if inspecting {
+            DeployError::new(
+                "EXISTING_STATE_COMMAND_TIMEOUT",
+                "SSH 已连接，远端安装状态检测命令超时",
+            )
+        } else {
+            DeployError::new(
+                "SSH_REMOTE_COMMAND_TIMEOUT",
+                "SSH 已连接，获取远端系统信息超时",
+            )
+        }
+    } else if inspecting {
+        DeployError::new(
+            "EXISTING_STATE_COMMAND_FAILED",
+            "SSH 已连接，Python3 安装状态检测命令失败；未授权安装或清理",
+        )
+    } else {
+        DeployError::new(
+            "SSH_REMOTE_COMMAND_FAILED",
+            "SSH 已连接，远端系统信息命令失败",
+        )
+    }
+}
+
 fn exec(session: &mut Session, command: &str) -> Result<String, DeployError> {
-    let mut channel = session.channel_session().map_err(|_| {
-        DeployError::new("SSH_COMMAND_TIMEOUT", "could not open SSH command channel")
-    })?;
-    channel
-        .exec(command)
-        .map_err(|_| DeployError::new("SSH_COMMAND_TIMEOUT", "SSH command could not start"))?;
+    exec_scoped(session, command, false)
+}
+
+fn exec_probe(session: &mut Session, command: &str) -> Result<String, DeployError> {
+    exec_scoped(session, command, true)
+}
+
+fn exec_scoped(session: &mut Session, command: &str, probing: bool) -> Result<String, DeployError> {
+    let transport = |err: ssh2::Error| {
+        if !probing || ssh_timeout(&err) {
+            DeployError::new("SSH_COMMAND_TIMEOUT", "SSH command timed out")
+        } else {
+            DeployError::new("SSH_REMOTE_COMMAND_FAILED", "SSH 已连接，远端命令通道失败")
+        }
+    };
+    let mut channel = session.channel_session().map_err(&transport)?;
+    channel.exec(command).map_err(&transport)?;
     let mut stdout = String::new();
     let mut stderr = String::new();
-    channel
-        .read_to_string(&mut stdout)
-        .map_err(|_| DeployError::new("SSH_COMMAND_TIMEOUT", "SSH command timed out"))?;
+    channel.read_to_string(&mut stdout).map_err(|err| {
+        if !probing
+            || matches!(
+                err.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+        {
+            DeployError::new("SSH_COMMAND_TIMEOUT", "SSH command timed out")
+        } else {
+            DeployError::new(
+                "SSH_REMOTE_COMMAND_FAILED",
+                "SSH 已连接，远端命令输出读取失败",
+            )
+        }
+    })?;
     channel.stderr().read_to_string(&mut stderr).ok();
-    channel
-        .wait_close()
-        .map_err(|_| DeployError::new("SSH_COMMAND_TIMEOUT", "SSH command timed out"))?;
+    channel.wait_close().map_err(&transport)?;
     if channel.exit_status().unwrap_or(1) == 0 {
         Ok(stdout)
     } else {
         Err(DeployError::new(
             "REMOTE_COMMAND_FAILED",
-            truncate_tail(&stderr),
+            if probing {
+                "远端检测命令未成功完成".into()
+            } else {
+                truncate_tail(&stderr)
+            },
         ))
     }
 }
@@ -1813,6 +1982,11 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum FakeBehavior {
+        ProbeFailure(&'static str),
+        InspectFailure(&'static str),
+        ProbeWait,
+        InspectWait,
+        SlowProbe,
         Success,
         RejectPassword,
         HostKeyMismatch,
@@ -1863,6 +2037,19 @@ mod tests {
             _ssh: &SshInput,
             _fingerprint: &str,
         ) -> Result<HostFacts, DeployError> {
+            match self.behavior {
+                FakeBehavior::InspectFailure(category) => {
+                    return Err(DeployError::new(
+                        category,
+                        "SSH 已连接，检测失败 wrong-password",
+                    ))
+                }
+                FakeBehavior::InspectWait => {
+                    _ssh.set_phase(ProbePhase::Inspect);
+                    std::future::pending::<()>().await;
+                }
+                _ => {}
+            }
             if self.inspect_calls.fetch_add(1, Ordering::SeqCst) > 0 {
                 if let Some(facts) = &self.later_host_facts {
                     return Ok(facts.clone());
@@ -1900,6 +2087,17 @@ mod tests {
             Ok(())
         }
         async fn probe(&self, _ssh: &SshInput) -> Result<SshProbe, DeployError> {
+            match self.behavior {
+                FakeBehavior::ProbeFailure(category) => {
+                    return Err(DeployError::new(category, "probe fixture wrong-password"))
+                }
+                FakeBehavior::ProbeWait => {
+                    _ssh.set_phase(ProbePhase::Handshake);
+                    std::future::pending::<()>().await;
+                }
+                FakeBehavior::SlowProbe => tokio::time::sleep(Duration::from_millis(11_000)).await,
+                _ => {}
+            }
             Ok(SshProbe {
                 fingerprint: "SHA256:fake".into(),
                 os: "Debian GNU/Linux 12".into(),
@@ -2473,6 +2671,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             tasks: Arc::new(Mutex::new(HashMap::new())),
             runner,
             total_timeout,
+            probe_timeout: PROBE_TIMEOUT,
             online_timeout,
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DEPLOYMENTS)),
         }
@@ -2519,6 +2718,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             port: 22,
             username: "root".into(),
             password: "wrong-password".into(),
+            probe_phase: None,
         }
     }
 
@@ -3555,6 +3755,191 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             serde_json::to_string(&state.deployments.logs(&status.id).await.unwrap()).unwrap();
         assert!(!logs.contains("wrong-password"));
         assert!(!logs.contains("node-token-secret"));
+    }
+
+    async fn probe_route(state: &AppState) -> serde_json::Value {
+        let token = encode(
+            &Header::default(),
+            &Claims {
+                sub: 1,
+                admin: true,
+                token_version: 0,
+                exp: 4_102_444_800,
+            },
+            &EncodingKey::from_secret(state.config.jwt_secret.as_bytes()),
+        )
+        .unwrap();
+        let response = crate::api::routes()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/node-deployments/fingerprint")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"host":"node.example","password":"wrong-password"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn probe_state(behavior: FakeBehavior) -> (AppState, Arc<FakeRunner>) {
+        let runner = Arc::new(FakeRunner::new(behavior));
+        (
+            test_state(test_registry(
+                runner.clone(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ))
+            .await,
+            runner,
+        )
+    }
+
+    #[tokio::test]
+    async fn ssh_probe_real_api_preserves_stage_errors_without_credentials_or_installation() {
+        for category in [
+            "SSH_CONNECT_TIMEOUT",
+            "SSH_TCP_UNREACHABLE",
+            "SSH_HANDSHAKE_FAILED",
+            "SSH_AUTH_FAILED",
+            "SSH_HOST_KEY_MISMATCH",
+        ] {
+            let (state, runner) = probe_state(FakeBehavior::ProbeFailure(category)).await;
+            let reply = probe_route(&state).await;
+            assert_ne!(reply["code"], 0);
+            assert!(reply["message"].as_str().unwrap().starts_with(category));
+            assert!(!reply.to_string().contains("wrong-password"));
+            assert!(reply["data"].is_null());
+            assert_eq!(runner.inspect_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(runner.install_calls.load(Ordering::SeqCst), 0);
+        }
+        for category in [
+            "EXISTING_STATE_COMMAND_FAILED",
+            "SSH_PYTHON_MISSING",
+            "EXISTING_STATE_AMBIGUOUS",
+            "SSH_HOST_KEY_MISMATCH",
+        ] {
+            let (state, runner) = probe_state(FakeBehavior::InspectFailure(category)).await;
+            let reply = probe_route(&state).await;
+            assert_ne!(reply["code"], 0);
+            assert!(reply["message"].as_str().unwrap().starts_with(category));
+            assert!(!reply["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("SSH_AUTH_FAILED"));
+            assert!(!reply.to_string().contains("wrong-password"));
+            assert!(reply["data"].is_null());
+            assert!(runner.reset_calls.lock().await.is_empty());
+            assert!(runner.retry_calls.lock().await.is_empty());
+            assert_eq!(runner.install_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_probe_request_budget_reports_current_phase_and_never_authorizes_deployment() {
+        for (behavior, expected) in [
+            (FakeBehavior::ProbeWait, "SSH_HANDSHAKE_TIMEOUT"),
+            (FakeBehavior::InspectWait, "EXISTING_STATE_TIMEOUT"),
+        ] {
+            let (mut state, runner) = probe_state(behavior).await;
+            state.deployments.probe_timeout = Duration::from_millis(15);
+            let reply = probe_route(&state).await;
+            assert!(reply["message"].as_str().unwrap().starts_with(expected));
+            assert!(reply["data"].is_null());
+            assert!(state.deployments.tasks.lock().await.is_empty());
+            assert_eq!(runner.install_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_probe_real_api_allows_success_after_original_ten_second_client_limit() {
+        let (state, runner) = probe_state(FakeBehavior::SlowProbe).await;
+        let start = std::time::Instant::now();
+        let reply = probe_route(&state).await;
+        assert!(start.elapsed() >= Duration::from_secs(11));
+        assert_eq!(reply["code"], 0);
+        assert_eq!(reply["data"]["fingerprint"], "SHA256:fake");
+        assert_eq!(reply["data"]["existing"]["classification"], "CLEAN_HOST");
+        assert_eq!(runner.inspect_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runner.install_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn ssh_authentication_timeout_rejection_and_transport_failure_are_distinct() {
+        for (raw, expected) in [
+            (-9, "SSH_AUTH_TIMEOUT"),
+            (-30, "SSH_AUTH_TIMEOUT"),
+            (-18, "SSH_AUTH_FAILED"),
+            (-15, "SSH_AUTH_FAILED"),
+            (-43, "SSH_AUTH_ERROR"),
+        ] {
+            let err = authentication_error(ssh2::Error::from_errno(ssh2::ErrorCode::Session(raw)));
+            assert_eq!(err.category, expected);
+        }
+        let err = probe_command_error(
+            DeployError::new("REMOTE_COMMAND_FAILED", "unrelated-private-token"),
+            true,
+        );
+        assert_eq!(err.category, "EXISTING_STATE_COMMAND_FAILED");
+        assert!(!err.message.contains("unrelated-private-token"));
+    }
+
+    #[test]
+    fn ssh_tcp_tries_remaining_resolved_addresses_within_one_budget() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first = dead.local_addr().unwrap();
+        drop(dead);
+        let available = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = connect_addresses(
+            &[first, available.local_addr().unwrap()],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), available.local_addr().unwrap());
+        assert_eq!(
+            connect_addresses(&[first], Duration::ZERO)
+                .err()
+                .unwrap()
+                .category,
+            "SSH_CONNECT_TIMEOUT"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_tcp_is_not_reported_as_password_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut input = ssh_input();
+        input.host = "127.0.0.1".into();
+        input.port = port;
+        let err = connect(&input, None).err().unwrap();
+        assert_eq!(err.category, "SSH_TCP_UNREACHABLE");
+    }
+
+    #[tokio::test]
+    async fn rejected_handshake_is_distinct_from_tcp_and_authentication() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.write_all(b"HTTP/1.0 400 Not SSH\r\n\r\n");
+        });
+        let mut input = ssh_input();
+        input.host = "127.0.0.1".into();
+        input.port = port;
+        let err = connect(&input, None).err().unwrap();
+        peer.join().unwrap();
+        assert_eq!(err.category, "SSH_HANDSHAKE_FAILED");
     }
 
     #[tokio::test]
