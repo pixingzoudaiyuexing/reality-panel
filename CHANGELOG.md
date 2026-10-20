@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.4.13] - 2026-10-20
+
+- Fix SSH connection testing and deployment inspection failing after successful authentication: the combined Python scripts exceeded libssh2's single exec-request limit. Send the unchanged inspection payload through stdin to a short, fixed Python command, then send EOF. Preserve existing timeouts, fingerprint/authentication checks, safe diagnostic errors and all installation/cleanup authorization gates.
+- Add real loopback SSH transport plus authenticated API regressions for Standard/Lite clean hosts, fingerprint mismatch, missing Python, remote command failure and invalid inspection JSON. The test executes the actual Python payload against an empty temporary root; it does not install a real Node or prove Debian 10 binary compatibility.
+
 ## [1.4.12] - 2026-10-19
 
 - Give SSH connection testing its own 60-second browser request budget while ordinary APIs retain 10 seconds. Bound the backend probe to 45 seconds with current-stage diagnostics, preserving complete installation inspection, fingerprint checks, CLEAN_HOST and confirmed failed-install retry protections.

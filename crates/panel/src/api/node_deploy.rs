@@ -385,9 +385,11 @@ impl DeploymentRunner for SystemSshRunner {
             let cleanup = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
                 "../../../../scripts/relay-node-failed-install-cleanup.py"
             ));
-            let output = exec_probe(
+            // The combined scripts exceed libssh2's single exec-request limit.
+            // Stream Python source over stdin; keep the exec request fixed and small.
+            let output = exec_probe_script(
                 &mut session,
-                &format!("python3 -c 'import base64; ns={{\"__name__\":\"retry_helper\"}};exec(base64.b64decode(\"{cleanup}\"),ns);exec(base64.b64decode(\"{script}\"),{{\"__name__\":\"__main__\",\"failed_retry_inspection\":ns[\"inspection\"]}})'"),
+                &format!("import base64; ns={{\"__name__\":\"retry_helper\"}};exec(base64.b64decode(\"{cleanup}\"),ns);exec(base64.b64decode(\"{script}\"),{{\"__name__\":\"__main__\",\"failed_retry_inspection\":ns[\"inspection\"]}})\n"),
             ).map_err(|err| probe_command_error(err, true))?;
             serde_json::from_str(&output)
                 .map_err(|_| DeployError::new("EXISTING_STATE_AMBIGUOUS", "SSH 已连接，安装检测未返回有效状态；未授权安装或清理"))
@@ -1794,14 +1796,23 @@ fn probe_command_error(err: DeployError, inspecting: bool) -> DeployError {
 }
 
 fn exec(session: &mut Session, command: &str) -> Result<String, DeployError> {
-    exec_scoped(session, command, false)
+    exec_scoped(session, command, false, None)
 }
 
 fn exec_probe(session: &mut Session, command: &str) -> Result<String, DeployError> {
-    exec_scoped(session, command, true)
+    exec_scoped(session, command, true, None)
 }
 
-fn exec_scoped(session: &mut Session, command: &str, probing: bool) -> Result<String, DeployError> {
+fn exec_probe_script(session: &mut Session, source: &str) -> Result<String, DeployError> {
+    exec_scoped(session, "python3 -", true, Some(source.as_bytes()))
+}
+
+fn exec_scoped(
+    session: &mut Session,
+    command: &str,
+    probing: bool,
+    stdin: Option<&[u8]>,
+) -> Result<String, DeployError> {
     let transport = |err: ssh2::Error| {
         if !probing || ssh_timeout(&err) {
             DeployError::new("SSH_COMMAND_TIMEOUT", "SSH command timed out")
@@ -1811,6 +1822,22 @@ fn exec_scoped(session: &mut Session, command: &str, probing: bool) -> Result<St
     };
     let mut channel = session.channel_session().map_err(&transport)?;
     channel.exec(command).map_err(&transport)?;
+    if let Some(stdin) = stdin {
+        channel.write_all(stdin).map_err(|err| {
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                DeployError::new("SSH_COMMAND_TIMEOUT", "SSH command timed out")
+            } else {
+                DeployError::new(
+                    "SSH_REMOTE_COMMAND_FAILED",
+                    "SSH 已连接，远端检测脚本传输失败",
+                )
+            }
+        })?;
+        channel.send_eof().map_err(&transport)?;
+    }
     let mut stdout = String::new();
     let mut stderr = String::new();
     channel.read_to_string(&mut stdout).map_err(|err| {
@@ -3758,6 +3785,17 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
     }
 
     async fn probe_route(state: &AppState) -> serde_json::Value {
+        probe_route_with_request(
+            state,
+            serde_json::json!({"host":"node.example","password":"wrong-password"}),
+        )
+        .await
+    }
+
+    async fn probe_route_with_request(
+        state: &AppState,
+        request: serde_json::Value,
+    ) -> serde_json::Value {
         let token = encode(
             &Header::default(),
             &Claims {
@@ -3777,9 +3815,7 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
                     .uri("/admin/node-deployments/fingerprint")
                     .header("Authorization", format!("Bearer {token}"))
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"host":"node.example","password":"wrong-password"}"#,
-                    ))
+                    .body(Body::from(request.to_string()))
                     .unwrap(),
             )
             .await
@@ -3789,6 +3825,143 @@ printf 'nginx %s\n' "$*" >> "${FAKE_COMMAND_LOG:?}"
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    struct InspectionSshServer {
+        child: std::process::Child,
+        ssh: SshInput,
+    }
+
+    impl InspectionSshServer {
+        fn start(mode: &str) -> Option<Self> {
+            use std::io::BufRead;
+            let available = Command::new("python3")
+                .args(["-B", "-c", "import paramiko"])
+                .output()
+                .is_ok_and(|out| out.status.success());
+            if !available {
+                assert!(
+                    std::env::var_os("RP_REQUIRE_SSH_INSPECTION_TESTS").is_none(),
+                    "required real SSH inspection fixture needs Python3 paramiko"
+                );
+                eprintln!("REAL SSH INSPECTION: NOT EXECUTED (Python3 paramiko unavailable)");
+                return None;
+            }
+            let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../scripts/ssh-inspection-test-server.py");
+            let mut child = Command::new("python3")
+                .args(["-B", "-u"])
+                .arg(script)
+                .arg(mode)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("start loopback-only SSH fixture");
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let facts: serde_json::Value = serde_json::from_str(&line).unwrap();
+            Some(Self {
+                child,
+                ssh: SshInput {
+                    host: "127.0.0.1".into(),
+                    port: facts["port"].as_u64().unwrap().try_into().unwrap(),
+                    username: facts["username"].as_str().unwrap().into(),
+                    password: facts["password"].as_str().unwrap().into(),
+                    probe_phase: None,
+                },
+            })
+        }
+    }
+
+    impl Drop for InspectionSshServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_inspection_real_transport_api_detects_clean_standard_and_lite_hosts() {
+        let Some(server) = InspectionSshServer::start("clean") else {
+            return;
+        };
+        let state = test_state(test_registry(
+            Arc::new(SystemSshRunner),
+            TOTAL_TIMEOUT,
+            ONLINE_TIMEOUT,
+        ))
+        .await;
+        for lite_mode in [false, true] {
+            let reply = probe_route_with_request(
+                &state,
+                serde_json::json!({
+                    "host": server.ssh.host, "port": server.ssh.port,
+                    "username": server.ssh.username, "password": server.ssh.password,
+                    "lite_mode": lite_mode,
+                }),
+            )
+            .await;
+            assert_eq!(reply["code"], 0, "complete real SSH/API probe: {reply}");
+            assert!(reply["data"]["fingerprint"]
+                .as_str()
+                .unwrap()
+                .starts_with("SHA256:"));
+            assert_eq!(reply["data"]["existing"]["classification"], "CLEAN_HOST");
+            assert!(state.deployments.tasks.lock().await.is_empty());
+            assert!(state.db.list_node_pool_records().await.unwrap().is_empty());
+            assert!(!reply.to_string().contains(&server.ssh.password));
+        }
+        let err = SystemSshRunner
+            .inspect(&server.ssh, "SHA256:wrong")
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.category, "SSH_HOST_KEY_MISMATCH");
+        eprintln!("REAL SSH INSPECTION API: EXECUTED (Standard + Lite + fingerprint guard)");
+    }
+
+    #[tokio::test]
+    async fn ssh_inspection_real_transport_failures_remain_safe_and_do_not_authorize_install() {
+        for (mode, category) in [
+            ("python_missing", "SSH_PYTHON_MISSING"),
+            ("command_failure", "EXISTING_STATE_COMMAND_FAILED"),
+            ("invalid_json", "EXISTING_STATE_AMBIGUOUS"),
+            // A peer that stops reading stdin can hit the existing request budget
+            // before libssh2's I/O timeout; it must still fail closed.
+            ("truncated_input", "EXISTING_STATE_TIMEOUT"),
+        ] {
+            let Some(server) = InspectionSshServer::start(mode) else {
+                return;
+            };
+            let state = test_state(test_registry(
+                Arc::new(SystemSshRunner),
+                TOTAL_TIMEOUT,
+                ONLINE_TIMEOUT,
+            ))
+            .await;
+            let reply = probe_route_with_request(
+                &state,
+                serde_json::json!({
+                    "host": server.ssh.host, "port": server.ssh.port,
+                    "username": server.ssh.username, "password": server.ssh.password,
+                }),
+            )
+            .await;
+            assert_ne!(reply["code"], 0);
+            assert!(
+                reply["message"].as_str().unwrap().starts_with(category),
+                "{mode}: {reply}"
+            );
+            assert!(reply["data"].is_null());
+            assert!(!reply
+                .to_string()
+                .contains("fixture-private-stderr-secret-marker"));
+            assert!(!reply.to_string().contains(&server.ssh.password));
+            assert!(state.deployments.tasks.lock().await.is_empty());
+            assert!(state.db.list_node_pool_records().await.unwrap().is_empty());
+        }
+        eprintln!("REAL SSH INSPECTION FAILURES: EXECUTED");
     }
 
     async fn probe_state(behavior: FakeBehavior) -> (AppState, Arc<FakeRunner>) {
